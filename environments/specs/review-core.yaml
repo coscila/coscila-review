@@ -1,0 +1,12 @@
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - "python >=3.12,<3.13"
+  - pip
+  - jsonschema
+  - pyyaml
+  - httpx
+  - pydantic
+  - pandas
+  - pyarrow

@@ -1,0 +1,26 @@
+schema_version = 1
+
+[[repository]]
+id = "crossref-rest-api-doc"
+url = "https://github.com/CrossRef/rest-api-doc.git"
+role = "provider-contract"
+license_expectation = "NOASSERTION"
+executed = false
+rationale = "Operator-archived documentation used to inspect Crossref response fields and query semantics. No project-authored text is redistributed into this companion."
+
+[[repository]]
+id = "mcp-python-sdk"
+url = "https://github.com/modelcontextprotocol/python-sdk.git"
+role = "protocol-contract"
+license_expectation = "MIT"
+executed = false
+rationale = "Pinned upstream protocol reference for compatibility review; the companion MCP servers are independently implemented."
+
+[[repository]]
+id = "citation-style-language-schema"
+url = "https://github.com/citation-style-language/schema.git"
+role = "citation-contract"
+license_expectation = "NOASSERTION"
+executed = false
+rationale = "Pinned citation-data interoperability reference. It is never imported or executed."
+

@@ -1,0 +1,11 @@
+# Operator-build input. Runtime commands never solve this file.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.8
+  - spacy=3.8.14
+  - nltk=3.9.1
+  - scikit-learn=1.6.0
+  - numpy=2.0.2
+  - pandas=2.2.3

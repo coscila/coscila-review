@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "server"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "server": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "enabled", "launcher", "environment", "transport", "startup_timeout_seconds", "call_timeout_seconds", "file_access", "live_tool", "live_arguments"],
+        "properties": {
+          "name": {"enum": ["ocsl_review_catalog", "ocsl_scholar"]},
+          "enabled": {"type": "boolean"}, "launcher": {"type": "string"},
+          "environment": {"const": "mcp-review"}, "transport": {"const": "stdio"},
+          "startup_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
+          "call_timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60},
+          "file_access": {"enum": ["none", "read-only"]}, "live_tool": {"type": "string"},
+          "live_arguments": {"type": "string"}
+        }
+      }
+    }
+  }
+}
+

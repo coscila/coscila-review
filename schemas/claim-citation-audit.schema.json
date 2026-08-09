@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ocsl.local/schemas/claim-citation-audit.schema.json",
+  "title": "Claim-citation audit graph",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "auditId", "createdAt", "manuscript", "auditScope", "claims", "citationClusters", "references", "verificationLinks", "completenessAssessments", "searchRuns", "reviewAssertions", "provenance"],
+  "properties": {
+    "schemaVersion": {"const": "1.0"},
+    "auditId": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+    "createdAt": {"type": "string", "format": "date-time"},
+    "manuscript": {"$ref": "#/$defs/manuscript"},
+    "auditScope": {"$ref": "#/$defs/auditScope"},
+    "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
+    "citationClusters": {"type": "array", "items": {"$ref": "#/$defs/citationCluster"}},
+    "references": {"type": "array", "items": {"$ref": "#/$defs/reference"}},
+    "verificationLinks": {"type": "array", "items": {"$ref": "#/$defs/verificationLink"}},
+    "completenessAssessments": {"type": "array", "items": {"$ref": "#/$defs/completeness"}},
+    "searchRuns": {"type": "array", "items": {"$ref": "#/$defs/searchRun"}},
+    "reviewAssertions": {"type": "array", "items": {"$ref": "#/$defs/reviewAssertion"}},
+    "provenance": {"$ref": "#/$defs/provenance"}
+  },
+  "$defs": {
+    "nonempty": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]+$"},
+    "locator": {
+      "type": "object", "additionalProperties": false,
+      "required": ["section", "paragraph", "sentence", "clause"],
+      "properties": {
+        "section": {"type": "string"}, "paragraph": {"type": "integer", "minimum": 0},
+        "sentence": {"type": "integer", "minimum": 0}, "clause": {"type": "integer", "minimum": 0},
+        "page": {"type": ["integer", "null"], "minimum": 1}, "anchor": {"type": ["string", "null"]}
+      }
+    },
+    "manuscript": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "sourceSha256", "confidential", "ingestionComplete", "ingestionIssues", "sectionsTotal", "sectionsProcessed"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "sourceSha256": {"$ref": "#/$defs/sha256"},
+        "confidential": {"type": "boolean"}, "ingestionComplete": {"type": "boolean"},
+        "ingestionIssues": {"type": "array", "items": {"type": "string"}},
+        "sectionsTotal": {"type": "integer", "minimum": 0}, "sectionsProcessed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "auditScope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "citationBindingComplete", "searchCurrentThrough"],
+      "properties": {
+        "mode": {"enum": ["exhaustive", "sample"]}, "citationBindingComplete": {"type": "boolean"},
+        "searchCurrentThrough": {"type": ["string", "null"], "format": "date"}
+      }
+    },
+    "claim": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "locator", "text", "origin", "claimType", "citationRequired", "citationRequirementReason", "citationClusterIds", "citationBindingStatus", "requiredEvidenceLevel", "processed"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "locator": {"$ref": "#/$defs/locator"}, "text": {"$ref": "#/$defs/nonempty"},
+        "origin": {"enum": ["external-background", "manuscript-result", "manuscript-method", "manuscript-interpretation", "reviewer-added", "other"]},
+        "claimType": {"enum": ["fact", "numeric", "causal", "generalization", "novelty", "method", "software", "dataset", "quotation", "recommendation", "interpretation"]},
+        "citationRequired": {"type": "boolean"}, "citationRequirementReason": {"$ref": "#/$defs/nonempty"},
+        "citationClusterIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
+        "citationBindingStatus": {"enum": ["exact", "ambiguous", "missing", "not-applicable"]},
+        "requiredEvidenceLevel": {"enum": ["full-text", "abstract-sufficient", "metadata-sufficient", "not-applicable"]},
+        "processed": {"type": "boolean"}
+      }
+    },
+    "citationCluster": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "locator", "raw", "markers", "referenceIds", "processed"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "locator": {"$ref": "#/$defs/locator"}, "raw": {"$ref": "#/$defs/nonempty"},
+        "markers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "referenceIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "processed": {"type": "boolean"}
+      }
+    },
+    "reference": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "raw", "identifiers", "identity", "resolutionStatus", "publicationStatus", "sourceRole", "independenceGroup", "metadataProblems"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "raw": {"type": "string"},
+        "identifiers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "identity": {
+          "type": "object", "additionalProperties": false, "required": ["title", "authors", "year", "container", "version"],
+          "properties": {"title": {"type": ["string", "null"]}, "authors": {"type": "array", "items": {"type": "string"}}, "year": {"type": ["integer", "null"]}, "container": {"type": ["string", "null"]}, "version": {"type": ["string", "null"]}}
+        },
+        "resolutionStatus": {"enum": ["resolved", "ambiguous", "unresolved"]},
+        "publicationStatus": {
+          "type": "object", "additionalProperties": false, "required": ["state", "checkedAt", "providers", "details"],
+          "properties": {
+            "state": {"enum": ["current", "corrected", "retracted", "expression-of-concern", "preprint", "superseded", "unknown"]},
+            "checkedAt": {"type": ["string", "null"], "format": "date-time"}, "providers": {"type": "array", "items": {"type": "string"}}, "details": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "sourceRole": {"enum": ["primary", "review", "guideline", "preprint", "dataset", "software", "other"]},
+        "independenceGroup": {"type": ["string", "null"]}, "metadataProblems": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "scopeComparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["species", "population", "exposureOrIntervention", "comparator", "outcome", "direction", "magnitude", "causalStrength", "setting", "timeframe"],
+      "properties": {
+        "species": {"$ref": "#/$defs/scopeValue"}, "population": {"$ref": "#/$defs/scopeValue"},
+        "exposureOrIntervention": {"$ref": "#/$defs/scopeValue"}, "comparator": {"$ref": "#/$defs/scopeValue"},
+        "outcome": {"$ref": "#/$defs/scopeValue"}, "direction": {"$ref": "#/$defs/scopeValue"},
+        "magnitude": {"$ref": "#/$defs/scopeValue"}, "causalStrength": {"$ref": "#/$defs/scopeValue"},
+        "setting": {"$ref": "#/$defs/scopeValue"}, "timeframe": {"$ref": "#/$defs/scopeValue"}
+      }
+    },
+    "scopeValue": {"enum": ["match", "mismatch", "unclear", "not-applicable"]},
+    "verificationLink": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "claimId", "referenceId", "access", "evidenceLocations", "supportVerdict", "supportReason", "scopeComparison", "quotationOrNumberCheck", "confidence", "abstentionReason", "humanAction"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "claimId": {"$ref": "#/$defs/id"}, "referenceId": {"$ref": "#/$defs/id"},
+        "access": {
+          "type": "object", "additionalProperties": false, "required": ["level", "provider", "uri", "checkedAt"],
+          "properties": {"level": {"enum": ["full-text", "abstract-only", "metadata-only", "inaccessible"]}, "provider": {"type": "string"}, "uri": {"type": ["string", "null"]}, "checkedAt": {"type": "string", "format": "date-time"}}
+        },
+        "evidenceLocations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["locator", "excerptSha256"], "properties": {"locator": {"$ref": "#/$defs/nonempty"}, "excerptSha256": {"$ref": "#/$defs/sha256"}, "excerpt": {"type": "string", "maxLength": 500}}}},
+        "supportVerdict": {"enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
+        "supportReason": {"$ref": "#/$defs/nonempty"}, "scopeComparison": {"$ref": "#/$defs/scopeComparison"},
+        "quotationOrNumberCheck": {"enum": ["faithful", "drift", "not-checked", "not-applicable"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "abstentionReason": {"type": ["string", "null"]}, "humanAction": {"$ref": "#/$defs/nonempty"}
+      }
+    },
+    "completeness": {
+      "type": "object", "additionalProperties": false, "required": ["claimId", "verdict", "reasons", "searchRunIds", "requiredHumanAction"],
+      "properties": {
+        "claimId": {"$ref": "#/$defs/id"},
+        "verdict": {"enum": ["sufficient", "missing-citation", "insufficient-directness", "insufficient-scope", "insufficient-breadth", "insufficient-currency", "insufficient-balance", "not-assessable"]},
+        "reasons": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "searchRunIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "requiredHumanAction": {"$ref": "#/$defs/nonempty"}
+      }
+    },
+    "searchRun": {
+      "type": "object", "additionalProperties": false, "required": ["id", "provider", "querySha256", "queryDisclosure", "executedAt", "dateRange", "databases", "resultCount", "independentGroupsFound", "fullQueryStored"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "provider": {"$ref": "#/$defs/nonempty"}, "querySha256": {"$ref": "#/$defs/sha256"},
+        "queryDisclosure": {"enum": ["identifier-only", "sanitized", "explicitly-approved"]}, "executedAt": {"type": "string", "format": "date-time"},
+        "dateRange": {"type": ["string", "null"]}, "databases": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "resultCount": {"type": "integer", "minimum": 0}, "independentGroupsFound": {"type": "integer", "minimum": 0}, "fullQueryStored": {"const": false}
+      }
+    },
+    "reviewAssertion": {
+      "type": "object", "additionalProperties": false, "required": ["id", "text", "type", "citationIds", "supportStatus"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "text": {"$ref": "#/$defs/nonempty"}, "type": {"enum": ["factual", "methodological-judgment", "editorial-opinion"]}, "citationIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "supportStatus": {"enum": ["supported", "manuscript-grounded", "opinion", "unsupported", "abstain"]}}
+    },
+    "provenance": {
+      "type": "object", "additionalProperties": false, "required": ["toolVersion", "schemaSha256", "createdBy", "commands"],
+      "properties": {"toolVersion": {"$ref": "#/$defs/nonempty"}, "schemaSha256": {"$ref": "#/$defs/sha256"}, "createdBy": {"$ref": "#/$defs/nonempty"}, "commands": {"type": "array", "items": {"type": "string"}}}
+    }
+  }
+}

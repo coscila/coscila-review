@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-manuscript-ingest"
+title = "Manuscript ingestion"
+summary = "Extract a location-stable manuscript model while preserving clauses, citation markers, tables, figures, and ingestion limitations."
+primary_environment = "review-documents"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["manuscript.json", "ingestion-report.json"]
+confidential_by_default = true
+

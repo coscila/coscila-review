@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-evidence-balance"
+title = "Evidence balance"
+summary = "Identify omitted contrary, null, replication, and higher-quality evidence while accounting for shared cohorts and dependent publications."
+primary_environment = "review-literature"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_scholar"]
+outputs = ["evidence-balance.jsonl"]
+confidential_by_default = true

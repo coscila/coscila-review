@@ -1,0 +1,201 @@
+schema_version = 1
+
+[[skill]]
+id = "ocsl-review-router"
+title = "Scientific review router"
+summary = "Classify the review request, confidentiality state, evidence burden, and required specialist passes before work begins."
+primary_environment = "review-core"
+secondary_environments = []
+mcps = ["ocsl_review_catalog"]
+outputs = ["review-plan.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-manuscript-ingest"
+title = "Manuscript ingestion"
+summary = "Extract a location-stable manuscript model while preserving clauses, citation markers, tables, figures, and ingestion limitations."
+primary_environment = "review-documents"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["manuscript.json", "ingestion-report.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-claim-inventory"
+title = "Atomic claim inventory"
+summary = "Split manuscript statements into auditable claims and decide whether each claim needs external evidence without penalizing original results."
+primary_environment = "review-nlp"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["audit-graph.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-reference-integrity"
+title = "Reference integrity"
+summary = "Resolve cited works, reconcile bibliographic identities and versions, and identify correction, expression-of-concern, or retraction status."
+primary_environment = "review-literature"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["references.jsonl", "reference-integrity.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-claim-source-verification"
+title = "Claim-to-source verification"
+summary = "Compare each cited clause against located source evidence, including population, direction, magnitude, and causal strength."
+primary_environment = "review-literature"
+secondary_environments = ["review-documents", "mcp-review"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["claim-source-edges.jsonl"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-citation-completeness"
+title = "Citation completeness"
+summary = "Assess whether citation-required claims have evidence of adequate directness, independence, breadth, currency, balance, and placement."
+primary_environment = "review-literature"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["citation-completeness.jsonl", "audit-summary.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-literature-search-update"
+title = "Literature search update"
+summary = "Run source-explicit, dated, reproducible searches that update a manuscript evidence base without disclosing confidential text."
+primary_environment = "review-literature"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_scholar"]
+outputs = ["search-protocol.json", "search-results.jsonl"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-novelty-priority"
+title = "Novelty and priority"
+summary = "Test priority language with multiple reproducible searches, version-aware deduplication, and an explicit limit on conclusions from incomplete coverage."
+primary_environment = "review-literature"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_scholar"]
+outputs = ["novelty-audit.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-evidence-balance"
+title = "Evidence balance"
+summary = "Identify omitted contrary, null, replication, and higher-quality evidence while accounting for shared cohorts and dependent publications."
+primary_environment = "review-literature"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_scholar"]
+outputs = ["evidence-balance.jsonl"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-methods-statistics"
+title = "Methods and statistics"
+summary = "Audit design, estimands, analysis units, model assumptions, uncertainty, multiplicity, missingness, and validation without conflating reporting with validity."
+primary_environment = "review-statistics"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["methods-statistics.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-reporting-guidelines"
+title = "Reporting guideline compliance"
+summary = "Select the applicable reporting checklist, map disclosed items to manuscript locations, and keep transparency findings separate from quality appraisal."
+primary_environment = "review-core"
+secondary_environments = ["review-documents"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["reporting-checklist.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-results-figures-tables"
+title = "Results, figures, and tables"
+summary = "Reconcile narrative results with displays and reported analyses, checking denominators, uncertainty, labels, transformations, and internal arithmetic."
+primary_environment = "review-statistics"
+secondary_environments = ["review-documents"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["results-display-audit.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-reproducibility-data-code"
+title = "Reproducibility, data, and code"
+summary = "Trace methods to executable materials, data and software identities, parameter provenance, access conditions, and feasible rerun checks."
+primary_environment = "review-core"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["reproducibility-audit.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-ethics-transparency"
+title = "Ethics and transparency"
+summary = "Audit approvals, consent, registration, conflicts, funding, authorship, data governance, and disclosure consistency without making legal determinations."
+primary_environment = "review-core"
+secondary_environments = ["review-documents"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["ethics-transparency.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-journal-policy"
+title = "Journal policy"
+summary = "Capture dated journal requirements and distinguish explicit policy conflicts from recommendations or unresolved interpretation."
+primary_environment = "review-literature"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_scholar"]
+outputs = ["journal-policy-audit.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-systematic-review"
+title = "Systematic review audit"
+summary = "Audit search, screening, deduplication, extraction, risk-of-bias, synthesis, heterogeneity, certainty, and protocol deviations for evidence syntheses."
+primary_environment = "review-statistics"
+secondary_environments = ["review-literature"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["systematic-review-audit.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-peer-report"
+title = "Peer review report"
+summary = "Compose a prioritized, evidence-linked report from completed audit records without introducing unsupported literature claims or exposing confidential material."
+primary_environment = "review-documents"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["peer-review.md", "audit-summary.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-revision-response"
+title = "Revision and response audit"
+summary = "Map reviewer requests to manuscript changes and author responses, verifying that claimed revisions are present and scientifically adequate."
+primary_environment = "review-documents"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["revision-response-audit.json", "response-letter.md"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-calibration"
+title = "Review calibration"
+summary = "Measure false-support errors, abstention quality, scope-mismatch detection, citation-needed accuracy, and factuality on adversarial fixtures."
+primary_environment = "review-statistics"
+secondary_environments = ["review-literature"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["calibration-report.json"]
+confidential_by_default = true
+
+[[skill]]
+id = "ocsl-review-environments"
+title = "Review environment management"
+summary = "Inspect and materialize immutable review templates and isolated chat instances while preserving lock, build, and fork provenance."
+primary_environment = "review-core"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["environment.json"]
+confidential_by_default = true

@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-calibration"
+title = "Review calibration"
+summary = "Measure false-support errors, abstention quality, scope-mismatch detection, citation-needed accuracy, and factuality on adversarial fixtures."
+primary_environment = "review-statistics"
+secondary_environments = ["review-literature"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["calibration-report.json"]
+confidential_by_default = true

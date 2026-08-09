@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-literature-search-update"
+title = "Literature search update"
+summary = "Run source-explicit, dated, reproducible searches that update a manuscript evidence base without disclosing confidential text."
+primary_environment = "review-literature"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_scholar"]
+outputs = ["search-protocol.json", "search-results.jsonl"]
+confidential_by_default = true
+

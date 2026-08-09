@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-claim-source-verification"
+title = "Claim-to-source verification"
+summary = "Compare each cited clause against located source evidence, including population, direction, magnitude, and causal strength."
+primary_environment = "review-literature"
+secondary_environments = ["review-documents", "mcp-review"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["claim-source-edges.jsonl"]
+confidential_by_default = true
+

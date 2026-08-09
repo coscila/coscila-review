@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-journal-policy"
+title = "Journal policy"
+summary = "Capture dated journal requirements and distinguish explicit policy conflicts from recommendations or unresolved interpretation."
+primary_environment = "review-literature"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_scholar"]
+outputs = ["journal-policy-audit.json"]
+confidential_by_default = true

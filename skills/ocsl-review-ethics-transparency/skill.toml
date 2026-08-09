@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-ethics-transparency"
+title = "Ethics and transparency"
+summary = "Audit approvals, consent, registration, conflicts, funding, authorship, data governance, and disclosure consistency without making legal determinations."
+primary_environment = "review-core"
+secondary_environments = ["review-documents"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["ethics-transparency.json"]
+confidential_by_default = true
+

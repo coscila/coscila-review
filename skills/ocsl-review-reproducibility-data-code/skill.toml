@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-reproducibility-data-code"
+title = "Reproducibility, data, and code"
+summary = "Trace methods to executable materials, data and software identities, parameter provenance, access conditions, and feasible rerun checks."
+primary_environment = "review-core"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["reproducibility-audit.json"]
+confidential_by_default = true

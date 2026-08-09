@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${OCSL_REVIEW_HOME:-}" ]]; then
+  OCSL_REVIEW_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  export OCSL_REVIEW_HOME
+fi
+
+export PYTHONPATH="$OCSL_REVIEW_HOME/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m ocsl_review.cli "$@"
