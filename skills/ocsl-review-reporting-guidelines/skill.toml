@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-reporting-guidelines"
+title = "Reporting guideline compliance"
+summary = "Select the applicable reporting checklist, map disclosed items to manuscript locations, and keep transparency findings separate from quality appraisal."
+primary_environment = "review-core"
+secondary_environments = ["review-documents"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["reporting-checklist.json"]
+confidential_by_default = true

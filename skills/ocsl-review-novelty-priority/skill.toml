@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-novelty-priority"
+title = "Novelty and priority"
+summary = "Test priority language with multiple reproducible searches, version-aware deduplication, and an explicit limit on conclusions from incomplete coverage."
+primary_environment = "review-literature"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_scholar"]
+outputs = ["novelty-audit.json"]
+confidential_by_default = true
+

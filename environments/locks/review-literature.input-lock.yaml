@@ -1,0 +1,12 @@
+# Operator-build input. Runtime commands never solve this file.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.8
+  - requests=2.32.3
+  - httpx=0.28.1
+  - biopython=1.85
+  - rapidfuzz=3.11.0
+  - pandas=2.2.3
+  - lxml=5.3.0

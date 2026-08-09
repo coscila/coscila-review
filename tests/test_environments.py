@@ -1,0 +1,852 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from ocsl_review.config import Paths
+from ocsl_review.environments import (
+    audit_inode_isolation,
+    build_template,
+    cmd_build,
+    cmd_fork,
+    cmd_run,
+    current_conda_platform,
+    ensure_environment,
+    fork_environment,
+    list_environments,
+    load_environment_catalog,
+    rematerialize_chat_fork,
+    resolve_template,
+    validate_descriptor,
+    verify_environment,
+    workspace_identifier,
+)
+from ocsl_review.errors import ReviewError, TrustBoundaryError, ValidationError
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+FAKE_CONDA = r"""#!/usr/bin/env python3
+import json
+import os
+import platform
+import shutil
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+args = sys.argv[1:]
+log = Path(os.environ["FAKE_CONDA_LOG"])
+with log.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\n")
+
+def value(flag):
+    return Path(args[args.index(flag) + 1])
+
+def populate(prefix):
+    (prefix / "bin").mkdir(parents=True, exist_ok=True)
+    (prefix / "conda-meta").mkdir(parents=True, exist_ok=True)
+    (prefix / "bin" / "python").write_text("fake-python\n", encoding="utf-8")
+    machine = platform.machine().lower()
+    subdir = "linux-aarch64" if machine in {"aarch64", "arm64"} else "linux-64"
+    record = {
+        "url": f"https://packages.example.test/{subdir}/python-3.12.8-0.conda",
+        "md5": "0123456789abcdef0123456789abcdef",
+    }
+    (prefix / "conda-meta" / "python.json").write_text(
+        json.dumps(record) + "\n", encoding="utf-8"
+    )
+    pip_record = {
+        "url": "https://packages.example.test/noarch/pip-24.3.1-0.conda",
+        "md5": "abcdef0123456789abcdef0123456789",
+    }
+    if os.environ.get("FAKE_OMIT_PIP_RECORD") != "1":
+        (prefix / "conda-meta" / "pip.json").write_text(
+            json.dumps(pip_record) + "\n", encoding="utf-8"
+    )
+    os.chmod(prefix / "bin" / "python", 0o755)
+    external_link = os.environ.get("FAKE_EXTERNAL_SYMLINK")
+    if external_link:
+        (prefix / "external-link").symlink_to(external_link)
+
+def hardlink_tree(source, destination):
+    destination.mkdir(parents=True)
+    for item in source.rglob("*"):
+        relative = item.relative_to(source)
+        target = destination / relative
+        if item.is_symlink():
+            target.symlink_to(os.readlink(item))
+        elif item.is_dir():
+            target.mkdir(exist_ok=True)
+        elif item.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.link(item, target)
+
+if args[:2] == ["env", "create"] or args[:1] == ["create"]:
+    prefix = value("--prefix")
+    if os.environ.get("FAKE_FAIL_CREATE") == "1":
+        prefix.mkdir(parents=True, exist_ok=True)
+        (prefix / "partial").write_text("partial", encoding="utf-8")
+        raise SystemExit(19)
+    if "--clone" in args:
+        source = value("--clone")
+        if os.environ.get("FAKE_CLONE_HARDLINK") == "1":
+            hardlink_tree(source, prefix)
+        else:
+            shutil.copytree(source, prefix, copy_function=shutil.copy2)
+    else:
+        prefix.mkdir(parents=True, exist_ok=True)
+        populate(prefix)
+    raise SystemExit(0)
+
+if args[:1] == ["install"]:
+    prefix = value("--prefix")
+    lock = value("--file")
+    for index, artifact in enumerate(lock.read_text(encoding="utf-8").splitlines()):
+        if not artifact or artifact.startswith("@") or artifact.startswith("#"):
+            continue
+        parsed = urlsplit(artifact)
+        fragment = parsed.fragment.lower()
+        if fragment.startswith("sha256="):
+            checksum = {"sha256": fragment.removeprefix("sha256=")}
+        else:
+            checksum = {"md5": fragment.removeprefix("md5=")}
+        record = {"url": artifact.split("#", 1)[0], **checksum}
+        (prefix / "conda-meta" / f"overlay-{index}.json").write_text(
+            json.dumps(record) + "\n", encoding="utf-8"
+        )
+    (prefix / "overlay-conda.txt").write_text("installed\n", encoding="utf-8")
+    raise SystemExit(0)
+
+if args[:1] == ["run"]:
+    if os.environ.get("FAKE_FAIL_PROBE") == "1":
+        raise SystemExit(23)
+    prefix = value("--prefix")
+    failure_fragment = os.environ.get("FAKE_FAIL_PROBE_PREFIX")
+    if failure_fragment and failure_fragment in str(prefix):
+        raise SystemExit(24)
+    if "pip" in args and "install" in args:
+        (prefix / "overlay-pip.txt").write_text("installed\n", encoding="utf-8")
+    raise SystemExit(0)
+
+if args[:2] == ["list", "--explicit"]:
+    machine = platform.machine().lower()
+    subdir = "linux-aarch64" if machine in {"aarch64", "arm64"} else "linux-64"
+    print("# generated by fake Conda")
+    print("@EXPLICIT")
+    print(f"https://packages.example.test/{subdir}/python-3.12.8-0.conda#"
+          "0123456789abcdef0123456789abcdef")
+    print("https://packages.example.test/noarch/pip-24.3.1-0.conda#"
+          "abcdef0123456789abcdef0123456789")
+    raise SystemExit(0)
+
+raise SystemExit(97)
+"""
+
+
+class EnvironmentLayerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.state = self.root / "state"
+        self.chat_root = self.root / "chat-conda"
+        self.workspace = self.root / "workspace-a"
+        self.workspace.mkdir()
+        self.paths = Paths(home=ROOT, state=self.state, lab_repo=None)
+        self.log = self.root / "conda-argv.jsonl"
+        self.conda = self.root / "bin" / "conda"
+        self.conda.parent.mkdir()
+        self.conda.write_text(FAKE_CONDA, encoding="utf-8")
+        self.conda.chmod(0o755)
+        self.micromamba = self.root / "bin" / "micromamba"
+        self.micromamba.write_text(FAKE_CONDA, encoding="utf-8")
+        self.micromamba.chmod(0o755)
+        self.environment = patch.dict(
+            os.environ,
+            {
+                "FAKE_CONDA_LOG": str(self.log),
+                "LAB_CONDA_ROOT": str(self.chat_root),
+            },
+            clear=False,
+        )
+        self.environment.start()
+
+    def tearDown(self) -> None:
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def argv(self) -> list[list[str]]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def clear_argv(self) -> None:
+        self.log.unlink(missing_ok=True)
+
+    def build_core(self) -> dict[str, object]:
+        return build_template(
+            self.paths,
+            "review-core",
+            executable=self.conda,
+            solve_timeout=10,
+            probe_timeout=10,
+        )
+
+    def test_catalog_has_six_hash_verified_inputs_and_unique_skill_mappings(self) -> None:
+        catalog = load_environment_catalog(self.paths)
+        self.assertEqual(
+            set(catalog),
+            {
+                "review-core",
+                "review-documents",
+                "review-literature",
+                "review-nlp",
+                "review-statistics",
+                "mcp-review",
+            },
+        )
+        skills = [skill for item in catalog.values() for skill in item.skills]
+        self.assertEqual(len(skills), 20)
+        self.assertEqual(len(skills), len(set(skills)))
+        for item in catalog.values():
+            self.assertTrue(item.spec.is_file())
+            self.assertTrue(item.input_lock.is_file())
+            self.assertRegex(item.input_lock_sha256, r"^[0-9a-f]{64}$")
+        with (ROOT / "skills" / "catalog.toml").open("rb") as handle:
+            skill_catalog = tomllib.load(handle)
+        primary = {item["id"]: item["primary_environment"] for item in skill_catalog["skill"]}
+        mapped = {
+            skill: environment.id
+            for environment in catalog.values()
+            for skill in environment.skills
+        }
+        self.assertEqual(mapped, primary)
+
+    def test_operator_build_stages_probes_exports_and_promotes_read_only(self) -> None:
+        result = self.build_core()
+        self.assertFalse(result["reused"])
+        template = Path(str(result["template"]))
+        exact_lock = Path(str(result["exactLock"]))
+        self.assertTrue(template.is_dir())
+        self.assertTrue(exact_lock.is_file())
+        current = template.parent / "current"
+        self.assertTrue(current.is_symlink())
+        self.assertEqual(os.readlink(current), template.name)
+        self.assertEqual(current.resolve(), template.resolve())
+        self.assertEqual(exact_lock.stat().st_mode & 0o222, 0)
+        self.assertTrue(exact_lock.read_text(encoding="utf-8").startswith("@EXPLICIT\n"))
+        for path in [template, *template.rglob("*")]:
+            if not path.is_symlink():
+                self.assertEqual(path.lstat().st_mode & 0o222, 0, path)
+        commands = self.argv()
+        self.assertEqual(commands[0][0], "create")
+        self.assertIn("--copy", commands[0])
+        self.assertEqual(
+            commands[0][commands[0].index("--subdir") + 1],
+            current_conda_platform(),
+        )
+        self.assertIn("--no-default-packages", commands[0])
+        staged_prefix = commands[0][commands[0].index("--prefix") + 1]
+        self.assertTrue(staged_prefix.startswith(str(self.state)))
+        self.assertTrue(any(command[:2] == ["list", "--explicit"] for command in commands))
+        self.assertTrue(Path(staged_prefix).name.startswith(".staging-"))
+        self.assertFalse(
+            any(path.name.startswith(".staging-") for path in template.parent.iterdir())
+        )
+
+    def test_environment_list_exposes_current_exact_lock_digest(self) -> None:
+        before = {item["id"]: item for item in list_environments(self.paths)}
+        self.assertIsNone(before["review-core"]["currentBuildId"])
+        self.assertIsNone(before["review-core"]["currentExactLockSha256"])
+
+        self.build_core()
+        current = resolve_template(self.paths, "review-core")
+        after = {item["id"]: item for item in list_environments(self.paths)}
+        self.assertEqual(after["review-core"]["currentBuildId"], current.build_id)
+        self.assertEqual(
+            after["review-core"]["currentExactLockSha256"],
+            current.exact_lock_sha256,
+        )
+        self.assertRegex(
+            after["review-core"]["currentExactLockSha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_cmd_build_rejects_a_chat_workspace_context(self) -> None:
+        args = SimpleNamespace(
+            paths=self.paths,
+            environment="review-core",
+            all=False,
+            executable=self.conda,
+            platform=current_conda_platform(),
+            timeout=10,
+            probe_timeout=10,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"LAB_WORKSPACE_ROOT": str(Path.cwd())},
+                clear=False,
+            ),
+            self.assertRaises(TrustBoundaryError),
+        ):
+            cmd_build(args)
+
+    def test_cmd_run_prefers_passthrough_argv_over_subcommand_name(self) -> None:
+        self.build_core()
+        self.clear_argv()
+        result = cmd_run(
+            SimpleNamespace(
+                paths=self.paths,
+                argv=["python", "-V"],
+                command="run",
+                workspace=self.workspace,
+                environment="review-core",
+                skill=None,
+                executable=self.conda,
+                chat_root=self.chat_root,
+                platform=current_conda_platform(),
+                timeout=10,
+                command_timeout=10,
+            )
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.argv()[-1][-2:], ["python", "-V"])
+
+    def test_cmd_run_accepts_verified_clone_and_rebuild_forks(self) -> None:
+        self.build_core()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            skill_id="ocsl-review-environments",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+
+        for index, mode in enumerate(("clone", "reproducible-rebuild", "rebuild")):
+            with self.subTest(mode=mode):
+                target = self.root / f"workspace-run-{index}"
+                target.mkdir()
+                logical_name = "review-core" if index == 0 else f"review-core-{index}"
+                forked = fork_environment(
+                    self.paths,
+                    source_workspace=self.workspace,
+                    target_workspace=target,
+                    environment_id="review-core",
+                    name=logical_name,
+                    mode=mode,
+                    executable=self.conda,
+                    chat_root=self.chat_root,
+                    timeout=10,
+                    probe_timeout=10,
+                )
+                self.clear_argv()
+                result = cmd_run(
+                    SimpleNamespace(
+                        paths=self.paths,
+                        argv=["python", "-V"],
+                        command="run",
+                        workspace=target,
+                        environment=None,
+                        skill="ocsl-review-environments",
+                        name=logical_name,
+                        executable=self.conda,
+                        chat_root=self.chat_root,
+                        platform=current_conda_platform(),
+                        timeout=10,
+                        probe_timeout=10,
+                        command_timeout=10,
+                    )
+                )
+                commands = self.argv()
+                self.assertEqual(result.returncode, 0)
+                self.assertFalse(any(command[0] == "create" for command in commands))
+                self.assertEqual(commands[-1][-2:], ["python", "-V"])
+                self.assertEqual(
+                    commands[-1][commands[-1].index("--prefix") + 1],
+                    str(forked.prefix),
+                )
+
+    def test_cmd_fork_rejects_all_with_overlays_before_materializing(self) -> None:
+        target = self.root / "workspace-b"
+        target.mkdir()
+        artifact = "https://packages.example.test/noarch/addon-1.0-0.conda#" + "a" * 32
+        requirement = "addon==1.0 --hash=sha256:" + "b" * 64
+        for additions in (
+            {"add_conda": [artifact], "add_pip": []},
+            {"add_conda": [], "add_pip": [requirement]},
+        ):
+            with (
+                self.subTest(additions=additions),
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "--all cannot be combined with --add-conda or --add-pip",
+                ),
+            ):
+                cmd_fork(
+                    SimpleNamespace(
+                        paths=self.paths,
+                        source_workspace=self.workspace,
+                        target_workspace=target,
+                        all=True,
+                        mode="clone",
+                        executable=self.conda,
+                        chat_root=self.chat_root,
+                        platform=current_conda_platform(),
+                        timeout=10,
+                        probe_timeout=10,
+                        **additions,
+                    )
+                )
+        self.assertFalse((target / "envs").exists())
+
+    def test_repeated_build_does_not_modify_a_promoted_template(self) -> None:
+        first = self.build_core()
+        template = Path(str(first["template"]))
+        receipt = template / ".ocsl-review-template.json"
+        before = (receipt.read_bytes(), receipt.stat().st_mtime_ns, template.stat().st_mode)
+        second = self.build_core()
+        after = (receipt.read_bytes(), receipt.stat().st_mtime_ns, template.stat().st_mode)
+        self.assertTrue(second["reused"])
+        self.assertEqual(before, after)
+
+    def test_resolve_and_verify_reject_an_unsafe_current_pointer(self) -> None:
+        result = self.build_core()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        current = Path(str(result["template"])).parent / "current"
+        current.unlink()
+        current.symlink_to("../outside")
+        with self.assertRaisesRegex(ValidationError, "unsafe target"):
+            resolve_template(self.paths, "review-core")
+        with self.assertRaisesRegex(ValidationError, "unsafe target"):
+            verify_environment(
+                self.paths,
+                workspace=self.workspace,
+                logical_name="review-core",
+                executable=self.conda,
+                chat_root=self.chat_root,
+                probe_timeout=10,
+            )
+
+    def test_verify_is_observational_and_preserves_prefix_permissions(self) -> None:
+        self.build_core()
+        instance = ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        descriptor_before = instance.descriptor_path.read_bytes()
+        descriptor_mtime_before = instance.descriptor_path.stat().st_mtime_ns
+        original_prefix_mode = stat.S_IMODE(instance.prefix.stat().st_mode)
+        prefix_mode = original_prefix_mode & ~0o222
+        os.chmod(instance.prefix, prefix_mode)
+        self.assertFalse((instance.prefix / ".ocsl-mamba-cache").exists())
+
+        try:
+            result = verify_environment(
+                self.paths,
+                workspace=self.workspace,
+                logical_name="review-core",
+                executable=self.micromamba,
+                chat_root=self.chat_root,
+                probe_timeout=10,
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(instance.descriptor_path.read_bytes(), descriptor_before)
+            self.assertEqual(
+                instance.descriptor_path.stat().st_mtime_ns,
+                descriptor_mtime_before,
+            )
+            self.assertEqual(stat.S_IMODE(instance.prefix.stat().st_mode), prefix_mode)
+            self.assertFalse((instance.prefix / ".ocsl-mamba-cache").exists())
+        finally:
+            os.chmod(instance.prefix, original_prefix_mode)
+
+    def test_micromamba_build_uses_copy_mode_and_package_records_for_export(self) -> None:
+        result = build_template(
+            self.paths,
+            "review-core",
+            executable=self.micromamba,
+            solve_timeout=10,
+            probe_timeout=10,
+        )
+        commands = self.argv()
+        self.assertIn("--always-copy", commands[0])
+        self.assertIn("--platform", commands[0])
+        self.assertNotIn("--subdir", commands[0])
+        self.assertFalse(any(command[:2] == ["list", "--explicit"] for command in commands))
+        exact = Path(str(result["exactLock"])).read_text(encoding="utf-8")
+        self.assertEqual(exact.count("https://"), 2)
+        self.clear_argv()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.micromamba,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        clone = self.argv()[0]
+        self.assertIn("--always-copy", clone)
+        self.assertIn("--clone", clone)
+        self.assertIn("--offline", clone)
+
+    def test_ordinary_ensure_uses_copy_clone_and_never_solves(self) -> None:
+        self.build_core()
+        self.clear_argv()
+        instance = ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        commands = self.argv()
+        clone = commands[0]
+        self.assertEqual(clone[0], "create")
+        self.assertIn("--copy", clone)
+        self.assertIn("--clone", clone)
+        self.assertNotIn("env", clone)
+        self.assertTrue(instance.prefix.is_relative_to(self.chat_root / "envs" / "ocsl-review"))
+        self.assertTrue(instance.descriptor_path.is_relative_to(self.workspace))
+        self.assertEqual(instance.descriptor["mode"], "template-clone")
+        template = Path(clone[clone.index("--clone") + 1])
+        self.assertEqual(audit_inode_isolation(template, instance.prefix)["sharedRegularFiles"], 0)
+        self.assertNotEqual(instance.prefix.stat().st_mode & stat.S_IWUSR, 0)
+        self.assertFalse(any(command[:2] == ["env", "create"] for command in commands))
+
+    def test_hardlinked_clone_is_rejected_after_full_audit_and_cleaned(self) -> None:
+        self.build_core()
+        self.clear_argv()
+        with (
+            patch.dict(os.environ, {"FAKE_CLONE_HARDLINK": "1"}, clear=False),
+            self.assertRaisesRegex(ValidationError, "hard links|share inodes"),
+        ):
+            ensure_environment(
+                self.paths,
+                workspace=self.workspace,
+                environment_id="review-core",
+                executable=self.conda,
+                chat_root=self.chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+        workspace_root = (
+            self.chat_root / "envs" / "ocsl-review" / workspace_identifier(self.workspace)
+        )
+        self.assertEqual(list(workspace_root.iterdir()), [])
+        self.assertFalse((self.workspace / "envs" / "review-core" / "environment.json").exists())
+
+    def test_rebuild_fork_consumes_exact_lock_and_only_exact_overlays(self) -> None:
+        self.build_core()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        target = self.root / "workspace-b"
+        target.mkdir()
+        self.clear_argv()
+        artifact = (
+            "https://packages.example.test/noarch/addon-1.0-0.conda"
+            "#11111111111111111111111111111111"
+        )
+        wheel_hash = "2" * 64
+        instance = fork_environment(
+            self.paths,
+            source_workspace=self.workspace,
+            target_workspace=target,
+            environment_id="review-core",
+            name="analysis extension",
+            mode="reproducible-rebuild",
+            conda_additions=[artifact],
+            pip_additions=[f"addon-wheel==1.0 --hash=sha256:{wheel_hash}"],
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        commands = self.argv()
+        create = commands[0]
+        self.assertEqual(create[0], "create")
+        self.assertIn("--copy", create)
+        self.assertIn("--file", create)
+        exact_lock = Path(create[create.index("--file") + 1])
+        self.assertIn("environment-locks", exact_lock.parts)
+        self.assertTrue(
+            any(command[0] == "install" and "--file" in command for command in commands)
+        )
+        self.assertFalse(any(command[:2] == ["env", "create"] for command in commands))
+        self.assertEqual(instance.descriptor["mode"], "rebuild-fork")
+        self.assertEqual(instance.descriptor["overlay"]["conda"], [artifact])
+        self.assertTrue((instance.prefix / "overlay-conda.txt").is_file())
+        self.assertTrue((instance.prefix / "overlay-pip.txt").is_file())
+
+    def test_clone_fork_rejects_additions_before_materializing(self) -> None:
+        self.build_core()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        target = self.root / "workspace-b"
+        target.mkdir()
+        with self.assertRaisesRegex(ReviewError, "only for reproducible rebuild"):
+            fork_environment(
+                self.paths,
+                source_workspace=self.workspace,
+                target_workspace=target,
+                environment_id="review-core",
+                name="bad overlay",
+                mode="clone",
+                conda_additions=["https://packages.example.test/noarch/a-1-0.conda#" + "a" * 32],
+                executable=self.conda,
+                chat_root=self.chat_root,
+            )
+
+    def test_rebuild_rejects_an_incomplete_exact_lock_install(self) -> None:
+        self.build_core()
+        ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        target = self.root / "workspace-b"
+        target.mkdir()
+        with (
+            patch.dict(os.environ, {"FAKE_OMIT_PIP_RECORD": "1"}, clear=False),
+            self.assertRaisesRegex(ValidationError, "differs from its exact lock"),
+        ):
+            fork_environment(
+                self.paths,
+                source_workspace=self.workspace,
+                target_workspace=target,
+                environment_id="review-core",
+                name="incomplete rebuild",
+                mode="reproducible-rebuild",
+                executable=self.conda,
+                chat_root=self.chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+        target_parent = self.chat_root / "envs" / "ocsl-review" / workspace_identifier(target)
+        self.assertEqual(list(target_parent.iterdir()), [])
+
+    def test_chat_fork_rematerializes_into_a_sanitized_distinct_prefix(self) -> None:
+        self.build_core()
+        marker = self.workspace / ".ocsl" / "chat.json"
+        marker.parent.mkdir()
+        marker.write_text(json.dumps({"chatId": "../../ Manuscript Ω 42"}), encoding="utf-8")
+        source = ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        target = self.root / "workspace-b"
+        target.mkdir()
+        target_marker = target / ".ocsl" / "chat.json"
+        target_marker.parent.mkdir()
+        target_marker.write_text(json.dumps({"chatId": "fork/../child"}), encoding="utf-8")
+        target_id = workspace_identifier(target)
+        self.assertRegex(target_id, r"^[a-z0-9][a-z0-9-]{0,79}$")
+        self.assertNotIn("..", target_id)
+        [forked] = rematerialize_chat_fork(
+            self.paths,
+            source_workspace=self.workspace,
+            target_workspace=target,
+            mode="clone",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        self.assertNotEqual(source.prefix, forked.prefix)
+        self.assertEqual(forked.descriptor["workspaceId"], target_id)
+        self.assertEqual(
+            forked.descriptor["sourceWorkspaceId"],
+            workspace_identifier(self.workspace),
+        )
+        audit_inode_isolation(source.prefix, forked.prefix)
+
+    def test_descriptor_validation_rejects_a_prefix_outside_chat_root(self) -> None:
+        self.build_core()
+        instance = ensure_environment(
+            self.paths,
+            workspace=self.workspace,
+            environment_id="review-core",
+            executable=self.conda,
+            chat_root=self.chat_root,
+            timeout=10,
+            probe_timeout=10,
+        )
+        descriptor = dict(instance.descriptor)
+        descriptor["instancePrefix"] = str(self.root / "escape")
+        with self.assertRaisesRegex(ValidationError, "escapes"):
+            validate_descriptor(
+                self.paths,
+                descriptor,
+                workspace=self.workspace,
+                chat_root=self.chat_root,
+            )
+
+    def test_symlinked_workspace_and_chat_roots_are_rejected(self) -> None:
+        self.build_core()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.workspace / "envs").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValidationError, "symlink component"):
+            ensure_environment(
+                self.paths,
+                workspace=self.workspace,
+                environment_id="review-core",
+                executable=self.conda,
+                chat_root=self.chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+        (self.workspace / "envs").unlink()
+        linked_chat_root = self.root / "linked-chat-conda"
+        linked_chat_root.mkdir()
+        (linked_chat_root / "envs").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValidationError, "symlink component"):
+            ensure_environment(
+                self.paths,
+                workspace=self.workspace,
+                environment_id="review-core",
+                executable=self.conda,
+                chat_root=linked_chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+
+    def test_chat_fork_rolls_back_earlier_materializations(self) -> None:
+        for environment_id in ("review-core", "review-documents"):
+            build_template(
+                self.paths,
+                environment_id,
+                executable=self.conda,
+                solve_timeout=10,
+                probe_timeout=10,
+            )
+            ensure_environment(
+                self.paths,
+                workspace=self.workspace,
+                environment_id=environment_id,
+                executable=self.conda,
+                chat_root=self.chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+        target = self.root / "workspace-b"
+        target.mkdir()
+        with (
+            patch.dict(
+                os.environ,
+                {"FAKE_FAIL_PROBE_PREFIX": "review-documents"},
+                clear=False,
+            ),
+            self.assertRaises(ReviewError),
+        ):
+            rematerialize_chat_fork(
+                self.paths,
+                source_workspace=self.workspace,
+                target_workspace=target,
+                mode="clone",
+                executable=self.conda,
+                chat_root=self.chat_root,
+                timeout=10,
+                probe_timeout=10,
+            )
+        self.assertEqual(list((target / "envs").glob("*/environment.json")), [])
+        target_parent = self.chat_root / "envs" / "ocsl-review" / workspace_identifier(target)
+        self.assertEqual(list(target_parent.iterdir()), [])
+
+    def test_failed_operator_probe_cleans_staging_and_promotes_nothing(self) -> None:
+        with (
+            patch.dict(os.environ, {"FAKE_FAIL_PROBE": "1"}, clear=False),
+            self.assertRaises(ReviewError),
+        ):
+            self.build_core()
+        template_parent = (
+            self.state / "environment-templates" / current_conda_platform() / "review-core"
+        )
+        self.assertTrue(template_parent.is_dir())
+        self.assertEqual(list(template_parent.iterdir()), [])
+        lock_parent = self.state / "environment-locks" / current_conda_platform() / "review-core"
+        self.assertFalse(lock_parent.exists())
+
+    def test_operator_rejects_a_template_symlink_that_escapes_staging(self) -> None:
+        external = self.root / "external-target"
+        external.write_text("outside", encoding="utf-8")
+        with (
+            patch.dict(
+                os.environ,
+                {"FAKE_EXTERNAL_SYMLINK": str(external)},
+                clear=False,
+            ),
+            self.assertRaisesRegex(ValidationError, "symlink escapes"),
+        ):
+            self.build_core()
+        template_parent = (
+            self.state / "environment-templates" / current_conda_platform() / "review-core"
+        )
+        self.assertEqual(list(template_parent.iterdir()), [])
+
+    def test_inode_audit_checks_all_regular_files(self) -> None:
+        source = self.root / "inode-source"
+        target = self.root / "inode-target"
+        source.mkdir()
+        target.mkdir()
+        for index in range(30):
+            (source / f"file-{index:02}.txt").write_text(str(index), encoding="utf-8")
+            (target / f"copy-{index:02}.txt").write_text(str(index), encoding="utf-8")
+        (target / "copy-29.txt").unlink()
+        os.link(source / "file-29.txt", target / "copy-29.txt")
+        with self.assertRaisesRegex(ValidationError, "file-29"):
+            audit_inode_isolation(source, target)
+
+
+if __name__ == "__main__":
+    unittest.main()

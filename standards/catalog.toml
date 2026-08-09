@@ -1,0 +1,64 @@
+schema_version = 1
+
+[[standard]]
+id = "icmje-reference-practice"
+title = "ICMJE manuscript preparation recommendations"
+url = "https://www.icmje.org/recommendations/browse/manuscript-preparation/preparing-for-submission.html"
+authority = "International Committee of Medical Journal Editors"
+purpose = "Reference accuracy, direct-source preference, publication status, and citation responsibility"
+media_type = "text/html"
+version_policy = "current-official-page"
+
+[[standard]]
+id = "cope-reviewer-ethics"
+title = "COPE ethical guidance for peer reviewers"
+url = "https://members.publicationethics.org/sites/default/files/cope-ethical-guidelines-peer-reviewers-v2_0.pdf"
+authority = "Committee on Publication Ethics"
+purpose = "Confidentiality, conflicts, constructive scope, and reviewer conduct"
+media_type = "application/pdf"
+version_policy = "publisher-hosted-edition"
+
+[[standard]]
+id = "equator-guideline-library"
+title = "EQUATOR reporting-guideline library"
+url = "https://www.equator-network.org/reporting-guidelines/"
+authority = "EQUATOR Network"
+purpose = "Study-type routing to reporting guidance, kept separate from validity appraisal"
+media_type = "text/html"
+version_policy = "current-official-page"
+
+[[standard]]
+id = "prisma-2020"
+title = "PRISMA 2020 statement"
+url = "https://www.prisma-statement.org/prisma-2020"
+authority = "PRISMA Statement"
+purpose = "Reporting checks for systematic reviews and meta-analyses"
+media_type = "text/html"
+version_policy = "named-version"
+
+[[standard]]
+id = "consort"
+title = "CONSORT reporting guidance"
+url = "https://www.consort-spirit.org/"
+authority = "CONSORT-SPIRIT"
+purpose = "Reporting checks for randomized trials"
+media_type = "text/html"
+version_policy = "current-official-page"
+
+[[standard]]
+id = "strobe"
+title = "STROBE statement"
+url = "https://www.strobe-statement.org/"
+authority = "STROBE Initiative"
+purpose = "Reporting checks for observational studies"
+media_type = "text/html"
+version_policy = "current-official-page"
+
+[[standard]]
+id = "arrive"
+title = "ARRIVE guidelines"
+url = "https://arriveguidelines.org/"
+authority = "NC3Rs"
+purpose = "Reporting checks for in vivo animal research"
+media_type = "text/html"
+version_policy = "current-official-page"

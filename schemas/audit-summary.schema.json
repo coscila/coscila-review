@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ocsl.local/schemas/audit-summary.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "auditId", "auditCoverage", "citedCorrectly", "citedEnough", "verificationLimits"],
+  "properties": {
+    "schemaVersion": {"const": "1.0"},
+    "auditId": {"type": "string"},
+    "auditCoverage": {"$ref": "#/$defs/coverage"},
+    "citedCorrectly": {"$ref": "#/$defs/correct"},
+    "citedEnough": {"$ref": "#/$defs/enough"},
+    "verificationLimits": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["yes", "no", "partly", "not-fully-verifiable"]},
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["inTextCitationClustersTotal", "inTextCitationClustersProcessed", "bibliographyEntriesTotal", "bibliographyEntriesResolved", "citationRequiredClaimsTotal", "citationRequiredClaimsProcessed", "sourcesFullTextChecked", "sourcesAbstractOnly", "sourcesInaccessible"],
+      "properties": {
+        "inTextCitationClustersTotal": {"$ref": "#/$defs/count"}, "inTextCitationClustersProcessed": {"$ref": "#/$defs/count"},
+        "bibliographyEntriesTotal": {"$ref": "#/$defs/count"}, "bibliographyEntriesResolved": {"$ref": "#/$defs/count"},
+        "citationRequiredClaimsTotal": {"$ref": "#/$defs/count"}, "citationRequiredClaimsProcessed": {"$ref": "#/$defs/count"},
+        "sourcesFullTextChecked": {"$ref": "#/$defs/count"}, "sourcesAbstractOnly": {"$ref": "#/$defs/count"}, "sourcesInaccessible": {"$ref": "#/$defs/count"}
+      }
+    },
+    "correct": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "directlySupported", "scopeCaveats", "partialOrIndirect", "contradicted", "notAddressed", "statusProblems", "metadataProblems"],
+      "properties": {"status": {"$ref": "#/$defs/status"}, "directlySupported": {"$ref": "#/$defs/count"}, "scopeCaveats": {"$ref": "#/$defs/count"}, "partialOrIndirect": {"$ref": "#/$defs/count"}, "contradicted": {"$ref": "#/$defs/count"}, "notAddressed": {"$ref": "#/$defs/count"}, "statusProblems": {"$ref": "#/$defs/count"}, "metadataProblems": {"$ref": "#/$defs/count"}}
+    },
+    "enough": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "sufficientClaims", "missingCitations", "insufficientDirectness", "insufficientScope", "insufficientBreadth", "insufficientCurrency", "insufficientBalance"],
+      "properties": {"status": {"$ref": "#/$defs/status"}, "sufficientClaims": {"$ref": "#/$defs/count"}, "missingCitations": {"$ref": "#/$defs/count"}, "insufficientDirectness": {"$ref": "#/$defs/count"}, "insufficientScope": {"$ref": "#/$defs/count"}, "insufficientBreadth": {"$ref": "#/$defs/count"}, "insufficientCurrency": {"$ref": "#/$defs/count"}, "insufficientBalance": {"$ref": "#/$defs/count"}}
+    }
+  }
+}
+

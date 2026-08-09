@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-citation-completeness"
+title = "Citation completeness"
+summary = "Assess whether citation-required claims have evidence of adequate directness, independence, breadth, currency, balance, and placement."
+primary_environment = "review-literature"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["citation-completeness.jsonl", "audit-summary.json"]
+confidential_by_default = true

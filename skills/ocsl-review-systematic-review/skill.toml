@@ -1,0 +1,9 @@
+schema_version = 1
+id = "ocsl-review-systematic-review"
+title = "Systematic review audit"
+summary = "Audit search, screening, deduplication, extraction, risk-of-bias, synthesis, heterogeneity, certainty, and protocol deviations for evidence syntheses."
+primary_environment = "review-statistics"
+secondary_environments = ["review-literature"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["systematic-review-audit.json"]
+confidential_by_default = true

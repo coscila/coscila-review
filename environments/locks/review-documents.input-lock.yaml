@@ -1,0 +1,11 @@
+# Operator-build input. Runtime commands never solve this file.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.8
+  - python-docx=1.1.2
+  - pypdf=5.1.0
+  - lxml=5.3.0
+  - beautifulsoup4=4.12.3
+  - pandoc=3.6.2

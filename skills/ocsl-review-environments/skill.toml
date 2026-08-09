@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-environments"
+title = "Review environment management"
+summary = "Inspect and materialize immutable review templates and isolated chat instances while preserving lock, build, and fork provenance."
+primary_environment = "review-core"
+secondary_environments = ["mcp-review"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["environment.json"]
+confidential_by_default = true
+

@@ -1,0 +1,12 @@
+# Operator-build input. Runtime commands never solve this file.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.8
+  - numpy=2.0.2
+  - scipy=1.14.1
+  - pandas=2.2.3
+  - statsmodels=0.14.4
+  - pingouin=0.5.5
+  - matplotlib-base=3.10.0

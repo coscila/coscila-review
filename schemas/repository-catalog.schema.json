@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "repository"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository": {"type": "array", "minItems": 1, "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "url", "role", "license_expectation", "executed", "rationale"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9-]+$"}, "url": {"type": "string", "pattern": "^https://"},
+        "role": {"enum": ["provider-contract", "protocol-contract", "citation-contract"]},
+        "license_expectation": {"type": "string"}, "executed": {"type": "boolean"}, "rationale": {"type": "string", "minLength": 20}
+      }
+    }}
+  }
+}
+

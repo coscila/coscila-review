@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "resolvedAt": "2026-08-07T00:00:00Z",
+  "repositories": [
+    {
+      "id": "crossref-rest-api-doc",
+      "url": "https://github.com/CrossRef/rest-api-doc.git",
+      "commit": "00b1cc2c90e62d49c82f5381710590a6d9ca53ff",
+      "license": "NOASSERTION",
+      "licenseEvidence": "No repository-level license was established during resolution; archive is reference-only.",
+      "executed": false
+    },
+    {
+      "id": "mcp-python-sdk",
+      "url": "https://github.com/modelcontextprotocol/python-sdk.git",
+      "commit": "a4f4ccd091138771535e17191123f20b30fda68e",
+      "license": "MIT",
+      "licenseEvidence": "LICENSE and package metadata in the pinned repository",
+      "executed": false
+    },
+    {
+      "id": "citation-style-language-schema",
+      "url": "https://github.com/citation-style-language/schema.git",
+      "commit": "e3ce254a72c4470a5ed3b9d23b428017d25674e9",
+      "license": "NOASSERTION",
+      "licenseEvidence": "No license assertion is relied upon; archive is reference-only.",
+      "executed": false
+    }
+  ]
+}
+

@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-router"
+title = "Scientific review router"
+summary = "Classify the review request, confidentiality state, evidence burden, and required specialist passes before work begins."
+primary_environment = "review-core"
+secondary_environments = []
+mcps = ["ocsl_review_catalog"]
+outputs = ["review-plan.json"]
+confidential_by_default = true
+

@@ -1,0 +1,108 @@
+schema_version = 1
+
+# The tracked input locks constrain the one operator-only solve. A successful
+# template build exports an @EXPLICIT package list, addresses the template by
+# that list's SHA-256, and stores both outside this source checkout. Chat-time
+# clone and rebuild operations are permitted to consume only those artifacts.
+
+[[environment]]
+id = "review-core"
+purpose = "Shared review orchestration, structured records, tabular exchange, and validation"
+spec = "specs/review-core.yaml"
+input_lock = "locks/review-core.input-lock.yaml"
+input_lock_sha256 = "4e41f20cb63125fc7eeda9d2ac08c03ed8cf3700f2c1d6721fb52fdd5281d6f5"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import httpx, jsonschema, pandas, pyarrow, pydantic, yaml"],
+]
+skills = [
+  "ocsl-review-router",
+  "ocsl-review-reporting-guidelines",
+  "ocsl-review-reproducibility-data-code",
+  "ocsl-review-ethics-transparency",
+  "ocsl-review-environments",
+]
+
+[[environment]]
+id = "review-documents"
+purpose = "Local manuscript, bibliography, table, and figure-adjacent document extraction"
+spec = "specs/review-documents.yaml"
+input_lock = "locks/review-documents.input-lock.yaml"
+input_lock_sha256 = "a5c2f7b94a833078e9408c91ebfd060a80d6cfcb7cd41a4cf95be1fa6fe636f9"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import bs4, docx, lxml, pypdf"],
+  ["pandoc", "--version"],
+]
+skills = [
+  "ocsl-review-manuscript-ingest",
+  "ocsl-review-peer-report",
+  "ocsl-review-revision-response",
+]
+
+[[environment]]
+id = "review-literature"
+purpose = "Bibliographic reconciliation, bounded scholarly lookup, and evidence-set analysis"
+spec = "specs/review-literature.yaml"
+input_lock = "locks/review-literature.input-lock.yaml"
+input_lock_sha256 = "1140e19e7c7d268c273d5c4753f765c7a8970ac337bbb58819e8b19f4a5e6808"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import Bio, httpx, lxml, pandas, rapidfuzz, requests"],
+]
+skills = [
+  "ocsl-review-reference-integrity",
+  "ocsl-review-claim-source-verification",
+  "ocsl-review-citation-completeness",
+  "ocsl-review-literature-search-update",
+  "ocsl-review-novelty-priority",
+  "ocsl-review-evidence-balance",
+  "ocsl-review-journal-policy",
+]
+
+[[environment]]
+id = "review-nlp"
+purpose = "Local clause segmentation, claim triage, similarity, and language diagnostics"
+spec = "specs/review-nlp.yaml"
+input_lock = "locks/review-nlp.input-lock.yaml"
+input_lock_sha256 = "32ff688e95f4bec2ea8cf19ae10f6a5892bae7f671c58592802fc15afad040b1"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import nltk, numpy, pandas, sklearn, spacy"],
+]
+skills = ["ocsl-review-claim-inventory"]
+
+[[environment]]
+id = "review-statistics"
+purpose = "Statistical checks, numerical recomputation, plots, and reproducibility diagnostics"
+spec = "specs/review-statistics.yaml"
+input_lock = "locks/review-statistics.input-lock.yaml"
+input_lock_sha256 = "00f3475a69a17c890482fa08e69f171799aeba306979fb1eb903a82e90b1be8f"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import matplotlib, numpy, pandas, pingouin, scipy, statsmodels"],
+]
+skills = [
+  "ocsl-review-methods-statistics",
+  "ocsl-review-results-figures-tables",
+  "ocsl-review-systematic-review",
+  "ocsl-review-calibration",
+]
+
+[[environment]]
+id = "mcp-review"
+purpose = "Dedicated Python runtime for the companion's local MCP processes"
+spec = "specs/mcp-review.yaml"
+input_lock = "locks/mcp-review.input-lock.yaml"
+input_lock_sha256 = "e1d3367fedbaaf1e976b1eb045d1f3365257274eb21202d9d9a86ba0e80fe9f3"
+platforms = ["linux-64", "linux-aarch64"]
+channels = ["conda-forge"]
+health_checks = [
+  ["python", "-c", "import httpx, mcp, pydantic, uvicorn"],
+]
+skills = []

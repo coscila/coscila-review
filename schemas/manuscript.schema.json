@@ -1,0 +1,297 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oc-science-lab.local/schemas/review/manuscript.schema.json",
+  "title": "OC Science Lab ingested manuscript",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "manuscriptId",
+    "confidential",
+    "source",
+    "sections",
+    "paragraphs",
+    "sentences",
+    "tables",
+    "figures",
+    "citationClusters",
+    "bibliographyEntries",
+    "ingestion"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "manuscriptId": { "type": "string", "pattern": "^ms-[a-f0-9]{20}$" },
+    "confidential": { "type": "boolean" },
+    "source": { "$ref": "#/$defs/source" },
+    "sections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/section" }
+    },
+    "paragraphs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/paragraph" }
+    },
+    "sentences": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sentence" }
+    },
+    "tables": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/table" }
+    },
+    "figures": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/figure" }
+    },
+    "citationClusters": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/citationCluster" }
+    },
+    "bibliographyEntries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/bibliographyEntry" }
+    },
+    "ingestion": { "$ref": "#/$defs/ingestion" }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileName", "format", "byteLength", "sha256"],
+      "properties": {
+        "fileName": { "type": "string", "minLength": 1 },
+        "format": { "enum": ["text", "markdown", "docx", "pdf"] },
+        "byteLength": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sectionId", "page"],
+      "properties": {
+        "sectionId": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "paragraphId": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+        "sentenceNumber": { "type": "integer", "minimum": 1 },
+        "tableId": { "type": "string", "pattern": "^tbl-[0-9]{4,}$" },
+        "figureId": { "type": "string", "pattern": "^fig-[0-9]{4,}$" },
+        "page": { "type": ["integer", "null"], "minimum": 1 },
+        "characterStart": { "type": "integer", "minimum": 0 },
+        "characterEnd": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ordinal",
+        "title",
+        "headingParagraphId",
+        "paragraphIds",
+        "tableIds",
+        "figureIds"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "headingParagraphId": {
+          "type": ["string", "null"],
+          "pattern": "^p-[0-9]{6,}$"
+        },
+        "paragraphIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+          "uniqueItems": true
+        },
+        "tableIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^tbl-[0-9]{4,}$" },
+          "uniqueItems": true
+        },
+        "figureIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^fig-[0-9]{4,}$" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "paragraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ordinal", "sectionId", "kind", "text", "locator", "sentenceIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "sectionId": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "kind": { "enum": ["heading", "body", "figure-caption", "bibliography-entry"] },
+        "text": { "type": "string", "minLength": 1 },
+        "locator": { "$ref": "#/$defs/locator" },
+        "sentenceIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^s-[0-9]{7,}$" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "sentence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ordinal",
+        "paragraphId",
+        "sectionId",
+        "text",
+        "locator",
+        "citationClusterIds"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^s-[0-9]{7,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "paragraphId": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+        "sectionId": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "text": { "type": "string", "minLength": 1 },
+        "locator": { "$ref": "#/$defs/locator" },
+        "citationClusterIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^cite-[0-9]{6,}$" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ordinal", "sectionId", "rows", "rowCount", "columnCount", "locator"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^tbl-[0-9]{4,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "sectionId": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "rowCount": { "type": "integer", "minimum": 0 },
+        "columnCount": { "type": "integer", "minimum": 0 },
+        "locator": { "$ref": "#/$defs/locator" }
+      }
+    },
+    "figure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ordinal", "sectionId", "caption", "label", "description", "locator"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^fig-[0-9]{4,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "sectionId": { "type": "string", "pattern": "^sec-[0-9]{3,}$" },
+        "caption": { "type": ["string", "null"] },
+        "label": { "type": ["string", "null"] },
+        "description": { "type": ["string", "null"] },
+        "locator": { "$ref": "#/$defs/locator" }
+      }
+    },
+    "citationCluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "ordinal",
+        "style",
+        "raw",
+        "tokens",
+        "sentenceId",
+        "paragraphId",
+        "locator"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^cite-[0-9]{6,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "style": { "enum": ["numeric", "author-year", "markdown-key"] },
+        "raw": { "type": "string", "minLength": 1 },
+        "tokens": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "sentenceId": { "type": "string", "pattern": "^s-[0-9]{7,}$" },
+        "paragraphId": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+        "locator": { "$ref": "#/$defs/locator" }
+      }
+    },
+    "identifierLists": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["doi", "pmid", "arxiv"],
+      "properties": {
+        "doi": { "type": "array", "items": { "type": "string" } },
+        "pmid": { "type": "array", "items": { "type": "string" } },
+        "arxiv": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "bibliographyEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ordinal", "label", "raw", "paragraphId", "identifiers", "locator"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^ref-[0-9]{5,}$" },
+        "ordinal": { "type": "integer", "minimum": 1 },
+        "label": { "type": ["string", "null"] },
+        "raw": { "type": "string", "minLength": 1 },
+        "paragraphId": { "type": "string", "pattern": "^p-[0-9]{6,}$" },
+        "identifiers": { "$ref": "#/$defs/identifierLists" },
+        "locator": { "$ref": "#/$defs/locator" }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputBytes",
+        "extractedCharacters",
+        "pagesObserved",
+        "sections",
+        "paragraphs",
+        "sentences",
+        "tables",
+        "figures",
+        "citationClusters",
+        "bibliographyEntries"
+      ],
+      "properties": {
+        "inputBytes": { "type": "integer", "minimum": 0 },
+        "extractedCharacters": { "type": "integer", "minimum": 0 },
+        "pagesObserved": { "type": "integer", "minimum": 0 },
+        "sections": { "type": "integer", "minimum": 0 },
+        "paragraphs": { "type": "integer", "minimum": 0 },
+        "sentences": { "type": "integer", "minimum": 0 },
+        "tables": { "type": "integer", "minimum": 0 },
+        "figures": { "type": "integer", "minimum": 0 },
+        "citationClusters": { "type": "integer", "minimum": 0 },
+        "bibliographyEntries": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ingestion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "status", "parser", "warnings", "errors", "coverage"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "status": { "enum": ["complete", "partial"] },
+        "parser": { "type": "string", "minLength": 1 },
+        "warnings": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+        "errors": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+        "coverage": { "$ref": "#/$defs/coverage" }
+      }
+    }
+  }
+}

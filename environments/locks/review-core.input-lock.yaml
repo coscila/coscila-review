@@ -1,0 +1,13 @@
+# Operator-build input. Runtime commands never solve this file.
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.8
+  - pip=24.3.1
+  - jsonschema=4.23.0
+  - pyyaml=6.0.2
+  - httpx=0.28.1
+  - pydantic=2.10.5
+  - pandas=2.2.3
+  - pyarrow=18.1.0

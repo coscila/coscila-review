@@ -1,0 +1,10 @@
+schema_version = 1
+id = "ocsl-review-methods-statistics"
+title = "Methods and statistics"
+summary = "Audit design, estimands, analysis units, model assumptions, uncertainty, multiplicity, missingness, and validation without conflating reporting with validity."
+primary_environment = "review-statistics"
+secondary_environments = ["review-core"]
+mcps = ["ocsl_review_catalog"]
+outputs = ["methods-statistics.json"]
+confidential_by_default = true
+

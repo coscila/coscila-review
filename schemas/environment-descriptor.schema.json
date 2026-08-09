@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oc-science-lab.local/schemas/review-environment-descriptor.schema.json",
+  "title": "OC Science Lab review chat environment descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "logicalName",
+    "skillId",
+    "templateId",
+    "templateBuildId",
+    "inputLockSha256",
+    "lockSha256",
+    "workspaceId",
+    "instancePrefix",
+    "mode",
+    "overlay",
+    "parentBuildId",
+    "sourceWorkspaceId",
+    "createdAt",
+    "verifiedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "logicalName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "skillId": {
+      "type": ["string", "null"],
+      "pattern": "^ocsl-review-[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "templateId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "templateBuildId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "inputLockSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "lockSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "workspaceId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,79}$" },
+    "instancePrefix": { "type": "string", "minLength": 1 },
+    "mode": {
+      "enum": ["template-clone", "clone-fork", "rebuild-fork"]
+    },
+    "overlay": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["conda", "pip"],
+          "properties": {
+            "conda": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "pip": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "parentBuildId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+    "sourceWorkspaceId": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9-]{0,79}$"
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "verifiedAt": { "type": "string", "format": "date-time" }
+  }
+}

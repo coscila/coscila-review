@@ -1,0 +1,339 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oc-science-lab.local/schemas/review/review-package.schema.json",
+  "title": "OC Science Lab review package",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageId",
+    "title",
+    "confidential",
+    "manuscript",
+    "reviewPlan",
+    "auditGraph",
+    "concerns",
+    "revisionLedger",
+    "auditSummary"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "packageId": { "type": "string", "pattern": "^review-[a-f0-9]{16}$" },
+    "title": { "type": "string", "minLength": 1 },
+    "confidential": { "type": "boolean" },
+    "manuscript": { "$ref": "#/$defs/manuscriptSummary" },
+    "reviewPlan": { "$ref": "#/$defs/reviewPlan" },
+    "auditGraph": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/auditGraph" }
+      ]
+    },
+    "concerns": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/concern" }
+    },
+    "revisionLedger": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/revisionAction" }
+    },
+    "auditSummary": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/auditSummary" }
+      ]
+    }
+  },
+  "$defs": {
+    "manuscriptSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manuscriptId", "sourceFileName", "sourceSha256", "ingestionComplete"],
+      "properties": {
+        "manuscriptId": { "type": "string", "pattern": "^ms-[a-f0-9]{20}$" },
+        "sourceFileName": { "type": "string", "minLength": 1 },
+        "sourceSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "ingestionComplete": { "type": "boolean" }
+      }
+    },
+    "lens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "label", "mission", "targets"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "mission": { "type": "string", "minLength": 1 },
+        "targets": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+    "reviewPass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "lensId", "targets"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "lensId": { "type": "string", "minLength": 1 },
+        "targets": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+      }
+    },
+    "studyProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signals", "signalStrength", "method", "requiresHumanConfirmation"],
+      "properties": {
+        "signals": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "signalStrength": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        },
+        "method": { "type": "string", "minLength": 1 },
+        "requiresHumanConfirmation": { "type": "boolean" }
+      }
+    },
+    "guardrails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "locationAnchorRequired",
+        "metadataIsEvidence",
+        "abstractCanEstablishFullTextSupport",
+        "inaccessibleEvidenceRequiresAbstention"
+      ],
+      "properties": {
+        "locationAnchorRequired": { "const": true },
+        "metadataIsEvidence": { "const": false },
+        "abstractCanEstablishFullTextSupport": { "const": false },
+        "inaccessibleEvidenceRequiresAbstention": { "const": true }
+      }
+    },
+    "reviewPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "planId",
+        "manuscriptId",
+        "confidential",
+        "ingestionComplete",
+        "studyProfile",
+        "lenses",
+        "passes",
+        "concerns",
+        "revisionLedger",
+        "guardrails"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0.0" },
+        "planId": { "type": "string", "pattern": "^plan-[a-f0-9]{16}$" },
+        "manuscriptId": { "type": "string", "pattern": "^ms-[a-f0-9]{20}$" },
+        "confidential": { "type": "boolean" },
+        "ingestionComplete": { "type": "boolean" },
+        "studyProfile": { "$ref": "#/$defs/studyProfile" },
+        "lenses": { "type": "array", "items": { "$ref": "#/$defs/lens" }, "minItems": 1 },
+        "passes": { "type": "array", "items": { "$ref": "#/$defs/reviewPass" }, "minItems": 1 },
+        "concerns": { "type": "array", "items": { "$ref": "#/$defs/concern" } },
+        "revisionLedger": { "type": "array", "items": { "$ref": "#/$defs/revisionAction" } },
+        "guardrails": { "$ref": "#/$defs/guardrails" }
+      }
+    },
+    "concern": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concernId",
+        "lensId",
+        "priority",
+        "anchor",
+        "finding",
+        "basis",
+        "requestedResolution",
+        "confidence",
+        "humanDecisionRequired",
+        "verificationState"
+      ],
+      "properties": {
+        "concernId": { "type": "string", "pattern": "^concern-[a-f0-9]{16}$" },
+        "lensId": { "type": "string", "minLength": 1 },
+        "priority": { "enum": ["blocking", "substantial", "editorial"] },
+        "anchor": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["locatorId", "locator"],
+          "properties": {
+            "locatorId": { "type": "string", "minLength": 1 },
+            "locator": { "type": "object" }
+          }
+        },
+        "finding": { "type": "string", "minLength": 1 },
+        "basis": { "type": "string", "minLength": 1 },
+        "requestedResolution": { "type": "string", "minLength": 1 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "humanDecisionRequired": { "type": "boolean" },
+        "verificationState": { "enum": ["unassessed", "verified", "abstained"] },
+        "claimId": { "type": "string", "minLength": 1 },
+        "verificationLinkIds": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "revisionAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actionId", "concernId", "state", "owner", "action", "verificationCriterion"],
+      "properties": {
+        "actionId": { "type": "string", "pattern": "^action-[a-f0-9]{16}$" },
+        "concernId": { "type": "string", "pattern": "^concern-[a-f0-9]{16}$" },
+        "state": {
+          "enum": [
+            "not-started",
+            "author-decision-needed",
+            "new-work-needed",
+            "edit-prepared",
+            "verification-pending",
+            "resolved",
+            "accepted-exception"
+          ]
+        },
+        "owner": { "type": "string", "minLength": 1 },
+        "action": { "type": "string", "minLength": 1 },
+        "verificationCriterion": { "type": "string", "minLength": 1 }
+      }
+    },
+    "auditGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "auditId",
+        "createdAt",
+        "manuscript",
+        "auditScope",
+        "claims",
+        "citationClusters",
+        "references",
+        "verificationLinks",
+        "completenessAssessments",
+        "searchRuns",
+        "reviewAssertions",
+        "provenance"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "auditId": { "type": "string", "minLength": 1 },
+        "createdAt": { "type": "string" },
+        "manuscript": { "type": "object" },
+        "auditScope": { "type": "object" },
+        "claims": { "type": "array" },
+        "citationClusters": { "type": "array" },
+        "references": { "type": "array" },
+        "verificationLinks": { "type": "array" },
+        "completenessAssessments": { "type": "array" },
+        "searchRuns": { "type": "array" },
+        "reviewAssertions": { "type": "array" },
+        "provenance": { "type": "object" }
+      }
+    },
+    "status": { "enum": ["yes", "no", "partly", "not-fully-verifiable"] },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inTextCitationClustersTotal",
+        "inTextCitationClustersProcessed",
+        "bibliographyEntriesTotal",
+        "bibliographyEntriesResolved",
+        "citationRequiredClaimsTotal",
+        "citationRequiredClaimsProcessed",
+        "sourcesFullTextChecked",
+        "sourcesAbstractOnly",
+        "sourcesInaccessible"
+      ],
+      "properties": {
+        "inTextCitationClustersTotal": { "type": "integer", "minimum": 0 },
+        "inTextCitationClustersProcessed": { "type": "integer", "minimum": 0 },
+        "bibliographyEntriesTotal": { "type": "integer", "minimum": 0 },
+        "bibliographyEntriesResolved": { "type": "integer", "minimum": 0 },
+        "citationRequiredClaimsTotal": { "type": "integer", "minimum": 0 },
+        "citationRequiredClaimsProcessed": { "type": "integer", "minimum": 0 },
+        "sourcesFullTextChecked": { "type": "integer", "minimum": 0 },
+        "sourcesAbstractOnly": { "type": "integer", "minimum": 0 },
+        "sourcesInaccessible": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "directlySupported",
+        "scopeCaveats",
+        "partialOrIndirect",
+        "contradicted",
+        "notAddressed",
+        "statusProblems",
+        "metadataProblems"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "directlySupported": { "type": "integer", "minimum": 0 },
+        "scopeCaveats": { "type": "integer", "minimum": 0 },
+        "partialOrIndirect": { "type": "integer", "minimum": 0 },
+        "contradicted": { "type": "integer", "minimum": 0 },
+        "notAddressed": { "type": "integer", "minimum": 0 },
+        "statusProblems": { "type": "integer", "minimum": 0 },
+        "metadataProblems": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "sufficiency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "sufficientClaims",
+        "missingCitations",
+        "insufficientDirectness",
+        "insufficientScope",
+        "insufficientBreadth",
+        "insufficientCurrency",
+        "insufficientBalance"
+      ],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "sufficientClaims": { "type": "integer", "minimum": 0 },
+        "missingCitations": { "type": "integer", "minimum": 0 },
+        "insufficientDirectness": { "type": "integer", "minimum": 0 },
+        "insufficientScope": { "type": "integer", "minimum": 0 },
+        "insufficientBreadth": { "type": "integer", "minimum": 0 },
+        "insufficientCurrency": { "type": "integer", "minimum": 0 },
+        "insufficientBalance": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "auditSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "auditId",
+        "auditCoverage",
+        "citedCorrectly",
+        "citedEnough",
+        "verificationLimits"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "1.0" },
+        "auditId": { "type": "string", "minLength": 1 },
+        "auditCoverage": { "$ref": "#/$defs/coverage" },
+        "citedCorrectly": { "$ref": "#/$defs/correctness" },
+        "citedEnough": { "$ref": "#/$defs/sufficiency" },
+        "verificationLimits": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

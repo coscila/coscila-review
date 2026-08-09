@@ -1,0 +1,26 @@
+schema_version = 1
+
+[[server]]
+name = "ocsl_review_catalog"
+enabled = true
+launcher = "mcp/launchers/ocsl_review_catalog.sh"
+environment = "mcp-review"
+transport = "stdio"
+startup_timeout_seconds = 15
+call_timeout_seconds = 20
+file_access = "read-only"
+live_tool = "list_skills"
+live_arguments = '{"limit":1}'
+
+[[server]]
+name = "ocsl_scholar"
+enabled = true
+launcher = "mcp/launchers/ocsl_scholar.sh"
+environment = "mcp-review"
+transport = "stdio"
+startup_timeout_seconds = 20
+call_timeout_seconds = 25
+file_access = "none"
+live_tool = "search_crossref"
+live_arguments = '{"query":"replication null evidence","limit":1}'
+

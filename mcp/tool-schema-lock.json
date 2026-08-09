@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "servers": {
+    "ocsl_review_catalog": {
+      "sha256": "89214cf3aa4fb29774446a93c3c6480a542f622b38fc9815f270205c50764e3f",
+      "toolCount": 7
+    },
+    "ocsl_scholar": {
+      "sha256": "45e1b428bfda3e0f0163d5c39b3a6b02bcfce0355a4d9149169cc332ec69fc49",
+      "toolCount": 13
+    }
+  }
+}
