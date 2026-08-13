@@ -272,6 +272,32 @@ def _operator_create_argv(
     input_lock: Path,
     platform: str,
 ) -> list[str]:
+    try:
+        value = yaml.safe_load(input_lock.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ValidationError(
+            f"cannot read operator environment input {input_lock}: {error}"
+        ) from error
+    if not isinstance(value, dict) or set(value) != {"channels", "dependencies"}:
+        raise ValidationError(f"operator environment input has an invalid shape: {input_lock}")
+    channels = value.get("channels")
+    dependencies = value.get("dependencies")
+    if (
+        not isinstance(channels, list)
+        or channels[-1:] != ["nodefaults"]
+        or not all(isinstance(channel, str) and channel for channel in channels)
+    ):
+        raise ValidationError(
+            f"operator environment input must end its channel list with nodefaults: {input_lock}"
+        )
+    if (
+        not isinstance(dependencies, list)
+        or not dependencies
+        or not all(isinstance(dependency, str) and dependency for dependency in dependencies)
+    ):
+        raise ValidationError(
+            f"operator environment input has invalid dependency specifications: {input_lock}"
+        )
     return [
         str(executable),
         "create",
@@ -280,10 +306,11 @@ def _operator_create_argv(
         _platform_option(executable),
         platform,
         *_no_default_packages_options(executable),
+        "--override-channels",
+        *(argument for channel in channels[:-1] for argument in ("--channel", channel)),
         "--prefix",
         str(prefix),
-        "--file",
-        str(input_lock),
+        *dependencies,
     ]
 
 
@@ -792,33 +819,21 @@ def build_template(
     staging_root = parent
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=staging_root))
     exact_lock_created: Path | None = None
-    temporary_input: Path | None = None
     destination: Path | None = None
     building_marker: Path | None = None
     destination_created = False
     promoted = False
     try:
-        operator_input = definition.input_lock
-        # Micromamba interprets any filename ending in ``lock.yaml`` as the
-        # separate conda-lock document format.  Our tracked file is a pinned
-        # environment YAML, so provide identical verified bytes under a
-        # neutral ephemeral name for that frontend.
-        if conda.name.lower().startswith("micromamba"):
-            descriptor, input_name = tempfile.mkstemp(
-                prefix=".operator-input-", suffix=".environment.yml", dir=parent
-            )
-            temporary_input = Path(input_name)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(definition.input_lock.read_bytes())
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary_input, 0o400)
-            operator_input = temporary_input
+        # Conda's ``create --file`` expects an explicit package list, whereas
+        # micromamba guesses formats from filenames.  Pass the already
+        # validated channels and exact version constraints as argv instead so
+        # every supported frontend performs the same one-time operator solve
+        # while retaining copy mode.
         _run_checked(
             _operator_create_argv(
                 conda,
                 staging,
-                operator_input,
+                definition.input_lock,
                 target_platform,
             ),
             timeout=solve_timeout,
@@ -959,8 +974,6 @@ def build_template(
     finally:
         if staging.exists():
             _cleanup_transient(staging, staging_root)
-        if temporary_input is not None:
-            temporary_input.unlink(missing_ok=True)
         if building_marker is not None:
             building_marker.unlink(missing_ok=True)
 
