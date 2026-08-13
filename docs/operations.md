@@ -91,8 +91,12 @@ entire root to review-time tools either.
 
 Optional network configuration includes `OCSL_REVIEW_CONTACT_EMAIL` for public
 provider etiquette and `NCBI_API_KEY` for NCBI. The scholarly MCP reads a
-review-specific policy through `OCSL_REVIEW_EGRESS_PLAN` and writes redacted
-events only when `OCSL_REVIEW_WORKSPACE` is set.
+review-specific policy through `OCSL_REVIEW_EGRESS_PLAN`. A plan that broadens
+the confidential default also requires the operator-bound
+`OCSL_REVIEW_EGRESS_PLAN_SHA256`; conservative plans need no digest. The MCP
+writes redacted events when `OCSL_REVIEW_WORKSPACE` selects a validated chat or
+when its exact process working directory is a validated descendant of
+`LAB_WORKSPACE_ROOT`.
 
 ## Pre-install preparation
 

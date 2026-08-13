@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -144,7 +145,14 @@ class ScholarContextTests(unittest.TestCase):
         fixed_plan = self.workspace / ".ocsl-review" / "egress-plan.json"
         fixed_plan.parent.mkdir()
         fixed_plan.write_text(
-            json.dumps({"approvedOperations": ["resolve_identifier"]}) + "\n",
+            json.dumps(
+                {
+                    "allowSanitizedQueries": False,
+                    "maxQueryTerms": 8,
+                    "approvedOperations": ["resolve_identifier"],
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         selected_plan, selected_again = load_scholarly_context(
@@ -156,7 +164,95 @@ class ScholarContextTests(unittest.TestCase):
             selected_plan.approved_operations,
             frozenset({"resolve_identifier"}),
         )
+        self.assertFalse(selected_plan.allow_sanitized_queries)
+        self.assertEqual(selected_plan.max_query_terms, 8)
         self.assertEqual(selected_again, self.workspace.resolve())
+
+    def test_writable_auto_plan_cannot_broaden_confidential_defaults(self) -> None:
+        plan_path = self.workspace / ".ocsl-review" / "egress-plan.json"
+        plan_path.parent.mkdir()
+        unsafe_plans = (
+            {"confidential": False},
+            {"confidential": False, "sharedCache": True},
+            {"approvedFields": ["keywords"]},
+            {"maxQueryTerms": 13},
+        )
+        for value in unsafe_plans:
+            with self.subTest(value=value):
+                plan_path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValidationError, "may only narrow"):
+                    load_scholarly_context(
+                        self.paths,
+                        {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+                        cwd=self.workspace,
+                    )
+
+    def test_broader_explicit_plan_requires_current_operator_digest(self) -> None:
+        plan_path = self.workspace / ".ocsl-review" / "egress-plan.json"
+        plan_path.parent.mkdir()
+        original = b'{"confidential":false}\n'
+        replacement = b'{ "confidential": false }\n'
+        plan_path.write_bytes(original)
+        original_digest = hashlib.sha256(original).hexdigest()
+        base = {
+            "LAB_WORKSPACE_ROOT": str(self.workspace_root),
+            "OCSL_REVIEW_WORKSPACE": str(self.workspace),
+            "OCSL_REVIEW_EGRESS_PLAN": str(plan_path),
+        }
+        with self.assertRaisesRegex(ValidationError, "requires OCSL_REVIEW_EGRESS_PLAN_SHA256"):
+            load_scholarly_context(self.paths, base)
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            load_scholarly_context(
+                self.paths,
+                {**base, "OCSL_REVIEW_EGRESS_PLAN_SHA256": "0" * 64},
+            )
+
+        plan_path.write_bytes(replacement)
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            load_scholarly_context(
+                self.paths,
+                {**base, "OCSL_REVIEW_EGRESS_PLAN_SHA256": original_digest},
+            )
+
+    def test_digest_mismatch_stops_dispatch_before_client_or_network(self) -> None:
+        plan_path = self.workspace / ".ocsl-review" / "egress-plan.json"
+        plan_path.parent.mkdir()
+        plan_path.write_text('{"confidential":false}\n', encoding="utf-8")
+        environment = {
+            "OCSL_REVIEW_HOME": str(Path(__file__).resolve().parents[1]),
+            "OCSL_REVIEW_STATE": str(self.state),
+            "LAB_WORKSPACE_ROOT": str(self.workspace_root),
+            "OCSL_REVIEW_WORKSPACE": str(self.workspace),
+            "OCSL_REVIEW_EGRESS_PLAN": str(plan_path),
+            "OCSL_REVIEW_EGRESS_PLAN_SHA256": "0" * 64,
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("ocsl_review.scholar_server.ScholarlyClient") as client,
+            patch("ocsl_review.scholarly.urllib.request.urlopen") as opener,
+            self.assertRaisesRegex(ValidationError, "does not match"),
+        ):
+            make_dispatch()
+        client.assert_not_called()
+        opener.assert_not_called()
+
+    def test_valid_hash_bound_broad_plan_loads_exact_authorized_bytes(self) -> None:
+        plan_path = self.workspace / ".ocsl-review" / "egress-plan.json"
+        plan_path.parent.mkdir()
+        body = b'{"confidential":false,"approvedFields":["keywords"]}\n'
+        plan_path.write_bytes(body)
+        plan, workspace = load_scholarly_context(
+            self.paths,
+            {
+                "LAB_WORKSPACE_ROOT": str(self.workspace_root),
+                "OCSL_REVIEW_WORKSPACE": str(self.workspace),
+                "OCSL_REVIEW_EGRESS_PLAN": str(plan_path),
+                "OCSL_REVIEW_EGRESS_PLAN_SHA256": hashlib.sha256(body).hexdigest(),
+            },
+        )
+        self.assertFalse(plan.confidential)
+        self.assertEqual(plan.approved_fields, frozenset({"keywords"}))
+        self.assertEqual(workspace, self.workspace.resolve())
 
     def test_workspace_root_cwd_is_rejected_without_creating_a_shared_ledger(self) -> None:
         with self.assertRaisesRegex(ValidationError, "itself is not a scholarly chat"):
