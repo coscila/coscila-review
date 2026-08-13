@@ -71,6 +71,20 @@ further:
 }
 ```
 
+The normal chat runtime may omit both review-specific variables. When the MCP
+process starts with its current working directory strictly below the validated
+`LAB_WORKSPACE_ROOT`, that exact directory becomes the workspace; the root
+container itself is never treated as a chat. The server then uses
+`<workspace>/.ocsl-review/egress-plan.json` when that fixed, non-symlinked file
+exists, otherwise it uses the confidential default plan. It does not search
+parents for a plan or infer a different workspace. This keeps separate chat
+working directories, plans, and ledgers from crossing into one another.
+
+A source-side doctor launched with a current directory outside
+`LAB_WORKSPACE_ROOT` retains the confidential diagnostic default and has no
+workspace ledger target. Starting it from the workspace-root container itself
+is rejected as ambiguous rather than sharing one container-level ledger.
+
 `approvedFields` can narrow or extend ordinary structured fields, but it does
 not override the hard block on manuscript-like field names. If a competent
 authority explicitly allows disclosure of manuscript content, record that

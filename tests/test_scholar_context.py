@@ -90,6 +90,106 @@ class ScholarContextTests(unittest.TestCase):
         self.assertEqual(plan.approved_operations, frozenset({"resolve_identifier"}))
         self.assertEqual(workspace, self.workspace.resolve())
 
+    def test_cwd_derives_exact_workspace_and_keeps_two_ledgers_separate(self) -> None:
+        workspace_b = self.workspace_root / "chat-b"
+        workspace_b.mkdir()
+        environment = {"LAB_WORKSPACE_ROOT": str(self.workspace_root)}
+
+        plan_a, selected_a = load_scholarly_context(
+            self.paths,
+            environment,
+            cwd=self.workspace,
+        )
+        plan_b, selected_b = load_scholarly_context(
+            self.paths,
+            environment,
+            cwd=workspace_b,
+        )
+
+        self.assertEqual(plan_a, EgressPlan())
+        self.assertEqual(plan_b, EgressPlan())
+        self.assertEqual(selected_a, self.workspace.resolve())
+        self.assertEqual(selected_b, workspace_b.resolve())
+        append_egress_event(selected_a, {"operation": "workspace-a"})
+        self.assertFalse((workspace_b / ".ocsl-review").exists())
+        append_egress_event(selected_b, {"operation": "workspace-b"})
+        ledger_a = json.loads(
+            (self.workspace / ".ocsl-review" / "egress-events.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        ledger_b = json.loads(
+            (workspace_b / ".ocsl-review" / "egress-events.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(ledger_a, [{"operation": "workspace-a"}])
+        self.assertEqual(ledger_b, [{"operation": "workspace-b"}])
+
+    def test_cwd_uses_only_its_fixed_optional_plan_without_parent_search(self) -> None:
+        parent_plan = self.workspace_root / ".ocsl-review" / "egress-plan.json"
+        parent_plan.parent.mkdir()
+        parent_plan.write_text(
+            json.dumps({"approvedOperations": ["search_crossref"]}) + "\n",
+            encoding="utf-8",
+        )
+        plan, selected = load_scholarly_context(
+            self.paths,
+            {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+            cwd=self.workspace,
+        )
+        self.assertEqual(plan, EgressPlan())
+        self.assertEqual(selected, self.workspace.resolve())
+
+        fixed_plan = self.workspace / ".ocsl-review" / "egress-plan.json"
+        fixed_plan.parent.mkdir()
+        fixed_plan.write_text(
+            json.dumps({"approvedOperations": ["resolve_identifier"]}) + "\n",
+            encoding="utf-8",
+        )
+        selected_plan, selected_again = load_scholarly_context(
+            self.paths,
+            {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+            cwd=self.workspace,
+        )
+        self.assertEqual(
+            selected_plan.approved_operations,
+            frozenset({"resolve_identifier"}),
+        )
+        self.assertEqual(selected_again, self.workspace.resolve())
+
+    def test_workspace_root_cwd_is_rejected_without_creating_a_shared_ledger(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "itself is not a scholarly chat"):
+            load_scholarly_context(
+                self.paths,
+                {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+                cwd=self.workspace_root,
+            )
+        self.assertFalse((self.workspace_root / ".ocsl-review").exists())
+
+    def test_cwd_outside_workspace_root_keeps_source_doctor_no_context_mode(self) -> None:
+        outside = self.root / "source-doctor"
+        outside.mkdir()
+        plan, workspace = load_scholarly_context(
+            self.paths,
+            {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+            cwd=outside,
+        )
+        self.assertEqual(plan, EgressPlan())
+        self.assertIsNone(workspace)
+        self.assertFalse((outside / ".ocsl-review").exists())
+
+    def test_cwd_symlink_is_rejected_without_plan_or_ledger_cross_talk(self) -> None:
+        linked = self.workspace_root / "linked-chat"
+        linked.symlink_to(self.workspace, target_is_directory=True)
+        with self.assertRaisesRegex(ValidationError, "symlink component"):
+            load_scholarly_context(
+                self.paths,
+                {"LAB_WORKSPACE_ROOT": str(self.workspace_root)},
+                cwd=linked,
+            )
+        self.assertFalse((self.workspace / ".ocsl-review").exists())
+
     def test_scholarly_workspace_cannot_overlap_any_protected_domain(self) -> None:
         for protected in (self.home, self.state, self.lab):
             environment = {
