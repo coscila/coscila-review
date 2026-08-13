@@ -258,10 +258,27 @@ def _platform_option(executable: Path) -> str:
     return "--platform"
 
 
+def _is_classic_conda(executable: Path) -> bool:
+    """True only for the classic Conda frontend.
+
+    Capability must not be keyed on the literal name ``micromamba``: mamba 2.x
+    behaves like micromamba, not like Conda, for every option this module
+    depends on. Verified against mamba 2.5.0 on linux-64:
+      * ``create --no-default-packages`` -> "argument was not expected"
+      * ``run --no-capture-output``      -> token leaks into the child command
+      * ``list --explicit``              -> omits the ``@EXPLICIT`` header
+    """
+    return executable.name.lower() == "conda"
+
+
 def _no_default_packages_options(executable: Path) -> list[str]:
-    # micromamba has no Conda create_default_packages injection. Its CLI does
-    # not consistently expose Conda's suppression flag across releases.
-    if executable.name.lower().startswith("micromamba"):
+    # Only Conda itself exposes the suppression flag. The mamba family does
+    # not: micromamba never injects create_default_packages, and mamba 2.x
+    # rejects the flag outright ("The following argument was not expected:
+    # --no-default-packages"), which fails the build. Hermeticity is preserved
+    # for the whole family by _create_process_env clearing the setting in the
+    # child environment instead.
+    if not _is_classic_conda(executable):
         return []
     return ["--no-default-packages"]
 
@@ -331,11 +348,21 @@ def _run_checked(
 
 def _run_in_prefix_argv(executable: Path, prefix: Path, command: Sequence[str]) -> list[str]:
     argv = [str(executable), "run"]
-    # Conda and Mamba expose this option; micromamba 2.x does not and treats
-    # the unknown token as part of the launched command.
-    if not executable.name.lower().startswith("micromamba"):
+    # Only classic Conda exposes this option. The mamba family (mamba 2.x and
+    # micromamba 2.x alike) treats the unknown token as part of the launched
+    # command, which fails every health check with "exec: --: invalid option".
+    if _is_classic_conda(executable):
         argv.append("--no-capture-output")
     return [*argv, "--prefix", str(prefix), *command]
+
+
+def _create_process_env(executable: Path) -> Mapping[str, str]:
+    # mamba-family frontends take no --no-default-packages flag, so suppress
+    # any configured create_default_packages through the environment to keep
+    # operator builds hermetic regardless of the host's condarc.
+    environment = dict(os.environ)
+    environment["CONDA_CREATE_DEFAULT_PACKAGES"] = ""
+    return environment
 
 
 def _micromamba_process_env(executable: Path, cache_root: Path) -> Mapping[str, str] | None:
@@ -534,7 +561,9 @@ def _export_exact_lock(
     platform: str,
     timeout: float,
 ) -> str:
-    if executable.name.lower().startswith("micromamba"):
+    if not _is_classic_conda(executable):
+        # The mamba family does not emit Conda's ``@EXPLICIT`` block, so the
+        # exact artifact set is reconstructed from the prefix's own records.
         artifacts: list[str] = []
         for record_path in sorted((prefix / "conda-meta").glob("*.json")):
             try:
@@ -836,6 +865,7 @@ def build_template(
                 definition.input_lock,
                 target_platform,
             ),
+            env=_create_process_env(conda),
             timeout=solve_timeout,
         )
         _assert_conda_prefix(staging)
