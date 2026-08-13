@@ -365,15 +365,21 @@ def _create_process_env(executable: Path) -> Mapping[str, str]:
     return environment
 
 
-def _micromamba_process_env(executable: Path, cache_root: Path) -> Mapping[str, str] | None:
-    if not executable.name.lower().startswith("micromamba"):
+def _mamba_family_process_env(executable: Path, cache_root: Path) -> Mapping[str, str] | None:
+    """Redirect the mamba family's cache into operator state.
+
+    mamba 2.x honours XDG_CACHE_HOME exactly as micromamba does, so both need
+    the redirect; without it an operator build scatters cache into the service
+    account's home instead of $OCSL_REVIEW_STATE.
+    """
+    if _is_classic_conda(executable):
         return None
     if cache_root.is_symlink():
-        raise ValidationError(f"micromamba process cache cannot be a symlink: {cache_root}")
+        raise ValidationError(f"conda-frontend process cache cannot be a symlink: {cache_root}")
     cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not cache_root.is_dir():
-        raise ValidationError(f"micromamba process cache is not a directory: {cache_root}")
-    environment = dict(os.environ)
+        raise ValidationError(f"conda-frontend process cache is not a directory: {cache_root}")
+    environment = dict(_create_process_env(executable))
     environment["XDG_CACHE_HOME"] = str(cache_root.resolve())
     return environment
 
@@ -387,7 +393,7 @@ def _run_health_checks(
     timeout: float,
     read_only: bool = False,
 ) -> None:
-    environment = _micromamba_process_env(executable, cache_root)
+    environment = _mamba_family_process_env(executable, cache_root)
     if read_only:
         environment = dict(os.environ) if environment is None else dict(environment)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1523,6 +1529,7 @@ def _install_exact_prefix(
             "--file",
             str(exact_lock),
         ],
+        env=_create_process_env(executable),
         timeout=timeout,
     )
     _assert_conda_prefix(destination)
@@ -1795,7 +1802,7 @@ def run_in_environment(
     return run_command(
         _run_in_prefix_argv(conda, prefix, command),
         cwd=workspace,
-        env=_micromamba_process_env(conda, prefix / ".ocsl-mamba-cache"),
+        env=_mamba_family_process_env(conda, prefix / ".ocsl-mamba-cache"),
         timeout=command_timeout,
         capture=False,
     )
@@ -1931,7 +1938,7 @@ def _apply_rebuild_overlay(
                         str(requirements_file),
                     ],
                 ),
-                env=_micromamba_process_env(executable, cache_root),
+                env=_mamba_family_process_env(executable, cache_root),
                 timeout=timeout,
             )
     finally:
