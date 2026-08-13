@@ -240,22 +240,35 @@ class EgressTests(unittest.TestCase):
                 plan=EgressPlan(),
             )
 
-    def test_explicit_plan_can_approve_a_sensitive_field(self):
+    def test_approved_fields_cannot_override_sensitive_field_block(self):
         plan = EgressPlan.from_mapping(
             {
                 "confidential": True,
                 "approvedOperations": ["resolve_reference"],
-                "approvedFields": ["title"],
+                "approvedFields": ["title", "keywords", "doi"],
             }
         )
+        sensitive_arguments = (
+            {"title": "Approved unpublished title"},
+            {"review": {"doi": "10.1000/example"}},
+            {"metadata": {"manuscriptTitle": []}},
+        )
+        for arguments in sensitive_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(ConfidentialityError):
+                authorize_egress(
+                    provider="crossref",
+                    operation="resolve_reference",
+                    arguments=arguments,
+                    plan=plan,
+                )
         event = authorize_egress(
             provider="crossref",
             operation="resolve_reference",
-            arguments={"title": "Approved unpublished title"},
+            arguments={"keywords": "ordinary structured extension"},
             plan=plan,
         )
         self.assertEqual(event["decision"], "allowed-minimized")
-        self.assertNotIn("Approved unpublished title", json.dumps(event))
+        self.assertNotIn("ordinary structured extension", json.dumps(event))
 
     def test_plan_rejects_string_booleans_and_duplicate_fields(self):
         with self.assertRaises(ValidationError):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -125,32 +126,42 @@ class EgressPlan:
 
     @classmethod
     def load(cls, path: Path | None) -> EgressPlan:
+        plan, _ = cls.load_with_digest(path)
+        return plan
+
+    @classmethod
+    def load_with_digest(cls, path: Path | None) -> tuple[EgressPlan, str | None]:
+        """Read, hash, and parse one bounded plan from the same file descriptor."""
+
         if path is None:
-            return cls()
+            return cls(), None
         try:
             descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         except OSError as exc:
             raise ValidationError(f"cannot open egress plan: {path}: {exc}") from exc
         try:
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValidationError(f"egress plan is not a regular file: {path}")
-            if metadata.st_size > MAX_EGRESS_PLAN_BYTES:
-                raise ValidationError(
-                    f"egress plan exceeds {MAX_EGRESS_PLAN_BYTES} bytes: {path}"
-                )
-            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
-                descriptor = -1
-                try:
-                    value = json.load(handle)
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise ValidationError(f"egress plan is not valid UTF-8 JSON: {path}") from exc
-        finally:
-            if descriptor >= 0:
+            with os.fdopen(descriptor, "rb") as handle:
+                metadata = os.fstat(handle.fileno())
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValidationError(f"egress plan is not a regular file: {path}")
+                body = handle.read(MAX_EGRESS_PLAN_BYTES + 1)
+        except Exception:
+            # os.fdopen owns and closes the descriptor once constructed.  If
+            # construction itself failed, close the raw descriptor here.
+            try:
                 os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        if len(body) > MAX_EGRESS_PLAN_BYTES:
+            raise ValidationError(f"egress plan exceeds {MAX_EGRESS_PLAN_BYTES} bytes: {path}")
+        try:
+            value = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError(f"egress plan is not valid UTF-8 JSON: {path}") from exc
         if not isinstance(value, Mapping):
             raise ValidationError("egress plan must be one JSON object")
-        return cls.from_mapping(value)
+        return cls.from_mapping(value), hashlib.sha256(body).hexdigest()
 
 
 def _lexical_absolute(value: str | os.PathLike[str], *, label: str) -> Path:
@@ -213,6 +224,51 @@ def _fixed_workspace_plan(workspace: Path) -> Path | None:
     return plan
 
 
+def _is_narrowing_only(plan: EgressPlan) -> bool:
+    default = EgressPlan()
+    sanitized_queries_are_not_broader = (
+        plan.allow_sanitized_queries is False
+        or plan.allow_sanitized_queries == default.allow_sanitized_queries
+    )
+    # The empty default operation set means that all declared public operations
+    # are eligible.  A non-empty plan set is therefore an allowlist restriction,
+    # while another empty set preserves the default.
+    return (
+        plan.confidential is True
+        and plan.shared_cache is False
+        and not plan.approved_fields
+        and plan.max_query_terms <= default.max_query_terms
+        and sanitized_queries_are_not_broader
+    )
+
+
+def _load_context_plan(
+    path: Path | None,
+    *,
+    expected_sha256: str | None,
+    auto_loaded: bool,
+) -> EgressPlan:
+    plan, actual_sha256 = EgressPlan.load_with_digest(path)
+    if path is None:
+        return plan
+    narrowing_only = _is_narrowing_only(plan)
+    if auto_loaded and not narrowing_only:
+        raise ValidationError(
+            "the fixed workspace egress plan may only narrow the confidential default"
+        )
+    if expected_sha256 is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise ValidationError("OCSL_REVIEW_EGRESS_PLAN_SHA256 must be lowercase SHA-256")
+        assert actual_sha256 is not None
+        if not hmac.compare_digest(actual_sha256, expected_sha256):
+            raise ValidationError("egress plan SHA-256 does not match operator configuration")
+    elif not narrowing_only:
+        raise ValidationError(
+            "a broader explicit egress plan requires OCSL_REVIEW_EGRESS_PLAN_SHA256"
+        )
+    return plan
+
+
 def load_scholarly_context(
     paths: Any,
     environment: Mapping[str, str],
@@ -229,9 +285,14 @@ def load_scholarly_context(
     """
 
     plan_value = environment.get("OCSL_REVIEW_EGRESS_PLAN")
+    plan_sha256 = environment.get("OCSL_REVIEW_EGRESS_PLAN_SHA256")
     workspace_value = environment.get("OCSL_REVIEW_WORKSPACE")
     if plan_value and not workspace_value:
         raise ValidationError("an explicit egress plan requires OCSL_REVIEW_WORKSPACE")
+    if plan_sha256 and not plan_value:
+        raise ValidationError(
+            "OCSL_REVIEW_EGRESS_PLAN_SHA256 requires an explicit OCSL_REVIEW_EGRESS_PLAN"
+        )
     root_value = environment.get("LAB_WORKSPACE_ROOT")
     if workspace_value:
         if not root_value:
@@ -268,16 +329,25 @@ def load_scholarly_context(
             raise ValidationError("egress plan must be inside the exact scholarly workspace")
     else:
         plan_path = _fixed_workspace_plan(workspace)
-    return EgressPlan.load(plan_path), workspace
+    plan = _load_context_plan(
+        plan_path,
+        expected_sha256=plan_sha256,
+        auto_loaded=not bool(plan_value),
+    )
+    return plan, workspace
 
 
 def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
     flattened: list[tuple[str, Any]] = []
     if isinstance(value, Mapping):
+        if not value and prefix:
+            flattened.append((prefix, value))
         for key, child in value.items():
             name = f"{prefix}.{key}" if prefix else str(key)
             flattened.extend(_flatten(child, name))
     elif isinstance(value, list):
+        if not value and prefix:
+            flattened.append((prefix, value))
         for index, child in enumerate(value):
             flattened.extend(_flatten(child, f"{prefix}[{index}]"))
     else:
@@ -322,11 +392,8 @@ def authorize_egress(
         allowed |= QUERY_FIELDS
     for path, value in _flatten(arguments):
         leaf = re.sub(r"\[\d+\]$", "", path.rsplit(".", 1)[-1])
-        lowered = leaf.lower()
-        if (
-            any(fragment in lowered for fragment in SENSITIVE_KEY_FRAGMENTS)
-            and leaf not in plan.approved_fields
-        ):
+        lowered_path = path.lower()
+        if any(fragment in lowered_path for fragment in SENSITIVE_KEY_FRAGMENTS):
             raise ConfidentialityError(f"confidential field cannot leave the workspace: {path}")
         if leaf not in allowed and value not in (None, "", False):
             raise ConfidentialityError(f"field is not approved for confidential egress: {path}")

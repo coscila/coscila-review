@@ -79,16 +79,32 @@ container itself is never treated as a chat. The server then uses
 exists, otherwise it uses the confidential default plan. It does not search
 parents for a plan or infer a different workspace. This keeps separate chat
 working directories, plans, and ledgers from crossing into one another.
+An automatically discovered plan is accepted only when it preserves or narrows
+the confidential default: `confidential` remains true, `sharedCache` remains
+false, `approvedFields` is empty, `maxQueryTerms` is at most twelve, and
+sanitized queries or public operations may only be restricted. A writable chat
+therefore cannot promote its own plan into broader disclosure authority.
 
 A source-side doctor launched with a current directory outside
 `LAB_WORKSPACE_ROOT` retains the confidential diagnostic default and has no
 workspace ledger target. Starting it from the workspace-root container itself
 is rejected as ambiguous rather than sharing one container-level ledger.
 
-`approvedFields` can narrow or extend ordinary structured fields, but it does
-not override the hard block on manuscript-like field names. If a competent
-authority explicitly allows disclosure of manuscript content, record that
-decision outside the manuscript and use a separately reviewed
+An explicitly configured plan inside the exact workspace may also work without
+a digest when it meets the same narrowing-only contract. Any broader explicit
+plan requires `OCSL_REVIEW_EGRESS_PLAN_SHA256` to contain the lowercase SHA-256
+of the exact bounded file bytes. The server reads, hashes, and parses those
+bytes through one no-follow file descriptor; an absent, malformed, stale, or
+mismatched digest stops startup before provider I/O. This is the operator's
+immutable authorization for that plan content, not an authority delegated to
+the writable workspace.
+
+`approvedFields` can extend ordinary structured fields only in such a
+hash-bound explicit plan. It never overrides the confidential-mode hard block
+on manuscript-like field names, including sensitive names nested inside other
+argument objects or attached to empty values. If a competent authority
+explicitly allows disclosure of manuscript content, record that decision
+outside the manuscript and use a separately reviewed, hash-bound
 `"confidential": false` plan for only the approved operation. Do not silently
 change the whole review's classification. An approved public posting, for
 example, does not necessarily make reviewer notes or an unpublished revision
@@ -99,8 +115,9 @@ not enter a cross-workspace cache.
 
 ## What the audit log contains
 
-When `OCSL_REVIEW_WORKSPACE` is set, allowed provider requests append an event
-to the non-symlinked, owner-only ledger directory:
+When a workspace is selected explicitly or from the trusted process working
+directory, allowed provider requests append an event to the non-symlinked,
+owner-only ledger directory:
 
 ```text
 <workspace>/.ocsl-review/egress-events.json
