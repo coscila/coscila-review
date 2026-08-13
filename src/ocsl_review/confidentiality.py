@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,7 +14,10 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConfidentialityError, ValidationError
-from .util import atomic_json
+from .util import atomic_json, is_within
+
+MAX_EGRESS_PLAN_BYTES = 64 * 1024
+MAX_EGRESS_LEDGER_BYTES = 8 * 1024 * 1024
 
 IDENTIFIER_FIELDS = {
     "doi",
@@ -122,7 +127,104 @@ class EgressPlan:
     def load(cls, path: Path | None) -> EgressPlan:
         if path is None:
             return cls()
-        return cls.from_mapping(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise ValidationError(f"cannot open egress plan: {path}: {exc}") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValidationError(f"egress plan is not a regular file: {path}")
+            if metadata.st_size > MAX_EGRESS_PLAN_BYTES:
+                raise ValidationError(
+                    f"egress plan exceeds {MAX_EGRESS_PLAN_BYTES} bytes: {path}"
+                )
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                try:
+                    value = json.load(handle)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValidationError(f"egress plan is not valid UTF-8 JSON: {path}") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if not isinstance(value, Mapping):
+            raise ValidationError("egress plan must be one JSON object")
+        return cls.from_mapping(value)
+
+
+def _lexical_absolute(value: str | os.PathLike[str], *, label: str) -> Path:
+    candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+    if not Path(value).expanduser().is_absolute():
+        raise ValidationError(f"{label} must be an absolute path")
+    return candidate
+
+
+def _assert_no_symlink_components(path: Path, *, label: str) -> None:
+    for candidate in reversed((path, *path.parents)):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValidationError(f"{label} contains a symlink component: {candidate}")
+
+
+def load_scholarly_context(
+    paths: Any,
+    environment: Mapping[str, str],
+) -> tuple[EgressPlan, Path | None]:
+    """Validate the deployment context before constructing a scholarly client.
+
+    With neither context variable, the documented confidential default remains
+    available for diagnostics.  Once either variable is supplied, the context
+    is bound to one real workspace and cannot use symlinks or broader paths to
+    reach another filesystem domain.
+    """
+
+    plan_value = environment.get("OCSL_REVIEW_EGRESS_PLAN")
+    workspace_value = environment.get("OCSL_REVIEW_WORKSPACE")
+    if plan_value and not workspace_value:
+        raise ValidationError("an explicit egress plan requires OCSL_REVIEW_WORKSPACE")
+    if not workspace_value:
+        return EgressPlan(), None
+
+    root_value = environment.get("LAB_WORKSPACE_ROOT")
+    if not root_value:
+        raise ValidationError(
+            "OCSL_REVIEW_WORKSPACE requires the deployment LAB_WORKSPACE_ROOT boundary"
+        )
+    workspace_lexical = _lexical_absolute(workspace_value, label="scholarly workspace")
+    root_lexical = _lexical_absolute(root_value, label="LAB_WORKSPACE_ROOT")
+    _assert_no_symlink_components(workspace_lexical, label="scholarly workspace")
+    _assert_no_symlink_components(root_lexical, label="LAB_WORKSPACE_ROOT")
+    if not workspace_lexical.is_dir():
+        raise ValidationError(f"scholarly workspace does not exist: {workspace_lexical}")
+    if not root_lexical.is_dir():
+        raise ValidationError(f"LAB_WORKSPACE_ROOT does not exist: {root_lexical}")
+    workspace = workspace_lexical.resolve()
+    workspace_root = root_lexical.resolve()
+    if workspace == Path(workspace.anchor):
+        raise ValidationError("the filesystem root cannot be a scholarly workspace")
+    if not is_within(workspace, workspace_root):
+        raise ValidationError("scholarly workspace is outside LAB_WORKSPACE_ROOT")
+
+    from .config import protected_workspace_roots
+
+    for label, protected in protected_workspace_roots(paths):
+        if is_within(workspace, protected) or is_within(protected, workspace):
+            raise ValidationError(f"scholarly workspace overlaps protected {label}: {protected}")
+
+    plan_path: Path | None = None
+    if plan_value:
+        plan_lexical = _lexical_absolute(plan_value, label="egress plan")
+        _assert_no_symlink_components(plan_lexical, label="egress plan")
+        if not plan_lexical.is_file():
+            raise ValidationError(f"egress plan does not exist: {plan_lexical}")
+        plan_path = plan_lexical.resolve()
+        if not is_within(plan_path, workspace):
+            raise ValidationError("egress plan must be inside the exact scholarly workspace")
+    return EgressPlan.load(plan_path), workspace
 
 
 def _flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -214,11 +316,29 @@ def _audit_event(
 def append_egress_event(workspace: Path, event: Mapping[str, Any]) -> None:
     """Persist only hashes and field names; never persist confidential payloads."""
 
-    path = workspace / ".ocsl-review" / "egress-events.json"
+    workspace = _lexical_absolute(workspace, label="egress-ledger workspace")
+    _assert_no_symlink_components(workspace, label="egress-ledger workspace")
+    if not workspace.is_dir():
+        raise ValidationError(f"egress-ledger workspace does not exist: {workspace}")
+    audit_root = workspace / ".ocsl-review"
+    _assert_no_symlink_components(audit_root, label="egress-ledger directory")
+    audit_root.mkdir(mode=0o700, exist_ok=True)
+    _assert_no_symlink_components(audit_root, label="egress-ledger directory")
+    if not audit_root.is_dir() or not is_within(audit_root, workspace):
+        raise ValidationError(f"egress-ledger directory escapes its workspace: {audit_root}")
+    os.chmod(audit_root, 0o700)
+    path = audit_root / "egress-events.json"
+    _assert_no_symlink_components(path, label="egress ledger")
     events: list[dict[str, Any]] = []
     if path.exists():
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(loaded, list):
-            events = loaded
+        if not path.is_file() or path.stat().st_size > MAX_EGRESS_LEDGER_BYTES:
+            raise ValidationError(f"egress ledger is not a bounded regular file: {path}")
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationError(f"egress ledger is not valid UTF-8 JSON: {path}") from exc
+        if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
+            raise ValidationError(f"egress ledger must contain one JSON event array: {path}")
+        events = loaded
     events.append(dict(event))
     atomic_json(path, events, mode=0o600)

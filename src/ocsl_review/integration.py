@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import stat
 import uuid
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -124,7 +125,9 @@ def resolve_mcp_config(args: Any | None = None) -> Path:
     value = value or os.environ.get("OCSL_REVIEW_MCP_CONFIG")
     value = value or os.environ.get("LAB_CODEX_MCP_CONFIG")
     if value:
-        return Path(value).expanduser().resolve()
+        # Keep the final path component unresolved so the transaction can
+        # reject a deployment config that is itself a symbolic link.
+        return Path(value).expanduser().absolute()
     config_root = os.environ.get("CLAUDE_CONFIG_DIR") or os.environ.get("LAB_CLAUDE_CONFIG_DIR")
     if config_root:
         return Path(config_root).expanduser().resolve() / ".claude.json"
@@ -193,7 +196,12 @@ def resolve_staging(
     }
     argv = [replacements.get(item, item) for item in argv]
     timeout_value = _arg(args, "stage_timeout", "staging_timeout")
-    timeout = float(timeout_value or os.environ.get("OCSL_REVIEW_STAGE_TIMEOUT", "900"))
+    if timeout_value is None:
+        timeout_value = os.environ.get("OCSL_REVIEW_STAGE_TIMEOUT", "900")
+    try:
+        timeout = float(timeout_value)
+    except (TypeError, ValueError) as exc:
+        raise ReviewError("deployment staging timeout must be numeric") from exc
     if timeout <= 0:
         raise ReviewError("deployment staging timeout must be positive")
     return argv, cwd, timeout
@@ -263,6 +271,8 @@ def _assert_siblings_unchanged(
 
 
 def _read_json_config(path: Path) -> tuple[bool, bytes, dict[str, Any]]:
+    if path.is_symlink():
+        raise ValidationError(f"MCP config must not be a symbolic link: {path}")
     if not path.exists():
         return False, b"", {}
     if not path.is_file():
@@ -287,6 +297,7 @@ def _merge_mcp_config(
     install_id: str,
 ) -> dict[str, Any]:
     existed, raw, config = _read_json_config(config_path)
+    config_mode = stat.S_IMODE(config_path.stat().st_mode) if existed else 0o600
     backup = paths.integration / "backups" / install_id / "mcp-config.before"
     atomic_write(backup, raw, mode=0o600)
     servers = deepcopy(config.get("mcpServers", {}))
@@ -298,19 +309,20 @@ def _merge_mcp_config(
         for name in OWNED_MCP_NAMES:
             servers[name] = deepcopy(entries[name])
         config["mcpServers"] = servers
-        atomic_json(config_path, config, mode=0o600)
+        atomic_json(config_path, config, mode=config_mode)
         _, _, verified = _read_json_config(config_path)
         if any(verified["mcpServers"].get(name) != entries[name] for name in OWNED_MCP_NAMES):
             raise ValidationError("MCP config merge did not verify")
     except Exception:
         if existed:
-            atomic_write(config_path, raw, mode=0o600)
+            atomic_write(config_path, raw, mode=config_mode)
         elif config_path.exists():
             config_path.unlink()
         raise
     return {
         "configPath": str(config_path),
         "configExisted": existed,
+        "configMode": config_mode,
         "backupPath": str(backup),
         "backupSha256": sha256_file(backup),
         "previousOwned": previous,
@@ -324,7 +336,11 @@ def _restore_mcp_file(record: Mapping[str, Any]) -> None:
     if not backup.is_file() or sha256_file(backup) != record.get("backupSha256"):
         raise ValidationError(f"MCP backup is missing or changed: {backup}")
     if record.get("configExisted"):
-        atomic_write(config_path, backup.read_bytes(), mode=0o600)
+        atomic_write(
+            config_path,
+            backup.read_bytes(),
+            mode=int(record.get("configMode", 0o600)),
+        )
     elif config_path.exists():
         config_path.unlink()
 
@@ -400,6 +416,13 @@ def _validate_install_state(state: Mapping[str, Any]) -> None:
         not isinstance(staged_config, str) or not staged_config.strip()
     ):
         raise ValidationError("install state has invalid staged MCP config identity")
+    config_mode = mcp.get("configMode")
+    if (
+        not isinstance(config_mode, int)
+        or isinstance(config_mode, bool)
+        or not 0 <= config_mode <= 0o777
+    ):
+        raise ValidationError("install state has invalid MCP config mode")
     manifest = state.get("skillManifest", {})
     if not isinstance(manifest, Mapping) or not manifest.get("path") or not manifest.get("sha256"):
         raise ValidationError("install state has invalid skill manifest identity")
@@ -417,7 +440,10 @@ def _verify_active_state(paths: Any, state: Mapping[str, Any]) -> dict[str, Any]
     if not skill_check.get("ok"):
         raise ValidationError(skill_check.get("reason", "skill installation verification failed"))
     mcp = state["mcp"]
-    _, _, config = _read_json_config(Path(mcp["configPath"]))
+    config_path = Path(mcp["configPath"])
+    _, _, config = _read_json_config(config_path)
+    if stat.S_IMODE(config_path.stat().st_mode) != mcp["configMode"]:
+        raise ValidationError("installed MCP config mode changed")
     servers = config.get("mcpServers", {})
     for name in OWNED_MCP_NAMES:
         if servers.get(name) != mcp["installedOwned"][name]:
@@ -610,11 +636,19 @@ def uninstall_integration(paths: Any, *, stage_timeout: float = 900) -> dict[str
     try:
         if restore_exact_original:
             if mcp["configExisted"]:
-                atomic_write(config_path, backup_path.read_bytes(), mode=0o600)
+                atomic_write(
+                    config_path,
+                    backup_path.read_bytes(),
+                    mode=int(mcp.get("configMode", 0o600)),
+                )
             elif config_path.exists():
                 config_path.unlink()
         else:
-            atomic_json(config_path, restored_config, mode=0o600)
+            atomic_json(
+                config_path,
+                restored_config,
+                mode=int(mcp.get("configMode", 0o600)),
+            )
         config_changed = True
         _run_staging(stage_argv, stage_cwd, stage_timeout)
         _assert_siblings_unchanged(siblings_before, snapshot_siblings(paths))
@@ -630,7 +664,11 @@ def uninstall_integration(paths: Any, *, stage_timeout: float = 900) -> dict[str
         rollback_errors: list[str] = []
         if config_changed:
             try:
-                atomic_write(config_path, current_raw, mode=0o600)
+                atomic_write(
+                    config_path,
+                    current_raw,
+                    mode=int(mcp.get("configMode", 0o600)),
+                )
                 _run_staging(stage_argv, stage_cwd, stage_timeout)
             except Exception as rollback_exc:  # noqa: BLE001
                 rollback_errors.append(f"MCP rollback: {rollback_exc}")
@@ -679,5 +717,12 @@ def cmd_verify(args: Any) -> dict[str, Any]:
 
 def cmd_uninstall(args: Any) -> dict[str, Any]:
     timeout_value = _arg(args, "stage_timeout", "staging_timeout")
-    timeout = float(timeout_value or os.environ.get("OCSL_REVIEW_STAGE_TIMEOUT", "900"))
+    if timeout_value is None:
+        timeout_value = os.environ.get("OCSL_REVIEW_STAGE_TIMEOUT", "900")
+    try:
+        timeout = float(timeout_value)
+    except (TypeError, ValueError) as exc:
+        raise ReviewError("deployment staging timeout must be numeric") from exc
+    if timeout <= 0:
+        raise ReviewError("deployment staging timeout must be positive")
     return uninstall_integration(args.paths, stage_timeout=timeout)

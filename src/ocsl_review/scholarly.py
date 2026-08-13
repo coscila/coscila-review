@@ -12,11 +12,13 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .confidentiality import EgressPlan, append_egress_event, authorize_egress
 from .errors import ProviderError, ReviewError
@@ -293,10 +295,36 @@ class ScholarlyClient:
         if self.contact_email:
             agent += f" mailto:{self.contact_email}"
         self.transport = transport or HttpTransport(user_agent=agent)
+        self._requested_operation: ContextVar[str | None] = ContextVar(
+            "ocsl_review_requested_operation",
+            default=None,
+        )
+
+    @contextmanager
+    def _operation_scope(self, operation: str) -> Iterator[None]:
+        """Keep provider authorization bound to the public operation requested.
+
+        Several public tools delegate to identifier or status helpers.  The
+        outer operation must remain authoritative for both allow-list checks
+        and egress-ledger events throughout that call graph.
+        """
+
+        if self._requested_operation.get() is not None:
+            yield
+            return
+        token = self._requested_operation.set(operation)
+        try:
+            yield
+        finally:
+            self._requested_operation.reset(token)
 
     def _authorize(self, provider: str, operation: str, arguments: Mapping[str, Any]) -> None:
+        effective_operation = self._requested_operation.get() or operation
         event = authorize_egress(
-            provider=provider, operation=operation, arguments=arguments, plan=self.plan
+            provider=provider,
+            operation=effective_operation,
+            arguments=arguments,
+            plan=self.plan,
         )
         if self.workspace:
             append_egress_event(self.workspace, event)
@@ -480,27 +508,29 @@ class ScholarlyClient:
         return self._envelope("resolve_identifier", "multiple", records, limitations=failures)
 
     def resolve_reference(self, reference: Mapping[str, Any]) -> dict[str, Any]:
-        for key in ("doi", "pmid", "pmcid"):
-            if reference.get(key):
-                return self.resolve_identifier(**{key: str(reference[key])})
-        title = str(reference.get("title", "")).strip()
-        author = str(reference.get("author", "")).strip()
-        year = str(reference.get("year", "")).strip()
-        if not title:
-            raise ReviewError("reference resolution requires an identifier or title")
-        egress = {"title": title}
-        if author:
-            egress["author"] = author
-        self._authorize("crossref", "resolve_reference", egress)
-        query = " ".join(part for part in (title, author, year) if part)
-        params: dict[str, Any] = {"query.bibliographic": query, "rows": 5}
-        if self.contact_email:
-            params["mailto"] = self.contact_email
-        payload = self.transport.get(f"{CROSSREF}/works", params=params).json()
-        records = [
-            normalize_crossref(item) for item in payload.get("message", {}).get("items", [])[:5]
-        ]
-        return self._envelope("resolve_reference", "crossref", records)
+        with self._operation_scope("resolve_reference"):
+            for key in ("doi", "pmid", "pmcid"):
+                if reference.get(key):
+                    return self.resolve_identifier(**{key: str(reference[key])})
+            title = str(reference.get("title", "")).strip()
+            author = str(reference.get("author", "")).strip()
+            year = str(reference.get("year", "")).strip()
+            if not title:
+                raise ReviewError("reference resolution requires an identifier or title")
+            egress = {"title": title}
+            if author:
+                egress["author"] = author
+            self._authorize("crossref", "resolve_reference", egress)
+            query = " ".join(part for part in (title, author, year) if part)
+            params: dict[str, Any] = {"query.bibliographic": query, "rows": 5}
+            if self.contact_email:
+                params["mailto"] = self.contact_email
+            payload = self.transport.get(f"{CROSSREF}/works", params=params).json()
+            records = [
+                normalize_crossref(item)
+                for item in payload.get("message", {}).get("items", [])[:5]
+            ]
+            return self._envelope("resolve_reference", "crossref", records)
 
     @staticmethod
     def reconcile_reference_metadata(records: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -614,15 +644,16 @@ class ScholarlyClient:
     def get_corrections_retractions(
         self, *, doi: str | None = None, pmid: str | None = None
     ) -> dict[str, Any]:
-        status = self.get_publication_status(doi=doi, pmid=pmid)
-        return {
-            "operation": "get_corrections_retractions",
-            "status": status["state"],
-            "notices": status["signals"],
-            "providersChecked": status["providersChecked"],
-            "checkedAt": status["checkedAt"],
-            "limitations": status["limitations"],
-        }
+        with self._operation_scope("get_corrections_retractions"):
+            status = self.get_publication_status(doi=doi, pmid=pmid)
+            return {
+                "operation": "get_corrections_retractions",
+                "status": status["state"],
+                "notices": status["signals"],
+                "providersChecked": status["providersChecked"],
+                "checkedAt": status["checkedAt"],
+                "limitations": status["limitations"],
+            }
 
     def get_related_versions(self, *, doi: str) -> dict[str, Any]:
         record = self._crossref_work(doi, "get_related_versions")
@@ -636,47 +667,58 @@ class ScholarlyClient:
     def get_abstract_or_open_sections(
         self, *, doi: str | None = None, pmid: str | None = None, pmcid: str | None = None
     ) -> dict[str, Any]:
-        resolved = self.resolve_identifier(doi=doi, pmid=pmid, pmcid=pmcid)
-        epmc = next(
-            (item for item in resolved["records"] if item.get("provider") == "europe-pmc"), None
-        )
-        if not epmc:
+        with self._operation_scope("get_abstract_or_open_sections"):
+            resolved = self.resolve_identifier(doi=doi, pmid=pmid, pmcid=pmcid)
+            epmc = next(
+                (item for item in resolved["records"] if item.get("provider") == "europe-pmc"),
+                None,
+            )
+            if not epmc:
+                return self._envelope(
+                    "get_abstract_or_open_sections",
+                    "europe-pmc",
+                    [],
+                    access="metadata-only",
+                    limitations=["No Europe PMC record resolved."],
+                )
+            records: dict[str, Any] = {"abstract": epmc.get("abstract"), "sections": []}
+            access = "abstract-only" if epmc.get("abstract") else "metadata-only"
+            open_pmcid = epmc.get("pmcid")
+            if open_pmcid and epmc.get("isOpenAccess"):
+                self._authorize(
+                    "europe-pmc",
+                    "get_abstract_or_open_sections",
+                    {"pmcid": open_pmcid},
+                )
+                response = self.transport.get(
+                    f"{EUROPE_PMC}/{urllib.parse.quote(open_pmcid)}/fullTextXML",
+                    headers={"Accept": "application/xml"},
+                )
+                try:
+                    root = ET.fromstring(response.body)
+                except ET.ParseError as exc:
+                    raise ProviderError("Europe PMC returned malformed full-text XML") from exc
+                sections = []
+                for section in root.findall(".//sec")[:20]:
+                    title = (
+                        " ".join("".join(section.find("title").itertext()).split())
+                        if section.find("title") is not None
+                        else ""
+                    )
+                    paragraphs = [
+                        " ".join("".join(p.itertext()).split()) for p in section.findall("./p")
+                    ]
+                    text = "\n".join(part for part in paragraphs if part)[:4000]
+                    if title or text:
+                        sections.append({"title": title, "text": text})
+                records["sections"] = sections
+                access = "full-text"
             return self._envelope(
                 "get_abstract_or_open_sections",
                 "europe-pmc",
-                [],
-                access="metadata-only",
-                limitations=["No Europe PMC record resolved."],
+                records,
+                access=access,
             )
-        records: dict[str, Any] = {"abstract": epmc.get("abstract"), "sections": []}
-        access = "abstract-only" if epmc.get("abstract") else "metadata-only"
-        open_pmcid = epmc.get("pmcid")
-        if open_pmcid and epmc.get("isOpenAccess"):
-            self._authorize("europe-pmc", "get_abstract_or_open_sections", {"pmcid": open_pmcid})
-            response = self.transport.get(
-                f"{EUROPE_PMC}/{urllib.parse.quote(open_pmcid)}/fullTextXML",
-                headers={"Accept": "application/xml"},
-            )
-            try:
-                root = ET.fromstring(response.body)
-            except ET.ParseError as exc:
-                raise ProviderError("Europe PMC returned malformed full-text XML") from exc
-            sections = []
-            for section in root.findall(".//sec")[:20]:
-                title = (
-                    " ".join("".join(section.find("title").itertext()).split())
-                    if section.find("title") is not None
-                    else ""
-                )
-                paragraphs = [
-                    " ".join("".join(p.itertext()).split()) for p in section.findall("./p")
-                ]
-                text = "\n".join(part for part in paragraphs if part)[:4000]
-                if title or text:
-                    sections.append({"title": title, "text": text})
-            records["sections"] = sections
-            access = "full-text"
-        return self._envelope("get_abstract_or_open_sections", "europe-pmc", records, access=access)
 
     def _epmc_links(self, kind: str, *, source: str, identifier: str, limit: int) -> dict[str, Any]:
         rows = bounded_limit(limit)
@@ -798,8 +840,9 @@ def call_tool(client: ScholarlyClient, name: str, arguments: Mapping[str, Any]) 
     if not method_name:
         raise ReviewError(f"unknown scholarly operation: {name}")
     method: Callable[..., Any] = getattr(client, method_name)
-    if name == "resolve_reference":
-        return method(arguments.get("reference", arguments))
-    if name == "reconcile_reference_metadata":
-        return method(list(arguments.get("records", [])))
-    return method(**dict(arguments))
+    with client._operation_scope(name):
+        if name == "resolve_reference":
+            return method(arguments.get("reference", arguments))
+        if name == "reconcile_reference_metadata":
+            return method(list(arguments.get("records", [])))
+        return method(**dict(arguments))

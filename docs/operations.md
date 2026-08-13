@@ -12,6 +12,18 @@ The launcher is:
 $OCSL_REVIEW_HOME/bin/ocsl-review
 ```
 
+After `review-core` has been promoted, the launcher resolves that immutable
+template through its validated `current` pointer and uses its Python runtime.
+Before the first environment build it falls back to `python3` from `PATH`, so
+that one-time operator runtime must satisfy the dependencies declared in
+`pyproject.toml`. The launcher canonicalizes its own path, so invoking it
+through a symlink does not change `OCSL_REVIEW_HOME`.
+
+Do not replace the checkout with a wheel-only installation. The Python modules
+are only one part of the companion; the source-tree catalogs, schemas, skills,
+environment inputs, and MCP launchers are required at runtime. For this reason
+the wheel deliberately exposes no console script.
+
 Global path overrides are `--home`, `--state`, and `--ocsl-repo`; `--json`
 selects machine-readable output. The command families are:
 
@@ -59,6 +71,9 @@ export LAB_CONDA_ROOT=/var/lib/ocsl/chat-conda
 `OCSL_REVIEW_STAGE_COMMAND` must be the deployment's real regeneration or
 staging command. A no-op command, unconditional success script, or command that
 does not make the MCP values reachable is not acceptable.
+
+`OCSL_REVIEW_STAGE_TIMEOUT` is used when `--stage-timeout` is omitted and
+defaults to 900 seconds. An explicit non-positive timeout is rejected.
 
 The sandbox configuration should add these as read-only roots:
 
@@ -168,6 +183,12 @@ Installation performs one transaction:
 8. verify that the tracked state of `oc-science-lab` and, when present,
    `oc-science-lab-bio` is unchanged;
 9. write `install-state.json` only after all preceding steps succeed.
+
+Skill roots are rejected if either they or any protected source/state tree
+contains the other; an untracked directory inside a sibling checkout is not a
+valid installation target. The MCP source must be a regular file (or absent),
+never a symbolic link. Its original permission mode is retained during install,
+rollback, and uninstall.
 
 The staged path identifies the generated configuration that the running agent
 consumes. It must differ from `OCSL_REVIEW_MCP_CONFIG`, which is the mutable

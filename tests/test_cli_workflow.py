@@ -10,7 +10,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from ocsl_review.cli import main
+from ocsl_review.cli import _chat_context, build_parser, main
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "manuscript_with_citations.md"
@@ -79,7 +79,10 @@ class CliWorkflowTests(unittest.TestCase):
 
     def test_operator_command_is_rejected_in_chat_context_before_mutation(self) -> None:
         state = Path(self.temporary.name) / "state"
-        with patch.dict(os.environ, {"LAB_WORKSPACE_ROOT": str(self.workspace)}, clear=False):
+        with (
+            patch.dict(os.environ, {"LAB_WORKSPACE_ROOT": str(self.workspace)}, clear=False),
+            patch("ocsl_review.cli.Path.cwd", return_value=self.workspace),
+        ):
             result, _, stderr = self.invoke(
                 "--state",
                 str(state),
@@ -90,6 +93,22 @@ class CliWorkflowTests(unittest.TestCase):
         self.assertEqual(result, 3)
         self.assertIn("trust boundary", stderr)
         self.assertFalse(state.exists())
+
+    def test_declared_workspace_root_does_not_make_an_external_operator_shell_a_chat(self) -> None:
+        operator_checkout = ROOT.resolve()
+        self.assertNotEqual(operator_checkout, self.workspace)
+        with (
+            patch.dict(os.environ, {"LAB_WORKSPACE_ROOT": str(self.workspace)}, clear=False),
+            patch("ocsl_review.cli.Path.cwd", return_value=operator_checkout),
+        ):
+            self.assertFalse(_chat_context())
+
+    def test_stage_timeout_defaults_are_resolved_by_the_deployment_layer(self) -> None:
+        parser = build_parser()
+        install = parser.parse_args(["integrate", "install"])
+        uninstall = parser.parse_args(["integrate", "uninstall"])
+        self.assertIsNone(install.stage_timeout)
+        self.assertIsNone(uninstall.stage_timeout)
 
     def test_env_fork_all_rejects_overlay_instead_of_ignoring_it(self) -> None:
         state = Path(self.temporary.name) / "state"

@@ -600,11 +600,11 @@ def _exact_lock_root(paths: Paths) -> Path:
 
 def _validated_state_root(paths: Paths) -> Path:
     state = paths.need_state().resolve()
-    source = paths.home.resolve()
     if state == Path(state.anchor):
         raise ReviewError("OCSL_REVIEW_STATE cannot be the filesystem root")
-    if is_within(state, source) or is_within(source, state):
-        raise ReviewError("OCSL_REVIEW_STATE must not overlap the review source checkout")
+    for label, source in config.protected_source_roots(paths):
+        if is_within(state, source) or is_within(source, state):
+            raise ReviewError(f"OCSL_REVIEW_STATE must not overlap {label}: {source}")
     return state
 
 
@@ -1190,10 +1190,9 @@ def _assert_runtime_workspace(paths: Paths, workspace: Path) -> Path:
         raise ReviewError(f"review workspace does not exist: {workspace}")
     if workspace == Path(workspace.anchor):
         raise ReviewError("the filesystem root cannot be used as a review workspace")
-    if is_within(workspace, paths.home):
-        raise ReviewError("chat environments cannot write into the review source checkout")
-    if paths.state is not None and is_within(workspace, paths.state):
-        raise ReviewError("chat environments cannot write into deployment state")
+    for label, protected in config.protected_workspace_roots(paths):
+        if is_within(workspace, protected) or is_within(protected, workspace):
+            raise ReviewError(f"review workspace overlaps protected {label}: {protected}")
     return workspace
 
 
@@ -1213,10 +1212,7 @@ def _chat_root(
     if root == Path(root.anchor):
         raise ReviewError("LAB_CONDA_ROOT cannot be the filesystem root")
     if paths is not None:
-        separated_roots = [("review source", paths.home)]
-        if paths.state is not None:
-            separated_roots.append(("review state", paths.state))
-        for label, separated in separated_roots:
+        for label, separated in config.protected_workspace_roots(paths):
             if is_within(root, separated) or is_within(separated, root):
                 raise ReviewError(f"LAB_CONDA_ROOT must not overlap {label}: {root}")
     return root
@@ -1297,10 +1293,7 @@ def validate_descriptor(
         label="descriptor chat root",
     )
     resolved_chat_root = Path(effective_chat_root).resolve()
-    separated_roots = [("review source", paths.home)]
-    if paths.state is not None:
-        separated_roots.append(("review state", paths.state))
-    for label, separated in separated_roots:
+    for label, separated in config.protected_workspace_roots(paths):
         if is_within(resolved_chat_root, separated) or is_within(separated, resolved_chat_root):
             raise ValidationError(
                 f"environment descriptor chat root overlaps {label}: {resolved_chat_root}"

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from .config import protected_workspace_roots
 from .errors import ReviewError, ValidationError
 from .util import atomic_json, is_within
 
@@ -139,6 +141,12 @@ def cmd_calibrate(args: Any) -> dict[str, Any]:
     workspace = Path(getattr(args, "workspace", None) or Path.cwd()).expanduser().resolve()
     if not workspace.is_dir() or workspace == Path(workspace.anchor):
         raise ReviewError("calibration requires a concrete workspace directory")
+    for label, protected in protected_workspace_roots(args.paths):
+        if is_within(workspace, protected) or is_within(protected, workspace):
+            raise ReviewError(f"calibration workspace overlaps protected {label}: {protected}")
+    declared = os.environ.get("LAB_WORKSPACE_ROOT")
+    if declared and not is_within(workspace, Path(declared).expanduser().resolve()):
+        raise ReviewError("selected calibration workspace is outside LAB_WORKSPACE_ROOT")
 
     def local(value: str | Path, *, exists: bool) -> Path:
         selected = Path(value).expanduser()

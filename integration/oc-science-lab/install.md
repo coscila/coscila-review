@@ -36,6 +36,12 @@ private install state for later read-only verification.
 
 Installation validates the complete skill set, backs up every pre-existing target independently, installs both skill mirrors, and merges only `ocsl_review_catalog` and `ocsl_scholar`. Existing values under those names are retained in the private rollback record. Every unrelated MCP entry remains untouched.
 
+Neither skill root may overlap the review state or any review, laboratory, or
+bioinformatics source checkout, in either ancestor direction. The deployment
+MCP source must be absent or a regular file rather than a symbolic link; an
+existing file retains its original permission mode throughout install,
+rollback, and removal.
+
 The configured staging command must return success. The installer then compares the tracked Git state of the laboratory and bioinformatics siblings with its pre-install snapshot. A staging failure, validation failure, or tracked-tree change triggers restoration of the MCP file and skill targets. Integration state is written only after all checks pass.
 
 ## Removal

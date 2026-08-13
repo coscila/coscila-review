@@ -12,6 +12,7 @@ import jsonschema
 
 from .audit import build_audit_summary, validate_audit_graph
 from .claim_inventory import build_claim_inventory
+from .config import protected_workspace_roots
 from .errors import ReviewError, ValidationError
 from .ingest import ingest_manuscript
 from .rendering import render_review_package, validate_review_package
@@ -27,10 +28,9 @@ def _workspace(args: Any) -> Path:
         raise ReviewError(f"review workspace does not exist: {workspace}")
     if workspace == Path(workspace.anchor):
         raise ReviewError("the filesystem root is not a review workspace")
-    if is_within(workspace, args.paths.home):
-        raise ReviewError("review-time artifacts cannot be written in companion source")
-    if args.paths.state and is_within(workspace, args.paths.state):
-        raise ReviewError("review-time artifacts cannot be written in operator state")
+    for label, protected in protected_workspace_roots(args.paths):
+        if is_within(workspace, protected) or is_within(protected, workspace):
+            raise ReviewError(f"review workspace overlaps protected {label}: {protected}")
     declared = os.environ.get("LAB_WORKSPACE_ROOT")
     if declared and not is_within(workspace, Path(declared).expanduser().resolve()):
         raise ReviewError("selected workspace is outside LAB_WORKSPACE_ROOT")
