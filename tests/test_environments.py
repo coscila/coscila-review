@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ocsl_review.config import Paths
+from ocsl_review import environments
 from ocsl_review.environments import (
     audit_inode_isolation,
     build_template,
@@ -856,3 +857,50 @@ class EnvironmentLayerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoDefaultPackagesGatingTests(unittest.TestCase):
+    """Only Conda accepts --no-default-packages; mamba 2.x rejects it outright."""
+
+    def test_conda_receives_the_suppression_flag(self) -> None:
+        self.assertEqual(
+            environments._no_default_packages_options(Path("/opt/conda/bin/conda")),
+            ["--no-default-packages"],
+        )
+
+    def test_mamba_family_omits_the_unsupported_flag(self) -> None:
+        # mamba 2.5.0: "The following argument was not expected:
+        # --no-default-packages" — passing it fails every operator build.
+        for name in ("mamba", "micromamba"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    environments._no_default_packages_options(Path(f"/opt/conda/bin/{name}")),
+                    [],
+                )
+
+    def test_mamba_family_omits_run_capture_flag(self) -> None:
+        # mamba 2.5.0 leaks the token into the child: "exec: --: invalid option".
+        for name in ("mamba", "micromamba"):
+            with self.subTest(name=name):
+                argv = environments._run_in_prefix_argv(
+                    Path(f"/opt/conda/bin/{name}"), Path("/prefix"), ["python", "-V"]
+                )
+                self.assertNotIn("--no-capture-output", argv)
+        self.assertIn(
+            "--no-capture-output",
+            environments._run_in_prefix_argv(
+                Path("/opt/conda/bin/conda"), Path("/prefix"), ["python", "-V"]
+            ),
+        )
+
+    def test_only_classic_conda_is_treated_as_conda(self) -> None:
+        self.assertTrue(environments._is_classic_conda(Path("/opt/conda/bin/conda")))
+        for name in ("mamba", "micromamba"):
+            with self.subTest(name=name):
+                self.assertFalse(environments._is_classic_conda(Path(f"/opt/conda/bin/{name}")))
+
+    def test_hermetic_env_clears_configured_default_packages(self) -> None:
+        # The flag is how hermeticity is expressed for Conda; for the mamba
+        # family the same guarantee has to come from the child environment.
+        env = environments._create_process_env(Path("/opt/conda/bin/mamba"))
+        self.assertEqual(env["CONDA_CREATE_DEFAULT_PACKAGES"], "")
