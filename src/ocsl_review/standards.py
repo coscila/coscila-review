@@ -34,24 +34,74 @@ def _current_path(paths, identifier: str) -> Path:
     return paths.standards / identifier / "current.json"
 
 
+def _retrieve(url: str, *, timeout: float) -> tuple[bytes, str, str]:
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "ocsl-review/0.1 standards snapshot"}, method="GET"
+    )
+    with urllib.request.urlopen(request, timeout=min(max(timeout, 1), 60)) as response:
+        body = response.read(MAX_STANDARD_BYTES + 1)
+        return body, response.geturl(), response.headers.get_content_type()
+
+
+def _validate_retrieval(
+    record: dict[str, Any], body: bytes, received_type: str
+) -> str:
+    identifier = record["id"]
+    if len(body) > MAX_STANDARD_BYTES:
+        raise ProviderError(f"standard {identifier} exceeds the snapshot size limit")
+    if received_type != record["media_type"]:
+        raise ProviderError(
+            f"standard {identifier} returned {received_type}, expected {record['media_type']}"
+        )
+    if record["media_type"] == "application/pdf" and not body.startswith(b"%PDF-"):
+        raise ProviderError(f"standard {identifier} did not return a PDF document")
+    digest = sha256_bytes(body)
+    expected_digest = record.get("sha256")
+    if expected_digest and digest != expected_digest:
+        raise ProviderError(
+            f"standard {identifier} differs from its catalogued SHA-256: "
+            f"expected {expected_digest}, received {digest}"
+        )
+    return digest
+
+
+def _fetch_validated(
+    record: dict[str, Any], url: str, *, timeout: float
+) -> tuple[bytes, str, str, str]:
+    body, final_url, received_type = _retrieve(url, timeout=timeout)
+    digest = _validate_retrieval(record, body, received_type)
+    return body, final_url, received_type, digest
+
+
 def sync_standard(paths, identifier: str, *, timeout: float = 30) -> dict[str, Any]:
     records = catalog(paths)
     if identifier not in records:
         raise ReviewError(f"unknown standard: {identifier}")
     record = records[identifier]
-    request = urllib.request.Request(
-        record["url"], headers={"User-Agent": "ocsl-review/0.1 standards snapshot"}, method="GET"
-    )
+    retrieval_url = record["url"]
+    used_archive = False
+    primary_failure = None
     try:
-        with urllib.request.urlopen(request, timeout=min(max(timeout, 1), 60)) as response:
-            body = response.read(MAX_STANDARD_BYTES + 1)
-            final_url = response.geturl()
-            received_type = response.headers.get_content_type()
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise ProviderError(f"could not retrieve standard {identifier}: {exc}") from exc
-    if len(body) > MAX_STANDARD_BYTES:
-        raise ProviderError(f"standard {identifier} exceeds the snapshot size limit")
-    digest = sha256_bytes(body)
+        body, final_url, received_type, digest = _fetch_validated(
+            record, retrieval_url, timeout=timeout
+        )
+    except (urllib.error.URLError, TimeoutError, ProviderError) as primary_error:
+        retrieval_url = record.get("archive_url", "")
+        if not retrieval_url:
+            raise ProviderError(
+                f"could not retrieve standard {identifier}: {primary_error}"
+            ) from primary_error
+        used_archive = True
+        primary_failure = f"{type(primary_error).__name__}: {primary_error}"[:500]
+        try:
+            body, final_url, received_type, digest = _fetch_validated(
+                record, retrieval_url, timeout=timeout
+            )
+        except (urllib.error.URLError, TimeoutError, ProviderError) as archive_error:
+            raise ProviderError(
+                f"could not retrieve standard {identifier} from its official or "
+                f"digest-pinned archive source: official={primary_error}; archive={archive_error}"
+            ) from archive_error
     root = paths.standards / identifier / digest
     document = root / f"document{_extension(record['media_type'])}"
     metadata = root / "snapshot.json"
@@ -75,7 +125,12 @@ def sync_standard(paths, identifier: str, *, timeout: float = 30) -> dict[str, A
                 "id": identifier,
                 "title": record["title"],
                 "requestedUrl": record["url"],
+                "retrievalUrl": retrieval_url,
                 "finalUrl": final_url,
+                "archiveFallback": used_archive,
+                "source": "archive" if used_archive else "official",
+                "expectedSha256": record.get("sha256"),
+                "primaryFailure": primary_failure,
                 "declaredMediaType": record["media_type"],
                 "receivedMediaType": received_type,
                 "sha256": digest,
@@ -91,7 +146,13 @@ def sync_standard(paths, identifier: str, *, timeout: float = 30) -> dict[str, A
         {"id": identifier, "sha256": digest, "snapshot": str(metadata)},
         mode=0o444,
     )
-    return {"id": identifier, "sha256": digest, "path": str(document), "status": "snapshotted"}
+    return {
+        "id": identifier,
+        "sha256": digest,
+        "path": str(document),
+        "source": "archive" if used_archive else "official",
+        "status": "snapshotted",
+    }
 
 
 def verify_standard(paths, identifier: str) -> dict[str, Any]:
@@ -100,20 +161,57 @@ def verify_standard(paths, identifier: str) -> dict[str, Any]:
         raise ReviewError(f"unknown standard: {identifier}")
     current = _current_path(paths, identifier)
     problems = []
-    if not current.is_file():
+    if current.is_symlink() or not current.is_file():
         return {"id": identifier, "ok": False, "problems": ["no current snapshot"], "path": None}
-    value = json.loads(current.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(current.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "id": identifier,
+            "ok": False,
+            "problems": [f"current pointer is invalid: {exc}"],
+            "path": None,
+        }
     digest = value.get("sha256", "")
     if not re.fullmatch(r"[0-9a-f]{64}", digest):
         problems.append("current pointer has invalid digest")
+    expected_digest = record.get("sha256")
+    if expected_digest and digest != expected_digest:
+        problems.append("current snapshot differs from the catalogued SHA-256")
     root = paths.standards / identifier / digest
     document = root / f"document{_extension(record['media_type'])}"
-    if not document.is_file():
+    metadata = root / "snapshot.json"
+    if document.is_symlink() or not document.is_file():
         problems.append("snapshot document is missing")
     elif sha256_file(document) != digest:
         problems.append("snapshot content digest differs")
-    if document.exists() and document.stat().st_mode & 0o222:
-        problems.append("snapshot document is writable")
+    else:
+        if document.stat().st_mode & 0o222:
+            problems.append("snapshot document is writable")
+        if record["media_type"] == "application/pdf":
+            with document.open("rb") as handle:
+                if handle.read(5) != b"%PDF-":
+                    problems.append("snapshot document is not a PDF")
+    if metadata.is_symlink() or not metadata.is_file():
+        problems.append("snapshot metadata is missing")
+    else:
+        try:
+            snapshot = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            problems.append("snapshot metadata is invalid")
+        else:
+            if snapshot.get("id") != identifier or snapshot.get("sha256") != digest:
+                problems.append("snapshot metadata identity differs")
+            if snapshot.get("requestedUrl") != record["url"]:
+                problems.append("snapshot metadata official URL differs")
+            if snapshot.get("declaredMediaType") != record["media_type"]:
+                problems.append("snapshot metadata media type differs")
+        if metadata.stat().st_mode & 0o222:
+            problems.append("snapshot metadata is writable")
+    if root.exists() and root.stat().st_mode & 0o222:
+        problems.append("snapshot directory is writable")
+    if current.stat().st_mode & 0o222:
+        problems.append("current pointer is writable")
     return {
         "id": identifier,
         "ok": not problems,

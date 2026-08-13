@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,30 @@ def _mcp_contracts(paths: Any) -> dict[str, Any]:
     return {"ok": True, "servers": len(records), "schemaLockSha256": sha256_file(lock_path)}
 
 
+def _standard_contracts(paths: Any) -> dict[str, Any]:
+    records = load_toml(paths.standards_catalog)["standard"]
+    identifiers = [record["id"] for record in records]
+    if len(identifiers) != len(set(identifiers)):
+        raise ValidationError("standards identifiers must be unique")
+    archive_pattern = re.compile(
+        r"^https://web\.archive\.org/web/[0-9]{14}id_/(https://.+)$"
+    )
+    for record in records:
+        archive_url = record.get("archive_url")
+        if not archive_url:
+            continue
+        if record["version_policy"] == "current-official-page":
+            raise ValidationError(
+                f"{record['id']}: a current-page standard cannot use a fixed archive"
+            )
+        match = archive_pattern.fullmatch(archive_url)
+        if not match or match.group(1) != record["url"]:
+            raise ValidationError(
+                f"{record['id']}: archive capture does not embed the official URL"
+            )
+    return {"ok": True, "standards": len(records)}
+
+
 def validate_path_boundaries(paths: Any) -> dict[str, Any]:
     if paths.state is None:
         return {"ok": True, "state": None}
@@ -161,10 +186,7 @@ def validate_catalogs(paths: Any) -> dict[str, Any]:
     skill_report = skills.validate_catalog(paths)
     source_report = repositories.validate_sources(paths)
     mcp_report = _mcp_contracts(paths)
-    standard_records = load_toml(paths.standards_catalog)["standard"]
-    standard_ids = [record["id"] for record in standard_records]
-    if len(standard_ids) != len(set(standard_ids)):
-        raise ValidationError("standards identifiers must be unique")
+    standard_report = _standard_contracts(paths)
     boundaries = validate_path_boundaries(paths)
     return {
         "ok": True,
@@ -173,7 +195,7 @@ def validate_catalogs(paths: Any) -> dict[str, Any]:
         "skills": skill_report,
         "repositories": source_report,
         "mcp": mcp_report,
-        "standards": {"ok": True, "standards": len(standard_records)},
+        "standards": standard_report,
         "boundaries": boundaries,
     }
 
