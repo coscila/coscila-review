@@ -170,30 +170,11 @@ def _assert_no_symlink_components(path: Path, *, label: str) -> None:
             raise ValidationError(f"{label} contains a symlink component: {candidate}")
 
 
-def load_scholarly_context(
+def _validated_scholarly_workspace(
     paths: Any,
-    environment: Mapping[str, str],
-) -> tuple[EgressPlan, Path | None]:
-    """Validate the deployment context before constructing a scholarly client.
-
-    With neither context variable, the documented confidential default remains
-    available for diagnostics.  Once either variable is supplied, the context
-    is bound to one real workspace and cannot use symlinks or broader paths to
-    reach another filesystem domain.
-    """
-
-    plan_value = environment.get("OCSL_REVIEW_EGRESS_PLAN")
-    workspace_value = environment.get("OCSL_REVIEW_WORKSPACE")
-    if plan_value and not workspace_value:
-        raise ValidationError("an explicit egress plan requires OCSL_REVIEW_WORKSPACE")
-    if not workspace_value:
-        return EgressPlan(), None
-
-    root_value = environment.get("LAB_WORKSPACE_ROOT")
-    if not root_value:
-        raise ValidationError(
-            "OCSL_REVIEW_WORKSPACE requires the deployment LAB_WORKSPACE_ROOT boundary"
-        )
+    workspace_value: str | os.PathLike[str],
+    root_value: str | os.PathLike[str],
+) -> tuple[Path, Path]:
     workspace_lexical = _lexical_absolute(workspace_value, label="scholarly workspace")
     root_lexical = _lexical_absolute(root_value, label="LAB_WORKSPACE_ROOT")
     _assert_no_symlink_components(workspace_lexical, label="scholarly workspace")
@@ -204,6 +185,8 @@ def load_scholarly_context(
         raise ValidationError(f"LAB_WORKSPACE_ROOT does not exist: {root_lexical}")
     workspace = workspace_lexical.resolve()
     workspace_root = root_lexical.resolve()
+    if workspace == workspace_root:
+        raise ValidationError("LAB_WORKSPACE_ROOT itself is not a scholarly chat workspace")
     if workspace == Path(workspace.anchor):
         raise ValidationError("the filesystem root cannot be a scholarly workspace")
     if not is_within(workspace, workspace_root):
@@ -214,6 +197,65 @@ def load_scholarly_context(
     for label, protected in protected_workspace_roots(paths):
         if is_within(workspace, protected) or is_within(protected, workspace):
             raise ValidationError(f"scholarly workspace overlaps protected {label}: {protected}")
+    return workspace, workspace_root
+
+
+def _fixed_workspace_plan(workspace: Path) -> Path | None:
+    plan = workspace / ".ocsl-review" / "egress-plan.json"
+    _assert_no_symlink_components(plan, label="fixed workspace egress plan")
+    audit_root = plan.parent
+    if audit_root.exists() and not audit_root.is_dir():
+        raise ValidationError(f"workspace review state is not a directory: {audit_root}")
+    if not plan.exists():
+        return None
+    if not plan.is_file():
+        raise ValidationError(f"fixed workspace egress plan is not a regular file: {plan}")
+    return plan
+
+
+def load_scholarly_context(
+    paths: Any,
+    environment: Mapping[str, str],
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+) -> tuple[EgressPlan, Path | None]:
+    """Validate the deployment context before constructing a scholarly client.
+
+    When the process runs from a strict descendant of LAB_WORKSPACE_ROOT, that
+    exact working directory is the implicit chat workspace.  An outside CWD
+    retains the documented confidential diagnostic default.  An explicit or
+    derived workspace cannot use symlinks or broader paths to reach another
+    filesystem domain.
+    """
+
+    plan_value = environment.get("OCSL_REVIEW_EGRESS_PLAN")
+    workspace_value = environment.get("OCSL_REVIEW_WORKSPACE")
+    if plan_value and not workspace_value:
+        raise ValidationError("an explicit egress plan requires OCSL_REVIEW_WORKSPACE")
+    root_value = environment.get("LAB_WORKSPACE_ROOT")
+    if workspace_value:
+        if not root_value:
+            raise ValidationError(
+                "OCSL_REVIEW_WORKSPACE requires the deployment LAB_WORKSPACE_ROOT boundary"
+            )
+        workspace, _ = _validated_scholarly_workspace(paths, workspace_value, root_value)
+    elif root_value:
+        cwd_value = Path.cwd() if cwd is None else cwd
+        cwd_lexical = _lexical_absolute(cwd_value, label="scholarly process cwd")
+        root_lexical = _lexical_absolute(root_value, label="LAB_WORKSPACE_ROOT")
+        _assert_no_symlink_components(cwd_lexical, label="scholarly process cwd")
+        _assert_no_symlink_components(root_lexical, label="LAB_WORKSPACE_ROOT")
+        if not root_lexical.is_dir():
+            raise ValidationError(f"LAB_WORKSPACE_ROOT does not exist: {root_lexical}")
+        cwd_resolved = cwd_lexical.resolve()
+        root_resolved = root_lexical.resolve()
+        if cwd_resolved == root_resolved:
+            raise ValidationError("LAB_WORKSPACE_ROOT itself is not a scholarly chat workspace")
+        if not is_within(cwd_resolved, root_resolved):
+            return EgressPlan(), None
+        workspace, _ = _validated_scholarly_workspace(paths, cwd_lexical, root_lexical)
+    else:
+        return EgressPlan(), None
 
     plan_path: Path | None = None
     if plan_value:
@@ -224,6 +266,8 @@ def load_scholarly_context(
         plan_path = plan_lexical.resolve()
         if not is_within(plan_path, workspace):
             raise ValidationError("egress plan must be inside the exact scholarly workspace")
+    else:
+        plan_path = _fixed_workspace_plan(workspace)
     return EgressPlan.load(plan_path), workspace
 
 
