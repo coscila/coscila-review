@@ -137,6 +137,11 @@ content digest, and selected through validated state pointers:
 A current official web page may change. The snapshot digest and retrieval
 record make the exact material used by a review identifiable.
 
+When an authority blocks non-browser retrieval, the catalogue may name a raw
+Internet Archive capture only together with the expected SHA-256. The official
+URL is always attempted first; the archived response is accepted only when its
+media type and digest match the tracked contract.
+
 ### 3. Build environment templates
 
 ```bash
