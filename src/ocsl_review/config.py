@@ -99,6 +99,42 @@ class Paths:
         return self.need_state() / "cache"
 
 
+def protected_source_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
+    """Return every source checkout that review-time state must not overlap."""
+
+    candidates: list[tuple[str, Path]] = [("companion source", paths.home)]
+    if paths.lab_repo is not None:
+        candidates.append(("OC Science Lab source", paths.lab_repo))
+    bio = paths.home.parent / "oc-science-lab-bio"
+    if bio.is_dir():
+        candidates.append(("OC Science Lab Bio source", bio))
+
+    result: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for label, candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append((label, resolved))
+    return tuple(result)
+
+
+def protected_workspace_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
+    """Return source and operator-state domains forbidden to review workspaces."""
+
+    candidates = list(protected_source_roots(paths))
+    if paths.state is not None:
+        candidates.append(("operator state", paths.state.resolve()))
+
+    result: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for label, candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            result.append((label, candidate))
+    return tuple(result)
+
+
 def resolve_paths(
     *,
     home: str | None = None,

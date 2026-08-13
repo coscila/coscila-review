@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest.mock import patch
 
 from ocsl_review.confidentiality import EgressPlan
@@ -13,6 +15,7 @@ from ocsl_review.scholarly import (
     HttpTransport,
     RawResponse,
     ScholarlyClient,
+    call_tool,
     normalize_doi,
 )
 
@@ -159,6 +162,85 @@ class ScholarlyTests(unittest.TestCase):
         called_hosts = " ".join(call[0] for call in transport.calls)
         self.assertIn("api.crossref.org", called_hosts)
         self.assertNotIn("labs.crossref", called_hosts)
+
+    def test_public_tool_allowlist_cannot_be_bypassed_through_helper_operations(self):
+        cases = (
+            (
+                "resolve_reference",
+                {"reference": {"doi": "10.1000/example"}},
+                "resolve_identifier",
+            ),
+            (
+                "get_corrections_retractions",
+                {"doi": "10.1000/example"},
+                "get_publication_status",
+            ),
+            (
+                "get_abstract_or_open_sections",
+                {"doi": "10.1000/example"},
+                "resolve_identifier",
+            ),
+        )
+        for requested, arguments, helper in cases:
+            with self.subTest(requested=requested, helper=helper):
+                transport = FakeTransport()
+                plan = EgressPlan.from_mapping({"approvedOperations": [helper]})
+                client = ScholarlyClient(plan=plan, transport=transport)
+                with self.assertRaisesRegex(
+                    ConfidentialityError,
+                    f"outside the approved egress plan: {requested}",
+                ):
+                    call_tool(client, requested, arguments)
+                self.assertEqual(transport.calls, [])
+
+    def test_wrapper_tool_allowlist_identity_reaches_every_provider_and_ledger_event(self):
+        cases = (
+            (
+                "resolve_reference",
+                {"reference": {"doi": "10.1000/example"}},
+            ),
+            (
+                "get_corrections_retractions",
+                {"doi": "10.1000/example"},
+            ),
+            (
+                "get_abstract_or_open_sections",
+                {"doi": "10.1000/example"},
+            ),
+        )
+        for requested, arguments in cases:
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+                workspace = Path(temporary)
+                transport = FakeTransport()
+                plan = EgressPlan.from_mapping({"approvedOperations": [requested]})
+                client = ScholarlyClient(
+                    plan=plan,
+                    workspace=workspace,
+                    transport=transport,
+                )
+                call_tool(client, requested, arguments)
+                self.assertGreater(len(transport.calls), 0)
+                events = json.loads(
+                    (workspace / ".ocsl-review" / "egress-events.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertTrue(events)
+                self.assertEqual({event["operation"] for event in events}, {requested})
+
+    def test_direct_wrapper_call_uses_and_then_releases_its_public_operation_scope(self):
+        transport = FakeTransport()
+        plan = EgressPlan.from_mapping({"approvedOperations": ["resolve_reference"]})
+        client = ScholarlyClient(plan=plan, transport=transport)
+
+        client.resolve_reference({"doi": "10.1000/example"})
+        completed_calls = len(transport.calls)
+        with self.assertRaisesRegex(
+            ConfidentialityError,
+            "outside the approved egress plan: resolve_identifier",
+        ):
+            client.resolve_identifier(doi="10.1000/example")
+        self.assertEqual(len(transport.calls), completed_calls)
 
     def test_http_transport_retries_429_and_respects_retry_after(self):
         clock = FakeClock()

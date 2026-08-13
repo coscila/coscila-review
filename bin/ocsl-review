@@ -1,10 +1,68 @@
 #!/usr/bin/env bash
+# Resolve the companion by canonical launcher path and, once the operator has
+# promoted review-core, run the CLI with that immutable environment's Python.
+# Before the first environment build, fall back to the host Python for help,
+# development, and the initial operator bootstrap.
 set -euo pipefail
 
 if [[ -z "${OCSL_REVIEW_HOME:-}" ]]; then
-  OCSL_REVIEW_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  launcher="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  OCSL_REVIEW_HOME="$(cd "$(dirname "$launcher")/.." && pwd -P)"
   export OCSL_REVIEW_HOME
 fi
 
+# An explicit global --state option has the same precedence here as it has in
+# the Python CLI. Stop at `--` so pass-through commands cannot select a runtime.
+review_state="${OCSL_REVIEW_STATE:-}"
+argv=("$@")
+for ((index = 0; index < ${#argv[@]}; index += 1)); do
+  token="${argv[$index]}"
+  if [[ "$token" == "--" ]]; then
+    break
+  fi
+  if [[ "$token" == "--state" && $((index + 1)) -lt ${#argv[@]} ]]; then
+    review_state="${argv[$((index + 1))]}"
+    index=$((index + 1))
+  elif [[ "$token" == --state=* ]]; then
+    review_state="${token#--state=}"
+  fi
+done
+
+python_bin=""
+if [[ -n "$review_state" ]]; then
+  platform="${OCSL_REVIEW_PLATFORM:-}"
+  if [[ -z "$platform" ]]; then
+    case "$(uname -s):$(uname -m)" in
+      Linux:x86_64) platform="linux-64" ;;
+      Linux:aarch64|Linux:arm64) platform="linux-aarch64" ;;
+    esac
+  fi
+  if [[ "$platform" == "linux-64" || "$platform" == "linux-aarch64" ]]; then
+    template_root="$review_state/environment-templates/$platform/review-core"
+    current="$template_root/current"
+    if [[ -L "$current" ]]; then
+      target="$(readlink -- "$current")"
+      if [[ "$target" =~ ^[0-9a-f]{64}$ ]]; then
+        canonical_root="$(readlink -f -- "$template_root" 2>/dev/null || true)"
+        promoted="$(readlink -f -- "$current" 2>/dev/null || true)"
+        if [[ -n "$canonical_root" && -n "$promoted" ]]; then
+          case "$promoted" in
+            "$canonical_root"/"$target")
+              if [[ -f "$promoted/.ocsl-review-template.json" && -x "$promoted/bin/python" ]]; then
+                python_bin="$promoted/bin/python"
+              fi
+              ;;
+          esac
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [[ -z "$python_bin" ]]; then
+  python_bin="$(command -v python3)"
+fi
+
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$OCSL_REVIEW_HOME/src${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m ocsl_review.cli "$@"
+exec "$python_bin" -m ocsl_review.cli "$@"

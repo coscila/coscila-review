@@ -46,8 +46,13 @@ paraphrased unpublished result.
 ## Egress plan
 
 The MCP process reads the plan path from `OCSL_REVIEW_EGRESS_PLAN` and the
-private workspace path from `OCSL_REVIEW_WORKSPACE`. A conservative plan can
-narrow the default further:
+private workspace path from `OCSL_REVIEW_WORKSPACE`. If either is supplied,
+the workspace must be an existing, non-symlinked directory inside
+`LAB_WORKSPACE_ROOT`; an explicit plan must be a regular, non-symlinked file
+inside that exact workspace. A plan without a workspace, an external plan, or
+a workspace overlapping source or operator state is rejected before a
+scholarly client is constructed. A conservative plan can narrow the default
+further:
 
 ```json
 {
@@ -81,7 +86,7 @@ not enter a cross-workspace cache.
 ## What the audit log contains
 
 When `OCSL_REVIEW_WORKSPACE` is set, allowed provider requests append an event
-to:
+to the non-symlinked, owner-only ledger directory:
 
 ```text
 <workspace>/.ocsl-review/egress-events.json

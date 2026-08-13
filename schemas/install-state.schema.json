@@ -37,6 +37,7 @@
       "required": [
         "configPath",
         "configExisted",
+        "configMode",
         "backupPath",
         "backupSha256",
         "previousOwned",
@@ -46,6 +47,7 @@
         "configPath": { "type": "string", "minLength": 1 },
         "stagedConfigPath": { "type": "string", "minLength": 1 },
         "configExisted": { "type": "boolean" },
+        "configMode": { "type": "integer", "minimum": 0, "maximum": 511 },
         "backupPath": { "type": "string", "minLength": 1 },
         "backupSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "previousOwned": {

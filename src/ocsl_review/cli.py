@@ -33,10 +33,12 @@ WORKSPACE = "workspace"
 def _chat_context() -> bool:
     if os.environ.get("OCSL_REVIEW_SANDBOX"):
         return True
+    current = Path.cwd().resolve()
     declared = os.environ.get("LAB_WORKSPACE_ROOT")
     if declared:
-        return True
-    current = Path.cwd().resolve()
+        workspace_root = Path(declared).expanduser().resolve()
+        if current == workspace_root or workspace_root in current.parents:
+            return True
     for candidate in (current, *current.parents):
         if (candidate / ".ocsl" / "chat.json").is_file():
             return True
@@ -152,7 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--mcp-entries-file")
     install.add_argument("--stage-command")
     install.add_argument("--stage-cwd")
-    install.add_argument("--stage-timeout", type=float, default=900)
+    install.add_argument("--stage-timeout", type=float, default=None)
     install.add_argument(
         "--staged-config",
         "--acceptance-config",
@@ -171,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _set(verify, "lifecycle", "cmd_verify", READ_ONLY, state_required=True)
     uninstall = integrate_commands.add_parser("uninstall")
-    uninstall.add_argument("--stage-timeout", type=float, default=900)
+    uninstall.add_argument("--stage-timeout", type=float, default=None)
     _set(uninstall, "lifecycle", "cmd_uninstall", OPERATOR, state_required=True)
 
     skill_family = families.add_parser("skills", help="inspect or mirror review skills")

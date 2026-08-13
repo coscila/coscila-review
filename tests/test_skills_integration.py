@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -112,6 +114,26 @@ class SkillCatalogTests(ReviewPathsTestCase):
         self.assertTrue(changed.read_text(encoding="utf-8").endswith("local edit\n"))
         self.assertTrue(skills.manifest_path(self.paths).is_file())
 
+    def test_skill_roots_cannot_overlap_protected_source_or_state(self) -> None:
+        bio = ROOT.parent / "oc-science-lab-bio"
+        self.assertTrue(bio.is_dir())
+        unsafe_roots = (
+            ROOT / "untracked-skill-root",
+            bio / "untracked-skill-root",
+            self.state / "skills",
+            self.state.parent,
+        )
+        for unsafe in unsafe_roots:
+            with self.subTest(unsafe=unsafe):
+                with self.assertRaisesRegex(
+                    ValidationError, "overlaps protected"
+                ):
+                    skills.install_skill_set(
+                        self.paths,
+                        {"native": unsafe, "codex": self.codex},
+                    )
+                self.assertFalse((unsafe / "ocsl-review-router").exists())
+
 
 @unittest.skipUnless(shutil.which("git"), "git is required for sibling-tree verification")
 class IntegrationTests(ReviewPathsTestCase):
@@ -189,6 +211,52 @@ class IntegrationTests(ReviewPathsTestCase):
         self.assertTrue(integration.uninstall_integration(self.paths)["reused"])
         self.assertEqual("unchanged\n", (self.lab / "tracked.txt").read_text(encoding="utf-8"))
 
+    def test_mcp_config_mode_survives_install_and_uninstall(self) -> None:
+        self.mcp_config.chmod(0o640)
+        self.install()
+        self.assertEqual(0o640, stat.S_IMODE(self.mcp_config.stat().st_mode))
+        state = json.loads(integration.install_state_path(self.paths).read_text(encoding="utf-8"))
+        self.assertEqual(0o640, state["mcp"]["configMode"])
+
+        integration.uninstall_integration(self.paths, stage_timeout=30)
+        self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
+        self.assertEqual(0o640, stat.S_IMODE(self.mcp_config.stat().st_mode))
+
+    def test_symlink_mcp_config_is_rejected_without_mutating_its_target(self) -> None:
+        target = Path(self.temporary.name) / "real-deployment.json"
+        target.write_bytes(self.original_bytes)
+        self.mcp_config.unlink()
+        self.mcp_config.symlink_to(target)
+
+        resolved = integration.resolve_mcp_config(
+            SimpleNamespace(mcp_config=str(self.mcp_config))
+        )
+        self.assertEqual(self.mcp_config.absolute(), resolved)
+        self.assertTrue(resolved.is_symlink())
+
+        with self.assertRaisesRegex(ReviewError, "symbolic link"):
+            self.install()
+
+        self.assertTrue(self.mcp_config.is_symlink())
+        self.assertEqual(self.original_bytes, target.read_bytes())
+        self.assertFalse(skills.manifest_path(self.paths).exists())
+        self.assertFalse(integration.install_state_path(self.paths).exists())
+
+    def test_skill_root_in_untracked_lab_directory_is_rejected_before_creation(self) -> None:
+        unsafe = self.lab / "untracked-skills"
+        with self.assertRaisesRegex(ReviewError, "overlaps protected"):
+            integration.install_integration(
+                self.paths,
+                skill_roots={"native": unsafe, "codex": self.codex},
+                mcp_entries=MCP_ENTRIES,
+                mcp_config=self.mcp_config,
+                stage_argv=self.stage_ok,
+                stage_cwd=self.lab,
+                stage_timeout=30,
+            )
+        self.assertFalse(unsafe.exists())
+        self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
+
     def test_verify_probes_recorded_staged_config_not_source_config(self) -> None:
         self.install(staged_config=self.staged_config)
         state = json.loads(
@@ -238,6 +306,7 @@ class IntegrationTests(ReviewPathsTestCase):
             lifecycle.cmd_verify(self.verify_args(strict=True))
 
     def test_staging_failure_rolls_back_skills_and_mcp_config(self) -> None:
+        self.mcp_config.chmod(0o640)
         failing = [sys.executable, "-c", "raise SystemExit(17)"]
         with self.assertRaisesRegex(ReviewError, "integration install failed"):
             integration.install_integration(
@@ -250,6 +319,7 @@ class IntegrationTests(ReviewPathsTestCase):
                 stage_timeout=30,
             )
         self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
+        self.assertEqual(0o640, stat.S_IMODE(self.mcp_config.stat().st_mode))
         self.assertFalse(skills.manifest_path(self.paths).exists())
         self.assertFalse(integration.install_state_path(self.paths).exists())
         self.assertFalse((self.native / "ocsl-review-router").exists())
@@ -296,6 +366,31 @@ class IntegrationTests(ReviewPathsTestCase):
         self.mcp_config.write_text(json.dumps(active), encoding="utf-8")
         with self.assertRaisesRegex(ValidationError, "installed MCP entry changed"):
             integration.uninstall_integration(self.paths, stage_timeout=30)
+
+    def test_stage_timeout_environment_is_honored_when_cli_value_is_absent(self) -> None:
+        args = SimpleNamespace(
+            stage_command=self.stage_ok,
+            stage_cwd=str(self.lab),
+            stage_timeout=None,
+        )
+        with patch.dict(os.environ, {"OCSL_REVIEW_STAGE_TIMEOUT": "41.5"}, clear=False):
+            _, _, timeout = integration.resolve_staging(self.paths, args)
+            self.assertEqual(41.5, timeout)
+            with patch.object(integration, "uninstall_integration", return_value={}) as uninstall:
+                integration.cmd_uninstall(SimpleNamespace(paths=self.paths, stage_timeout=None))
+        uninstall.assert_called_once_with(self.paths, stage_timeout=41.5)
+
+        with self.assertRaisesRegex(ReviewError, "must be positive"):
+            integration.resolve_staging(
+                self.paths,
+                SimpleNamespace(
+                    stage_command=self.stage_ok,
+                    stage_cwd=str(self.lab),
+                    stage_timeout=0,
+                ),
+            )
+        with self.assertRaisesRegex(ReviewError, "must be positive"):
+            integration.cmd_uninstall(SimpleNamespace(paths=self.paths, stage_timeout=0))
 
 
 if __name__ == "__main__":

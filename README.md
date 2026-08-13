@@ -65,6 +65,13 @@ The checkout contains build inputs, catalogs, schemas, launchers, and tests. It
 does **not** contain solved Conda prefixes or proof that public services and a
 particular OC Science Lab deployment are reachable.
 
+The supported deployment artifact is the complete source checkout, not a
+standalone Python wheel: skills, schemas, catalogs, environment inputs, and MCP
+launchers are repository-level runtime assets. `pyproject.toml` declares the
+Python package and dependencies for development and build tooling, but it does
+not install an `ocsl-review` console script. Invoke `bin/ocsl-review` from the
+checkout so those assets retain one verified identity.
+
 Set explicit source and state roots first:
 
 ```bash

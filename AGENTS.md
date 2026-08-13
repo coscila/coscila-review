@@ -24,7 +24,7 @@ deployment state, and chat workspaces are separate security domains.
 ## Development
 
 - Python 3.11 or newer; two-space indentation is not required for Python.
-- Run `python -m unittest discover -s tests -v` for the dependency-light suite.
-- Run `python -m ocsl_review.cli --help` to verify the CLI surface.
+- Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` for the dependency-light suite.
+- Run `PYTHONPATH=src python3 -m ocsl_review.cli --help` to verify the CLI surface from a
+  clean source checkout, or use `./bin/ocsl-review --help` to exercise the deployment launcher.
 - Use imperative, one-line commit messages if committing changes.
-

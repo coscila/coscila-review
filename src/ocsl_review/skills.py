@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import config
 from .errors import ReviewError, ValidationError
 from .util import atomic_json, is_within, load_toml, sha256_bytes, sha256_file, tree_digest
 
@@ -361,9 +362,13 @@ def install_skill_set(
     if set(normalized_roots) != {"native", "codex"}:
         raise ValidationError("both native and codex skill roots are required")
     unique_roots = list(dict.fromkeys(normalized_roots.values()))
+    protected_roots = config.protected_workspace_roots(paths)
     for root in unique_roots:
-        if is_within(root, paths.home) or is_within(paths.home, root):
-            raise ValidationError(f"skill root overlaps companion source: {root}")
+        for label, protected in protected_roots:
+            if is_within(root, protected) or is_within(protected, root):
+                raise ValidationError(
+                    f"skill root overlaps protected {label}: {root} and {protected}"
+                )
     for index, first in enumerate(unique_roots):
         for second in unique_roots[index + 1 :]:
             if is_within(first, second) or is_within(second, first):
