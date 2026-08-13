@@ -8,3 +8,4 @@ dependencies:
   - lxml
   - beautifulsoup4
   - pandoc
+  - poppler

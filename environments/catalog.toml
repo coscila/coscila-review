@@ -29,12 +29,13 @@ id = "review-documents"
 purpose = "Local manuscript, bibliography, table, and figure-adjacent document extraction"
 spec = "specs/review-documents.yaml"
 input_lock = "locks/review-documents.input-lock.yaml"
-input_lock_sha256 = "a5c2f7b94a833078e9408c91ebfd060a80d6cfcb7cd41a4cf95be1fa6fe636f9"
+input_lock_sha256 = "f16264ac0150bbd489a5d316be62f2923e2bbbbfad034899f74ba75c59358dff"
 platforms = ["linux-64", "linux-aarch64"]
 channels = ["conda-forge"]
 health_checks = [
   ["python", "-c", "import bs4, docx, lxml, pypdf"],
   ["pandoc", "--version"],
+  ["pdftotext", "-v"],
 ]
 skills = [
   "ocsl-review-manuscript-ingest",
