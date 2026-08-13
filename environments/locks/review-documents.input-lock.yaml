@@ -9,3 +9,4 @@ dependencies:
   - lxml=5.3.0
   - beautifulsoup4=4.12.3
   - pandoc=3.6.2
+  - poppler=26.05.0
