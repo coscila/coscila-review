@@ -19,6 +19,11 @@ PATH=/tmp/ocsl-review-bootstrap/bin:$PATH \
   --conda-executable /path/to/mamba
 ```
 
+Package caching is self-contained: builds export `CONDA_PKGS_DIRS` pointing
+into `$OCSL_REVIEW_STATE/cache/micromamba-operator/pkgs` (created on demand),
+so a fresh service account needs no pre-existing `~/.mamba/pkgs` and mamba
+never writes package artifacts into the account's home directory.
+
 Once `review-core` is promoted the launcher resolves its own pinned Python from
 `$OCSL_REVIEW_STATE/environment-templates/<platform>/review-core/current` and the
 temporary interpreter is no longer used. Build `mcp-review` next: the MCP
