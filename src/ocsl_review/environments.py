@@ -381,6 +381,25 @@ def _mamba_family_process_env(executable: Path, cache_root: Path) -> Mapping[str
         raise ValidationError(f"conda-frontend process cache is not a directory: {cache_root}")
     environment = dict(_create_process_env(executable))
     environment["XDG_CACHE_HOME"] = str(cache_root.resolve())
+    # libmamba's package cache ignores XDG_CACHE_HOME. Without an explicit
+    # override it writes into root_prefix/pkgs and ~/.mamba/pkgs — polluting
+    # the service account's home — and ``create`` aborts outright when
+    # ~/.mamba/pkgs does not exist yet (fresh operator account).
+    # CONDA_PKGS_DIRS is the override mamba 2.x honours (MAMBA_PKGS_DIRS is
+    # ignored; verified on mamba 2.5.0, comma-separated). The first entry is
+    # the write target; the previous default locations stay appended as
+    # read-only fallbacks so artifacts cached by earlier builds keep
+    # satisfying ``--offline`` installs.
+    pkgs_dir = cache_root / "pkgs"
+    pkgs_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    entries = [str(pkgs_dir.resolve())]
+    for fallback in (
+        executable.resolve().parent.parent / "pkgs",
+        Path.home() / ".mamba" / "pkgs",
+    ):
+        if fallback.is_dir():
+            entries.append(str(fallback))
+    environment["CONDA_PKGS_DIRS"] = ",".join(entries)
     return environment
 
 
@@ -871,7 +890,12 @@ def build_template(
                 definition.input_lock,
                 target_platform,
             ),
-            env=_create_process_env(conda),
+            # The solve downloads into the operator cache the later
+            # --offline exact install (and fork installs) read from.
+            env=_mamba_family_process_env(
+                conda, paths.cache / "micromamba-operator"
+            )
+            or _create_process_env(conda),
             timeout=solve_timeout,
         )
         _assert_conda_prefix(staging)
@@ -956,6 +980,7 @@ def build_template(
             destination,
             platform=target_platform,
             timeout=solve_timeout,
+            cache_root=paths.cache / "micromamba-operator",
         )
         _run_health_checks(
             conda,
@@ -1512,6 +1537,7 @@ def _install_exact_prefix(
     *,
     platform: str,
     timeout: float,
+    cache_root: Path,
 ) -> None:
     # --file points to a validated @EXPLICIT artifact list; --copy also keeps
     # the new prefix isolated from Conda's package cache and the template.
@@ -1529,7 +1555,8 @@ def _install_exact_prefix(
             "--file",
             str(exact_lock),
         ],
-        env=_create_process_env(executable),
+        env=_mamba_family_process_env(executable, cache_root)
+        or _create_process_env(executable),
         timeout=timeout,
     )
     _assert_conda_prefix(destination)
@@ -2121,12 +2148,16 @@ def _materialize_fork(
         if normalized_mode == "clone":
             _clone_prefix(conda, source_prefix, destination, timeout=timeout)
         else:
+            # Shares the operator build cache: exact locks install --offline,
+            # so the fork must read the same artifact store the template
+            # build wrote into.
             _install_exact_prefix(
                 conda,
                 template.exact_lock,
                 destination,
                 platform=template.platform,
                 timeout=timeout,
+                cache_root=paths.cache / "micromamba-operator",
             )
         if not destination.is_dir():
             raise ValidationError(f"Conda did not materialize the fork prefix: {destination}")
