@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+import http.client
 import json
 import math
 import os
@@ -22,17 +24,26 @@ from typing import Any, Iterator
 
 from .confidentiality import EgressPlan, append_egress_event, authorize_egress
 from .errors import ProviderError, ReviewError
+from .fulltext import MAX_DOCUMENT_BYTES, open_public_https, parse_source_document, validate_public_url
 
 CROSSREF = "https://api.crossref.org"
 PUBMED = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 EUROPE_PMC = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 DATACITE = "https://api.datacite.org"
 OPENCITATIONS_INDEX = "https://api.opencitations.net/index/v2"
+UNPAYWALL = "https://api.unpaywall.org/v2"
 MAX_RESULTS = 25
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 TRANSIENT_PROVIDER_STATUSES = frozenset({429, 503})
 MAX_HTTP_ATTEMPTS = 4
 MAX_RETRY_DELAY_SECONDS = 5.0
+# Public NLM records, independently checked against their PubMed notice pages.
+# https://pubmed.ncbi.nlm.nih.gov/20137807/
+# https://pubmed.ncbi.nlm.nih.gov/32336359/
+STATUS_POSITIVE_CONTROLS = (
+    ("9500320", "RetractionIn", "20137807"),
+    ("32336359", "ErratumIn", "35473980"),
+)
 
 
 def utc_now() -> str:
@@ -63,6 +74,7 @@ class RawResponse:
     body: bytes
     status: int
     headers: Mapping[str, str]
+    url: str | None = None
 
     def json(self) -> Any:
         try:
@@ -94,6 +106,7 @@ class HttpTransport:
         self.max_retry_delay = min(max(parsed_retry_delay, 0.0), MAX_RETRY_DELAY_SECONDS)
         self._sleep = sleep
         self._monotonic = monotonic
+        self._next_ncbi_request = 0.0
 
     @staticmethod
     def _retry_after_seconds(headers: Mapping[str, Any]) -> float | None:
@@ -125,9 +138,13 @@ class HttpTransport:
         *,
         params: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+        document: bool = False,
+        authorize_url: Callable[[str], None] | None = None,
     ) -> RawResponse:
-        if not url.startswith("https://"):
-            raise ProviderError("scholarly providers must use HTTPS")
+        validate_public_url(url)
+        if not 1 <= max_response_bytes <= MAX_DOCUMENT_BYTES:
+            raise ProviderError("invalid provider response size bound")
         filtered = {key: value for key, value in (params or {}).items() if value is not None}
         encoded = urllib.parse.urlencode(filtered, doseq=True)
         target = f"{url}?{encoded}" if encoded else url
@@ -136,12 +153,22 @@ class HttpTransport:
         request = urllib.request.Request(target, headers=request_headers, method="GET")
         deadline = self._monotonic() + self.timeout
         for attempt in range(1, self.max_attempts + 1):
+            # Sequential bibliography retrieval must respect NCBI's three
+            # requests/second ceiling even when every response is successful.
+            # https://www.ncbi.nlm.nih.gov/books/NBK25497/
+            if urllib.parse.urlsplit(target).hostname == "eutils.ncbi.nlm.nih.gov":
+                delay = max(0.0, self._next_ncbi_request - self._monotonic())
+                if self._monotonic() + delay >= deadline:
+                    raise ProviderError("provider rate limit exceeds the configured timeout")
+                if delay:
+                    self._sleep(delay)
+                self._next_ncbi_request = self._monotonic() + 0.35
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise ProviderError("provider request exceeded the configured timeout")
 
             try:
-                with urllib.request.urlopen(request, timeout=remaining) as response:
+                with open_public_https(request, timeout=remaining, allow_cross_origin=document, authorize_url=authorize_url) as response:
                     response_headers = dict(response.headers.items())
                     status = int(response.status)
                     if status >= 400:
@@ -149,16 +176,22 @@ class HttpTransport:
                         raw = None
                     else:
                         length = response.headers.get("Content-Length")
-                        if length and int(length) > MAX_RESPONSE_BYTES:
+                        try:
+                            declared_length = int(length) if length else None
+                        except ValueError as exc:
+                            raise ProviderError("provider returned an invalid Content-Length") from exc
+                        if declared_length is not None and (declared_length < 0 or declared_length > max_response_bytes):
                             raise ProviderError(
                                 "provider response exceeds the configured size bound"
                             )
-                        body = response.read(MAX_RESPONSE_BYTES + 1)
-                        if len(body) > MAX_RESPONSE_BYTES:
+                        body = response.read(max_response_bytes + 1)
+                        if len(body) > max_response_bytes:
                             raise ProviderError(
                                 "provider response exceeds the configured size bound"
                             )
-                        raw = RawResponse(body, status, response_headers)
+                        if declared_length is not None and len(body) != declared_length:
+                            raise ProviderError("provider response was truncated")
+                        raw = RawResponse(body, status, response_headers, getattr(response, "url", target))
                         detail = ""
             except urllib.error.HTTPError as exc:
                 response_headers = dict(exc.headers.items()) if exc.headers else {}
@@ -169,7 +202,7 @@ class HttpTransport:
                     exc.close()
                 raw = None
                 cause: BaseException | None = exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
                 raise ProviderError(f"provider request failed: {exc}") from exc
             else:
                 cause = None
@@ -194,11 +227,20 @@ class HttpTransport:
 
         raise ProviderError("provider request exhausted its retry budget")
 
+    def get_document(self, url: str, *, authorize_url: Callable[[str], None] | None = None) -> RawResponse:
+        return self.get(url, max_response_bytes=MAX_DOCUMENT_BYTES, document=True, authorize_url=authorize_url)
+
 
 def _first(value: Any, default: Any = None) -> Any:
     if isinstance(value, list) and value:
         return value[0]
     return default if value is None else value
+
+
+def display_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return " ".join(re.sub(r"<[^>]+>", "", html.unescape(str(value))).split())
 
 
 def _crossref_year(item: Mapping[str, Any]) -> int | None:
@@ -218,13 +260,17 @@ def normalize_crossref(item: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "provider": "crossref",
         "doi": item.get("DOI"),
-        "title": _first(item.get("title")),
+        "title": display_text(_first(item.get("title"))),
         "authors": [
-            " ".join(part for part in (author.get("given"), author.get("family")) if part)
+            display_text(" ".join(part for part in (author.get("given"), author.get("family")) if part))
             for author in item.get("author", [])
         ],
         "year": _crossref_year(item),
-        "container": _first(item.get("container-title")),
+        "container": display_text(_first(item.get("container-title"))),
+        "volume": item.get("volume"),
+        "issue": item.get("issue"),
+        "pages": item.get("page") or item.get("article-number"),
+        "rawMetadata": dict(item),
         "type": item.get("type"),
         "subtype": item.get("subtype"),
         "relation": item.get("relation", {}),
@@ -247,18 +293,22 @@ def normalize_europe_pmc(item: Mapping[str, Any]) -> dict[str, Any]:
         "id": item.get("id"),
         "source": item.get("source"),
         "doi": item.get("doi"),
-        "pmid": item.get("pmid"),
+        "pmid": item.get("pmid") or (item.get("id") if item.get("source") == "MED" else None),
         "pmcid": item.get("pmcid"),
-        "title": item.get("title"),
-        "authors": [part.strip() for part in author_text.split(",") if part.strip()],
+        "title": display_text(item.get("title")),
+        "authors": [display_text(part) for part in author_text.split(",") if part.strip()],
         "year": int(item["pubYear"]) if str(item.get("pubYear", "")).isdigit() else None,
-        "container": item.get("journalTitle"),
+        "container": display_text(item.get("journalTitle") or item.get("journalInfo", {}).get("journal", {}).get("title")),
+        "volume": item.get("journalVolume") or item.get("journalInfo", {}).get("volume"),
+        "issue": item.get("issue") or item.get("journalInfo", {}).get("issue"),
+        "pages": item.get("pageInfo"),
+        "rawMetadata": dict(item),
         "publicationTypes": item.get("pubTypeList", {}).get("pubType", []),
         "isOpenAccess": item.get("isOpenAccess") == "Y" or item.get("isOpenAccess") is True,
         "isRetracted": item.get("isRetracted") == "Y" or item.get("isRetracted") is True,
         "hasReferences": item.get("hasReferences") == "Y" or item.get("hasReferences") is True,
         "hasTextMinedTerms": item.get("hasTextMinedTerms") == "Y",
-        "abstract": item.get("abstractText"),
+        "abstract": display_text(item.get("abstractText")),
     }
 
 
@@ -279,6 +329,57 @@ def normalize_datacite(item: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def parse_pubmed_record(body: bytes, pmid: str) -> dict[str, Any]:
+    """Read identity, complete abstract sections, and directed notice links."""
+
+    if len(body) > MAX_RESPONSE_BYTES or re.search(br"<!ENTITY\b", body, re.IGNORECASE):
+        raise ProviderError("PubMed XML exceeds bounds or declares entities")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise ProviderError("PubMed returned malformed structured XML") from exc
+    citation = next((node for node in root.findall(".//MedlineCitation") if node.findtext("PMID") == pmid), None)
+    if citation is None:
+        raise ProviderError(f"PubMed structured response did not contain PMID {pmid}")
+
+    def text(node: ET.Element | None) -> str | None:
+        return display_text("".join(node.itertext())) if node is not None else None
+
+    article = citation.find("Article")
+    if article is None or not text(article.find("ArticleTitle")):
+        raise ProviderError("PubMed structured record lacks an article title")
+    year = article.findtext("Journal/JournalIssue/PubDate/Year")
+    if not year:
+        year_match = re.search(r"\b(?:18|19|20)\d{2}\b", article.findtext("Journal/JournalIssue/PubDate/MedlineDate") or "")
+        year = year_match.group() if year_match else None
+    abstract_sections = [
+        {"label": node.get("Label") or node.get("NlmCategory") or "", "text": text(node)}
+        for node in article.findall("Abstract/AbstractText") if text(node)
+    ]
+    notices = [
+        {"refType": node.get("RefType"), "pmid": node.findtext("PMID"), "source": text(node.find("RefSource")), "note": text(node.find("Note"))}
+        for node in citation.findall("CommentsCorrectionsList/CommentsCorrections")
+    ]
+    identifiers = {}
+    for parent in root.findall(".//PubmedArticle"):
+        if parent.findtext("MedlineCitation/PMID") == pmid:
+            identifiers = {node.get("IdType"): text(node) for node in parent.findall("PubmedData/ArticleIdList/ArticleId")}
+    return {
+        "provider": "pubmed", "pmid": pmid, "doi": identifiers.get("doi"), "pmcid": identifiers.get("pmc"),
+        "title": text(article.find("ArticleTitle")),
+        "authors": [" ".join(part for part in (node.findtext("ForeName"), node.findtext("LastName"), node.findtext("CollectiveName")) if part) for node in article.findall("AuthorList/Author")],
+        "year": int(year) if year and year.isdigit() else None,
+        "container": text(article.find("Journal/Title")),
+        "volume": article.findtext("Journal/JournalIssue/Volume"), "issue": article.findtext("Journal/JournalIssue/Issue"),
+        "pages": article.findtext("Pagination/MedlinePgn"),
+        "publicationTypes": [text(node) for node in article.findall("PublicationTypeList/PublicationType")],
+        "abstractSections": abstract_sections,
+        "abstract": "\n".join((part["label"] + ": " if part["label"] else "") + part["text"] for part in abstract_sections) or None,
+        "notices": notices, "noticeRoute": "pubmed-efetch-CommentsCorrectionsList",
+        "rawMetadata": {"xml": body.decode("utf-8", errors="replace")},
+    }
+
+
 class ScholarlyClient:
     def __init__(
         self,
@@ -295,6 +396,7 @@ class ScholarlyClient:
         if self.contact_email:
             agent += f" mailto:{self.contact_email}"
         self.transport = transport or HttpTransport(user_agent=agent)
+        self._status_probe_cache: dict[str, Any] | None = None
         self._requested_operation: ContextVar[str | None] = ContextVar(
             "ocsl_review_requested_operation",
             default=None,
@@ -354,7 +456,7 @@ class ScholarlyClient:
         params: dict[str, Any] = {
             "query.bibliographic": query,
             "rows": rows,
-            "select": "DOI,title,author,published,container-title,type,relation,update-to,license,URL",
+            "select": "DOI,title,author,published,container-title,volume,issue,page,type,relation,update-to,license,URL",
         }
         if self.contact_email:
             params["mailto"] = self.contact_email
@@ -368,7 +470,16 @@ class ScholarlyClient:
         encoded = urllib.parse.quote(doi, safe="")
         params = {"mailto": self.contact_email} if self.contact_email else None
         payload = self.transport.get(f"{CROSSREF}/works/{encoded}", params=params).json()
-        return normalize_crossref(payload.get("message", {}))
+        if not isinstance(payload, dict) or not isinstance(payload.get("message"), dict):
+            raise ProviderError("Crossref returned no structured work record")
+        item = payload["message"]
+        try:
+            matched = normalize_doi(str(item.get("DOI") or "")) == doi
+        except ReviewError:
+            matched = False
+        if not matched:
+            raise ProviderError("Crossref returned an absent or mismatched DOI")
+        return normalize_crossref(item)
 
     def search_pubmed(self, query: str, *, limit: int = 10) -> dict[str, Any]:
         rows = bounded_limit(limit)
@@ -431,13 +542,48 @@ class ScholarlyClient:
         return {
             "provider": "pubmed",
             "pmid": pmid,
-            "title": item.get("title"),
+            "title": display_text(item.get("title")),
             "authors": [author.get("name") for author in item.get("authors", [])],
             "published": item.get("pubdate"),
-            "container": item.get("fulljournalname") or item.get("source"),
+            "year": int(match.group()) if (match := re.search(r"\b(?:18|19|20)\d{2}\b", item.get("pubdate") or "")) else None,
+            "container": display_text(item.get("fulljournalname") or item.get("source")),
+            "volume": item.get("volume"), "issue": item.get("issue"), "pages": item.get("pages"),
+            "doi": next((value.get("value") for value in item.get("articleids", []) if value.get("idtype") == "doi"), None),
+            "rawMetadata": dict(item),
             "publicationTypes": item.get("pubtype", []),
             "identifiers": item.get("articleids", []),
         }
+
+    def _pubmed_structured(self, pmid: str, operation: str) -> dict[str, Any]:
+        if not re.fullmatch(r"\d{1,10}", pmid):
+            raise ReviewError("invalid PMID")
+        self._authorize("pubmed", operation, {"pmid": pmid})
+        params: dict[str, Any] = {"db": "pubmed", "id": pmid, "retmode": "xml", "tool": "ocsl_review"}
+        if self.contact_email:
+            params["email"] = self.contact_email
+        if os.environ.get("NCBI_API_KEY"):
+            params["api_key"] = os.environ["NCBI_API_KEY"]
+        response = self.transport.get(f"{PUBMED}/efetch.fcgi", params=params, headers={"Accept": "application/xml"})
+        return parse_pubmed_record(response.body, pmid)
+
+    def probe_publication_status(self) -> dict[str, Any]:
+        """Exercise the exact structured notice route on known-positive records."""
+
+        if self._status_probe_cache is not None:
+            return dict(self._status_probe_cache)
+        cases = []
+        for pmid, relationship, notice in STATUS_POSITIVE_CONTROLS:
+            try:
+                record = self._pubmed_structured(pmid, "get_publication_status")
+                passed = any(item["refType"] == relationship and item["pmid"] == notice for item in record["notices"])
+                cases.append({"pmid": pmid, "expectedRelationship": relationship, "expectedNotice": notice, "passed": passed})
+            except ProviderError as exc:
+                cases.append({"pmid": pmid, "passed": False, "error": str(exc)})
+        result = {"route": "pubmed-efetch-CommentsCorrectionsList", "checkedAt": utc_now(), "passed": bool(cases) and all(case["passed"] for case in cases), "cases": cases}
+        # A failed probe is retryable on the next source, never a cached success.
+        if result["passed"]:
+            self._status_probe_cache = result
+        return result
 
     def search_europe_pmc(self, query: str, *, limit: int = 10) -> dict[str, Any]:
         rows = bounded_limit(limit)
@@ -460,9 +606,14 @@ class ScholarlyClient:
             f"{EUROPE_PMC}/search",
             params={"query": query, "pageSize": 5, "resultType": "core", "format": "json"},
         ).json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("resultList"), dict):
+            raise ProviderError("Europe PMC returned no structured result list")
+        items = payload["resultList"].get("result", [])
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise ProviderError("Europe PMC returned malformed result records")
         return [
             normalize_europe_pmc(item)
-            for item in payload.get("resultList", {}).get("result", [])[:5]
+            for item in items[:5]
         ]
 
     def resolve_identifier(
@@ -486,7 +637,13 @@ class ScholarlyClient:
             except ProviderError as exc:
                 failures.append(f"europe-pmc: {exc}")
         elif pmid:
-            records.append(self._pubmed_summary(pmid, "resolve_identifier"))
+            pmid = pmid.strip()
+            if not re.fullmatch(r"\d{1,10}", pmid):
+                raise ReviewError("invalid PMID")
+            try:
+                records.append(self._pubmed_summary(pmid, "resolve_identifier"))
+            except ProviderError as exc:
+                failures.append(f"pubmed: {exc}")
             try:
                 records.extend(
                     self._europe_pmc_lookup(
@@ -505,6 +662,40 @@ class ScholarlyClient:
                     f"PMCID:{normalized}", "resolve_identifier", {"pmcid": normalized}
                 )
             )
+        if not doi:
+            # Follow only identifiers linked to the requested record. Keep the
+            # originating metadata alongside each independent provider result:
+            # disagreement must survive reconciliation, never be overwritten.
+            key, expected = ("pmid", pmid) if pmid else ("pmcid", normalized)
+            candidates = [record for record in records
+                          if str(record.get(key) or "").upper() == expected.upper()]
+            if pmcid:
+                discovered_pmid = next((str(record["pmid"]).strip() for record in candidates
+                                        if record.get("pmid")), None)
+                if discovered_pmid:
+                    if not re.fullmatch(r"\d{1,10}", discovered_pmid):
+                        failures.append("pubmed: source record supplied an invalid PMID")
+                    else:
+                        try:
+                            additional = self._pubmed_summary(discovered_pmid, "resolve_identifier")
+                            records.append(additional)
+                            candidates.append(additional)
+                        except ProviderError as exc:
+                            failures.append(f"pubmed: {exc}")
+            discovered_doi = next((str(record["doi"]) for record in candidates
+                                   if record.get("doi")), None)
+            if discovered_doi:
+                try:
+                    discovered_doi = normalize_doi(discovered_doi)
+                except ReviewError:
+                    failures.append("crossref: source record supplied an invalid DOI")
+                else:
+                    try:
+                        records.append(self._crossref_work(discovered_doi, "resolve_identifier"))
+                    except ProviderError as exc:
+                        failures.append(f"crossref: {exc}")
+            # At most one request to each of Europe PMC, PubMed, and Crossref;
+            # discovered identifiers never recurse through this resolver.
         return self._envelope("resolve_identifier", "multiple", records, limitations=failures)
 
     def resolve_reference(self, reference: Mapping[str, Any]) -> dict[str, Any]:
@@ -533,35 +724,89 @@ class ScholarlyClient:
             return self._envelope("resolve_reference", "crossref", records)
 
     @staticmethod
-    def reconcile_reference_metadata(records: list[Mapping[str, Any]]) -> dict[str, Any]:
+    def reconcile_reference_metadata(records: list[Mapping[str, Any]], printed_reference: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """Compare already-retrieved records locally; this performs no egress."""
 
-        if len(records) < 2:
-            return {
-                "agreement": "single-source",
-                "differences": [],
-                "recordsCompared": len(records),
-            }
-
         def canonical_text(value: Any) -> str:
-            return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+            return " ".join(re.findall(r"\w+", (display_text(value) or "").casefold(), flags=re.UNICODE))
 
-        fields = ("doi", "title", "year", "container")
+        def canonical_field(field: str, value: Any) -> str:
+            if field == "doi":
+                try:
+                    return normalize_doi(str(value))
+                except ReviewError:
+                    return f"invalid-doi:{value}"
+            if field == "pmcid":
+                return str(value).strip().upper().removeprefix("PMC")
+            return canonical_text(value)
+
+        providers = {str(record.get("provider")) for record in records if record.get("provider") not in (None, "", "unknown")}
+        fields = ("doi", "pmid", "pmcid", "title", "year", "container", "volume", "pages")
         differences = []
+        missing = []
+        printed = dict(printed_reference or {})
+        printed["container"] = printed.get("container") or printed.get("journal")
+        printed["pages"] = printed.get("pages") or printed.get("page")
+        required = {"title", "year", "container"} | {field for field in ("volume", "pages") if printed.get(field)}
         for field in fields:
             values = {
-                canonical_text(record.get(field))
+                canonical_field(field, record.get(field))
                 for record in records
                 if record.get(field) not in (None, "")
             }
             if len(values) > 1:
                 differences.append({"field": field, "values": sorted(values)})
+            observed_by = {str(record.get("provider")) for record in records if record.get(field) not in (None, "") and record.get("provider") in providers}
+            if field in required and len(observed_by) < 2:
+                missing.append({"field": field, "reason": "fewer-than-two-provider-values"})
+            if printed.get(field) and values and canonical_field(field, printed[field]) not in values:
+                differences.append({"field": field, "printed": canonical_field(field, printed[field]), "values": sorted(values)})
+            if printed_reference is not None and field in required and not printed.get(field):
+                raw = canonical_text(printed.get("raw"))
+                # An exact occurrence in the printed entry is useful; venue
+                # abbreviation guesses and title similarity are never repairs.
+                if len(values) != 1 or not raw or not any(f" {value} " in f" {raw} " for value in values):
+                    missing.append({"field": field, "reason": "printed-field-unconfirmed"})
+        agreement = "conflict" if differences else "single-source" if len(providers) < 2 else "incomplete" if missing else "consistent"
         return {
-            "agreement": "conflict" if differences else "consistent",
+            "agreement": agreement,
+            "agreementStrength": "strong" if agreement == "consistent" and printed_reference is not None else "conflict" if agreement == "conflict" else "weak",
             "differences": differences,
+            "missingFields": [f"{item['field']}:{item['reason']}" for item in missing],
             "recordsCompared": len(records),
-            "providers": sorted({str(record.get("provider", "unknown")) for record in records}),
+            "providers": sorted(providers), "providersCompared": sorted(providers), "providerCount": len(providers),
         }
+
+    @staticmethod
+    def reconcile_identifier_metadata(records: list[Mapping[str, Any]], *, doi: str) -> dict[str, Any]:
+        """Reconcile a newly discovered DOI without inventing a printed entry."""
+
+        expected = normalize_doi(doi)
+        result = ScholarlyClient.reconcile_reference_metadata(records)
+        absent = False
+        conflicting = []
+        for record in records:
+            if not record.get("doi"):
+                absent = True
+                continue
+            try:
+                observed = normalize_doi(str(record["doi"]))
+            except ReviewError:
+                conflicting.append(str(record["doi"]))
+                continue
+            if observed != expected:
+                conflicting.append(observed)
+        if conflicting:
+            result["differences"].append({"field": "doi", "expected": expected, "values": sorted(set(conflicting))})
+            result["agreement"] = "conflict"
+            result["agreementStrength"] = "conflict"
+        elif absent:
+            result["missingFields"].append("doi:identifier-unconfirmed")
+            if result["agreement"] == "consistent":
+                result["agreement"] = "incomplete"
+        elif result["agreement"] == "consistent":
+            result["agreementStrength"] = "strong"
+        return result
 
     def get_publication_status(
         self, *, doi: str | None = None, pmid: str | None = None
@@ -584,7 +829,10 @@ class ScholarlyClient:
                 failures.append(f"europe-pmc: {exc}")
         else:
             assert pmid
-            records.append(self._pubmed_summary(pmid, "get_publication_status"))
+            try:
+                records.append(self._pubmed_summary(pmid, "get_publication_status"))
+            except ProviderError as exc:
+                failures.append(f"pubmed: {exc}")
             try:
                 records.extend(
                     self._europe_pmc_lookup(
@@ -593,6 +841,17 @@ class ScholarlyClient:
                 )
             except ProviderError as exc:
                 failures.append(f"europe-pmc: {exc}")
+        resolved_pmid = pmid or next((str(record["pmid"]) for record in records if record.get("pmid")), None)
+        structured = None
+        if resolved_pmid:
+            try:
+                structured = self._pubmed_structured(resolved_pmid, "get_publication_status")
+                records.append(structured)
+            except ProviderError as exc:
+                failures.append(f"pubmed-structured: {exc}")
+        probe = self.probe_publication_status()
+        if not probe["passed"]:
+            failures.append("Publication-notice surveillance is unproven: known-positive controls failed.")
         signals: list[dict[str, Any]] = []
         for record in records:
             provider = record.get("provider")
@@ -605,14 +864,21 @@ class ScholarlyClient:
                     }
                 )
             for update in record.get("updates", []):
-                kind = str(update.get("type", "update")).lower()
-                signals.append({"provider": provider, "kind": kind, "detail": update})
+                # update-to belongs to the updating notice. It is not proof
+                # that this returned work was itself withdrawn.
+                signals.append({"provider": provider, "kind": "update-notice", "detail": update})
+            for notice in record.get("notices", []):
+                kind = {
+                    "RetractionIn": "retraction", "RetractedandRepublishedIn": "retraction",
+                    "ErratumIn": "correction", "CorrectedandRepublishedIn": "correction",
+                    "ExpressionOfConcernIn": "expression-of-concern",
+                }.get(notice["refType"], "related-notice")
+                signals.append({"provider": provider, "kind": kind, "relationship": notice["refType"], "detail": notice})
             types = " ".join(record.get("publicationTypes", [])).lower()
             for phrase, kind in (
                 ("retracted publication", "retraction"),
-                ("retraction of publication", "retraction"),
-                ("published erratum", "correction"),
-                ("expression of concern", "expression-of-concern"),
+                ("retraction of publication", "related-notice"),
+                ("published erratum", "related-notice"),
             ):
                 if phrase in types:
                     signals.append({"provider": provider, "kind": kind, "detail": phrase})
@@ -627,7 +893,7 @@ class ScholarlyClient:
             "preprint" in " ".join(record.get("publicationTypes", [])).lower() for record in records
         ):
             state = "preprint"
-        elif records:
+        elif structured is not None and probe["passed"] and not failures:
             state = "current"
         else:
             state = "unknown"
@@ -638,6 +904,8 @@ class ScholarlyClient:
             "providersChecked": sorted({str(record.get("provider")) for record in records}),
             "checkedAt": utc_now(),
             "limitations": failures,
+            "surveillance": probe,
+            "records": records,
             "warning": "No status service is exhaustive; inspect publisher notices for high-stakes use.",
         }
 
@@ -653,6 +921,7 @@ class ScholarlyClient:
                 "providersChecked": status["providersChecked"],
                 "checkedAt": status["checkedAt"],
                 "limitations": status["limitations"],
+                "surveillance": status["surveillance"],
             }
 
     def get_related_versions(self, *, doi: str) -> dict[str, Any]:
@@ -663,6 +932,152 @@ class ScholarlyClient:
             for value in values if isinstance(values, list) else [values]:
                 related.append({"relationship": relationship, "target": value})
         return self._envelope("get_related_versions", "crossref", related)
+
+    def _source_document(self, url: str, identifiers: Mapping[str, str]) -> dict[str, Any]:
+        def authorize(destination: str) -> None:
+            parsed = validate_public_url(destination)
+            self._authorize(str(parsed.hostname), "acquire_full_text", {**identifiers, "source": destination})
+
+        getter = getattr(self.transport, "get_document", None)
+        if getter is None:
+            # Injectable test/adaptor transports may implement the base get
+            # protocol only; the same authorization and parse bounds apply.
+            authorize(url)
+            response = self.transport.get(url, headers={"Accept": "application/xml, application/pdf"})
+        else:
+            response = getter(url, authorize_url=authorize)
+        if response.status < 200 or response.status >= 300:
+            raise ProviderError(f"source download returned HTTP {response.status}")
+        media_type = next((value for name, value in response.headers.items() if name.lower() == "content-type"), None)
+        # Text/Markdown are permitted for explicit local attachments. A remote
+        # access-denied message in text/plain is not a complete paper.
+        remote_type = media_type
+        if (media_type or "").split(";", 1)[0].strip().lower() in {"text/plain", "text/markdown"}:
+            remote_type = None
+        document = parse_source_document(response.body, remote_type, response.url or url)
+        for key, expected in identifiers.items():
+            observed = document["identifiers"].get(key)
+            if observed:
+                if key == "doi":
+                    try:
+                        matches = normalize_doi(observed) == normalize_doi(expected)
+                    except ReviewError as exc:
+                        raise ProviderError("downloaded article contains an invalid source DOI") from exc
+                elif key == "pmcid":
+                    matches = observed.upper().removeprefix("PMC") == expected.upper().removeprefix("PMC")
+                else:
+                    matches = observed == expected
+                if not matches:
+                    raise ProviderError("downloaded article identifies a different source")
+        return document
+
+    def acquire_full_text(
+        self, *, doi: str | None = None, pmid: str | None = None, pmcid: str | None = None
+    ) -> dict[str, Any]:
+        """Acquire a complete document for private workspace persistence.
+
+        This internal method returns original bytes. It is deliberately absent
+        from MCP's JSON response surface; workspace workflow owns file writes.
+        """
+
+        if sum(value is not None for value in (doi, pmid, pmcid)) != 1:
+            raise ReviewError("acquire_full_text requires exactly one DOI, PMID, or PMCID")
+        identifier = {"doi": normalize_doi(doi)} if doi else {"pmid": pmid} if pmid else {"pmcid": str(pmcid).upper()}
+        limitations: list[str] = []
+        attempts: list[dict[str, Any]] = []
+        documents: list[dict[str, Any]] = []
+        abstract_candidates: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
+        with self._operation_scope("acquire_full_text"):
+            try:
+                resolved = self.resolve_identifier(**identifier)
+                records = resolved["records"]
+                limitations.extend(resolved["limitations"])
+            except ProviderError as exc:
+                limitations.append(f"identity lookup: {exc}")
+            key, value = next(iter(identifier.items()))
+            epmc = next((record for record in records if record.get("provider") == "europe-pmc" and str(record.get(key) or "").casefold() == str(value).casefold()), None)
+            resolved_pmid = pmid or (epmc or {}).get("pmid")
+            resolved_doi = identifier.get("doi") or (epmc or {}).get("doi")
+            if epmc and epmc.get("abstract"):
+                abstract_candidates.append({"provider": "europe-pmc", "text": epmc["abstract"]})
+            if resolved_pmid:
+                try:
+                    structured = self._pubmed_structured(str(resolved_pmid), "acquire_full_text")
+                    if structured.get("abstract"):
+                        abstract_candidates.append({"provider": "pubmed", "text": structured["abstract"]})
+                except ProviderError as exc:
+                    limitations.append(f"pubmed abstract: {exc}")
+            if epmc and epmc.get("pmcid") and epmc.get("isOpenAccess"):
+                url = f"{EUROPE_PMC}/{urllib.parse.quote(str(epmc['pmcid']), safe='')}/fullTextXML"
+                try:
+                    document = self._source_document(url, identifier)
+                    document.update({"provider": "europe-pmc", "version": "repository-copy", "license": None})
+                    documents.append(document)
+                    attempts.append({"provider": "europe-pmc", "sourceUrl": url, "status": "obtained", "sha256": document["sha256"]})
+                except ProviderError as exc:
+                    attempts.append({"provider": "europe-pmc", "sourceUrl": url, "status": "failed", "error": str(exc)})
+                    limitations.append(f"europe-pmc complete source: {exc}")
+            if not documents and resolved_doi:
+                if not self.contact_email:
+                    limitations.append("Unpaywall requires configured OCSL_REVIEW_CONTACT_EMAIL; no contact identity was inferred.")
+                else:
+                    normalized = normalize_doi(str(resolved_doi))
+                    try:
+                        self._authorize("unpaywall", "acquire_full_text", {"doi": normalized})
+                        payload = self.transport.get(f"{UNPAYWALL}/{urllib.parse.quote(normalized, safe='')}", params={"email": self.contact_email}).json()
+                        if not isinstance(payload, dict) or normalize_doi(str(payload.get("doi") or "")) != normalized:
+                            raise ProviderError("Unpaywall returned a different or absent DOI")
+                        locations = ([payload["best_oa_location"]] if payload.get("best_oa_location") else []) + list(payload.get("oa_locations") or [])
+                        urls: set[str] = set()
+                        for location in locations:
+                            if not isinstance(location, dict):
+                                continue
+                            url = location.get("url_for_pdf")
+                            if not url:
+                                landing = location.get("url_for_landing_page") or location.get("url")
+                                if landing:
+                                    attempts.append({"provider": "unpaywall", "sourceUrl": str(landing), "status": "landing-page-only"})
+                                continue
+                            if url in urls:
+                                continue
+                            if len(urls) >= 10:
+                                limitations.append("Open-copy route bound reached after ten distinct document locations.")
+                                break
+                            urls.add(url)
+                            try:
+                                document = self._source_document(str(url), {"doi": normalized})
+                                document.update({"provider": "unpaywall", "version": location.get("version"), "license": location.get("license")})
+                                documents.append(document)
+                                attempts.append({"provider": "unpaywall", "sourceUrl": str(url), "status": "obtained", "sha256": document["sha256"]})
+                                break
+                            except ProviderError as exc:
+                                attempts.append({"provider": "unpaywall", "sourceUrl": str(url), "status": "failed", "error": str(exc)})
+                        if not documents:
+                            limitations.append("No complete readable document obtained from the available Unpaywall locations.")
+                    except (ProviderError, ReviewError) as exc:
+                        # Policy errors are never caught here: they must stop
+                        # the denied route before I/O and remain distinguishable.
+                        from .errors import ConfidentialityError
+                        if isinstance(exc, ConfidentialityError):
+                            raise
+                        limitations.append(f"unpaywall: {exc}")
+            abstract_record = max(abstract_candidates, key=lambda item: len(item["text"]), default=None)
+            abstract = abstract_record["text"] if abstract_record else None
+            abstract_complete = bool(abstract and re.search(r"[.!?][\"')\]]*$", abstract.strip()))
+            if abstract and not abstract_complete:
+                limitations.append("Provider abstract may end mid-sentence; completeness is unproven.")
+            for document in documents:
+                if document["supplements"]:
+                    limitations.append("Supplement links were recorded; external supplement files require separate acquisition and examination.")
+                if document["visualAssets"]:
+                    limitations.append("XML graphics/media links were recorded; their visual content requires separate acquisition and inspection where relevant.")
+            return {
+                "operation": "acquire_full_text", "provider": documents[0]["provider"] if documents else "multiple",
+                "retrievedAt": utc_now(), "accessLevel": "full-text" if documents else "abstract-only" if abstract else "metadata-only" if records else "inaccessible",
+                "abstract": abstract, "abstractComplete": abstract_complete, "abstractProvider": abstract_record["provider"] if abstract_record else None,
+                "abstractCandidates": abstract_candidates, "documents": documents, "limitations": limitations, "attempts": attempts,
+            }
 
     def get_abstract_or_open_sections(
         self, *, doi: str | None = None, pmid: str | None = None, pmcid: str | None = None
@@ -694,6 +1109,8 @@ class ScholarlyClient:
                     f"{EUROPE_PMC}/{urllib.parse.quote(open_pmcid)}/fullTextXML",
                     headers={"Accept": "application/xml"},
                 )
+                if re.search(br"<!ENTITY\b", response.body, re.IGNORECASE):
+                    raise ProviderError("Europe PMC preview contains entity declarations")
                 try:
                     root = ET.fromstring(response.body)
                 except ET.ParseError as exc:
@@ -712,13 +1129,18 @@ class ScholarlyClient:
                     if title or text:
                         sections.append({"title": title, "text": text})
                 records["sections"] = sections
-                access = "full-text"
-            return self._envelope(
+                access = "partial-text" if sections else access
+            result = self._envelope(
                 "get_abstract_or_open_sections",
                 "europe-pmc",
                 records,
                 access=access,
             )
+            result["complete"] = False
+            result["truncated"] = access == "partial-text"
+            if access == "partial-text":
+                result["limitations"].append("Preview only: at most twenty sections and 4,000 characters per section; this is not complete full-text evidence.")
+            return result
 
     def _epmc_links(self, kind: str, *, source: str, identifier: str, limit: int) -> dict[str, Any]:
         rows = bounded_limit(limit)
@@ -737,7 +1159,12 @@ class ScholarlyClient:
         key = "referenceList" if kind == "references" else "citationList"
         singular = "reference" if kind == "references" else "citation"
         records = payload.get(key, {}).get(singular, [])[:rows]
-        return self._envelope(f"get_{kind}", "europe-pmc", records)
+        result = self._envelope(f"get_{kind}", "europe-pmc", records)
+        total = payload.get("hitCount")
+        total = total if isinstance(total, int) and not isinstance(total, bool) and total >= len(records) else None
+        result.update({"total": total, "complete": total is not None and total == len(records),
+                       "truncated": total is None or total > len(records)})
+        return result
 
     def get_references(
         self,
@@ -757,7 +1184,7 @@ class ScholarlyClient:
         )
         encoded = urllib.parse.quote(f"doi:{doi}", safe=":")
         records = self.transport.get(f"{OPENCITATIONS_INDEX}/references/{encoded}").json()
-        return self._envelope("get_references", "opencitations", records[: bounded_limit(limit)])
+        return self._bounded_links("get_references", records, limit)
 
     def get_citations(
         self,
@@ -777,7 +1204,16 @@ class ScholarlyClient:
         )
         encoded = urllib.parse.quote(f"doi:{doi}", safe=":")
         records = self.transport.get(f"{OPENCITATIONS_INDEX}/citations/{encoded}").json()
-        return self._envelope("get_citations", "opencitations", records[: bounded_limit(limit)])
+        return self._bounded_links("get_citations", records, limit)
+
+    def _bounded_links(self, operation: str, records: Any, limit: int) -> dict[str, Any]:
+        if not isinstance(records, list):
+            raise ProviderError("citation provider returned a non-list response")
+        selected = records[:bounded_limit(limit)]
+        result = self._envelope(operation, "opencitations", selected)
+        result.update({"total": len(records), "complete": len(selected) == len(records),
+                       "truncated": len(selected) < len(records)})
+        return result
 
     def resolve_dataset_or_software(
         self,

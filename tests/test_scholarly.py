@@ -158,7 +158,8 @@ class ScholarlyTests(unittest.TestCase):
         transport = FakeTransport()
         client = ScholarlyClient(plan=EgressPlan(), transport=transport)
         result = client.get_publication_status(doi="10.1000/example")
-        self.assertEqual(result["state"], "current")
+        self.assertEqual(result["state"], "unknown")
+        self.assertFalse(result["surveillance"]["passed"])
         called_hosts = " ".join(call[0] for call in transport.calls)
         self.assertIn("api.crossref.org", called_hosts)
         self.assertNotIn("labs.crossref", called_hosts)
@@ -242,6 +243,34 @@ class ScholarlyTests(unittest.TestCase):
             client.resolve_identifier(doi="10.1000/example")
         self.assertEqual(len(transport.calls), completed_calls)
 
+    def test_successful_ncbi_requests_are_throttled_across_operations(self):
+        clock = FakeClock()
+        transport = HttpTransport(user_agent="test", sleep=clock.sleep, monotonic=clock.monotonic)
+        times = []
+        def respond(*args, **kwargs):
+            times.append(clock.now)
+            return FakeHttpResponse()
+        with patch("ocsl_review.scholarly.open_public_https", side_effect=respond):
+            transport.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi")
+            transport.get("https://api.crossref.org/works")
+            transport.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
+            transport.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi")
+        self.assertEqual(times, [0.0, 0.0, 0.35, 0.7])
+
+    def test_reference_preview_exposes_omitted_entries(self):
+        client = ScholarlyClient(transport=FakeTransport())
+        with patch.object(client.transport, "get", return_value=RawResponse(
+                json.dumps([{"cited": str(i)} for i in range(30)]).encode(), 200, {})):
+            result = client.get_references(doi="10.1234/example", limit=25)
+        self.assertEqual(result["total"], 30)
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["complete"])
+        with patch.object(client.transport, "get", return_value=RawResponse(
+                b'{"referenceList":{"reference":[]}}', 200, {})):
+            result = client.get_references(source="MED", identifier="123")
+        self.assertIsNone(result["total"])
+        self.assertFalse(result["complete"])
+
     def test_http_transport_retries_429_and_respects_retry_after(self):
         clock = FakeClock()
         transport = HttpTransport(
@@ -256,7 +285,7 @@ class ScholarlyTests(unittest.TestCase):
             http_error(429, headers={"Retry-After": "1"}),
             FakeHttpResponse(b'{"message":"ok"}'),
         ]
-        with patch("ocsl_review.scholarly.urllib.request.urlopen", side_effect=responses) as opener:
+        with patch("ocsl_review.scholarly.open_public_https", side_effect=responses) as opener:
             response = transport.get("https://api.crossref.org/works")
 
         self.assertEqual(response.status, 200)
@@ -280,7 +309,7 @@ class ScholarlyTests(unittest.TestCase):
         )
         with (
             patch(
-                "ocsl_review.scholarly.urllib.request.urlopen",
+                "ocsl_review.scholarly.open_public_https",
                 side_effect=[http_error(429, headers={"Retry-After": "999"}) for _ in range(4)],
             ) as opener,
             self.assertRaisesRegex(ProviderError, "provider HTTP 429"),
@@ -295,7 +324,7 @@ class ScholarlyTests(unittest.TestCase):
         transport = HttpTransport(user_agent="test", sleep=clock.sleep, monotonic=clock.monotonic)
         with (
             patch(
-                "ocsl_review.scholarly.urllib.request.urlopen", side_effect=http_error(400)
+                "ocsl_review.scholarly.open_public_https", side_effect=http_error(400)
             ) as opener,
             self.assertRaisesRegex(ProviderError, "provider HTTP 400"),
         ):
@@ -315,7 +344,7 @@ class ScholarlyTests(unittest.TestCase):
         )
         with (
             patch(
-                "ocsl_review.scholarly.urllib.request.urlopen",
+                "ocsl_review.scholarly.open_public_https",
                 side_effect=http_error(429, headers={"Retry-After": "2"}),
             ) as opener,
             self.assertRaisesRegex(ProviderError, "retry delay exceeds"),
@@ -338,7 +367,7 @@ class ScholarlyTests(unittest.TestCase):
             FakeHttpResponse(headers={"Content-Length": str(MAX_RESPONSE_BYTES + 1)}),
         ]
         with (
-            patch("ocsl_review.scholarly.urllib.request.urlopen", side_effect=responses) as opener,
+            patch("ocsl_review.scholarly.open_public_https", side_effect=responses) as opener,
             self.assertRaisesRegex(ProviderError, "response exceeds"),
         ):
             transport.get("https://api.crossref.org/works")
