@@ -1,7 +1,7 @@
 {"caseId":"fabricated-reference","supportVerdict":"abstain","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"not-assessable","publicationStatus":"unknown"}
-{"caseId":"doi-metadata-conflict","supportVerdict":"not-addressed","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"missing-citation","publicationStatus":"current"}
+{"caseId":"doi-metadata-conflict","supportVerdict":"abstain","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"not-assessable","publicationStatus":"current"}
 {"caseId":"duplicate-preprint-version","supportVerdict":"partial-indirect","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"insufficient-breadth","publicationStatus":"current"}
-{"caseId":"retracted-source","supportVerdict":"contradicted","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"missing-citation","publicationStatus":"retracted"}
+{"caseId":"retracted-source","supportVerdict":"abstain","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"not-assessable","publicationStatus":"retracted"}
 {"caseId":"mouse-to-human","supportVerdict":"scope-caveat","scopeMismatch":true,"citationRequired":true,"completenessVerdict":"insufficient-scope","publicationStatus":"current"}
 {"caseId":"association-to-causation","supportVerdict":"scope-caveat","scopeMismatch":true,"citationRequired":true,"completenessVerdict":"insufficient-directness","publicationStatus":"current"}
 {"caseId":"compound-clause-partial","supportVerdict":"partial-indirect","scopeMismatch":false,"citationRequired":true,"completenessVerdict":"insufficient-directness","publicationStatus":"current"}
