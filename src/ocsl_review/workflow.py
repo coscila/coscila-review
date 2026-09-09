@@ -138,6 +138,9 @@ def cmd_package(args: Any) -> dict[str, Any]:
     graph = _read_json(graph_path) if graph_path.is_file() else build_claim_inventory(manuscript)
     if not graph_path.is_file():
         atomic_json(graph_path, graph, mode=0o600 if manuscript["confidential"] else 0o644)
+    from .literature import guard_graph
+
+    guard_graph(_workspace(args), graph)
     summary_path_value = getattr(args, "audit_summary", None)
     summary = (
         _read_json(_inside(_workspace(args), summary_path_value, must_exist=True))
@@ -170,6 +173,10 @@ def cmd_render(args: Any) -> dict[str, Any]:
         args, "package", ".ocsl-review/review-package.json", must_exist=True
     )
     package = _read_json(package_path)
+    if package.get("auditGraph") is not None:
+        from .literature import guard_graph
+
+        guard_graph(_workspace(args), package["auditGraph"])
     output_stem = _artifact_path(args, "output_stem", ".ocsl-review/review-report")
     rendered = render_review_package(package, output_stem)
     return {key.lstrip("."): str(value) for key, value in rendered.items()}
@@ -212,6 +219,9 @@ def _load_graph(args: Any) -> tuple[Path, dict[str, Any]]:
     path = _artifact_path(args, "audit_graph", ".ocsl-review/audit-graph.json", must_exist=True)
     graph = _read_json(path)
     validate_audit_graph(graph)
+    from .literature import guard_graph
+
+    guard_graph(_workspace(args), graph)
     return path, graph
 
 

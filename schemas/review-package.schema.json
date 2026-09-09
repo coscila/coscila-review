@@ -17,7 +17,7 @@
     "auditSummary"
   ],
   "properties": {
-    "schemaVersion": { "const": "1.0.0" },
+    "schemaVersion": {"enum": ["1.0.0", "1.1.0"]},
     "packageId": { "type": "string", "pattern": "^review-[a-f0-9]{16}$" },
     "title": { "type": "string", "minLength": 1 },
     "confidential": { "type": "boolean" },
@@ -124,7 +124,7 @@
         "guardrails"
       ],
       "properties": {
-        "schemaVersion": { "const": "1.0.0" },
+        "schemaVersion": {"enum": ["1.0.0", "1.1.0"]},
         "planId": { "type": "string", "pattern": "^plan-[a-f0-9]{16}$" },
         "manuscriptId": { "type": "string", "pattern": "^ms-[a-f0-9]{20}$" },
         "confidential": { "type": "boolean" },
@@ -134,7 +134,8 @@
         "passes": { "type": "array", "items": { "$ref": "#/$defs/reviewPass" }, "minItems": 1 },
         "concerns": { "type": "array", "items": { "$ref": "#/$defs/concern" } },
         "revisionLedger": { "type": "array", "items": { "$ref": "#/$defs/revisionAction" } },
-        "guardrails": { "$ref": "#/$defs/guardrails" }
+        "guardrails": { "$ref": "#/$defs/guardrails" },
+        "literatureReview": {"type": "object", "additionalProperties": false, "required": ["mode", "confirmationRequired", "correctness", "completeness", "scope", "bibliographyEntries", "citationOccurrences", "stateArtifact", "unavailablePolicy"], "properties": {"mode": {"const": "extensive"}, "confirmationRequired": {"type": "boolean"}, "correctness": {"type": "boolean"}, "completeness": {"type": "boolean"}, "scope": {"const": "bibliography-and-targeted-gaps"}, "bibliographyEntries": {"type": "integer", "minimum": 0}, "citationOccurrences": {"type": "integer", "minimum": 0}, "stateArtifact": {"type": "string"}, "unavailablePolicy": {"const": "continue-with-gaps"}}}
       }
     },
     "concern": {
@@ -221,7 +222,7 @@
         "provenance"
       ],
       "properties": {
-        "schemaVersion": { "const": "1.0" },
+        "schemaVersion": {"enum": ["1.0", "1.1"]},
         "auditId": { "type": "string", "minLength": 1 },
         "createdAt": { "type": "string" },
         "manuscript": { "type": "object" },
@@ -233,7 +234,9 @@
         "completenessAssessments": { "type": "array" },
         "searchRuns": { "type": "array" },
         "reviewAssertions": { "type": "array" },
-        "provenance": { "type": "object" }
+        "provenance": { "type": "object" },
+        "sourceExaminations": {"type": "array"},
+        "additionalReferences": {"type": "array", "items": {"type": "object"}}
       }
     },
     "status": { "enum": ["yes", "no", "partly", "not-fully-verifiable"] },
@@ -260,7 +263,18 @@
         "citationRequiredClaimsProcessed": { "type": "integer", "minimum": 0 },
         "sourcesFullTextChecked": { "type": "integer", "minimum": 0 },
         "sourcesAbstractOnly": { "type": "integer", "minimum": 0 },
-        "sourcesInaccessible": { "type": "integer", "minimum": 0 }
+        "sourcesInaccessible": { "type": "integer", "minimum": 0 },
+        "sourcesMetadataOnly": {"type": "integer", "minimum": 0},
+        "sourcesFullTextObtained": {"type": "integer", "minimum": 0},
+        "referencesAttempted": {"type": "integer", "minimum": 0},
+        "referencesPending": {"type": "integer", "minimum": 0},
+        "referencesBlocked": {"type": "integer", "minimum": 0},
+        "referencesAssessed": {"type": "integer", "minimum": 0},
+        "verificationLinksTotal": {"type": "integer", "minimum": 0},
+        "verificationLinksAbstained": {"type": "integer", "minimum": 0},
+        "evidenceFullTextUsed": {"type": "integer", "minimum": 0},
+        "evidenceAbstractUsed": {"type": "integer", "minimum": 0},
+        "additionalReferencesTotal": {"type": "integer", "minimum": 0}
       }
     },
     "correctness": {
@@ -284,7 +298,8 @@
         "contradicted": { "type": "integer", "minimum": 0 },
         "notAddressed": { "type": "integer", "minimum": 0 },
         "statusProblems": { "type": "integer", "minimum": 0 },
-        "metadataProblems": { "type": "integer", "minimum": 0 }
+        "metadataProblems": { "type": "integer", "minimum": 0 },
+        "verificationLimits": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
       }
     },
     "sufficiency": {
@@ -308,7 +323,8 @@
         "insufficientScope": { "type": "integer", "minimum": 0 },
         "insufficientBreadth": { "type": "integer", "minimum": 0 },
         "insufficientCurrency": { "type": "integer", "minimum": 0 },
-        "insufficientBalance": { "type": "integer", "minimum": 0 }
+        "insufficientBalance": { "type": "integer", "minimum": 0 },
+        "verificationLimits": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
       }
     },
     "auditSummary": {
@@ -323,7 +339,7 @@
         "verificationLimits"
       ],
       "properties": {
-        "schemaVersion": { "const": "1.0" },
+        "schemaVersion": {"enum": ["1.0", "1.1"]},
         "auditId": { "type": "string", "minLength": 1 },
         "auditCoverage": { "$ref": "#/$defs/coverage" },
         "citedCorrectly": { "$ref": "#/$defs/correctness" },
