@@ -6,6 +6,7 @@ import stat
 import tempfile
 import tomllib
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -420,6 +421,135 @@ class EnvironmentLayerTests(unittest.TestCase):
         after = (receipt.read_bytes(), receipt.stat().st_mtime_ns, template.stat().st_mode)
         self.assertTrue(second["reused"])
         self.assertEqual(before, after)
+
+    def upgraded_core_definition(self) -> environments.EnvironmentDefinition:
+        original = load_environment_catalog(self.paths)["review-core"]
+        updated_lock = self.root / "updated-core.input-lock.yaml"
+        updated_lock.write_bytes(original.input_lock.read_bytes() + b"\n# upgraded input\n")
+        return replace(
+            original,
+            input_lock=updated_lock,
+            input_lock_sha256=environments.sha256_file(updated_lock),
+            health_checks=(*original.health_checks, ("pdftotext", "-v")),
+        )
+
+    def test_operator_upgrade_retains_old_build_and_runtime_requires_new_contract(self) -> None:
+        first = self.build_core()
+        old_template = Path(str(first["template"]))
+        current = old_template.parent / "current"
+
+        def old_tree_snapshot() -> dict[str, tuple[object, ...]]:
+            return {
+                str(path.relative_to(old_template)): (
+                    path.lstat().st_ino,
+                    path.lstat().st_mode,
+                    path.lstat().st_mtime_ns,
+                    path.read_bytes() if path.is_file() else None,
+                )
+                for path in (old_template, *old_template.rglob("*"))
+            }
+
+        before = old_tree_snapshot()
+        updated = self.upgraded_core_definition()
+        with (
+            patch.object(environments, "_definition", return_value=updated),
+            patch.object(
+                environments, "load_environment_catalog", return_value={updated.id: updated}
+            ),
+        ):
+            with self.assertRaisesRegex(ValidationError, "superseded input lock"):
+                resolve_template(self.paths, "review-core")
+            second = self.build_core()
+            self.assertNotEqual(first["buildId"], second["buildId"])
+            self.assertEqual(os.readlink(current), second["buildId"])
+            selected = resolve_template(self.paths, "review-core")
+            self.assertEqual(selected.definition, updated)
+            self.assertEqual(selected.build_id, second["buildId"])
+            with self.assertRaisesRegex(ValidationError, "superseded input lock"):
+                resolve_template(self.paths, "review-core", build_id=str(first["buildId"]))
+            listed = list_environments(self.paths)
+            self.assertEqual(listed[0]["templateBuilds"], [second["buildId"]])
+            self.assertTrue(listed[0]["ready"])
+            # An immutable receipt cannot be relabelled as satisfying a newer
+            # health contract, even when its input-lock digest is unchanged.
+            changed_health = replace(updated, health_checks=(("python", "--version"),))
+            with patch.object(environments, "_definition", return_value=changed_health):
+                with self.assertRaisesRegex(ValidationError, "health-check contract changed"):
+                    resolve_template(self.paths, "review-core")
+        self.assertEqual(before, old_tree_snapshot())
+
+    def test_upgrade_rejects_unsafe_existing_current_pointer(self) -> None:
+        updated = self.upgraded_core_definition()
+        for variant in ("escape", "regular-file", "missing", "symlink-prefix"):
+            with self.subTest(variant=variant):
+                paths = replace(self.paths, state=self.root / variant)
+                first = build_template(paths, "review-core", executable=self.conda)
+                old_template = Path(str(first["template"]))
+                current = old_template.parent / "current"
+                current.unlink()
+                if variant == "regular-file":
+                    current.write_text("not a pointer", encoding="utf-8")
+                elif variant == "escape":
+                    current.symlink_to("../outside")
+                else:
+                    target = "a" * 64
+                    if variant == "symlink-prefix":
+                        (old_template.parent / target).symlink_to(old_template.name)
+                    current.symlink_to(target)
+                before = os.readlink(current) if current.is_symlink() else current.read_bytes()
+                with patch.object(environments, "_definition", return_value=updated):
+                    with self.assertRaisesRegex(ValidationError, "current pointer"):
+                        build_template(paths, "review-core", executable=self.conda)
+                after = os.readlink(current) if current.is_symlink() else current.read_bytes()
+                self.assertEqual(before, after)
+                self.assertTrue(old_template.is_dir())
+
+    def test_upgrade_still_rejects_corrupt_or_writable_historical_templates(self) -> None:
+        updated = self.upgraded_core_definition()
+        for variant in ("input-hash", "build-identity", "health-shape", "writable", "exact-lock"):
+            with self.subTest(variant=variant):
+                paths = replace(self.paths, state=self.root / variant)
+                first = build_template(paths, "review-core", executable=self.conda)
+                old_template = Path(str(first["template"]))
+                current = old_template.parent / "current"
+                receipt = old_template / ".ocsl-review-template.json"
+                if variant == "writable":
+                    (old_template / "bin" / "python").chmod(0o755)
+                elif variant == "exact-lock":
+                    exact_lock = Path(str(first["exactLock"]))
+                    exact_lock.chmod(0o644)
+                    exact_lock.write_text("@EXPLICIT\ncorrupt\n", encoding="utf-8")
+                    exact_lock.chmod(0o444)
+                else:
+                    value = json.loads(receipt.read_text(encoding="utf-8"))
+                    if variant == "health-shape":
+                        value["healthChecks"] = [[23]]
+                    else:
+                        value["inputLockSha256"] = (
+                            "a" * 64 if variant == "build-identity" else "invalid"
+                        )
+                    receipt.chmod(0o644)
+                    receipt.write_text(json.dumps(value), encoding="utf-8")
+                    receipt.chmod(0o444)
+                with patch.object(environments, "_definition", return_value=updated):
+                    with self.assertRaises(ValidationError):
+                        build_template(paths, "review-core", executable=self.conda)
+                self.assertEqual(os.readlink(current), first["buildId"])
+                self.assertTrue(old_template.is_dir())
+
+    def test_failed_upgrade_health_probe_keeps_previous_selection(self) -> None:
+        first = self.build_core()
+        old_template = Path(str(first["template"]))
+        current = old_template.parent / "current"
+        updated = self.upgraded_core_definition()
+        with (
+            patch.object(environments, "_definition", return_value=updated),
+            patch.dict(os.environ, {"FAKE_FAIL_PROBE": "1"}),
+            self.assertRaises(ReviewError),
+        ):
+            self.build_core()
+        self.assertEqual(os.readlink(current), first["buildId"])
+        self.assertEqual(resolve_template(self.paths, "review-core").build_id, first["buildId"])
 
     def test_resolve_and_verify_reject_an_unsafe_current_pointer(self) -> None:
         result = self.build_core()
