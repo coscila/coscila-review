@@ -5,8 +5,15 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "auditId", "createdAt", "manuscript", "auditScope", "claims", "citationClusters", "references", "verificationLinks", "completenessAssessments", "searchRuns", "reviewAssertions", "provenance"],
+  "allOf": [{
+    "if": {"properties": {"schemaVersion": {"const": "1.1"}}},
+    "then": {
+      "required": ["sourceExaminations"],
+      "properties": {"verificationLinks": {"items": {"required": ["citationClusterId", "sourceExaminationId", "evidenceTier", "claimSha256", "citationClusterSha256"]}}}
+    }
+  }],
   "properties": {
-    "schemaVersion": {"const": "1.0"},
+    "schemaVersion": {"enum": ["1.0", "1.1"]},
     "auditId": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
     "createdAt": {"type": "string", "format": "date-time"},
     "manuscript": {"$ref": "#/$defs/manuscript"},
@@ -14,7 +21,9 @@
     "claims": {"type": "array", "items": {"$ref": "#/$defs/claim"}},
     "citationClusters": {"type": "array", "items": {"$ref": "#/$defs/citationCluster"}},
     "references": {"type": "array", "items": {"$ref": "#/$defs/reference"}},
+    "additionalReferences": {"type": "array", "items": {"$ref": "#/$defs/reference"}},
     "verificationLinks": {"type": "array", "items": {"$ref": "#/$defs/verificationLink"}},
+    "sourceExaminations": {"type": "array", "items": {"$ref": "#/$defs/sourceExamination"}},
     "completenessAssessments": {"type": "array", "items": {"$ref": "#/$defs/completeness"}},
     "searchRuns": {"type": "array", "items": {"$ref": "#/$defs/searchRun"}},
     "reviewAssertions": {"type": "array", "items": {"$ref": "#/$defs/reviewAssertion"}},
@@ -30,7 +39,8 @@
       "properties": {
         "section": {"type": "string"}, "paragraph": {"type": "integer", "minimum": 0},
         "sentence": {"type": "integer", "minimum": 0}, "clause": {"type": "integer", "minimum": 0},
-        "page": {"type": ["integer", "null"], "minimum": 1}, "anchor": {"type": ["string", "null"]}
+        "page": {"type": ["integer", "null"], "minimum": 1}, "anchor": {"type": ["string", "null"]},
+        "table": {"type": ["string", "null"]}, "row": {"type": ["integer", "null"], "minimum": 0}, "column": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "manuscript": {
@@ -62,6 +72,7 @@
         "citationClusterIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
         "citationBindingStatus": {"enum": ["exact", "ambiguous", "missing", "not-applicable"]},
         "requiredEvidenceLevel": {"enum": ["full-text", "abstract-sufficient", "metadata-sufficient", "not-applicable"]},
+        "evidenceRequirementReason": {"$ref": "#/$defs/nonempty"},
         "processed": {"type": "boolean"}
       }
     },
@@ -71,7 +82,10 @@
       "properties": {
         "id": {"$ref": "#/$defs/id"}, "locator": {"$ref": "#/$defs/locator"}, "raw": {"$ref": "#/$defs/nonempty"},
         "markers": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-        "referenceIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "processed": {"type": "boolean"}
+        "referenceIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "processed": {"type": "boolean"},
+        "bindingStatus": {"enum": ["exact", "ambiguous", "unresolved"]},
+        "unresolvedMarkers": {"type": "array", "items": {"type": "string"}},
+        "locusType": {"enum": ["prose", "table-cell", "figure-caption"]}
       }
     },
     "reference": {
@@ -85,6 +99,20 @@
           "properties": {"title": {"type": ["string", "null"]}, "authors": {"type": "array", "items": {"type": "string"}}, "year": {"type": ["integer", "null"]}, "container": {"type": ["string", "null"]}, "version": {"type": ["string", "null"]}}
         },
         "resolutionStatus": {"enum": ["resolved", "ambiguous", "unresolved"]},
+        "identityEvidence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["agreementStrength", "providersCompared", "missingFields", "differences"],
+          "properties": {
+            "agreementStrength": {"enum": ["strong", "weak", "conflict"]},
+            "providersCompared": {"type": "array", "items": {"type": "string"}},
+            "missingFields": {"type": "array", "items": {"type": "string"}},
+            "differences": {"type": "array", "items": {"type": "object"}}
+          }
+        },
+        "acquisition": {
+          "type": "object", "additionalProperties": false, "required": ["state", "attempted", "limitations"],
+          "properties": {"state": {"enum": ["pending", "available", "inaccessible", "blocked", "failed"]}, "attempted": {"type": "boolean"}, "limitations": {"type": "array", "items": {"type": "string"}}}
+        },
         "publicationStatus": {
           "type": "object", "additionalProperties": false, "required": ["state", "checkedAt", "providers", "details"],
           "properties": {
@@ -108,16 +136,33 @@
       }
     },
     "scopeValue": {"enum": ["match", "mismatch", "unclear", "not-applicable"]},
+    "sourceExamination": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "referenceIds", "referenceDigests", "artifactPath", "artifactSha256", "textSha256", "accessLevel", "contentComplete", "expectedUnitIds", "readUnitIds"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "referenceIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "minItems": 1, "uniqueItems": true},
+        "referenceDigests": {"type": "object", "additionalProperties": {"$ref": "#/$defs/sha256"}},
+        "artifactPath": {"$ref": "#/$defs/nonempty"}, "artifactSha256": {"$ref": "#/$defs/sha256"}, "textSha256": {"$ref": "#/$defs/sha256"},
+        "accessLevel": {"enum": ["full-text", "abstract-only", "metadata-only"]}, "contentComplete": {"type": "boolean"},
+        "expectedUnitIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
+        "readUnitIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}
+      }
+    },
     "verificationLink": {
       "type": "object", "additionalProperties": false,
       "required": ["id", "claimId", "referenceId", "access", "evidenceLocations", "supportVerdict", "supportReason", "scopeComparison", "quotationOrNumberCheck", "confidence", "abstentionReason", "humanAction"],
       "properties": {
         "id": {"$ref": "#/$defs/id"}, "claimId": {"$ref": "#/$defs/id"}, "referenceId": {"$ref": "#/$defs/id"},
+        "citationClusterId": {"$ref": "#/$defs/id"}, "sourceExaminationId": {"type": ["string", "null"]},
+        "claimSha256": {"$ref": "#/$defs/sha256"}, "citationClusterSha256": {"$ref": "#/$defs/sha256"},
+        "evidenceTier": {"enum": ["full-text", "abstract-only", "metadata-only", "inaccessible"]},
+        "confidenceLabel": {"enum": ["very-confident", "confident", "not-confident"]},
         "access": {
           "type": "object", "additionalProperties": false, "required": ["level", "provider", "uri", "checkedAt"],
           "properties": {"level": {"enum": ["full-text", "abstract-only", "metadata-only", "inaccessible"]}, "provider": {"type": "string"}, "uri": {"type": ["string", "null"]}, "checkedAt": {"type": "string", "format": "date-time"}}
         },
-        "evidenceLocations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["locator", "excerptSha256"], "properties": {"locator": {"$ref": "#/$defs/nonempty"}, "excerptSha256": {"$ref": "#/$defs/sha256"}, "excerpt": {"type": "string", "maxLength": 500}}}},
+        "evidenceLocations": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["locator", "excerptSha256"], "properties": {"locator": {"$ref": "#/$defs/nonempty"}, "unitId": {"$ref": "#/$defs/id"}, "excerptSha256": {"$ref": "#/$defs/sha256"}, "excerpt": {"type": "string", "maxLength": 500}}}},
         "supportVerdict": {"enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
         "supportReason": {"$ref": "#/$defs/nonempty"}, "scopeComparison": {"$ref": "#/$defs/scopeComparison"},
         "quotationOrNumberCheck": {"enum": ["faithful", "drift", "not-checked", "not-applicable"]},
@@ -128,6 +173,7 @@
       "type": "object", "additionalProperties": false, "required": ["claimId", "verdict", "reasons", "searchRunIds", "requiredHumanAction"],
       "properties": {
         "claimId": {"$ref": "#/$defs/id"},
+        "sourceExaminationIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true},
         "verdict": {"enum": ["sufficient", "missing-citation", "insufficient-directness", "insufficient-scope", "insufficient-breadth", "insufficient-currency", "insufficient-balance", "not-assessable"]},
         "reasons": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "searchRunIds": {"type": "array", "items": {"$ref": "#/$defs/id"}, "uniqueItems": true}, "requiredHumanAction": {"$ref": "#/$defs/nonempty"}
       }
