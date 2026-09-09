@@ -15,7 +15,7 @@ Primary environment: `review-literature`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-journal-policy \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review --help
 ```
 
 ## Procedure

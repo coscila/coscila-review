@@ -35,8 +35,12 @@ The scholarly server exposes thirteen operations:
 
 Results identify their provider, retrieval time, access level, and limitations.
 Searches return at most 25 records, transport timeouts are bounded, provider
-responses are capped at 8 MiB, and only HTTPS endpoints are accepted. Metadata
-reconciliation is local once records have been retrieved.
+metadata responses are capped at 8 MiB, and only validated public HTTPS
+destinations are accepted. Bounded reference/citation previews expose totals
+when known and mark truncation or incomplete coverage. They are not the
+manuscript bibliography universe. Metadata reconciliation is local once records
+have been retrieved; the internal extensive workflow additionally corroborates
+provider fields against the printed reference.
 
 Every network operation passes the egress policy described in
 [Confidential review and egress](confidentiality.md).
@@ -48,15 +52,26 @@ The implementation uses these production endpoints and official documentation:
 | Provider | Runtime base | Role | Official documentation |
 | --- | --- | --- | --- |
 | Crossref | `https://api.crossref.org` | DOI resolution, bibliographic search, deposited relationships, update and status signals | [Crossref REST API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/) |
-| NCBI E-utilities / PubMed | `https://eutils.ncbi.nlm.nih.gov/entrez/eutils` | PubMed search and PMID summaries | [NCBI E-utilities quick start](https://www.ncbi.nlm.nih.gov/books/NBK25500/) |
+| NCBI E-utilities / PubMed | `https://eutils.ncbi.nlm.nih.gov/entrez/eutils` | Search, PMID summaries, complete structured abstracts, and directed publication notices | [NCBI E-utilities quick start](https://www.ncbi.nlm.nih.gov/books/NBK25500/) |
 | Europe PMC | `https://www.ebi.ac.uk/europepmc/webservices/rest` | biomedical metadata, abstracts, licensed open full-text XML, references and citations | [Europe PMC REST service](https://europepmc.org/RestfulWebService) |
 | DataCite | `https://api.datacite.org` | DOI records and search for datasets and research software | [DataCite API guide](https://support.datacite.org/docs/api) |
 | OpenCitations Index | `https://api.opencitations.net/index/v2` | DOI-based incoming and outgoing citation links | [OpenCitations Index REST API v2](https://opencitations.net/index/api/v2) |
+| Unpaywall | `https://api.unpaywall.org/v2` | Open-copy PDF locations and version/license metadata for internal full-source acquisition | [Unpaywall API](https://unpaywall.org/api), [data format](https://unpaywall.org/data-format) |
 
 Operators should supply `OCSL_REVIEW_CONTACT_EMAIL` where provider etiquette
 requests contact identification. `NCBI_API_KEY` is passed to NCBI when present.
 Credentials belong in the deployment environment, never a tracked egress plan
 or review package.
+
+Unpaywall is used only when a contact email is configured; no manuscript,
+reviewer, or commit-author identity supplies a fallback. Document downloads
+carry generic headers without provider credentials or a contact address, and
+redirects receive fresh destination checks and egress authorization. Metadata
+requests cannot redirect credentials to another origin. NCBI requests are
+spaced by at least 0.35 seconds within each transport, including retries. This
+does not coordinate independent processes sharing an IP; operators must
+account for aggregate use under the
+[NCBI usage policy](https://www.ncbi.nlm.nih.gov/books/NBK25497/).
 
 Provider terms, rate policies, schemas, and coverage can change. Before a
 production deployment, consult the linked official pages and run the live MCP
@@ -65,10 +80,11 @@ service-level guarantee.
 
 ## Retractions, corrections, and versions
 
-Status lookup combines current Crossref and Europe PMC/PubMed signals. It
-examines Crossref update relationships, Europe PMC retraction flags, and PubMed
-publication types for retractions, errata, expressions of concern, corrections,
-and preprints.
+Status lookup combines Crossref and Europe PMC/PubMed signals and reads PubMed
+`CommentsCorrectionsList` from structured EFetch XML. Notice direction is
+preserved: an `ErratumIn` link concerns the target article, while an `ErratumFor`
+link identifies the notice's subject. A Crossref `update-to` record attached to
+a notice does not establish that the notice itself was retracted.
 
 Retraction Watch data is available through Crossref's production REST metadata.
 The companion therefore reads production Crossref update records rather than a
@@ -76,9 +92,15 @@ separate historical laboratory endpoint. Crossref documents the current feed
 and its `update-to` records on its
 [Retraction Watch integration page](https://www.crossref.org/documentation/retrieve-metadata/retraction-watch/).
 
-No metadata service is exhaustive. A returned state of `current` means no
-configured provider supplied a contrary signal at that check time; it does not
-prove the absence of an unindexed publisher notice. For consequential decisions,
+Before reporting `current`, the route must retrieve the target's structured
+record and demonstrate notice detection using known-positive controls without
+provider failures. Missing controls or a dead route leave surveillance
+unproven and the state unknown unless a positive signal was found. Controls
+exercise the same EFetch relationship path; they are not static claims of
+service health. Their provenance is recorded in `scholarly.py`.
+
+No metadata service is exhaustive. `current` does not prove the absence of an
+unindexed publisher notice. For consequential decisions,
 inspect the version of record and relevant notice directly. The
 [ICMJE recommendations](https://www.icmje.org/recommendations/browse/manuscript-preparation/preparing-for-submission.html)
 also place responsibility on authors to check references, support, and
@@ -99,15 +121,29 @@ Provider envelopes distinguish:
 - `abstract-only`: potentially enough for a claim explicitly classified that
   way, but not for an exact method, quotation, number, subgroup, or other
   full-text question;
-- `full-text`: open sections were retrieved and still require an exact evidence
-  locator and scope comparison;
+- `partial-text`: the MCP open-section preview contains at most twenty sections
+  and 4,000 characters per section, with `complete: false`;
+- `full-text`: the internal acquisition workflow retained a complete readable
+  document, which still requires actual reading and scientific comparison;
 - inaccessible: the source cannot support a verdict in this run.
 
-An open full-text response is bounded to a limited number and length of
-sections. It is an access mechanism, not an automatic support decision.
-Copyright and license conditions still govern any source text stored in the
-workspace; the graph supports a locator plus excerpt digest so lengthy copying
-is unnecessary.
+The [extensive CLI workflow](literature-review.md) calls internal
+`acquire_full_text` rather than using an MCP preview as complete evidence.
+It attempts Europe PMC full article XML and eligible Unpaywall PDF locations,
+retaining original bytes, hashes, complete text, and ordered blocks privately
+inside the workspace. Documents have a separate 100 MiB limit and bounded
+extraction time/output. XML tables, captions, footnotes, and late sections are
+included without section caps. External supplements and graphics are
+inventoried as remaining access/inspection limitations. PDF extraction needs
+`pdftotext`; image-only pages prevent complete-text certification.
+
+Complete abstracts remain available when source acquisition fails. Title and
+abstract analysis can support an appropriately classified claim at lower
+confidence; full-text-required claims still abstain. Identity, access, reading,
+evidence used, and confidence are distinct controls. Neither an access level
+nor metadata establishes support. Source storage and excerpts remain subject
+to applicable rights and license conditions; a report needs only bounded
+evidence excerpts and their verified locators.
 
 ## MCP launcher and schema contract
 

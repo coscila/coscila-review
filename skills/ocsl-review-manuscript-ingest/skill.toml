@@ -5,6 +5,6 @@ summary = "Extract a location-stable manuscript model while preserving clauses, 
 primary_environment = "review-documents"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["manuscript.json", "ingestion-report.json"]
+outputs = [".ocsl-review/manuscript.json"]
 confidential_by_default = true
 

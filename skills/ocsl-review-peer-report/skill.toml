@@ -5,5 +5,5 @@ summary = "Compose a prioritized, evidence-linked report from completed audit re
 primary_environment = "review-documents"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["peer-review.md", "audit-summary.json"]
+outputs = [".ocsl-review/review-package.json", ".ocsl-review/audit-summary.json", ".ocsl-review/review-report.md", ".ocsl-review/review-report.docx", ".ocsl-review/review-report.manifest.json"]
 confidential_by_default = true

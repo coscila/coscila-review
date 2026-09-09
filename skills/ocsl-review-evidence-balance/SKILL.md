@@ -15,7 +15,7 @@ Primary environment: `review-literature`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-evidence-balance \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review literature --help
 ```
 
 ## Procedure
@@ -25,6 +25,13 @@ Build an evidence map by study design, population, outcome, direction, publicati
 Compare the manuscript's certainty and breadth with the whole located set. Flag duplicated cohorts counted as multiple confirmations, review-mediated citation laundering, exclusion of a relevant higher-quality design, obsolete guidance, and asymmetric treatment of favorable and unfavorable studies.
 
 For each finding, record the affected claim ID, omitted or overweighted source IDs, independence rationale, likely consequence, confidence, and a specific human action. Avoid informal vote counting; direction alone does not capture precision, bias, or design quality.
+
+Store these as claim completeness assessments in `.ocsl-review/audit-graph.json`,
+with dated search IDs and examined supplementary source IDs. Follow
+`$OCSL_REVIEW_HOME/docs/literature-review.md` to obtain and read additional
+candidates without changing the manuscript bibliography denominator. Availability
+of full text must not bias the reported direction of evidence; retain every
+missing source and make the remaining uncertainty explicit.
 
 ## Limits and confidentiality
 

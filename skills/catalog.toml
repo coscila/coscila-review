@@ -7,7 +7,7 @@ summary = "Classify the review request, confidentiality state, evidence burden, 
 primary_environment = "review-core"
 secondary_environments = []
 mcps = ["ocsl_review_catalog"]
-outputs = ["review-plan.json"]
+outputs = [".ocsl-review/review-plan.json", ".ocsl-review/literature-audit.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -17,7 +17,7 @@ summary = "Extract a location-stable manuscript model while preserving clauses, 
 primary_environment = "review-documents"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["manuscript.json", "ingestion-report.json"]
+outputs = [".ocsl-review/manuscript.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -27,7 +27,7 @@ summary = "Split manuscript statements into auditable claims and decide whether 
 primary_environment = "review-nlp"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["audit-graph.json"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -37,7 +37,7 @@ summary = "Resolve cited works, reconcile bibliographic identities and versions,
 primary_environment = "review-literature"
 secondary_environments = ["mcp-review"]
 mcps = ["ocsl_review_catalog", "ocsl_scholar"]
-outputs = ["references.jsonl", "reference-integrity.json"]
+outputs = [".ocsl-review/literature-audit.json", ".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -47,7 +47,7 @@ summary = "Compare each cited clause against located source evidence, including 
 primary_environment = "review-literature"
 secondary_environments = ["review-documents", "mcp-review"]
 mcps = ["ocsl_review_catalog", "ocsl_scholar"]
-outputs = ["claim-source-edges.jsonl"]
+outputs = [".ocsl-review/literature-audit.json", ".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -57,7 +57,7 @@ summary = "Assess whether citation-required claims have evidence of adequate dir
 primary_environment = "review-literature"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog", "ocsl_scholar"]
-outputs = ["citation-completeness.jsonl", "audit-summary.json"]
+outputs = [".ocsl-review/audit-graph.json", ".ocsl-review/audit-summary.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -67,7 +67,7 @@ summary = "Run source-explicit, dated, reproducible searches that update a manus
 primary_environment = "review-literature"
 secondary_environments = ["mcp-review"]
 mcps = ["ocsl_scholar"]
-outputs = ["search-protocol.json", "search-results.jsonl"]
+outputs = [".ocsl-review/audit-graph.json", ".ocsl-review/literature-audit.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -77,7 +77,7 @@ summary = "Test priority language with multiple reproducible searches, version-a
 primary_environment = "review-literature"
 secondary_environments = ["mcp-review"]
 mcps = ["ocsl_scholar"]
-outputs = ["novelty-audit.json"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -87,7 +87,7 @@ summary = "Identify omitted contrary, null, replication, and higher-quality evid
 primary_environment = "review-literature"
 secondary_environments = ["review-statistics"]
 mcps = ["ocsl_scholar"]
-outputs = ["evidence-balance.jsonl"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 
 [[skill]]
@@ -167,7 +167,7 @@ summary = "Compose a prioritized, evidence-linked report from completed audit re
 primary_environment = "review-documents"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["peer-review.md", "audit-summary.json"]
+outputs = [".ocsl-review/review-package.json", ".ocsl-review/audit-summary.json", ".ocsl-review/review-report.md", ".ocsl-review/review-report.docx", ".ocsl-review/review-report.manifest.json"]
 confidential_by_default = true
 
 [[skill]]

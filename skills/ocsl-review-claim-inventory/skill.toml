@@ -5,5 +5,5 @@ summary = "Split manuscript statements into auditable claims and decide whether 
 primary_environment = "review-nlp"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog"]
-outputs = ["audit-graph.json"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true
