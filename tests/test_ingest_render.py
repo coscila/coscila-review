@@ -9,6 +9,7 @@ from unittest import mock
 from xml.etree import ElementTree as ET
 
 from ocsl_review.errors import ReviewError, ValidationError
+from ocsl_review.claim_inventory import build_claim_inventory
 from ocsl_review.ingest import (
     IngestionError,
     audit_identifier_leaks,
@@ -121,9 +122,18 @@ class ManuscriptIngestionTests(unittest.TestCase):
             pdf = root / "bounded.pdf"
             pdf.write_bytes(b"%PDF-1.4\n")
             extractor = root / "pdftotext-fixture"
+            bbox = '''<html><body><doc>
+<page width="600" height="800"><flow><block><line>
+<word xMin="40" yMin="80" xMax="300" yMax="90">An observation was reported [1].</word>
+</line></block></flow></page>
+<page width="600" height="800"><flow><block><line>
+<word xMin="40" yMin="100" xMax="100" yMax="110">References</word>
+</line></block><block><line>
+<word xMin="40" yMin="140" xMax="300" yMax="150">1. Author. Record. 2020.</word>
+</line></block></flow></page></doc></body></html>'''
             extractor.write_text(
-                "#!/bin/sh\n"
-                "printf 'INTRODUCTION\\n\\nAn observation was reported [1].\\fREFERENCES\\n\\n1. Author. Record. 2020.\\n' > \"$5\"\n",
+                "#!/usr/bin/env python3\nimport pathlib, sys\n"
+                + f"pathlib.Path(sys.argv[-1]).write_text({bbox!r})\n",
                 encoding="utf-8",
             )
             extractor.chmod(0o755)
@@ -136,6 +146,33 @@ class ManuscriptIngestionTests(unittest.TestCase):
                     pdf_timeout=2,
                     max_extracted_bytes=16,
                 )
+
+    def test_docx_preserves_superscript_lists_across_runs_and_table_cells(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "superscripts.docx"
+            xml = f'''<w:document xmlns:w="{W}"><w:body>
+<w:p><w:r><w:t>Introduction</w:t></w:r></w:p>
+<w:p><w:r><w:t>Earlier work</w:t></w:r>
+<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>1</w:t></w:r>
+<w:r><w:t>–</w:t></w:r>
+<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>3</w:t></w:r>
+<w:r><w:t>.</w:t></w:r></w:p>
+<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Study</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Finding</w:t></w:r></w:p></w:tc></w:tr>
+<w:tr><w:tc><w:p><w:r><w:t>Alpha</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Improved response</w:t></w:r><w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+<w:p><w:r><w:t>References</w:t></w:r></w:p>
+<w:p><w:r><w:t>1. First source.</w:t></w:r></w:p>
+<w:p><w:r><w:t>2. Second source.</w:t></w:r></w:p>
+<w:p><w:r><w:t>3. Third source.</w:t></w:r></w:p>
+</w:body></w:document>'''
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("word/document.xml", xml)
+            model = ingest_manuscript(path)
+        self.assertEqual([["1", "2", "3"], ["2"]], [item["tokens"] for item in model["citationClusters"]])
+        self.assertEqual("table-cell", model["citationClusters"][1]["locusType"])
+        self.assertTrue(model["ingestion"]["complete"])
+        graph = build_claim_inventory(model)
+        self.assertIn("Study: Alpha; Finding: Improved response", [item["text"] for item in graph["claims"]])
+        _validate_schema(model, "manuscript.schema.json")
 
     def test_identifier_audit_reports_only_fingerprints(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -193,8 +230,8 @@ class ReviewPackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             stem = Path(temporary) / "audit-result"
             paths = render_review_package(package, stem)
-            self.assertEqual({".json", ".md", ".docx"}, set(paths))
-            self.assertEqual({stem.name}, {path.stem for path in paths.values()})
+            self.assertEqual({".json", ".md", ".docx", ".manifest.json"}, set(paths))
+            self.assertEqual({stem.name}, {path.stem for suffix, path in paths.items() if suffix != ".manifest.json"})
             self.assertTrue(all((path.stat().st_mode & 0o777) == 0o600 for path in paths.values()))
             self.assertEqual(package, json.loads(paths[".json"].read_text(encoding="utf-8")))
             markdown = paths[".md"].read_text(encoding="utf-8")
@@ -261,7 +298,7 @@ class ReviewPackageTests(unittest.TestCase):
         manuscript = ingest_manuscript(FIXTURE)
         package["auditSummary"] = empty_audit_summary(manuscript)
         package["auditSummary"]["citedCorrectly"]["status"] = "yes"
-        with self.assertRaisesRegex(ValidationError, "affirmative citation verdict is forbidden"):
+        with self.assertRaisesRegex(ValidationError, "affirmative citation verdict"):
             validate_review_package(package)
 
 

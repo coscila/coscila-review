@@ -15,7 +15,7 @@ Primary environment: `review-documents`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-peer-report \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review package --help
 ```
 
 ## Composition procedure
@@ -30,6 +30,15 @@ Primary environment: `review-documents`
 ## Output rules
 
 Keep `audit-summary.json` machine-readable with explicit totals and processed counts. Do not announce “yes” for cited-correctly or cited-enough when any mandatory gate forbids it. Include material abstentions and remaining human actions, not only adverse findings.
+
+Run the package and render commands in
+`$OCSL_REVIEW_HOME/docs/literature-review.md`; canonical files are
+`.ocsl-review/review-package.json`, `.ocsl-review/audit-summary.json`, and
+`.ocsl-review/review-report.*`. Preserve every citation locus and verdict in the
+rendered appendix, including correctly supported and abstained rows. Use graph
+counts for all prose and tables, and verify the render manifest against fresh
+artifacts. Keep obtained, read, and evidence-used counts distinct. Never rank
+papers or combine correctness and completeness into an unsupported score.
 
 ## Boundary
 

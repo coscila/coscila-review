@@ -329,6 +329,42 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--title")
     _set(prepare, "workflow", "cmd_prepare", WORKSPACE, state_required=False)
 
+    literature = review_commands.add_parser(
+        "literature", help="prepare, acquire, and record an extensive reference audit"
+    )
+    literature_commands = _subcommands(literature, "literature_command")
+    for name in ("prepare", "confirm", "fetch", "attach", "record", "status"):
+        command = literature_commands.add_parser(name)
+        command.add_argument("--workspace", default=".")
+        command.add_argument("--manuscript", default=".ocsl-review/manuscript.json")
+        command.add_argument("--audit-graph", default=".ocsl-review/audit-graph.json")
+        if name == "confirm":
+            decision = command.add_mutually_exclusive_group(required=True)
+            decision.add_argument("--accept", action="store_true")
+            decision.add_argument("--decline", action="store_true")
+            command.add_argument("--scope-sha256", required=True,
+                                 help="scope digest returned by prepare")
+            command.add_argument("--basis", required=True,
+                                 help="record the user's actual confirmation or explicit request")
+        if name in {"fetch", "attach"}:
+            command.add_argument("--reference-id", action="append", default=[])
+        if name == "fetch":
+            command.add_argument("--retry", action="store_true",
+                                 help="retry recorded failures or refresh successful acquisitions")
+            command.add_argument("--additional-doi", action="append", default=[],
+                                 help="acquire a targeted gap source without changing bibliography counts")
+            command.add_argument("--claim-id", action="append", default=[],
+                                 help="claim motivating an additional literature source")
+        if name == "attach":
+            command.add_argument("input", help="source document inside this workspace")
+            command.add_argument("--media-type", help="override a document's detected media type")
+            command.add_argument("--access-level", choices=("full-text", "abstract-only"),
+                                 default="full-text")
+        if name == "record":
+            command.add_argument("input", help="assessment JSON inside this workspace")
+        _set(command, "literature", f"cmd_{name}",
+             READ_ONLY if name == "status" else WORKSPACE, state_required=False)
+
     audit_family = families.add_parser("audit", help="validate or summarize an audit graph")
     audit_commands = _subcommands(audit_family)
     audit_validate = audit_commands.add_parser("validate")
@@ -344,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate = families.add_parser("calibrate", help="score predictions on adversarial fixtures")
     calibrate.add_argument("predictions")
     calibrate.add_argument("--gold")
+    calibrate.add_argument("--first-predictions", help="first-pass local JSONL for repair comparison")
     calibrate.add_argument("--output")
     calibrate.add_argument("--workspace", default=".")
     _set(calibrate, "calibration", "cmd_calibrate", WORKSPACE, state_required=False)

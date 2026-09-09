@@ -308,7 +308,7 @@ def validate_catalog(paths: Any) -> dict[str, Any]:
             '"$OCSL_REVIEW_HOME/bin/ocsl-review" env run \\',
             f"--skill {skill_id} \\",
             '--workspace "$PWD" \\',
-            "-- <command>",
+            '-- "$OCSL_REVIEW_HOME/bin/ocsl-review"',
         )
         for fragment in required_fragments:
             if fragment not in markdown:

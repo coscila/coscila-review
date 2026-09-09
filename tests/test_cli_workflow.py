@@ -60,7 +60,7 @@ class CliWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result, 0, stderr)
         rendered = json.loads(stdout)
-        self.assertEqual(set(rendered), {"docx", "json", "md"})
+        self.assertEqual(set(rendered), {"docx", "json", "md", "manifest.json"})
         self.assertTrue(all(Path(value).is_file() for value in rendered.values()))
         self.assertTrue(
             all(Path(value).stat().st_mode & 0o777 == 0o600 for value in rendered.values())

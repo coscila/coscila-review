@@ -4,7 +4,7 @@ import json
 import unittest
 from datetime import UTC, datetime
 
-from ocsl_review.audit import build_audit_summary, validate_audit_graph
+from ocsl_review.audit import build_audit_summary, validate_audit_graph, reference_digest, claim_digest, citation_cluster_digest
 from ocsl_review.confidentiality import EgressPlan, authorize_egress
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.util import sha256_file
@@ -29,8 +29,8 @@ def scope(value="match"):
 
 
 def graph():
-    return {
-        "schemaVersion": "1.0",
+    value = {
+        "schemaVersion": "1.1",
         "auditId": "audit-1",
         "createdAt": NOW,
         "manuscript": {
@@ -153,6 +153,24 @@ def graph():
             "commands": [],
         },
     }
+    reference = value["references"][0]
+    reference["identityEvidence"] = {"agreementStrength": "strong", "providersCompared": ["crossref", "pubmed"], "missingFields": [], "differences": []}
+    reference["acquisition"] = {"state": "available", "attempted": True, "limitations": []}
+    value["sourceExaminations"] = [{
+        "id": "exam-1", "referenceIds": ["r1"], "referenceDigests": {"r1": reference_digest(reference)},
+        "artifactPath": ".ocsl-review/sources/example.xml", "artifactSha256": SHA, "textSha256": SHA,
+        "accessLevel": "full-text", "contentComplete": True,
+        "expectedUnitIds": ["abstract", "results"], "readUnitIds": ["abstract", "results"],
+    }]
+    link = value["verificationLinks"][0]
+    link.update(citationClusterId="cc1", sourceExaminationId="exam-1", evidenceTier="full-text",
+                claimSha256=claim_digest(value["claims"][0]), citationClusterSha256=citation_cluster_digest(value["citationClusters"][0]))
+    link["evidenceLocations"][0]["unitId"] = "results"
+    value["searchRuns"] = [{"id": "search-1", "provider": "crossref", "querySha256": SHA,
+        "queryDisclosure": "identifier-only", "executedAt": NOW, "dateRange": None,
+        "databases": ["crossref"], "resultCount": 3, "independentGroupsFound": 2, "fullQueryStored": False}]
+    value["completenessAssessments"][0]["searchRunIds"] = ["search-1"]
+    return value
 
 
 class AuditTests(unittest.TestCase):
@@ -185,11 +203,15 @@ class AuditTests(unittest.TestCase):
         value = graph()
         link = value["verificationLinks"][0]
         link["access"]["level"] = "inaccessible"
+        link["evidenceTier"] = "inaccessible"
+        link["sourceExaminationId"] = None
         link["supportVerdict"] = "abstain"
         link["supportReason"] = "source unavailable"
         link["evidenceLocations"] = []
         link["confidence"] = 0.2
         link["abstentionReason"] = "No lawful full-text access."
+        value["sourceExaminations"] = []
+        value["references"][0]["acquisition"]["state"] = "inaccessible"
         value["completenessAssessments"][0]["verdict"] = "not-assessable"
         summary = build_audit_summary(value)
         self.assertNotEqual(summary["citedCorrectly"]["status"], "yes")

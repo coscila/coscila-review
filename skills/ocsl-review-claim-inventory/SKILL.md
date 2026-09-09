@@ -15,7 +15,7 @@ Primary environment: `review-nlp`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-claim-inventory \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review inventory --help
 ```
 
 ## Claim record
@@ -31,7 +31,13 @@ For each material proposition, emit its stable location, exact clause text, norm
 5. Record uncited material claims, misplaced citation markers, and clauses whose binding remains ambiguous.
 6. Preserve hedges and negation; never normalize association into causation or possibility into certainty.
 
+Write the inventory to `.ocsl-review/audit-graph.json`. Every bound
+claim–citation occurrence–reference member needs its own verification record;
+repeating a DOI or citing it elsewhere does not cover another locus. A table's
+reference cell belongs to its row. Preserve ambiguous bindings and original
+results as such. Use `$OCSL_REVIEW_HOME/docs/literature-review.md` for the
+managed workflow; claim inventory itself does not authorize bulk acquisition.
+
 ## Boundary
 
 Claim segmentation is not a support verdict. Keep confidential text local, and use only opaque claim IDs outside the workspace. If syntax or extraction loss prevents a reliable atomic statement, abstain, retain the original span, and assign human clause resolution.
-

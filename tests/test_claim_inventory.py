@@ -112,8 +112,8 @@ The intervention causes durable recovery [1].
                 encoding="utf-8"
             )
         )
-        self.assertEqual(record["outputs"], ["audit-graph.json"])
-        self.assertEqual(descriptor["outputs"], ["audit-graph.json"])
+        self.assertEqual(record["outputs"], [".ocsl-review/audit-graph.json"])
+        self.assertEqual(descriptor["outputs"], [".ocsl-review/audit-graph.json"])
 
 
 if __name__ == "__main__":
