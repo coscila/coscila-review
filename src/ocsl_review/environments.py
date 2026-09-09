@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -697,6 +697,8 @@ def _read_current_template(
     paths: Paths,
     definition: EnvironmentDefinition,
     platform: str,
+    *,
+    require_current_definition: bool = True,
 ) -> TemplateRecord | None:
     parent = _template_parent(paths, platform, definition.id)
     current = parent / "current"
@@ -713,7 +715,9 @@ def _read_current_template(
     prefix = parent / target
     if prefix.is_symlink() or not prefix.is_dir():
         raise ValidationError(f"template current pointer is broken: {current}")
-    return _read_template(paths, definition, prefix)
+    return _read_template(
+        paths, definition, prefix, require_current_definition=require_current_definition
+    )
 
 
 def _publish_current_template(
@@ -724,7 +728,13 @@ def _publish_current_template(
 
     parent = _template_parent(paths, record.platform, record.definition.id)
     current = parent / "current"
-    existing = _read_current_template(paths, record.definition, record.platform)
+    # Validate the replacement against today's contract before relaxing catalog
+    # compatibility for the old selection. Historical builds remain immutable
+    # and integrity-checked; they are never selected for review-time execution.
+    _read_template(paths, record.definition, parent / record.build_id)
+    existing = _read_current_template(
+        paths, record.definition, record.platform, require_current_definition=False
+    )
     if existing is not None and existing.build_id == record.build_id:
         return
     descriptor, temporary_name = tempfile.mkstemp(prefix=".current-", dir=parent)
@@ -771,6 +781,7 @@ def _read_template(
     prefix: Path,
     *,
     require_read_only: bool = True,
+    require_current_definition: bool = True,
 ) -> TemplateRecord:
     if _template_build_marker(prefix).exists():
         raise ValidationError(f"template build has not been promoted: {prefix}")
@@ -808,9 +819,26 @@ def _read_template(
     exact_lock_sha256 = receipt.get("exactLockSha256")
     if not isinstance(exact_lock_sha256, str) or not _HASH_PATTERN.fullmatch(exact_lock_sha256):
         raise ValidationError(f"template exact-lock identity is invalid: {prefix}")
-    if receipt.get("inputLockSha256") != definition.input_lock_sha256:
+    input_lock_sha256 = receipt.get("inputLockSha256")
+    if not isinstance(input_lock_sha256, str) or not _HASH_PATTERN.fullmatch(input_lock_sha256):
+        raise ValidationError(f"template input-lock identity is invalid: {prefix}")
+    if require_current_definition and input_lock_sha256 != definition.input_lock_sha256:
         raise ValidationError(f"template was built from a superseded input lock: {prefix}")
-    if receipt.get("healthChecks") != [list(command) for command in definition.health_checks]:
+    health_checks = receipt.get("healthChecks")
+    if (
+        not isinstance(health_checks, list)
+        or not health_checks
+        or any(
+            not isinstance(command, list)
+            or not command
+            or any(not isinstance(argument, str) or not argument for argument in command)
+            for command in health_checks
+        )
+    ):
+        raise ValidationError(f"template health-check receipt is invalid: {prefix}")
+    if require_current_definition and health_checks != [
+        list(command) for command in definition.health_checks
+    ]:
         raise ValidationError(f"template health-check contract changed after build: {prefix}")
     relative_lock = require_relative_path(str(receipt.get("exactLock", "")))
     exact_lock = (_validated_state_root(paths) / relative_lock).resolve()
@@ -826,14 +854,18 @@ def _read_template(
         platform=receipt_platform,
     )
     expected_build_id = sha256_bytes(
-        (f"{definition.input_lock_sha256}\0{receipt_platform}\0{exact_lock_sha256}").encode("ascii")
+        (f"{input_lock_sha256}\0{receipt_platform}\0{exact_lock_sha256}").encode("ascii")
     )
     if build_id != expected_build_id:
         raise ValidationError(f"template build identity failed recomputation: {prefix}")
     if require_read_only:
         _assert_read_only_tree(prefix)
     return TemplateRecord(
-        definition=definition,
+        definition=replace(
+            definition,
+            input_lock_sha256=input_lock_sha256,
+            health_checks=tuple(tuple(command) for command in health_checks),
+        ),
         platform=str(receipt["platform"]),
         build_id=build_id,
         prefix=prefix,
@@ -1078,7 +1110,13 @@ def available_templates(
             and _HASH_PATTERN.fullmatch(candidate.name)
             and not _template_build_marker(candidate).exists()
         ):
-            records.append(_read_template(paths, definition, candidate))
+            record = _read_template(
+                paths, definition, candidate, require_current_definition=False
+            )
+            # Retained historical builds are audited above, but only builds
+            # satisfying the current source contract are runtime candidates.
+            if record.definition == definition:
+                records.append(record)
     return sorted(records, key=lambda item: (item.created_at, item.build_id), reverse=True)
 
 
