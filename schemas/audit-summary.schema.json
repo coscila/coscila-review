@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": ["schemaVersion", "auditId", "auditCoverage", "citedCorrectly", "citedEnough", "verificationLimits"],
   "properties": {
-    "schemaVersion": {"const": "1.0"},
+    "schemaVersion": {"enum": ["1.0", "1.1"]},
     "auditId": {"type": "string"},
     "auditCoverage": {"$ref": "#/$defs/coverage"},
     "citedCorrectly": {"$ref": "#/$defs/correct"},
@@ -22,18 +22,31 @@
         "inTextCitationClustersTotal": {"$ref": "#/$defs/count"}, "inTextCitationClustersProcessed": {"$ref": "#/$defs/count"},
         "bibliographyEntriesTotal": {"$ref": "#/$defs/count"}, "bibliographyEntriesResolved": {"$ref": "#/$defs/count"},
         "citationRequiredClaimsTotal": {"$ref": "#/$defs/count"}, "citationRequiredClaimsProcessed": {"$ref": "#/$defs/count"},
-        "sourcesFullTextChecked": {"$ref": "#/$defs/count"}, "sourcesAbstractOnly": {"$ref": "#/$defs/count"}, "sourcesInaccessible": {"$ref": "#/$defs/count"}
+        "sourcesFullTextChecked": {"$ref": "#/$defs/count"}, "sourcesAbstractOnly": {"$ref": "#/$defs/count"}, "sourcesInaccessible": {"$ref": "#/$defs/count"},
+        "sourcesMetadataOnly": {"$ref": "#/$defs/count"},
+        "sourcesFullTextObtained": {"$ref": "#/$defs/count"},
+        "referencesAttempted": {"$ref": "#/$defs/count"},
+        "referencesPending": {"$ref": "#/$defs/count"},
+        "referencesBlocked": {"$ref": "#/$defs/count"},
+        "referencesAssessed": {"$ref": "#/$defs/count"},
+        "verificationLinksTotal": {"$ref": "#/$defs/count"},
+        "verificationLinksAbstained": {"$ref": "#/$defs/count"},
+        "evidenceFullTextUsed": {"$ref": "#/$defs/count"},
+        "evidenceAbstractUsed": {"$ref": "#/$defs/count"},
+        "additionalReferencesTotal": {"$ref": "#/$defs/count"}
       }
     },
     "correct": {
       "type": "object", "additionalProperties": false,
       "required": ["status", "directlySupported", "scopeCaveats", "partialOrIndirect", "contradicted", "notAddressed", "statusProblems", "metadataProblems"],
-      "properties": {"status": {"$ref": "#/$defs/status"}, "directlySupported": {"$ref": "#/$defs/count"}, "scopeCaveats": {"$ref": "#/$defs/count"}, "partialOrIndirect": {"$ref": "#/$defs/count"}, "contradicted": {"$ref": "#/$defs/count"}, "notAddressed": {"$ref": "#/$defs/count"}, "statusProblems": {"$ref": "#/$defs/count"}, "metadataProblems": {"$ref": "#/$defs/count"}}
+      "properties": {"status": {"$ref": "#/$defs/status"}, "directlySupported": {"$ref": "#/$defs/count"}, "scopeCaveats": {"$ref": "#/$defs/count"}, "partialOrIndirect": {"$ref": "#/$defs/count"}, "contradicted": {"$ref": "#/$defs/count"}, "notAddressed": {"$ref": "#/$defs/count"}, "statusProblems": {"$ref": "#/$defs/count"}, "metadataProblems": {"$ref": "#/$defs/count"},
+        "verificationLimits": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}
     },
     "enough": {
       "type": "object", "additionalProperties": false,
       "required": ["status", "sufficientClaims", "missingCitations", "insufficientDirectness", "insufficientScope", "insufficientBreadth", "insufficientCurrency", "insufficientBalance"],
-      "properties": {"status": {"$ref": "#/$defs/status"}, "sufficientClaims": {"$ref": "#/$defs/count"}, "missingCitations": {"$ref": "#/$defs/count"}, "insufficientDirectness": {"$ref": "#/$defs/count"}, "insufficientScope": {"$ref": "#/$defs/count"}, "insufficientBreadth": {"$ref": "#/$defs/count"}, "insufficientCurrency": {"$ref": "#/$defs/count"}, "insufficientBalance": {"$ref": "#/$defs/count"}}
+      "properties": {"status": {"$ref": "#/$defs/status"}, "sufficientClaims": {"$ref": "#/$defs/count"}, "missingCitations": {"$ref": "#/$defs/count"}, "insufficientDirectness": {"$ref": "#/$defs/count"}, "insufficientScope": {"$ref": "#/$defs/count"}, "insufficientBreadth": {"$ref": "#/$defs/count"}, "insufficientCurrency": {"$ref": "#/$defs/count"}, "insufficientBalance": {"$ref": "#/$defs/count"},
+        "verificationLimits": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}
     }
   }
 }
