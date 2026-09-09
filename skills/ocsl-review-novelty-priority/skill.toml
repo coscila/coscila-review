@@ -5,6 +5,6 @@ summary = "Test priority language with multiple reproducible searches, version-a
 primary_environment = "review-literature"
 secondary_environments = ["mcp-review"]
 mcps = ["ocsl_scholar"]
-outputs = ["novelty-audit.json"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true
 

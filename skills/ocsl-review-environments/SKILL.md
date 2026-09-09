@@ -15,7 +15,7 @@ Primary environment: `review-core`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-environments \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" env --help
 ```
 
 ## Procedure

@@ -23,6 +23,13 @@ The review workflow produces related but distinct artifacts:
 6. A review package connects graph evidence to anchored concerns and a revision
    ledger, then renders machine-readable and human-readable outputs.
 
+The managed extensive workflow adds `.ocsl-review/literature-audit.json` with
+the confirmed scope, per-entry acquisition history, source artifacts, and
+reading coverage. Content-addressed graph snapshots make interrupted writes
+recoverable. Use the [literature commands](literature-review.md) to record
+changes; source hashes and graph guards prevent stale evidence from entering
+a new report.
+
 The schemas under `schemas/` are the authoritative field contracts. They use
 closed objects so misspellings and undeclared fields fail validation instead of
 silently disappearing.
@@ -65,6 +72,15 @@ resolved reference identifiers, and processing state. A reference retains the
 raw entry, identifiers, reconciled identity, resolution state, publication
 status and check time, source role, independence group, and metadata problems.
 
+Ranges expand completely: `[1-10]` is one occurrence with ten members. Raw text
+and offsets remain available, and uncertain superscripts, duplicate labels,
+malformed groups, missing members, and table bindings retain diagnostics.
+Bibliography records use manuscript-local IDs, so identical DOIs do not merge
+entries or their citation loci. Raw provider metadata remains separate from
+decoded display text. Strong identity requires distinct providers and multiple
+fields corroborated against the printed reference; title-only agreement is
+insufficient.
+
 `independenceGroup` prevents multiple reports of the same underlying work from
 being counted as independent confirmation. A preprint and journal version,
 papers reusing one cohort, or several analyses of one trial can therefore be
@@ -84,6 +100,13 @@ Each claim-reference edge records the actual verification:
 - quotation or numeric fidelity;
 - confidence, abstention reason, and required human action.
 
+A modern link binds the exact claim–citation occurrence–reference triple and
+the hashes of its claim and citation cluster. `sourceExaminations` bind the
+reference identity digest to retained source bytes, complete extracted text,
+and expected/read unit IDs. A source is examined only when all required units
+were actually read. Download status, extraction completion, reading completion,
+and evidence used by a particular judgment are separate facts.
+
 The support vocabulary is deliberately more expressive than yes/no:
 
 | Verdict | Meaning |
@@ -99,6 +122,17 @@ Metadata-only and inaccessible edges must abstain. An abstract-only edge must
 also abstain when the claim's evidence requirement is full text. Positive
 support requires a source location, and `direct-support` is invalid when any
 recorded scope dimension is a mismatch.
+
+These gates also apply to adverse verdicts. An unread paper cannot be called
+`not-addressed` merely because a search or abstract omitted the detail. The
+explicit confidence labels are `very-confident`, `confident`, and
+`not-confident`. Complete full text with strong identity can permit the highest
+label, but does not select it. Complete abstract reading can permit at most
+`confident` for a claim explicitly classified `abstract-sufficient` with a
+reason. Numeric, causal, quotation, method/resource, and novelty claims retain
+their full-text requirement. Metadata, weak identity, or incomplete reading
+cannot justify substantive support. Legacy graphs can still load without
+inventing source-reading provenance or historical confidence labels.
 
 ### Completeness assessments
 
@@ -116,6 +150,13 @@ be backed by searches from at least two providers. Source count alone is never
 a sufficiency rule: roles, independence groups, claim breadth, contrary or null
 results, replication, and date coverage all matter.
 
+Targeted search candidates live in `additionalReferences`; they do not change
+the manuscript bibliography denominator and cannot replace a cited source's
+verification link. Their complete source examinations may be named in a
+completeness assessment's `sourceExaminationIds`. Both a sufficient judgment
+and a substantive omission finding need examined evidence. Structural missing
+citations and lack of access remain distinguishable.
+
 ### Search runs and review assertions
 
 A search run records provider, execution time, database names, date range,
@@ -132,7 +173,7 @@ facts.
 
 `audit-summary.json` exposes totals and processed counts for citation clusters,
 bibliography entries, and citation-required claims, plus the number of unique
-sources checked at full-text, abstract-only, or inaccessible levels. These
+sources examined and the evidence-access levels used by verification links. These
 counts let a reader distinguish “all 84 citations were examined” from “five
 examples were sampled.”
 
@@ -144,8 +185,10 @@ The summary separately aggregates:
   breadth, currency, and balance.
 
 The status vocabulary is `yes`, `no`, `partly`, and
-`not-fully-verifiable`. A `yes` is impossible while any mandatory verification
-limit is present. Current blockers are:
+`not-fully-verifiable`. Each question has its own relevant blockers. Correct
+existing citations can therefore coexist with unassessed or insufficient
+completeness, and an identified citation defect does not decide whether enough
+independent evidence exists. Verification blockers include:
 
 - incomplete manuscript ingestion;
 - a sampled rather than exhaustive audit;
@@ -155,6 +198,12 @@ limit is present. Current blockers are:
 - an inaccessible necessary source;
 - a metadata-only source check;
 - an abstract-only check for a full-text question.
+
+The summary also exposes expected citation-locus triples, missing assessments,
+reading gaps, confidence labels, and additional-source coverage. Empty graphs
+and zero-row subsets cannot pass vacuously. Publication-integrity concerns
+remain separate from the scientific direction of support; a corrected or
+retracted status does not automatically create a contradiction verdict.
 
 This is more than display logic. Semantic graph validation rejects evidence
 edges that could otherwise allow an unsupported positive conclusion, and the

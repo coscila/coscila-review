@@ -20,6 +20,14 @@ configured global skill roots and adds only `ocsl_review_catalog` and
 `ocsl_scholar` to deployment MCP configuration. It does not require tracked
 changes in either sibling repository.
 
+A request to check references or citations now leads to a concrete proposal
+for an extensive review: confirm the scope, obtain and read every accessible
+reference, verify each citation locus, and investigate targeted evidence gaps.
+Missing full text remains visible; complete abstracts can inform appropriate
+claims at lower confidence, while full-text questions still abstain. Numeric
+ranges such as `[1-10]` retain all ten members. See the runnable
+[literature workflow](docs/literature-review.md).
+
 ## What the companion decides
 
 The primary data structure is a claim-citation audit graph, not a free-form
@@ -97,7 +105,7 @@ Skills invoke tools through their mapped environment with one uniform form:
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-claim-source-verification \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review literature --help
 ```
 
 For deployment integration, configure distinct native-agent and Codex skill
@@ -129,6 +137,8 @@ commands on a deployment.
 - [Architecture and trust boundaries](docs/architecture.md)
 - [Clean-room implementation boundary](docs/clean-room.md)
 - [Claim-citation evidence model](docs/evidence-model.md)
+- [Extensive literature workflow](docs/literature-review.md)
+- [Workflow regression applicability](docs/workflow-regressions.md)
 - [Confidential review and egress](docs/confidentiality.md)
 - [Review environments](docs/environments.md)
 - [Scholarly sources and MCPs](docs/scholarly-sources.md)

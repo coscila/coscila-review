@@ -15,7 +15,7 @@ Primary environment: `review-statistics`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-systematic-review \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review literature --help
 ```
 
 ## Audit sequence
@@ -30,6 +30,14 @@ Primary environment: `review-statistics`
 ## Citation audit integration
 
 Claims made by the review manuscript still require claim-source edges. A review's included-study table does not prove its narrative interpretation, and several reports from one cohort are not independent evidence.
+
+When the user asks to check the review's references or citations, propose and
+confirm the extensive bibliography workflow in
+`$OCSL_REVIEW_HOME/docs/literature-review.md`. After acceptance, account for
+every reference, read every accessible complete source, and conduct targeted
+gap searches. Missing sources remain visible and do not stop independent work.
+This reference audit does not by itself certify the review's systematic-search
+or screening methodology.
 
 ## Limits and confidentiality
 

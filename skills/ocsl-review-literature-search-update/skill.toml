@@ -5,6 +5,6 @@ summary = "Run source-explicit, dated, reproducible searches that update a manus
 primary_environment = "review-literature"
 secondary_environments = ["mcp-review"]
 mcps = ["ocsl_scholar"]
-outputs = ["search-protocol.json", "search-results.jsonl"]
+outputs = [".ocsl-review/audit-graph.json", ".ocsl-review/literature-audit.json"]
 confidential_by_default = true
 
