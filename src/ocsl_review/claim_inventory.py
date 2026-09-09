@@ -12,6 +12,7 @@ from typing import Any
 
 from . import __version__
 from .audit import validate_audit_graph
+from .citations import numeric_citations, parse_numeric_group
 from .errors import ValidationError
 from .util import atomic_json, sha256_file
 
@@ -47,8 +48,35 @@ _EXTERNAL_SECTIONS = {"introduction", "background"}
 
 
 def _clean_claim(text: str) -> str:
-    value = _CITATION_TEXT.sub("", text)
+    spans = [(marker.start, marker.end) for marker in numeric_citations(text)]
+    spans.extend((m.start(), m.end()) for m in _CITATION_TEXT.finditer(text) if "@" in m.group() or m.group().startswith("("))
+    value = text
+    for start, end in sorted(spans, reverse=True):
+        value = value[:start] + " " * (end - start) + value[end:]
     return re.sub(r"\s+", " ", value).strip(" ,;:.\t")
+
+
+def _clause_spans(
+    text: str, spans: list[tuple[int, int]], *, split_method_coordination: bool = False,
+) -> list[tuple[int, str, int, int, bool]]:
+    masked = list(text)
+    for start, end in spans:
+        masked[max(0, start):min(len(text), end)] = "\0" * (min(len(text), end) - max(0, start))
+    clean = "".join(masked)
+    intervals = []
+    start = 0
+    for boundary in _CLAUSE_BOUNDARY.finditer(clean):
+        intervals.append((start, boundary.start()))
+        start = boundary.end()
+    intervals.append((start, len(text)))
+    clauses = []
+    for start, end in intervals:
+        piece = clean[start:end].replace("\0", " ")
+        variants = _split_method_coordination(piece.strip()) if split_method_coordination else [_clean_claim(piece)]
+        for value in variants:
+            if len(value) >= 3:
+                clauses.append((len(clauses) + 1, value, start, end, len(variants) > 1))
+    return clauses
 
 
 def _split_method_coordination(text: str) -> list[str]:
@@ -62,22 +90,6 @@ def _split_method_coordination(text: str) -> list[str]:
         _clean_claim(f"{prefix}{resource}"),
         _clean_claim(f"{prefix}{procedure}"),
     ]
-
-
-def _atomic_clauses(text: str, *, split_method_coordination: bool = False) -> list[tuple[int, str]]:
-    clauses: list[tuple[int, str]] = []
-    for piece in _CLAUSE_BOUNDARY.split(text):
-        if len(_clean_claim(piece)) < 3:
-            continue
-        variants = (
-            _split_method_coordination(piece.strip())
-            if split_method_coordination
-            else [_clean_claim(piece)]
-        )
-        for variant in variants:
-            if len(variant) >= 3:
-                clauses.append((len(clauses) + 1, variant))
-    return clauses
 
 
 def _claim_type(text: str) -> str:
@@ -179,12 +191,6 @@ def citation_requirement(origin: str, claim_type: str, text: str) -> tuple[bool,
     )
 
 
-def _evidence_level(claim_type: str) -> str:
-    if claim_type in {"dataset", "software"}:
-        return "abstract-sufficient"
-    return "full-text"
-
-
 def _table_cells(table: dict[str, Any]) -> Iterator[dict[str, Any]]:
     rows = table.get("rows", [])
     if not isinstance(rows, list) or len(rows) < 2:
@@ -200,6 +206,8 @@ def _table_cells(table: dict[str, Any]) -> Iterator[dict[str, Any]]:
             if not value:
                 continue
             header = headers[zero_based_column] if zero_based_column < len(headers) else ""
+            if re.fullmatch(r"(?:refs?|references?|citations?)\.?", header, re.I):
+                continue
             context = []
             if row_label:
                 context.append(f"{headers[0]}: {row_label}")
@@ -207,7 +215,7 @@ def _table_cells(table: dict[str, Any]) -> Iterator[dict[str, Any]]:
             yield {
                 "row": row_number,
                 "column": zero_based_column + 1,
-                "text": "; ".join(context),
+                "text": _clean_claim("; ".join(context)),
             }
 
 
@@ -261,6 +269,7 @@ def _claim_record(
     origin: str,
     citation_cluster_ids: list[str],
     citation_by_id: dict[str, dict[str, Any]],
+    ambiguous_scope: bool = False,
 ) -> dict[str, Any]:
     claim_type = _claim_type(text)
     required, reason = citation_requirement(origin, claim_type, text)
@@ -268,7 +277,10 @@ def _claim_record(
         binding = "not-applicable"
     elif not citation_cluster_ids:
         binding = "missing"
-    elif all(citation_by_id[item]["referenceIds"] for item in citation_cluster_ids):
+    elif not ambiguous_scope and all(
+        citation_by_id[item]["referenceIds"] and citation_by_id[item].get("bindingStatus") == "exact"
+        for item in citation_cluster_ids
+    ):
         binding = "exact"
     else:
         binding = "ambiguous"
@@ -282,7 +294,7 @@ def _claim_record(
         "citationRequirementReason": reason,
         "citationClusterIds": citation_cluster_ids,
         "citationBindingStatus": binding,
-        "requiredEvidenceLevel": _evidence_level(claim_type) if required else "not-applicable",
+        "requiredEvidenceLevel": "full-text" if required else "not-applicable",
         "processed": False,
     }
 
@@ -299,16 +311,28 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("unsupported manuscript schema version")
     section_titles, paragraph_ordinals, _ = _section_maps(manuscript)
     bibliography = manuscript.get("bibliographyEntries", [])
-    by_label = {str(item["label"]): item["id"] for item in bibliography if item.get("label")}
+    by_label: dict[str, list[str]] = {}
+    for reference in bibliography:
+        if reference.get("label"):
+            by_label.setdefault(str(reference["label"]), []).append(reference["id"])
     references = [_reference_seed(item) for item in bibliography]
     citations: list[dict[str, Any]] = []
     citation_by_id: dict[str, dict[str, Any]] = {}
     for item in manuscript.get("citationClusters", []):
         reference_ids = []
+        markers = list(item.get("tokens", [])) or [item["raw"]]
+        unresolved = list(markers)
+        binding = "unresolved"
         if item["style"] == "numeric":
+            tokens, issues, _ = parse_numeric_group(item["raw"], labels=by_label)
+            markers = list(tokens) or [item["raw"]]
             reference_ids = [
-                by_label[token] for token in item.get("tokens", []) if token in by_label
+                by_label[token][0] for token in tokens if len(by_label.get(token, [])) == 1
             ]
+            unresolved = [token for token in tokens if len(by_label.get(token, [])) != 1]
+            if issues or not tokens:
+                unresolved.append(item["raw"])
+            binding = "ambiguous" if unresolved else "exact"
         locator = item["locator"]
         record = {
             "id": item["id"],
@@ -321,10 +345,17 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
                 "anchor": item["id"],
             },
             "raw": item["raw"],
-            "markers": list(item.get("tokens", [])) or [item["raw"]],
+            "markers": markers,
             "referenceIds": sorted(set(reference_ids)),
+            "bindingStatus": binding,
+            "unresolvedMarkers": list(dict.fromkeys(unresolved)),
+            "locusType": item.get("locusType", "prose"),
             "processed": False,
         }
+        if locator.get("tableId"):
+            record["locator"].update({
+                "table": locator["tableId"], "row": locator["row"], "column": locator["column"],
+            })
         citations.append(record)
         citation_by_id[record["id"]] = record
 
@@ -340,6 +371,7 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         sentences_by_section.setdefault(sentence["sectionId"], []).append(sentence)
 
     claims: list[dict[str, Any]] = []
+    manuscript_citations = {item["id"]: item for item in manuscript.get("citationClusters", [])}
     for section_record in manuscript.get("sections", []):
         section_id = section_record["id"]
         section = section_titles.get(section_id, section_id)
@@ -349,9 +381,17 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
             cluster_ids = list(sentence.get("citationClusterIds", []))
             locator = sentence["locator"]
             split_coordination = normalized_section in _METHOD_SECTIONS
-            for clause_number, text in _atomic_clauses(
-                sentence["text"], split_method_coordination=split_coordination
+            sentence_start = locator.get("characterStart", 0)
+            spans = {
+                identifier: (
+                    manuscript_citations[identifier]["locator"]["characterStart"] - sentence_start,
+                    manuscript_citations[identifier]["locator"]["characterEnd"] - sentence_start,
+                ) for identifier in cluster_ids
+            }
+            for clause_number, text, start, end, ambiguous_scope in _clause_spans(
+                sentence["text"], list(spans.values()), split_method_coordination=split_coordination
             ):
+                bound = [identifier for identifier, (a, b) in spans.items() if start <= a and b <= end]
                 claims.append(
                     _claim_record(
                         claim_id=f"claim-{len(claims) + 1:07d}",
@@ -365,17 +405,41 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
                         },
                         text=text,
                         origin=_origin(section, text),
-                        citation_cluster_ids=cluster_ids,
+                        citation_cluster_ids=bound,
                         citation_by_id=citation_by_id,
+                        ambiguous_scope=ambiguous_scope,
                     )
                 )
 
     for table in manuscript.get("tables", []):
         section = section_titles.get(table["sectionId"], table["sectionId"])
         table_locator = table["locator"]
-        for cell in _table_cells(table):
+        clean_rows = [list(row) for row in table.get("rows", [])]
+        cell_citations: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for identifier in table.get("citationClusterIds", []):
+            location = manuscript_citations[identifier]["locator"]
+            cell_citations.setdefault((location["row"] - 1, location["column"] - 1), []).append(
+                (location["characterStart"], location["characterEnd"])
+            )
+        for (row, column), positions in cell_citations.items():
+            for start, end in sorted(positions, reverse=True):
+                value = clean_rows[row][column]
+                clean_rows[row][column] = value[:start] + " " * (end - start) + value[end:]
+        for cell in _table_cells({**table, "rows": clean_rows}):
             anchor = f"{table['id']}:r{cell['row']}:c{cell['column']}"
             text = cell["text"]
+            bound = []
+            for identifier in table.get("citationClusterIds", []):
+                citation = manuscript_citations[identifier]
+                location = citation["locator"]
+                if location["row"] != cell["row"]:
+                    continue
+                source_column = location["column"]
+                header = table["rows"][0][source_column - 1] if source_column <= len(table["rows"][0]) else ""
+                if source_column == cell["column"] or source_column == 1 or re.fullmatch(
+                    r"(?:refs?|references?|citations?)\.?", header.strip(), re.I
+                ):
+                    bound.append(identifier)
             claims.append(
                 _claim_record(
                     claim_id=f"claim-{len(claims) + 1:07d}",
@@ -386,10 +450,11 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
                         "clause": 0,
                         "page": table_locator.get("page"),
                         "anchor": anchor,
+                        "table": table["id"], "row": cell["row"], "column": cell["column"],
                     },
                     text=text,
                     origin=_origin(section, text),
-                    citation_cluster_ids=[],
+                    citation_cluster_ids=bound,
                     citation_by_id=citation_by_id,
                 )
             )
@@ -402,7 +467,7 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         ensure_ascii=False,
     ).encode()
     graph = {
-        "schemaVersion": "1.0",
+        "schemaVersion": "1.1",
         "auditId": "audit-" + hashlib.sha256(digest_material).hexdigest()[:20],
         "createdAt": datetime.now(UTC).isoformat(),
         "manuscript": {
@@ -416,7 +481,7 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         },
         "auditScope": {
             "mode": "exhaustive",
-            "citationBindingComplete": all(
+            "citationBindingComplete": all(item["bindingStatus"] == "exact" for item in citations) and all(
                 claim["citationBindingStatus"] != "ambiguous"
                 for claim in claims
                 if claim["citationRequired"]
@@ -427,6 +492,7 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         "citationClusters": citations,
         "references": references,
         "verificationLinks": [],
+        "sourceExaminations": [],
         "completenessAssessments": [],
         "searchRuns": [],
         "reviewAssertions": [],

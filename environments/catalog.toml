@@ -29,12 +29,13 @@ id = "review-documents"
 purpose = "Local manuscript, bibliography, table, and figure-adjacent document extraction"
 spec = "specs/review-documents.yaml"
 input_lock = "locks/review-documents.input-lock.yaml"
-input_lock_sha256 = "a5c2f7b94a833078e9408c91ebfd060a80d6cfcb7cd41a4cf95be1fa6fe636f9"
+input_lock_sha256 = "28978add7e3d3d4325bb383f2290fc8554523ee57bf1c3fe9a477310b3ff1867"
 platforms = ["linux-64", "linux-aarch64"]
 channels = ["conda-forge"]
 health_checks = [
   ["python", "-c", "import bs4, docx, lxml, pypdf"],
   ["pandoc", "--version"],
+  ["pdftotext", "-v"],
 ]
 skills = [
   "ocsl-review-manuscript-ingest",
@@ -47,11 +48,12 @@ id = "review-literature"
 purpose = "Bibliographic reconciliation, bounded scholarly lookup, and evidence-set analysis"
 spec = "specs/review-literature.yaml"
 input_lock = "locks/review-literature.input-lock.yaml"
-input_lock_sha256 = "1140e19e7c7d268c273d5c4753f765c7a8970ac337bbb58819e8b19f4a5e6808"
+input_lock_sha256 = "dfb8e6d70da238476764696707dbca2a0926aa30fd00c63fd19eb15eb54b3644"
 platforms = ["linux-64", "linux-aarch64"]
 channels = ["conda-forge"]
 health_checks = [
   ["python", "-c", "import Bio, httpx, lxml, pandas, rapidfuzz, requests"],
+  ["pdftotext", "-v"],
 ]
 skills = [
   "ocsl-review-reference-integrity",
