@@ -218,6 +218,42 @@ staging command reuses the active installation. A request with different values
 is rejected rather than mutating an installation whose ownership record no
 longer describes it.
 
+### Updating an existing installation
+
+`integrate install` is idempotent, not an upgrade command: reusing an active
+installation does not refresh its skill files from a changed source checkout.
+For an update, validate and test the merged source, then preserve private
+backups of the current skill mirrors, ownership records, MCP source and staged
+configuration, runtime environment, and current template pointers.
+
+Build only environments whose input locks or health-check contracts changed.
+Promotion selects a new immutable template; retained older templates must not
+be edited, and review-time resolution must not silently use superseded inputs.
+Verify all six current templates before refreshing the installation.
+
+Once preparation succeeds, use the existing guarded lifecycle with the same
+configured roots and real staging command:
+
+```bash
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate status
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate uninstall
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate install \
+  --staged-config "$OCSL_REVIEW_STAGED_MCP_CONFIG"
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate verify --live --strict
+```
+
+Do not bypass ownership checks if removal detects installed-file or owned-MCP
+edits. Both stages preserve unrelated MCP entries and have their own rollback
+checks; retain the pre-update backup across the entire refresh in case the
+second stage cannot complete. Expect a brief interval between staging passes
+when newly launched agents do not have the review tools registered.
+
+No web rebuild is required for companion-only changes. New agent/MCP processes
+load the refreshed package; existing processes can retain earlier code or skill
+context. Do not interrupt active chats merely to refresh them. Current core6
+staging also re-attests the configured Codex providers, so verify its actual
+result rather than rerunning an obsolete, hard-coded provider identifier.
+
 ## Status and verification
 
 ```bash
