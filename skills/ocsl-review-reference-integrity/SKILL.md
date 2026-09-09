@@ -15,7 +15,7 @@ Primary environment: `review-literature`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-reference-integrity \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review literature --help
 ```
 
 ## Procedure
@@ -27,10 +27,26 @@ Primary environment: `review-literature`
 5. Detect plausible fabrications, DOI-to-title mismatches, duplicate entries, citations to the wrong version, and bibliography entries never cited in text.
 6. Emit resolution confidence and the exact fields needing human confirmation.
 
+Use the confirmed workflow in `$OCSL_REVIEW_HOME/docs/literature-review.md`.
+`review literature fetch` records provider comparisons and acquisition outcomes
+in the managed ledger and audit graph. Strong printed identity requires two
+distinct providers and corroboration of title, year, and venue against the
+printed entry, plus supplied volume/pages. A shared author/year or guessed
+venue expansion is insufficient. Preserve raw metadata beside decoded display
+fields. Duplicate identifiers may share a source file but retain every
+bibliography entry. Only call an entry uncited after structural binding is
+complete; treat uncited bibliography entries as integrity findings, not
+automatic unsupported claims.
+
+Publication status uses directed structured notices and known-positive route
+controls. An unavailable or failed control means surveillance is unproven;
+zero returned notices cannot establish a healthy route. Never invent or recall
+an identifier to fill an unresolved entry.
+
 ## Verdict limits
 
 Identity metadata establishes existence and status, not evidentiary support. A matching title or abstract may not yield a “supports” edge. If providers disagree or no authoritative identity is available, abstain on identity, mark the reference unresolved, and prevent an unconditional “cited correctly” result.
 
 ## Confidentiality and role
 
-For confidential manuscripts, send identifiers or isolated bibliographic fields only. Do not submit an unpublished title-author combination without approval. This skill resolves records; claim-level reading belongs to `ocsl-review-claim-source-verification`.
+For confidential manuscripts, send approved identifiers or minimized concepts through the egress gate. Raw bibliographic fields need the applicable authorization. This skill resolves records; claim-level reading belongs to `ocsl-review-claim-source-verification`.

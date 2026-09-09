@@ -5,5 +5,5 @@ summary = "Assess whether citation-required claims have evidence of adequate dir
 primary_environment = "review-literature"
 secondary_environments = ["review-core"]
 mcps = ["ocsl_review_catalog", "ocsl_scholar"]
-outputs = ["citation-completeness.jsonl", "audit-summary.json"]
+outputs = [".ocsl-review/audit-graph.json", ".ocsl-review/audit-summary.json"]
 confidential_by_default = true

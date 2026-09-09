@@ -15,7 +15,7 @@ Primary environment: `review-literature`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-novelty-priority \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review literature --help
 ```
 
 ## Procedure
@@ -31,7 +31,12 @@ Primary environment: `review-literature`
 
 Never return an unconditional “first” finding from one database or metadata-only screening. Inaccessible records, ambiguous dates, limited language coverage, or provider gaps require a calibrated abstention or narrowed claim and a human priority check.
 
+Record searches and candidate examinations in `.ocsl-review/audit-graph.json`
+through `$OCSL_REVIEW_HOME/docs/literature-review.md`. A sufficient novelty
+assessment requires dated searches from at least two providers and actual
+examination of the relevant sources. A targeted update does not certify a
+systematic search of every literature database.
+
 ## Confidentiality and role
 
 Construct generic concept queries locally for unpublished work. An unpublished title, author list, abstract, or distinctive sentence may leave the workspace only under explicit approval. This skill audits priority; it does not draft promotional novelty language.
-

@@ -10,8 +10,8 @@ from typing import Any
 
 from .errors import ValidationError
 
-PLAN_SCHEMA_VERSION = "1.0.0"
-PACKAGE_SCHEMA_VERSION = "1.0.0"
+PLAN_SCHEMA_VERSION = "1.1.0"
+PACKAGE_SCHEMA_VERSION = "1.1.0"
 
 CONCERN_PRIORITIES = frozenset({"blocking", "substantial", "editorial"})
 ACTION_STATES = frozenset(
@@ -108,6 +108,7 @@ _PROFILE_SIGNALS: dict[str, tuple[re.Pattern[str], ...]] = {
     ),
     "evidence-synthesis": (
         re.compile(r"\bsystematic review\b|\bmeta-analysis\b", re.IGNORECASE),
+        re.compile(r"\bnarrative review\b|\bliterature review\b|\breview article\b", re.IGNORECASE),
         re.compile(r"\bsearch strategy\b|\bdatabases? searched\b", re.IGNORECASE),
         re.compile(r"\bPRISMA\b", re.IGNORECASE),
     ),
@@ -225,6 +226,17 @@ def build_review_plan(manuscript: Mapping[str, Any]) -> dict[str, Any]:
             "metadataIsEvidence": False,
             "abstractCanEstablishFullTextSupport": False,
             "inaccessibleEvidenceRequiresAbstention": True,
+        },
+        "literatureReview": {
+            "mode": "extensive",
+            "confirmationRequired": True,
+            "correctness": True,
+            "completeness": True,
+            "scope": "bibliography-and-targeted-gaps",
+            "bibliographyEntries": len(manuscript.get("bibliography", [])),
+            "citationOccurrences": len(manuscript.get("citationClusters", [])),
+            "stateArtifact": ".ocsl-review/literature-audit.json",
+            "unavailablePolicy": "continue-with-gaps",
         },
     }
 

@@ -15,7 +15,7 @@ Primary environment: `review-statistics`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-calibration \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" calibrate --help
 ```
 
 ## Evaluation design
@@ -23,6 +23,14 @@ Primary environment: `review-statistics`
 Maintain immutable fixture inputs and adjudicated expected records for fabricated identities, mismatched identifiers, version-family duplication, retracted or corrected sources, species and population mismatch, association-to-causation inflation, clause-level partial support, review laundering, narrow evidence for broad claims, omitted null evidence, outdated guidance, number and quotation drift, inadequate priority searches, citation padding, manuscript-result citation exemptions, inaccessible full text, attempted confidential egress, and unsupported claims introduced by a report.
 
 Measure false-support rate as the primary high-cost error. Also report abstention precision and recall, scope-mismatch detection, citation-required accuracy, completeness findings, status recall, audit coverage, and factuality of generated review text. Stratify by access level and claim type and include denominators and confidence intervals where meaningful.
+
+Also measure false adverse verdicts and both changes of direction after an
+identity repair. Preserve initial and repaired decisions separately. State
+whether denominators include abstentions and unresolved cases; a stress-test
+sample is not a population error-rate estimate. Zero-row runs cannot pass.
+Use `$OCSL_REVIEW_HOME/docs/workflow-regressions.md` to select applicable W1–W46
+checks, keeping source access, evidence actually used, and verdict requirements
+consistent. Scoring weights and category sensitivity need an explicit rationale.
 
 ## Release gate
 

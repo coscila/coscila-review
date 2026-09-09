@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ocsl.local/schemas/literature-audit.schema.json",
+  "title": "Workspace literature acquisition and examination ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "auditId", "manuscriptId", "manuscriptPath", "graphPath", "scope", "scopeSha256", "bindingSha256", "confirmation", "entries", "sources", "history", "graphSha256", "updatedAt"],
+  "properties": {
+    "schemaVersion": {"const": "1.0"},
+    "auditId": {"type": "string", "minLength": 1},
+    "manuscriptId": {"type": "string", "minLength": 1},
+    "manuscriptPath": {"$ref": "#/$defs/path"},
+    "graphPath": {"$ref": "#/$defs/path"},
+    "scope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manuscriptSha256", "bibliographySha256", "mode", "correctness", "completeness", "searchScope", "unavailablePolicy"],
+      "properties": {
+        "manuscriptSha256": {"$ref": "#/$defs/hash"},
+        "bibliographySha256": {"$ref": "#/$defs/hash"},
+        "mode": {"const": "extensive"}, "correctness": {"const": true},
+        "completeness": {"const": true},
+        "searchScope": {"const": "bibliography-and-targeted-gaps"},
+        "unavailablePolicy": {"const": "continue-with-gaps"}
+      }
+    },
+    "scopeSha256": {"$ref": "#/$defs/hash"},
+    "bindingSha256": {"$ref": "#/$defs/hash"},
+    "graphSha256": {"$ref": "#/$defs/hash"},
+    "projectionRecoverySha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "updatedAt": {"type": "string", "format": "date-time"},
+    "confirmation": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false,
+         "required": ["decision", "scopeSha256", "at", "basis"],
+         "properties": {
+           "decision": {"enum": ["accepted", "declined"]},
+           "scopeSha256": {"$ref": "#/$defs/hash"},
+           "at": {"type": "string", "format": "date-time"},
+           "basis": {"type": "string", "minLength": 1}
+         }}
+      ]
+    },
+    "entries": {"type": "array", "items": {"$ref": "#/$defs/entry"}},
+    "sources": {"type": "object", "additionalProperties": {"$ref": "#/$defs/source"}},
+    "history": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["at", "event", "previousGraphSha256", "graphSha256"],
+      "properties": {
+        "at": {"type": "string"}, "event": {"type": "string", "minLength": 1},
+        "previousGraphSha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+        "graphSha256": {"$ref": "#/$defs/hash"}
+      }
+    }}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "entry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["referenceId", "sourceId", "state", "attempts", "records", "limitations"],
+      "properties": {
+        "referenceId": {"type": "string", "minLength": 1},
+        "sourceId": {"type": ["string", "null"]},
+        "state": {"enum": ["pending", "available", "inaccessible", "blocked", "failed"]},
+        "attempts": {"type": "array", "items": {"type": "object", "required": ["operation", "at", "state"]}},
+        "records": {"type": "array", "items": {"type": "object"}},
+        "abstractCandidates": {"type": "array", "items": {"type": "object"}},
+        "limitations": {"$ref": "#/$defs/strings"},
+        "acquiredIdentifiers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "publicationStatusEvidence": {"type": "object"}
+        ,"purposeClaimIds": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "source": {
+      "type": "object",
+      "required": ["id", "artifactPath", "documentPath", "textPath", "artifactSha256", "textSha256", "documentSha256", "accessLevel", "provider", "expectedUnitIds", "readUnitIds", "retrievedAt", "complete"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^source-[a-f0-9]{64}$"},
+        "artifactPath": {"$ref": "#/$defs/path"},
+        "documentPath": {"$ref": "#/$defs/path"},
+        "textPath": {"$ref": "#/$defs/path"},
+        "artifactSha256": {"$ref": "#/$defs/hash"},
+        "textSha256": {"$ref": "#/$defs/hash"},
+        "documentSha256": {"$ref": "#/$defs/hash"},
+        "accessLevel": {"enum": ["full-text", "abstract-only"]},
+        "provider": {"type": "string", "minLength": 1},
+        "expectedUnitIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "readUnitIds": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "retrievedAt": {"type": "string", "format": "date-time"},
+        "complete": {"type": "boolean"}
+      }
+    }
+  }
+}

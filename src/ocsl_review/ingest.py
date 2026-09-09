@@ -10,8 +10,10 @@ library.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
+import statistics
 import subprocess
 import tempfile
 import zipfile
@@ -22,6 +24,7 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from .errors import ReviewError
+from .citations import DASHES, numeric_citations, parse_numeric_group
 
 MANUSCRIPT_SCHEMA_VERSION = "1.0.0"
 DEFAULT_MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -57,10 +60,7 @@ _BIBLIOGRAPHY_TITLES = {"references", "bibliography", "works cited"}
 _FIGURE_CAPTION = re.compile(
     r"^\s*(?:figure|fig\.)\s*([A-Za-z]?\d+[A-Za-z]?)\s*[:.\-]?\s*(.*)$", re.IGNORECASE
 )
-_NUMBERED_REFERENCE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.)])\s+(.+)$")
-_NUMERIC_CITATION = re.compile(
-    r"\[(?:\s*\d+[A-Za-z]?(?:\s*[-\u2013]\s*\d+[A-Za-z]?)?\s*(?:[,;]\s*)?)+\]"
-)
+_NUMBERED_REFERENCE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.)]?)\s+(.+)$")
 _MARKDOWN_CITATION = re.compile(r"\[(?:@[A-Za-z0-9][A-Za-z0-9_.:+/-]*(?:\s*;\s*)?)+\]")
 _AUTHOR_YEAR_CITATION = re.compile(r"\((?=[^()]{1,240}\b(?:19|20)\d{2}[a-z]?\b)[^()]{1,240}\)")
 _DOI = re.compile(r"\b10\.\d{4,9}/[^\s<>\"]+", re.IGNORECASE)
@@ -173,10 +173,11 @@ def _text_blocks(text: str, *, markdown: bool) -> list[dict[str, Any]]:
             nonlocal paragraph
             if not paragraph:
                 return
+            raw = "\n".join(paragraph)
             value = " ".join(part.strip() for part in paragraph if part.strip()).strip()
             paragraph = []
             if value:
-                blocks.append({"kind": "paragraph", "text": value, "page": current_page})
+                blocks.append({"kind": "paragraph", "text": value, "rawText": raw, "page": current_page})
 
         i = 0
         while i < len(lines):
@@ -239,15 +240,25 @@ def _text_blocks(text: str, *, markdown: bool) -> list[dict[str, Any]]:
     return blocks
 
 
-def _docx_paragraph(element: ET.Element) -> tuple[str, str | None, list[str]]:
+def _docx_paragraph(element: ET.Element) -> tuple[str, str | None, list[str], list[tuple[int, int]]]:
     parts: list[str] = []
-    for node in element.iter():
-        if node.tag == f"{{{_W}}}t":
-            parts.append(node.text or "")
-        elif node.tag == f"{{{_W}}}tab":
-            parts.append("\t")
-        elif node.tag in (f"{{{_W}}}br", f"{{{_W}}}cr"):
-            parts.append("\n")
+    raised: list[tuple[int, int]] = []
+    offset = 0
+    for run in element.iter(f"{{{_W}}}r"):
+        run_parts = []
+        for node in run.iter():
+            if node.tag == f"{{{_W}}}t":
+                run_parts.append(node.text or "")
+            elif node.tag == f"{{{_W}}}tab":
+                run_parts.append("\t")
+            elif node.tag in (f"{{{_W}}}br", f"{{{_W}}}cr"):
+                run_parts.append("\n")
+        value = "".join(run_parts)
+        alignment = run.find(f"./{{{_W}}}rPr/{{{_W}}}vertAlign")
+        if alignment is not None and alignment.get(f"{{{_W}}}val") == "superscript" and value:
+            raised.append((offset, offset + len(value)))
+        parts.append(value)
+        offset += len(value)
     style: str | None = None
     style_node = element.find(f"./{{{_W}}}pPr/{{{_W}}}pStyle")
     if style_node is not None:
@@ -259,7 +270,15 @@ def _docx_paragraph(element: ET.Element) -> tuple[str, str | None, list[str]]:
         )
         if description:
             descriptions.append(description.strip())
-    return "".join(parts).strip(), style, descriptions
+    value = "".join(parts)
+    leading = len(value) - len(value.lstrip())
+    stripped = value.strip()
+    spans = [
+        (max(0, start - leading), min(len(stripped), end - leading))
+        for start, end in raised
+        if start - leading < len(stripped) and end > leading
+    ]
+    return stripped, style, descriptions, spans
 
 
 def _docx_table(element: ET.Element) -> list[list[str]]:
@@ -269,7 +288,7 @@ def _docx_table(element: ET.Element) -> list[list[str]]:
         for cell in row.findall(f"./{{{_W}}}tc"):
             pieces: list[str] = []
             for paragraph in cell.findall(f".//{{{_W}}}p"):
-                value, _, _ = _docx_paragraph(paragraph)
+                value, _, _, _ = _docx_paragraph(paragraph)
                 if value:
                     pieces.append(value)
             values.append("\n".join(pieces))
@@ -333,7 +352,7 @@ def _docx_blocks(
         )
     for child in body:
         if child.tag == f"{{{_W}}}p":
-            text, style, descriptions = _docx_paragraph(child)
+            text, style, descriptions, superscripts = _docx_paragraph(child)
             heading = bool(style and (style.casefold().startswith("heading") or style == "Title"))
             caption = bool(style and style.casefold() == "caption") and bool(
                 _FIGURE_CAPTION.match(text)
@@ -356,10 +375,25 @@ def _docx_blocks(
                         "heading": heading,
                         "headingLevel": _heading_level(style),
                         "caption": caption,
+                        "superscriptSpans": superscripts,
                     }
                 )
         elif child.tag == f"{{{_W}}}tbl":
-            blocks.append({"kind": "table", "rows": _docx_table(child), "page": None})
+            cell_spans: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            for row_index, row in enumerate(child.findall(f"./{{{_W}}}tr")):
+                for column, cell in enumerate(row.findall(f"./{{{_W}}}tc")):
+                    offset = 0
+                    for paragraph in cell.findall(f".//{{{_W}}}p"):
+                        value, _, _, spans = _docx_paragraph(paragraph)
+                        cell_spans.setdefault((row_index, column), []).extend(
+                            (start + offset, end + offset) for start, end in spans
+                        )
+                        if value:
+                            offset += len(value) + 1
+            blocks.append({
+                "kind": "table", "rows": _docx_table(child), "page": None,
+                "cellSuperscriptSpans": cell_spans,
+            })
     return blocks
 
 
@@ -376,14 +410,15 @@ def _pdf_blocks(
     executable: str | os.PathLike[str],
     timeout: float,
     max_extracted_bytes: int,
+    warnings: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if timeout <= 0:
         raise IngestionError("PDF extraction timeout must be positive")
     with tempfile.TemporaryDirectory(prefix="ocsl-review-pdf-") as temporary:
-        output = Path(temporary) / "manuscript.txt"
+        output = Path(temporary) / "manuscript.xhtml"
         argv = [
             os.fspath(executable),
-            "-layout",
+            "-bbox-layout",
             "-enc",
             "UTF-8",
             os.fspath(path),
@@ -414,19 +449,356 @@ def _pdf_blocks(
         data = output.read_bytes()
         if not data.strip():
             raise IngestionError("PDF contains no extractable text; OCR is required")
-        warnings: list[dict[str, Any]] = []
-        text = _decode_utf8(data, warnings)
-        if warnings:
+        decoding_warnings: list[dict[str, Any]] = []
+        text = _decode_utf8(data, decoding_warnings)
+        if decoding_warnings:
             raise IngestionError("PDF extractor emitted invalid UTF-8")
-        return _text_blocks(text, markdown=False)
+        return _bbox_blocks(text, warnings)
 
 
-def _sentence_spans(text: str) -> Iterator[tuple[int, int, str]]:
+def _bbox_blocks(text: str, warnings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Read Poppler word geometry, retaining columns and locally raised runs.
+
+    Poppler's flow order supplies paragraphs and columns. A raised run can be
+    emitted as its own line/block; it is attached only to a nearby baseline with
+    a preceding word, never by concatenating all numeric spans on a page.
+    """
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise IngestionError("PDF extractor did not produce valid bbox-layout XML") from exc
+    pages = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "page"]
+    if not pages:
+        raise IngestionError("PDF bbox extraction contains no pages")
+    all_lines: list[dict[str, Any]] = []
+    for page_number, page in enumerate(pages, start=1):
+        try:
+            width, height = float(page.attrib["width"]), float(page.attrib["height"])
+            if not all(math.isfinite(v) and v > 0 for v in (width, height)):
+                raise ValueError("invalid page dimensions")
+            block_number = 0
+            for node in page.iter():
+                tag = node.tag.rsplit("}", 1)[-1]
+                if tag == "block":
+                    block_number += 1
+                if tag != "line":
+                    continue
+                words = []
+                for word in node:
+                    if word.tag.rsplit("}", 1)[-1] != "word":
+                        continue
+                    box = [float(word.attrib[key]) for key in ("xMin", "yMin", "xMax", "yMax")]
+                    if not all(math.isfinite(v) for v in box) or box[2] <= box[0] or box[3] <= box[1]:
+                        raise ValueError("invalid word dimensions")
+                    value = "".join(word.itertext())
+                    if value:
+                        words.append({"text": value, "box": box, "raised": False})
+                if words:
+                    all_lines.append({
+                        "page": page_number, "block": block_number, "words": words,
+                        "width": width, "height": height,
+                    })
+        except (KeyError, TypeError, ValueError) as exc:
+            raise IngestionError("PDF bbox extraction contains invalid geometry") from exc
+    if not all_lines:
+        raise IngestionError("PDF contains no extractable words; OCR is required")
+    observed_pages = {line["page"] for line in all_lines}
+    if len(observed_pages) != len(pages):
+        warnings.append({
+            "code": "pdf-pages-without-text", "message": "one or more PDF pages contain no words",
+            "pages": sorted(set(range(1, len(pages) + 1)) - observed_pages),
+            "affectsCompleteness": True,
+        })
+
+    # Repeated page chrome is recognized by text AND position. No blanket page
+    # band is removed: a reference continuing near a page edge remains intact.
+    chrome_pages: dict[str, set[int]] = {}
+    for line in all_lines:
+        words = line["words"]
+        near_edge = min(w["box"][1] for w in words) < line["height"] * .07 or max(
+            w["box"][3] for w in words
+        ) > line["height"] * .93
+        raw = " ".join(w["text"] for w in words)
+        structural_content = (
+            _NUMBERED_REFERENCE.match(raw) or _FIGURE_CAPTION.match(raw)
+            or re.match(r"^Table\s+\d+\b", raw, re.I)
+            or _is_heading(raw, markdown=False)[0]
+        )
+        if near_edge and not structural_content:
+            key = re.sub(r"\d+", "#", raw).casefold()
+            chrome_pages.setdefault(key, set()).add(line["page"])
+            line["chromeKey"] = key
+    retained = [
+        line for line in all_lines
+        if len(chrome_pages.get(line.get("chromeKey", ""), set())) < 2
+    ]
+    removed = len(all_lines) - len(retained)
+    if removed:
+        warnings.append({"code": "pdf-repeated-chrome-removed", "message": "repeated page chrome removed", "lines": removed})
+    all_lines = retained
+    # A new section beginning in the left column applies across the page.
+    # Poppler can emit the complete left flow (including References) before the
+    # right body column; partition by those section boundaries before retaining
+    # the flow order within each band.
+    section_bands: dict[int, list[float]] = {}
+    for line in all_lines:
+        value = " ".join(word["text"] for word in line["words"])
+        if _is_heading(value, markdown=False)[0] and min(w["box"][0] for w in line["words"]) < line["width"] / 3:
+            section_bands.setdefault(line["page"], []).append(min(w["box"][1] for w in line["words"]))
+    all_lines.sort(key=lambda line: (
+        line["page"], sum(y <= min(w["box"][1] for w in line["words"]) for y in section_bands.get(line["page"], []))
+    ))
+    lines_by_page: dict[int, list[dict[str, Any]]] = {}
+    for line in all_lines:
+        lines_by_page.setdefault(line["page"], []).append(line)
+    numeric_word = re.compile(rf"^[0-9⁰¹²³⁴⁵⁶⁷⁸⁹,;{re.escape(DASHES)}]+$")
+    for line in all_lines:
+        for word in list(line["words"]):
+            if not numeric_word.fullmatch(word["text"]) or not re.search(
+                r"[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]", word["text"]
+            ):
+                continue
+            x0, y0, x1, y1 = word["box"]
+            word_height = y1 - y0
+            neighbors = []
+            for other in lines_by_page[line["page"]]:
+                for body_word in other["words"]:
+                    if not re.search(r"[A-Za-z]{2}", body_word["text"]) or body_word.get("raised"):
+                        continue
+                    bx0, by0, bx1, by1 = body_word["box"]
+                    bh = by1 - by0
+                    gap = x0 - bx1
+                    if -.2 * bh <= gap <= 2.5 * bh and .1 * bh < by1 - y1 < .9 * bh and word_height < .9 * bh:
+                        neighbors.append((abs(gap), other, body_word))
+            if neighbors:
+                _, target, _ = min(neighbors, key=lambda item: item[0])
+                word["raised"] = True
+                if target is not line:
+                    line["words"].remove(word)
+                    target["words"].append(word)
+    # Join the rest of a raised digit/list/range run using local geometry. A
+    # baseline-sized dash may bridge smaller digit words without swallowing an
+    # adjacent column or treating ordinary small table text as a superscript.
+    while True:
+        joined = False
+        for line in all_lines:
+            for word in list(line["words"]):
+                if word["raised"] or not (numeric_word.fullmatch(word["text"]) or word["text"].casefold() == "and"):
+                    continue
+                x0, y0, x1, y1 = word["box"]
+                matches = []
+                for target in lines_by_page[line["page"]]:
+                    for prior in target["words"]:
+                        if not prior["raised"]:
+                            continue
+                        px0, py0, px1, py1 = prior["box"]
+                        h = max(y1 - y0, py1 - py0)
+                        if -.15 * h <= x0 - px1 <= .8 * h and abs(y0 - py0) < .6 * h:
+                            matches.append((abs(x0 - px1), target))
+                if matches:
+                    _, target = min(matches, key=lambda item: item[0])
+                    word["raised"] = True
+                    joined = True
+                    if target is not line:
+                        line["words"].remove(word)
+                        target["words"].append(word)
+        if not joined:
+            break
+
+    table_blocks, table_lines = _bbox_tables(all_lines, warnings)
+    blocks: list[dict[str, Any]] = []
+    current_key = None
+    for line in all_lines:
+        if id(line) in table_blocks:
+            blocks.append(table_blocks[id(line)])
+            current_key = None
+        if id(line) in table_lines:
+            continue
+        words = sorted(line["words"], key=lambda item: item["box"][0])
+        if not words:
+            continue
+        value = ""
+        spans = []
+        positions = []
+        prior = None
+        for word in words:
+            if value:
+                gap = word["box"][0] - prior["box"][2]
+                height = word["box"][3] - word["box"][1]
+                # Keep token adjacency from geometry. Do not insert a space
+                # inside a superscript range split across font runs.
+                if not (word["raised"] and prior["raised"] and gap < .3 * height):
+                    value += " "
+            start = len(value)
+            value += word["text"]
+            if word["raised"]:
+                spans.append((start, len(value)))
+            positions.append({"start": start, "end": len(value), "bbox": word["box"]})
+            prior = word
+        heading, title, level = _is_heading(value, markdown=False)
+        key = (line["page"], line["block"])
+        separate = heading or _NUMBERED_REFERENCE.match(value) or _FIGURE_CAPTION.match(value)
+        if blocks and current_key == key and not separate and not blocks[-1].get("heading"):
+            block = blocks[-1]
+            offset = len(block["text"]) + 1
+            block["text"] += " " + value
+            block["superscriptSpans"].extend((a + offset, b + offset) for a, b in spans)
+            block["wordPositions"].extend(
+                {**item, "start": item["start"] + offset, "end": item["end"] + offset}
+                for item in positions
+            )
+        else:
+            blocks.append({
+                "kind": "paragraph", "text": title if heading else value,
+                "page": line["page"], "heading": heading, "headingLevel": level,
+                "superscriptSpans": spans, "wordPositions": positions,
+            })
+        current_key = key
+    # Word geometry cannot recover arbitrary ruled/merged PDF tables. Keep the
+    # text, and block completeness where a table needs a structural re-ingest.
+    table_captions = sum(
+        bool(re.match(r"^Table\s+\d+\b", b.get("text", ""), re.I)) for b in blocks
+    )
+    if table_captions > len(table_blocks):
+        warnings.append({
+            "code": "pdf-table-structure-unresolved",
+            "message": "PDF table text requires row/cell confirmation or a structural source",
+            "affectsCompleteness": True,
+        })
+    return blocks
+
+
+def _bbox_tables(
+    lines: list[dict[str, Any]], warnings: list[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], set[int]]:
+    """Recover aligned tables with an explicit reference column.
+
+    Column starts come from separated header cells, and rows from shared text
+    baselines. We require reference-column grammar and never guess a merged-cell
+    or unlabelled table's row-to-source assignment.
+    """
+
+    tables: dict[int, dict[str, Any]] = {}
+    consumed: set[int] = set()
+    header_word = re.compile(r"(?:refs?|references?|citations?)\.?", re.I)
+    for header_line in lines:
+        if id(header_line) in consumed or not any(header_word.fullmatch(w["text"]) for w in header_line["words"]):
+            continue
+        page_lines = [line for line in lines if line["page"] == header_line["page"] and line["words"]]
+        header_y = statistics.median(w["box"][3] for w in header_line["words"])
+        height = statistics.median(w["box"][3] - w["box"][1] for w in header_line["words"])
+        same_row = [line for line in page_lines if abs(statistics.median(w["box"][3] for w in line["words"]) - header_y) < .35 * height]
+        words = sorted([w for line in same_row for w in line["words"]], key=lambda w: w["box"][0])
+        groups: list[list[dict[str, Any]]] = []
+        for word in words:
+            if not groups or word["box"][0] - groups[-1][-1]["box"][2] > 1.5 * height:
+                groups.append([word])
+            else:
+                groups[-1].append(word)
+        headers = [" ".join(w["text"] for w in group) for group in groups]
+        reference_columns = [i for i, value in enumerate(headers) if header_word.fullmatch(value)]
+        if len(groups) < 2 or len(reference_columns) != 1:
+            continue
+        reference_column = reference_columns[0]
+        starts = [group[0]["box"][0] for group in groups]
+        boundaries = [(groups[i][-1]["box"][2] + starts[i + 1]) / 2 for i in range(len(groups) - 1)]
+        candidates = sorted(
+            [line for line in page_lines if min(w["box"][1] for w in line["words"]) > header_y],
+            key=lambda line: (min(w["box"][1] for w in line["words"]), min(w["box"][0] for w in line["words"])),
+        )
+        visual_rows: list[list[dict[str, Any]]] = []
+        last_y = header_y
+        for line in candidates:
+            y = statistics.median(w["box"][3] for w in line["words"])
+            content = " ".join(w["text"] for w in line["words"])
+            if y - last_y > 3 * height or _is_heading(content, markdown=False)[0] or re.match(r"^(?:Table|Figure)\s+\d+", content, re.I):
+                break
+            if visual_rows and abs(y - last_y) < .4 * height:
+                visual_rows[-1].append(line)
+            else:
+                visual_rows.append([line])
+                last_y = y
+        rows = [headers]
+        accepted_lines = list(same_row)
+        uncertain = False
+        for visual in visual_rows:
+            row_words = sorted([word for line in visual for word in line["words"]], key=lambda word: word["box"][0])
+            cells: list[list[str]] = [[] for _ in headers]
+            if any(word["box"][0] < starts[0] - height for word in row_words):
+                break
+            for word in row_words:
+                column = sum(word["box"][0] >= boundary for boundary in boundaries)
+                cells[column].append(word["text"])
+            values = [" ".join(cell) for cell in cells]
+            reference_text = values[reference_column]
+            tokens, issues, _ = parse_numeric_group(reference_text)
+            dangling = len(rows) > 1 and re.search(
+                r"(?:and|[,;" + re.escape(DASHES) + r"])\s*$",
+                rows[-1][reference_column],
+            )
+            if reference_text and tokens and not (set(issues) - {"compressed-citation-range-unconfirmed"}):
+                # Reference-only continuation after a dangling separator is the
+                # same printed row, rather than a second citation occurrence.
+                continuation = not values[0] if reference_column else not any(values[1:])
+                if dangling and continuation:
+                    for column, value in enumerate(values):
+                        if value:
+                            rows[-1][column] += " " + value
+                else:
+                    rows.append(values)
+                accepted_lines.extend(visual)
+            elif not reference_text and len(rows) > 1 and not values[0]:
+                for column, value in enumerate(values):
+                    if value:
+                        rows[-1][column] += " " + value
+                accepted_lines.extend(visual)
+            elif reference_text and re.fullmatch(r"[\d,;\s" + re.escape(DASHES) + r"]+(?:and)?", reference_text):
+                rows.append(values)
+                accepted_lines.extend(visual)
+            else:
+                uncertain = True
+                break
+        if len(rows) < 2:
+            continue
+        if any(
+            set(parse_numeric_group(row[reference_column])[1])
+            - {"compressed-citation-range-unconfirmed"}
+            for row in rows[1:]
+        ):
+            uncertain = True
+        tables[id(header_line)] = {"kind": "table", "rows": rows, "page": header_line["page"]}
+        consumed.update(id(line) for line in accepted_lines)
+        if uncertain:
+            warnings.append({
+                "code": "pdf-table-row-ambiguity", "message": "table row boundaries or reference cells require confirmation",
+                "page": header_line["page"], "affectsCompleteness": True,
+            })
+    return tables, consumed
+
+
+def _sentence_spans(
+    text: str, citation_spans: Iterable[tuple[int, int]] = (),
+) -> Iterator[tuple[int, int, str]]:
     if not text.strip():
         return
+    markers = sorted(citation_spans)
     start = 0
-    for match in re.finditer(r"(?:[.!?][\]\)\"']*|[。！？])\s+", text):
+    for match in re.finditer(r"(?:[.!?][\]\)\"']*|[。！？])", text):
+        if match.start() < start or any(a <= match.start() < b for a, b in markers):
+            continue
+        if match.group().startswith(".") and re.search(
+            r"\b(?:fig|eq|dr|prof|vs|al|e\.g|i\.e)$", text[:match.start()], re.I
+        ):
+            continue
         end = match.end()
+        for marker_start, marker_end in markers:
+            if marker_start >= end and not text[end:marker_start].strip():
+                end = marker_end
+                if end < len(text) and text[end] in ".!?":
+                    end += 1
+        if end < len(text) and not text[end].isspace():
+            continue
         value = text[start:end].strip()
         if value:
             value_start = text.find(value, start, end)
@@ -438,11 +810,15 @@ def _sentence_spans(text: str) -> Iterator[tuple[int, int, str]]:
         yield value_start, value_start + len(value), value
 
 
-def _citation_matches(text: str) -> list[tuple[int, int, str, str]]:
-    candidates: list[tuple[int, int, str, str]] = []
+def _citation_matches(
+    text: str, *, superscript_spans: Iterable[tuple[int, int]] = (),
+) -> list[tuple[int, int, str, str]]:
+    candidates = [
+        (marker.start, marker.end, marker.raw, "numeric")
+        for marker in numeric_citations(text, superscript_spans=superscript_spans)
+    ]
     for style, pattern in (
         ("markdown-key", _MARKDOWN_CITATION),
-        ("numeric", _NUMERIC_CITATION),
         ("author-year", _AUTHOR_YEAR_CITATION),
     ):
         for match in pattern.finditer(text):
@@ -465,17 +841,7 @@ def _citation_tokens(raw: str, style: str) -> list[str]:
     if style == "markdown-key":
         return re.findall(r"@([A-Za-z0-9][A-Za-z0-9_.:+/-]*)", raw)
     if style == "numeric":
-        tokens: list[str] = []
-        for part in re.findall(r"\d+[A-Za-z]?(?:\s*[-\u2013]\s*\d+[A-Za-z]?)?", raw):
-            if re.fullmatch(r"\d+\s*[-\u2013]\s*\d+", part):
-                low, high = (int(value) for value in re.split(r"[-\u2013]", part))
-                if low <= high and high - low <= 100:
-                    tokens.extend(str(value) for value in range(low, high + 1))
-                else:
-                    tokens.append(part.replace(" ", ""))
-            else:
-                tokens.append(part.replace(" ", ""))
-        return tokens
+        return list(parse_numeric_group(raw)[0])
     return [part.strip() for part in raw.strip("()").split(";") if part.strip()]
 
 
@@ -496,6 +862,8 @@ def _make_locator(
     page: int | None = None,
     character_start: int | None = None,
     character_end: int | None = None,
+    row: int | None = None,
+    column: int | None = None,
 ) -> dict[str, Any]:
     locator: dict[str, Any] = {"sectionId": section_id, "page": page}
     if paragraph_id is not None:
@@ -510,6 +878,10 @@ def _make_locator(
         locator["characterStart"] = character_start
     if character_end is not None:
         locator["characterEnd"] = character_end
+    if row is not None:
+        locator["row"] = row
+    if column is not None:
+        locator["column"] = column
     return locator
 
 
@@ -555,7 +927,7 @@ def _assemble(
     for block in blocks:
         kind = block["kind"]
         if kind == "paragraph":
-            text = re.sub(r"[ \t]+", " ", block.get("text", "")).strip()
+            text = block.get("text", "").strip()
             if not text:
                 continue
             paragraph_id = f"p-{len(paragraphs) + 1:06d}"
@@ -581,6 +953,7 @@ def _assemble(
                 "sectionId": section["id"],
                 "kind": paragraph_kind,
                 "text": text,
+                "rawText": block.get("rawText", block.get("text", "")),
                 "locator": _make_locator(
                     section_id=section["id"], paragraph_id=paragraph_id, page=block.get("page")
                 ),
@@ -618,20 +991,34 @@ def _assemble(
                     section["figureIds"].append(figure_id)
             if paragraph_kind == "bibliography-entry":
                 match = _NUMBERED_REFERENCE.match(text)
-                bibliography.append(
-                    {
+                if (
+                    match is None and bibliography and bibliography[-1]["label"]
+                    and bibliography[-1]["locator"]["sectionId"] == section["id"]
+                ):
+                    # Numbered references may continue in another flow or on
+                    # the next page. Preserve every contributing paragraph
+                    # instead of inventing an additional unlabelled reference.
+                    reference = bibliography[-1]
+                    reference["raw"] += "\n" + text
+                    reference["paragraphIds"].append(paragraph_id)
+                    reference["identifiers"] = _reference_identifiers(reference["raw"])
+                else:
+                    bibliography.append({
                         "id": f"ref-{len(bibliography) + 1:05d}",
                         "ordinal": len(bibliography) + 1,
                         "label": (match.group(1) or match.group(2)) if match else None,
                         "raw": match.group(3) if match else text,
                         "paragraphId": paragraph_id,
+                        "paragraphIds": [paragraph_id],
                         "identifiers": _reference_identifiers(text),
                         "locator": paragraph["locator"],
-                    }
-                )
+                    })
             if not is_heading:
+                paragraph_citations = [] if paragraph_kind == "bibliography-entry" else _citation_matches(
+                    text, superscript_spans=block.get("superscriptSpans", [])
+                )
                 for sentence_number, (start, end, sentence_text) in enumerate(
-                    _sentence_spans(text), start=1
+                    _sentence_spans(text, [(a, b) for a, b, _, _ in paragraph_citations]), start=1
                 ):
                     sentence_id = f"s-{len(sentences) + 1:07d}"
                     locator = _make_locator(
@@ -653,11 +1040,10 @@ def _assemble(
                     }
                     sentences.append(sentence)
                     paragraph["sentenceIds"].append(sentence_id)
-                    sentence_citations = (
-                        []
-                        if paragraph_kind == "bibliography-entry"
-                        else _citation_matches(sentence_text)
-                    )
+                    sentence_citations = [
+                        (a - start, b - start, raw, style)
+                        for a, b, raw, style in paragraph_citations if start <= a and b <= end
+                    ]
                     for local_start, local_end, raw, style in sentence_citations:
                         citation_id = f"cite-{len(citations) + 1:06d}"
                         citation = {
@@ -666,6 +1052,7 @@ def _assemble(
                             "style": style,
                             "raw": raw,
                             "tokens": _citation_tokens(raw, style),
+                            "locusType": "figure-caption" if paragraph_kind == "figure-caption" else "prose",
                             "sentenceId": sentence_id,
                             "paragraphId": paragraph_id,
                             "locator": _make_locator(
@@ -677,6 +1064,12 @@ def _assemble(
                                 character_end=start + local_end,
                             ),
                         }
+                        positions = [
+                            word["bbox"] for word in block.get("wordPositions", [])
+                            if word["start"] < start + local_end and start + local_start < word["end"]
+                        ]
+                        if positions:
+                            citation["boundingBoxes"] = positions
                         citations.append(citation)
                         sentence["citationClusterIds"].append(citation_id)
         elif kind == "table":
@@ -693,9 +1086,34 @@ def _assemble(
                 "locator": _make_locator(
                     section_id=section["id"], table_id=table_id, page=block.get("page")
                 ),
+                "citationClusterIds": [],
             }
             tables.append(table)
             section["tableIds"].append(table_id)
+            for row_index, row in enumerate(rows):
+                for column, cell in enumerate(row):
+                    matches = _citation_matches(
+                        cell,
+                        superscript_spans=block.get("cellSuperscriptSpans", {}).get((row_index, column), []),
+                    )
+                    # A labelled reference column may print undecorated lists.
+                    if row_index and column < len(rows[0]) and re.fullmatch(
+                        r"(?:refs?|references?|citations?)\.?", rows[0][column].strip(), re.I
+                    ) and not matches and re.search(r"\d", cell):
+                        matches = [(0, len(cell), cell, "numeric")]
+                    for start, end, raw, style in matches:
+                        citation_id = f"cite-{len(citations) + 1:06d}"
+                        citations.append({
+                            "id": citation_id, "ordinal": len(citations) + 1,
+                            "style": style, "raw": raw, "tokens": _citation_tokens(raw, style),
+                            "locusType": "table-cell", "sentenceId": None, "paragraphId": None,
+                            "locator": _make_locator(
+                                section_id=section["id"], table_id=table_id, page=block.get("page"),
+                                row=row_index + 1, column=column + 1,
+                                character_start=start, character_end=end,
+                            ),
+                        })
+                        table["citationClusterIds"].append(citation_id)
         elif kind == "figure":
             section = need_section()
             figure_id = f"fig-{len(figures) + 1:04d}"
@@ -713,6 +1131,52 @@ def _assemble(
                 }
             )
             section["figureIds"].append(figure_id)
+
+    by_label: dict[str, list[str]] = {}
+    for reference in bibliography:
+        if reference["label"]:
+            by_label.setdefault(reference["label"], []).append(reference["id"])
+    duplicates = sorted(label for label, entries in by_label.items() if len(entries) > 1)
+    if duplicates:
+        warnings.append({
+            "code": "duplicate-bibliography-labels", "message": "printed reference labels are not unique",
+            "labels": duplicates, "affectsCompleteness": True,
+        })
+    labels = set(by_label)
+    numeric_labels = sorted(int(label) for label in labels if label.isdecimal())
+    if numeric_labels and numeric_labels[-1] <= 100_000:
+        gaps = sorted(set(range(1, numeric_labels[-1] + 1)) - set(numeric_labels))
+        if gaps:
+            warnings.append({
+                "code": "bibliography-numbering-gaps",
+                "message": "reference numbering has gaps; confirm manuscript numbering and extraction",
+                "labels": gaps, "affectsCompleteness": True,
+            })
+    for citation in citations:
+        issues: list[str] = []
+        if citation["style"] == "numeric":
+            tokens, parse_issues, _ = parse_numeric_group(citation["raw"], labels=labels)
+            citation["tokens"] = list(tokens)
+            issues.extend(parse_issues)
+            unresolved = [token for token in tokens if len(by_label.get(token, [])) != 1]
+            if not tokens or parse_issues:
+                unresolved.append(citation["raw"])
+            citation["referenceIds"] = [
+                by_label[token][0] for token in tokens if len(by_label.get(token, [])) == 1
+            ]
+            citation["unresolvedMarkers"] = list(dict.fromkeys(unresolved))
+            citation["bindingStatus"] = "exact" if not unresolved else "ambiguous"
+            if unresolved:
+                warnings.append({
+                    "code": "unresolved-numeric-citation", "message": "citation requires label or syntax reconciliation",
+                    "citationId": citation["id"], "markers": unresolved, "issues": issues,
+                    "affectsCompleteness": True,
+                })
+        else:
+            citation["referenceIds"] = []
+            citation["unresolvedMarkers"] = list(citation["tokens"])
+            citation["bindingStatus"] = "unresolved"
+        citation["parseIssues"] = issues
 
     complete = not any(bool(item.get("affectsCompleteness")) for item in warnings)
     if not paragraphs:
@@ -786,6 +1250,11 @@ def _assemble(
                 "figures": len(figures),
                 "citationClusters": len(citations),
                 "bibliographyEntries": len(bibliography),
+                "numericMarkersDetected": sum(item["style"] == "numeric" for item in citations),
+                "numericMarkersReconciled": sum(item["style"] == "numeric" and item["bindingStatus"] == "exact" for item in citations),
+                "citationReferenceLinks": sum(len(item["referenceIds"]) for item in citations),
+                "distinctCitedReferences": len({reference for item in citations for reference in item["referenceIds"]}),
+                "tableCitationLoci": sum(item["locusType"] == "table-cell" for item in citations),
             },
         },
     }
@@ -829,9 +1298,10 @@ def ingest_manuscript(
             executable=pdftotext,
             timeout=pdf_timeout,
             max_extracted_bytes=max_extracted_bytes,
+            warnings=warnings,
         )
         source_format = "pdf"
-        parser = "pdftotext-layout-1"
+        parser = "pdftotext-bbox-layout-2"
     else:
         raise IngestionError(
             f"unsupported manuscript format {source.suffix or '<none>'}; expected txt, md, docx, or pdf"

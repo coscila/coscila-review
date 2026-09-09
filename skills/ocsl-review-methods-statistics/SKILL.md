@@ -15,7 +15,7 @@ Primary environment: `review-statistics`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-methods-statistics \
   --workspace "$PWD" \
-  -- <command>
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review --help
 ```
 
 ## Audit sequence

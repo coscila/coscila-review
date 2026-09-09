@@ -5,5 +5,5 @@ summary = "Identify omitted contrary, null, replication, and higher-quality evid
 primary_environment = "review-literature"
 secondary_environments = ["review-statistics"]
 mcps = ["ocsl_scholar"]
-outputs = ["evidence-balance.jsonl"]
+outputs = [".ocsl-review/audit-graph.json"]
 confidential_by_default = true

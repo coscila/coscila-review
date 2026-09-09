@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import tempfile
@@ -148,11 +149,12 @@ def validate_review_package(package: Mapping[str, Any]) -> None:
     }
     if set(summary) != expected_summary_fields:
         raise ValidationError("auditSummary must use the canonical six-field shape")
-    if summary.get("schemaVersion") != "1.0" or not summary.get("auditId"):
+    if summary.get("schemaVersion") not in {"1.0", "1.1"} or not summary.get("auditId"):
         raise ValidationError("auditSummary schemaVersion or auditId is invalid")
     if isinstance(audit_graph, Mapping) and summary.get("auditId") != audit_graph.get("auditId"):
         raise ValidationError("auditSummary and auditGraph identifiers differ")
-    if expected_summary is not None and dict(summary) != dict(expected_summary):
+    legacy = isinstance(audit_graph, Mapping) and audit_graph.get("schemaVersion") == "1.0" and summary.get("schemaVersion") == "1.0"
+    if expected_summary is not None and dict(summary) != dict(expected_summary) and not legacy:
         raise ValidationError("auditSummary does not match the deterministic auditGraph summary")
     coverage = _require_mapping(summary.get("auditCoverage"), "auditSummary.auditCoverage")
     correctness = _require_mapping(summary.get("citedCorrectly"), "auditSummary.citedCorrectly")
@@ -191,7 +193,7 @@ def validate_review_package(package: Mapping[str, Any]) -> None:
             raise ValidationError(f"auditSummary {processed} cannot exceed {total}")
     for block_name, block in (("citedCorrectly", correctness), ("citedEnough", sufficiency)):
         for key, value in block.items():
-            if key == "status":
+            if key in {"status", "verificationLimits"}:
                 continue
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValidationError(
@@ -199,23 +201,11 @@ def validate_review_package(package: Mapping[str, Any]) -> None:
                 )
     affirmative = correctness.get("status") == "yes" or sufficiency.get("status") == "yes"
     if affirmative:
-        blockers: list[str] = []
-        if not manuscript.get("ingestionComplete"):
-            blockers.append("manuscript ingestion is incomplete")
-        if coverage["inTextCitationClustersProcessed"] != coverage["inTextCitationClustersTotal"]:
-            blockers.append("not every citation cluster was processed")
-        if coverage["bibliographyEntriesResolved"] != coverage["bibliographyEntriesTotal"]:
-            blockers.append("not every bibliography entry was resolved")
-        if coverage["citationRequiredClaimsProcessed"] != coverage["citationRequiredClaimsTotal"]:
-            blockers.append("not every citation-required claim was processed")
-        if coverage["sourcesInaccessible"]:
-            blockers.append("one or more necessary sources were inaccessible")
-        if verification_limits:
-            blockers.append("verification limits remain: " + ", ".join(verification_limits))
-        if blockers:
-            raise ValidationError(
-                "affirmative citation verdict is forbidden: " + "; ".join(blockers)
-            )
+        if expected_summary is None:
+            raise ValidationError("affirmative citation verdict requires its canonical audit graph")
+        # Canonical graph validation applies each axis's own blockers. Legacy
+        # summaries are retained as input only; every rendered view recomputes them.
+        return
 
 
 def _md_escape(value: Any) -> str:
@@ -227,6 +217,8 @@ def _claim_audit_rows(package: Mapping[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(graph, Mapping):
         return []
     completeness = {item.get("claimId"): item for item in graph.get("completenessAssessments", [])}
+    clusters = {item["id"]: item for item in graph.get("citationClusters", [])}
+    references = {item["id"]: item for item in graph.get("references", [])}
     links: dict[str, list[Mapping[str, Any]]] = {}
     for item in graph.get("verificationLinks", []):
         links.setdefault(str(item.get("claimId", "")), []).append(item)
@@ -234,15 +226,7 @@ def _claim_audit_rows(package: Mapping[str, Any]) -> list[dict[str, Any]]:
     for claim in graph.get("claims", []):
         claim_id = str(claim.get("id", ""))
         claim_links = links.get(claim_id, [])
-        support = ", ".join(
-            dict.fromkeys(str(item.get("supportVerdict", "")) for item in claim_links)
-        )
-        actions = [
-            str(item.get("humanAction", "")) for item in claim_links if item.get("humanAction")
-        ]
         assessment = completeness.get(claim_id, {})
-        if assessment.get("requiredHumanAction"):
-            actions.append(str(assessment["requiredHumanAction"]))
         locator = claim.get("locator", {})
         if isinstance(locator, Mapping):
             location = "/".join(
@@ -252,19 +236,60 @@ def _claim_audit_rows(package: Mapping[str, Any]) -> list[dict[str, Any]]:
             )
         else:
             location = str(locator)
-        rows.append(
-            {
-                "atomicClaim": claim.get("text", ""),
-                "manuscriptLocation": location,
-                "supportVerdict": support or "not assessed",
+        entries = [(link, link["referenceId"], link.get("citationClusterId"), None)
+                   for link in claim_links]
+        assessed = {(link["referenceId"], link.get("citationClusterId")) for link in claim_links}
+        for cluster_id in claim.get("citationClusterIds", []):
+            cluster = clusters.get(cluster_id, {})
+            entries.extend((None, reference_id, cluster_id, None)
+                           for reference_id in cluster.get("referenceIds", [])
+                           if (reference_id, cluster_id) not in assessed)
+            entries.extend((None, None, cluster_id, marker)
+                           for marker in cluster.get("unresolvedMarkers", []))
+            if not cluster.get("referenceIds") and not cluster.get("unresolvedMarkers"):
+                entries.append((None, None, cluster_id, None))
+        for link, reference_id, cluster_id, marker in entries or [(None, None, None, None)]:
+            support = "not assessed; pending; not confident"
+            linked_location = location
+            actions = []
+            if reference_id is not None:
+                linked_location += f"; reference {reference_id}"
+            if cluster_id is not None:
+                linked_location += f"; locus {cluster_id}"
+            if marker is not None:
+                linked_location += f"; unresolved marker {marker}"
+            if link is not None:
+                label = link.get("confidenceLabel", "not-confident").replace("-", " ")
+                support = f"{link['supportVerdict']}; {link.get('evidenceTier', 'legacy-tier-unknown')}; {label}"
+                if cluster_id is None:
+                    linked_location += "; locus legacy-locus-unknown"
+                source_locations = "; ".join(str(item['locator']) for item in link["evidenceLocations"])
+                if source_locations:
+                    linked_location += f"; source: {source_locations}"
+                actions.append(str(link["humanAction"]))
+            elif reference_id is not None:
+                state = references.get(reference_id, {}).get("acquisition", {}).get("state", "pending")
+                support = f"not assessed; acquisition {state}; not confident"
+                actions.append("Obtain, read, and assess this source at this citation locus.")
+            elif claim.get("citationRequired"):
+                actions.append("Resolve this citation binding and record its assessment.")
+            if assessment.get("requiredHumanAction"):
+                actions.append(str(assessment["requiredHumanAction"]))
+            rows.append({
+                "atomicClaim": f"{claim_id}: {claim.get('text', '')}",
+                "manuscriptLocation": linked_location,
+                "supportVerdict": support,
                 "citationCompletenessVerdict": assessment.get("verdict", "not assessed"),
                 "requiredHumanAction": "; ".join(dict.fromkeys(actions)) or "none recorded",
-            }
-        )
+            })
     return rows
 
 
 def _summary_view(package: Mapping[str, Any]) -> Mapping[str, Any]:
+    graph = package.get("auditGraph")
+    if isinstance(graph, Mapping):
+        from .audit import build_audit_summary
+        return build_audit_summary(dict(graph))
     summary = package.get("auditSummary")
     if isinstance(summary, Mapping):
         return summary
@@ -327,6 +352,11 @@ def render_markdown(package: Mapping[str, Any]) -> str:
             f"| Claims requiring citations | {coverage['citationRequiredClaimsProcessed']} | {coverage['citationRequiredClaimsTotal']} |",
             "",
             f"Full texts checked: {coverage['sourcesFullTextChecked']}; abstract-only sources: {coverage['sourcesAbstractOnly']}; inaccessible sources: {coverage['sourcesInaccessible']}.",
+            f"Bibliography entries attempted: {coverage.get('referencesAttempted', 0)} / {coverage['bibliographyEntriesTotal']}; assessed: {coverage.get('referencesAssessed', 0)}; pending: {coverage.get('referencesPending', 0)}; blocked or unavailable: {coverage.get('referencesBlocked', 0)}.",
+            f"Additional sources for targeted literature gaps: {coverage.get('additionalReferencesTotal', 0)}. Source access and reading counts include these sources.",
+            f"Full-text entries obtained: {coverage.get('sourcesFullTextObtained', 0)}; fully read: {coverage['sourcesFullTextChecked']}. Evidence used by assessments: full text {coverage.get('evidenceFullTextUsed', 0)}, abstract {coverage.get('evidenceAbstractUsed', 0)}; abstentions {coverage.get('verificationLinksAbstained', 0)} / {coverage.get('verificationLinksTotal', 0)}.",
+            f"Correctness limits: {_md_escape('; '.join(summary['citedCorrectly'].get('verificationLimits', [])) or 'none recorded')}",
+            f"Completeness limits: {_md_escape('; '.join(summary['citedEnough'].get('verificationLimits', [])) or 'none recorded')}",
             "",
             "## Review route",
             "",
@@ -504,6 +534,11 @@ def _document_xml(package: Mapping[str, Any]) -> bytes:
     _add_paragraph(body, f"Citation support: {summary['citedCorrectly']['status']}")
     _add_paragraph(body, f"Citation sufficiency: {summary['citedEnough']['status']}")
     coverage = summary["auditCoverage"]
+    _add_paragraph(body, f"Bibliography entries: attempted {coverage.get('referencesAttempted', 0)} / {coverage['bibliographyEntriesTotal']}; assessed {coverage.get('referencesAssessed', 0)}; pending {coverage.get('referencesPending', 0)}; blocked or unavailable {coverage.get('referencesBlocked', 0)}.")
+    _add_paragraph(body, f"Additional sources for targeted literature gaps: {coverage.get('additionalReferencesTotal', 0)}. Source access and reading counts include these sources.")
+    _add_paragraph(body, f"Full-text entries: obtained {coverage.get('sourcesFullTextObtained', 0)}, fully read {coverage['sourcesFullTextChecked']}. Assessments using full text {coverage.get('evidenceFullTextUsed', 0)}, abstract {coverage.get('evidenceAbstractUsed', 0)}; abstentions {coverage.get('verificationLinksAbstained', 0)} / {coverage.get('verificationLinksTotal', 0)}.")
+    for axis in ("citedCorrectly", "citedEnough"):
+        _add_paragraph(body, f"{axis} limits: " + ("; ".join(summary[axis].get("verificationLimits", [])) or "none recorded"))
     _add_table(
         body,
         ["Coverage item", "Processed", "Total"],
@@ -859,15 +894,42 @@ def render_review_package(
     """
 
     validate_review_package(package)
+    if isinstance(package.get("auditGraph"), Mapping) and package["auditGraph"].get("schemaVersion") == "1.0":
+        package = dict(package)
+        package["auditSummary"] = dict(_summary_view(package))
     json_bytes = (json.dumps(package, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
         "utf-8"
     )
     markdown_bytes = render_markdown(package).encode("utf-8")
     docx_bytes = build_docx_bytes(package)
     base = _bundle_base(output_stem)
+    contents = {".json": json_bytes, ".md": markdown_bytes, ".docx": docx_bytes}
+    graph = package.get("auditGraph") or {}
+    manifest = {
+        "schemaVersion": "1.0",
+        "packageId": package["packageId"],
+        "generator": "ocsl_review.rendering.render_review_package",
+        "generatorSha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "inputCodeSha256": {
+            "audit.py": hashlib.sha256(Path(__file__).with_name("audit.py").read_bytes()).hexdigest(),
+            "claim-citation-audit.schema.json": hashlib.sha256((Path(__file__).resolve().parents[2] / "schemas" / "claim-citation-audit.schema.json").read_bytes()).hexdigest(),
+        },
+        "manuscriptSha256": package["manuscript"].get("sourceSha256"),
+        "auditGraphSha256": hashlib.sha256(json.dumps(graph, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest(),
+        "sourceDependencies": [
+            {key: item[key] for key in ("id", "artifactPath", "artifactSha256", "textSha256", "referenceDigests")}
+            for item in graph.get("sourceExaminations", [])
+        ],
+        "artifacts": [
+            {"name": f"{base.name}{suffix}", "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for suffix, data in contents.items()
+        ],
+        "verificationLinks": len(graph.get("verificationLinks", [])),
+    }
+    contents[".manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
     return _publish_bundle(
         base,
-        {".json": json_bytes, ".md": markdown_bytes, ".docx": docx_bytes},
+        contents,
         mode=0o600 if package["confidential"] else 0o644,
     )
 

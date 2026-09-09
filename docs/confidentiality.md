@@ -63,6 +63,7 @@ further:
     "resolve_identifier",
     "get_publication_status",
     "get_corrections_retractions",
+    "acquire_full_text",
     "search_pubmed",
     "search_europe_pmc"
   ],
@@ -134,6 +135,13 @@ correlation without creating another copy of an identifier or search concept.
 It is not proof that a query was scientifically adequate; adequacy belongs in a
 search-run record in the audit graph.
 
+The extensive CLI workflow uses this same validated context and ledger. Its
+user confirmation records permission for the review's scope; it does not
+broaden egress. Every complete-source request, including each redirect, passes
+the gate with its public source destination and identifiers. Downloads use
+validated public HTTPS addresses and isolate provider credentials. An egress
+rejection is not permission to retry through shell networking.
+
 ## Local handling
 
 Confidentiality also affects local files:
@@ -147,6 +155,15 @@ Confidentiality also affects local files:
 - a workspace cannot be the repository, deployment state, or filesystem root;
 - the catalog MCP is read-only, while the scholarly MCP has no filesystem
   access through its declared server contract.
+
+The CLI additionally retains `.ocsl-review/literature-audit.json`, immutable
+source bytes and extracted document records under `.ocsl-review/literature/`,
+and content-addressed graph snapshots. These are private workspace state, not
+tracked repository artifacts or shared provider caches. Original local source
+attachments are copied, and symlinks, workspace escapes, and shared mutable
+inodes are rejected. Source/graph digests bind recorded evidence to the version
+actually examined. Reviewer notes, actual scope confirmation, and assessment
+JSON remain local.
 
 The companion does not implement document-rights management, encrypted storage,
 or identity and access management. Operators must still protect the workspace,
@@ -171,9 +188,13 @@ text.
 
 ### Inspect sources
 
-Public metadata and open sections may be retrieved, but the returned access
-level controls what can be concluded. If a disputed number or method is visible
-only in inaccessible full text, the graph must abstain and request human access.
+Public metadata, complete abstracts, and available complete sources may be
+retrieved after the applicable scope confirmation. The returned access level
+sets a ceiling on conclusions. A complete abstract may inform an explicitly
+abstract-sufficient claim at lower confidence. If a disputed number or method
+requires inaccessible full text, the graph must abstain and record the missing
+evidence while other sources continue. Keep complete downloaded text private;
+only bounded evidence excerpts belong in deliverable audit links.
 
 ### Prepare a review report
 
