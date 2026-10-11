@@ -141,6 +141,21 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(["10.1234/source1"], value["bibliographyEntries"][0]["identifiers"]["doi"])
         self.assertEqual(1, len(value["citationClusters"]))
 
+    def test_linked_external_table_blocks_whole_article_completeness(self):
+        text = '''<html><body><article><p>Finding <a href="#ref-1">1</a>.</p>
+        <figure><figcaption>Table description</figcaption><a href="/articles/example/tables/1">View table</a></figure>
+        <ol class="references"><li id="ref-1" data-label="1">Alpha A. Example source.</li></ol>
+        </article></body></html>'''
+        value = self.ingest(text, '.html')
+        self.assertFalse(value["ingestion"]["complete"])
+        warning = next(w for w in value["ingestion"]["warnings"] if w["code"] == "external-table-content-unprovided")
+        self.assertEqual(["/articles/example/tables/1"], warning["targets"])
+        self.assertEqual(1, value["structuredSource"]["ownedAnchors"])
+        inline = text.replace('</figure>', '<table><tr><td>Finding <a href="#ref-1">1</a>.</td></tr></table></figure>')
+        value = self.ingest(inline, '.html')
+        self.assertTrue(value["ingestion"]["complete"])
+        self.assertEqual(2, value["structuredSource"]["ownedAnchors"])
+
     def test_entities_and_html_without_article_are_rejected(self):
         with self.assertRaises(ValidationError):
             self.ingest('<!DOCTYPE article [<!ENTITY x "x">]>' + article('<p>&x;</p>'))
