@@ -306,6 +306,9 @@
             "pattern": "^s-[0-9]{7,}$"
           },
           "uniqueItems": true
+        },
+        "sourceLocator": {
+          "$ref": "#/$defs/sourceLocator"
         }
       }
     },
@@ -407,6 +410,9 @@
         },
         "locator": {
           "$ref": "#/$defs/locator"
+        },
+        "sourceLocator": {
+          "$ref": "#/$defs/sourceLocator"
         }
       }
     },
@@ -567,6 +573,12 @@
         },
         "sourceMarker": {
           "type": "string"
+        },
+        "sourceAnchors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sourceLocator"
+          }
         }
       }
     },
@@ -809,6 +821,28 @@
         },
         "coverage": {
           "$ref": "#/$defs/coverage"
+        }
+      }
+    },
+    "sourceLocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "elementPath",
+        "elementId",
+        "tag"
+      ],
+      "properties": {
+        "elementPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "elementId": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

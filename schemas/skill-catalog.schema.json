@@ -9,8 +9,8 @@
     "schema_version": { "const": 1 },
     "skill": {
       "type": "array",
-      "minItems": 20,
-      "maxItems": 20,
+      "minItems": 21,
+      "maxItems": 21,
       "items": {
         "type": "object",
         "additionalProperties": false,

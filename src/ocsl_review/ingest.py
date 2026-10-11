@@ -932,7 +932,7 @@ def _assemble(
                 continue
             paragraph_id = f"p-{len(paragraphs) + 1:06d}"
             is_heading = bool(block.get("heading"))
-            if not is_heading and not block.get("sourceIdentity"):
+            if not is_heading and not block.get("sourceIdentity") and not block.get("sourceLocator"):
                 detected, heading_text, level = _is_heading(text, markdown=False)
                 if detected:
                     is_heading = True
@@ -960,6 +960,8 @@ def _assemble(
                 "sentenceIds": [],
             }
             paragraphs.append(paragraph)
+            if block.get("sourceLocator"):
+                paragraph["sourceLocator"] = block["sourceLocator"]
             section["paragraphIds"].append(paragraph_id)
             if paragraph_kind == "figure-caption":
                 caption_match = _FIGURE_CAPTION.match(text)
@@ -1075,6 +1077,7 @@ def _assemble(
                             original = next(c for c in block["explicitCitations"] if c["start"] == start + local_start)
                             citation["sourceTargets"] = original["targets"]
                             citation["sourceMarker"] = original["sourceMarker"]
+                            citation["sourceAnchors"] = original["sourceAnchors"]
                         positions = [
                             word["bbox"] for word in block.get("wordPositions", [])
                             if word["start"] < start + local_end and start + local_start < word["end"]
@@ -1100,6 +1103,8 @@ def _assemble(
                 "citationClusterIds": [],
             }
             tables.append(table)
+            if block.get("sourceLocator"):
+                table["sourceLocator"] = block["sourceLocator"]
             section["tableIds"].append(table_id)
             for row_index, row in enumerate(rows):
                 for column, cell in enumerate(row):
@@ -1129,6 +1134,7 @@ def _assemble(
                             original = next(c for c in block["explicitCellCitations"][(row_index, column)] if c["start"] == start)
                             citations[-1]["sourceTargets"] = original["targets"]
                             citations[-1]["sourceMarker"] = original["sourceMarker"]
+                            citations[-1]["sourceAnchors"] = original["sourceAnchors"]
                         table["citationClusterIds"].append(citation_id)
         elif kind == "figure":
             section = need_section()

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Local, independently implemented structured citation extraction.
 
 Publisher markup is data, never code. Original bytes remain the source of
@@ -15,7 +16,8 @@ from xml.etree import ElementTree as ET
 from .errors import ValidationError
 
 BLOCKS = {"p", "li", "list-item", "td", "th", "caption", "figcaption", "title",
-          "h1", "h2", "h3", "h4", "fn", "disp-quote", "def-item", "attrib"}
+          "h1", "h2", "h3", "h4", "fn", "disp-quote", "def-item", "attrib",
+          "abstract", "article-title", "trans-title", "disp-formula"}
 SKIP = {"script", "style", "nav", "noscript", "form"}
 _MARKER = re.compile(r"\x1e(\d+)\x1f")
 _RANGE = re.compile(r"^(\d+)\s*[-–—]\s*(\d+)$")
@@ -77,6 +79,15 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         if root.tag != "article" or root.find("body") is None:
             raise ValidationError("structured XML needs an article body")
     parents = {child: parent for parent in root.iter() for child in parent}
+    element_paths = {root: "/" + root.tag + "[1]"}
+    for parent in root.iter():
+        counts: dict[str, int] = {}
+        for child in parent:
+            counts[child.tag] = counts.get(child.tag, 0) + 1
+            element_paths[child] = f"{element_paths[parent]}/{child.tag}[{counts[child.tag]}]"
+
+    def location(node: ET.Element) -> dict[str, str]:
+        return {"elementPath": element_paths[node], "elementId": node.get("id", ""), "tag": node.tag}
 
     def ancestors(node: ET.Element):
         while node in parents:
@@ -103,7 +114,9 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         content_roots = [article]
     else:
         refs = list(root.findall(".//ref-list/ref"))
-        content_roots = [root.find("body"), *root.findall("floats-group")]
+        # Abstract and back-matter footnotes can contain material citation loci.
+        # Walk once from the article and exclude bibliography branches explicitly.
+        content_roots = [root]
     identities: dict[str, dict[str, Any]] = {}
     warnings: list[dict[str, Any]] = []
     for number, node in enumerate(refs, 1):
@@ -156,7 +169,7 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             else:
                 warnings.append({"code": "invalid-structured-range", "message": printed,
                                  "affectsCompleteness": True})
-        markers.append({"targets": ids, "sourceMarker": printed})
+        markers.append({"targets": ids, "sourceMarker": printed, "sourceAnchors": [location(node)]})
         return f"\x1e{len(markers) - 1}\x1f"
 
     def serialize(node: ET.Element, *, stop_blocks: bool = True) -> str:
@@ -187,6 +200,7 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             markers.append({"targets": [by_label.get(str(i), f"<missing-label:{i}>")
                                         for i in range(int(a), int(b) + 1)],
                             "sourceMarker": f"{left['sourceMarker']}–{right['sourceMarker']}"})
+            markers[-1]["sourceAnchors"] = left["sourceAnchors"] + right["sourceAnchors"]
             return f"\x1e{len(markers) - 1}\x1f"
         raw = pair.sub(expand, raw)
         pieces, explicit, cursor, length = [], [], 0, 0
@@ -202,7 +216,8 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         text = "".join(pieces)
         if text.strip():
             blocks.append({"kind": "paragraph", "text": text, "rawText": text,
-                           "heading": node.tag in {"title", "h1", "h2", "h3", "h4"},
+                           "heading": node.tag in {"title", "article-title", "trans-title", "h1", "h2", "h3", "h4"},
+                           "sourceLocator": location(node),
                            "caption": node.tag in {"caption", "figcaption"} or any(a.tag in {"fig", "figure"} for a in ancestors(node)),
                            "explicitCitations": explicit})
 
@@ -224,7 +239,8 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
                 if cells:
                     rows.append(cells)
             if rows:
-                blocks.append({"kind": "table", "rows": rows, "explicitCellCitations": cell_citations})
+                blocks.append({"kind": "table", "rows": rows, "explicitCellCitations": cell_citations,
+                               "sourceLocator": location(node)})
             return
         if node.tag in BLOCKS:
             emit(node)
@@ -248,6 +264,10 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
                                           "identifiers": identity["identifiers"]}})
     publication = {node.get("pub-id-type"): _text(node) for node in root.findall("./front/article-meta/article-id")
                    if node.get("pub-id-type")}
+    for name in ("article-title", "trans-title"):
+        title = root.find("./front/article-meta/title-group/" + name)
+        if title is not None:
+            publication[name] = _text(title)
     for node in root.iter("meta"):
         if node.get("name") in {"citation_doi", "citation_title", "citation_publication_date"}:
             publication[node.get("name")] = node.get("content", "")

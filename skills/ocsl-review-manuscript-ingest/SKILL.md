@@ -5,7 +5,7 @@ description: Convert manuscript files into a location-stable review model and re
 
 # Manuscript ingestion
 
-Use this skill before claim extraction whenever the source is PDF, DOCX, LaTeX, HTML, or a bundle of manuscript and supplement files.
+Use this skill before claim extraction whenever the source is PDF, DOCX, LaTeX, JATS XML, publisher HTML, or a bundle of manuscript and supplement files.
 
 ## Runtime
 
@@ -28,6 +28,12 @@ The canonical output is `.ocsl-review/manuscript.json`; its `ingestion` record c
 
 1. Hash inputs before parsing and never alter the originals.
 2. Prefer structural sources over rendered text when both are supplied; retain mappings back to the rendered page.
+   Local JATS (`.xml`/`.jats`) and publisher HTML (`.html`/`.htm`) preserve
+   bibliographic target IDs and printed labels independently of canonical
+   numbering. Check `structuredSource`, paragraph/table `sourceLocator`,
+   citation `sourceAnchors`, bibliography `sourceIdentity`,
+   raw `sourceMarker`, and anchor ownership diagnostics. Entity declarations,
+   non-article pages, and unowned bibliography anchors cannot become a clean census.
 3. Detect repeated headers, hyphenation, ligatures, hidden text, multi-column order, and OCR uncertainty.
 4. Bind a citation marker to the narrowest recoverable clause. Mark ambiguity rather than attaching it to an entire paragraph.
 5. Reconcile bibliography labels with in-text clusters without resolving scholarly identity yet.

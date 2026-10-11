@@ -38,6 +38,7 @@ standards list|path|verify|sync
 env list|build|ensure|run|fork|describe|verify
 mcp list|render|doctor|call
 review ingest|inventory|plan|package|render|prepare
+review census prepare|run|list|status|wait|resume|cancel|import|export
 audit validate|summarize
 calibrate
 ```
@@ -181,7 +182,7 @@ Install only after the prerequisites are ready:
 Installation performs one transaction:
 
 1. resolve two distinct configured global skill roots;
-2. validate all twenty skill source directories and descriptors;
+2. validate all twenty-one skill source directories and descriptors;
 3. snapshot every pre-existing destination, including files, directories,
    symbolic links, empty directories, and modes;
 4. copy the namespaced skills and record hashes and ownership metadata;

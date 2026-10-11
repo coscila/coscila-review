@@ -1,5 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0; independently implemented original schema",
   "title": "One citation locus assessment",
   "type": "object",
   "additionalProperties": false,

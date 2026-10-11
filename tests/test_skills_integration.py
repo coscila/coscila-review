@@ -49,7 +49,7 @@ class ReviewPathsTestCase(unittest.TestCase):
 class SkillCatalogTests(ReviewPathsTestCase):
     def test_catalog_and_all_runtime_contracts_validate(self) -> None:
         result = skills.validate_catalog(self.paths)
-        self.assertEqual(20, result["skills"])
+        self.assertEqual(21, result["skills"])
         self.assertEqual(
             {
                 "review-core",
@@ -94,7 +94,7 @@ class SkillCatalogTests(ReviewPathsTestCase):
         self.assertEqual(2, len(set(router_backups)))
 
         removed = skills.uninstall_skill_set(self.paths)
-        self.assertEqual(40, removed["removed"])
+        self.assertEqual(2 * len(skills.REQUIRED_SKILLS), removed["removed"])
         self.assertEqual(
             "native-original",
             (self.native / "ocsl-review-router" / "local.txt").read_text(encoding="utf-8"),

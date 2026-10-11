@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+schema_version = 1
+id = "ocsl-review-citation-census"
+title = "Resumable citation-support census"
+summary = "Measure every bound citation locus through pinned platform workers while preserving evidence tiers, assessment history, and reproducible facts."
+primary_environment = "review-literature"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = [".ocsl-review/census/census.sqlite3", "results/census/facts.json", "results/census/facts.sqlite3", "results/census/assessments.jsonl"]
+confidential_by_default = true

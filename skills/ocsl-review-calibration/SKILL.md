@@ -34,6 +34,13 @@ consistent. Scoring weights and category sensitivity need an explicit rationale.
 
 ## Release gate
 
+For census studies, also retain independent abstract/full-text/panel runs and
+actual provider/model receipts with token counts. Check every supplied reading
+unit and quoted substring mechanically. These checks cannot certify that a
+model attended to all units or establish a human gold label; matched-locus
+comparisons require a separately specified study design. Export SQL/hash facts
+through `$OCSL_REVIEW_HOME/docs/citation-census.md` before drafting numeric prose.
+
 Pin fixture, provider-recording, schema, environment, and implementation versions. Separate deterministic offline tests from bounded live-provider tests. A skipped or unavailable case cannot count as passed, and a metric without its denominator cannot satisfy the gate.
 
 ## Boundary

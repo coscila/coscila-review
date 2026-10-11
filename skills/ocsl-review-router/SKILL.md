@@ -31,6 +31,11 @@ For the runnable preparation, confirmation, acquisition, reading, and recording
 sequence, read `$OCSL_REVIEW_HOME/docs/literature-review.md`. Resolve this path
 from the source root even when this skill is installed in a global mirror.
 
+For an authorized systematic census or model-judgment study, use
+`ocsl-review-citation-census` after reference acquisition and binding. Its worker
+observations have their own history and facts export; they do not certify the
+manuscript graph's scientific verdicts.
+
 ## Decision rules
 
 - Do not route drafting or stylistic polishing away from the laboratory's existing writing skills. This companion owns evidence-chain audit work.
