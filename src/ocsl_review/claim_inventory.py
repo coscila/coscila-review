@@ -323,7 +323,11 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         markers = list(item.get("tokens", [])) or [item["raw"]]
         unresolved = list(markers)
         binding = "unresolved"
-        if item["style"] == "numeric":
+        if item["style"] == "structured":
+            reference_ids = list(item["referenceIds"])
+            unresolved = list(item["unresolvedMarkers"])
+            binding = item["bindingStatus"]
+        elif item["style"] == "numeric":
             tokens, issues, _ = parse_numeric_group(item["raw"], labels=by_label)
             markers = list(tokens) or [item["raw"]]
             reference_ids = [

@@ -932,7 +932,7 @@ def _assemble(
                 continue
             paragraph_id = f"p-{len(paragraphs) + 1:06d}"
             is_heading = bool(block.get("heading"))
-            if not is_heading:
+            if not is_heading and not block.get("sourceIdentity"):
                 detected, heading_text, level = _is_heading(text, markdown=False)
                 if detected:
                     is_heading = True
@@ -1013,10 +1013,17 @@ def _assemble(
                         "identifiers": _reference_identifiers(text),
                         "locator": paragraph["locator"],
                     })
+                    if block.get("sourceIdentity"):
+                        bibliography[-1]["sourceIdentity"] = block["sourceIdentity"]
+                        bibliography[-1]["identifiers"].update({key: [value] for key, value in block["sourceIdentity"]["identifiers"].items()})
             if not is_heading:
-                paragraph_citations = [] if paragraph_kind == "bibliography-entry" else _citation_matches(
-                    text, superscript_spans=block.get("superscriptSpans", [])
-                )
+                if paragraph_kind == "bibliography-entry":
+                    paragraph_citations = []
+                elif "explicitCitations" in block:
+                    paragraph_citations = [(c["start"], c["end"], c["raw"], c["style"])
+                                           for c in block["explicitCitations"]]
+                else:
+                    paragraph_citations = _citation_matches(text, superscript_spans=block.get("superscriptSpans", []))
                 for sentence_number, (start, end, sentence_text) in enumerate(
                     _sentence_spans(text, [(a, b) for a, b, _, _ in paragraph_citations]), start=1
                 ):
@@ -1064,6 +1071,10 @@ def _assemble(
                                 character_end=start + local_end,
                             ),
                         }
+                        if style == "structured":
+                            original = next(c for c in block["explicitCitations"] if c["start"] == start + local_start)
+                            citation["sourceTargets"] = original["targets"]
+                            citation["sourceMarker"] = original["sourceMarker"]
                         positions = [
                             word["bbox"] for word in block.get("wordPositions", [])
                             if word["start"] < start + local_end and start + local_start < word["end"]
@@ -1092,10 +1103,11 @@ def _assemble(
             section["tableIds"].append(table_id)
             for row_index, row in enumerate(rows):
                 for column, cell in enumerate(row):
-                    matches = _citation_matches(
-                        cell,
-                        superscript_spans=block.get("cellSuperscriptSpans", {}).get((row_index, column), []),
-                    )
+                    if "explicitCellCitations" in block:
+                        matches = [(c["start"], c["end"], c["raw"], c["style"])
+                                   for c in block["explicitCellCitations"].get((row_index, column), [])]
+                    else:
+                        matches = _citation_matches(cell, superscript_spans=block.get("cellSuperscriptSpans", {}).get((row_index, column), []))
                     # A labelled reference column may print undecorated lists.
                     if row_index and column < len(rows[0]) and re.fullmatch(
                         r"(?:refs?|references?|citations?)\.?", rows[0][column].strip(), re.I
@@ -1113,6 +1125,10 @@ def _assemble(
                                 character_start=start, character_end=end,
                             ),
                         })
+                        if style == "structured":
+                            original = next(c for c in block["explicitCellCitations"][(row_index, column)] if c["start"] == start)
+                            citations[-1]["sourceTargets"] = original["targets"]
+                            citations[-1]["sourceMarker"] = original["sourceMarker"]
                         table["citationClusterIds"].append(citation_id)
         elif kind == "figure":
             section = need_section()
@@ -1154,7 +1170,16 @@ def _assemble(
             })
     for citation in citations:
         issues: list[str] = []
-        if citation["style"] == "numeric":
+        if citation["style"] == "structured":
+            identities = {r["sourceIdentity"]["targetId"]: r["id"] for r in bibliography if r.get("sourceIdentity")}
+            citation["tokens"] = citation["sourceTargets"]
+            citation["referenceIds"] = [identities[t] for t in citation["sourceTargets"] if t in identities]
+            citation["unresolvedMarkers"] = [t for t in citation["sourceTargets"] if t not in identities]
+            citation["bindingStatus"] = "ambiguous" if citation["unresolvedMarkers"] else "exact"
+            if citation["unresolvedMarkers"]:
+                warnings.append({"code": "unresolved-structured-citation", "message": "explicit source target is absent from bibliography",
+                                 "citationId": citation["id"], "affectsCompleteness": True})
+        elif citation["style"] == "numeric":
             tokens, parse_issues, _ = parse_numeric_group(citation["raw"], labels=labels)
             citation["tokens"] = list(tokens)
             issues.extend(parse_issues)
@@ -1292,6 +1317,13 @@ def ingest_manuscript(
         )
         source_format = "docx"
         parser = "ocsl-docx-opc-1"
+    elif suffix in {".xml", ".jats", ".html", ".htm"}:
+        from .structured import extract
+        structured = extract(source_data, html=suffix in {".html", ".htm"})
+        blocks = structured["blocks"]
+        warnings.extend(structured["warnings"])
+        source_format = "publisher-html" if suffix in {".html", ".htm"} else "jats"
+        parser = "ocsl-structured-citations-1"
     elif suffix == ".pdf":
         blocks = _pdf_blocks(
             source,
@@ -1304,9 +1336,9 @@ def ingest_manuscript(
         parser = "pdftotext-bbox-layout-2"
     else:
         raise IngestionError(
-            f"unsupported manuscript format {source.suffix or '<none>'}; expected txt, md, docx, or pdf"
+            f"unsupported manuscript format {source.suffix or '<none>'}; expected txt, md, docx, pdf, jats/xml, or publisher html"
         )
-    return _assemble(
+    result = _assemble(
         source=source,
         source_data=source_data,
         source_format=source_format,
@@ -1315,6 +1347,9 @@ def ingest_manuscript(
         confidential=confidential,
         warnings=warnings,
     )
+    if suffix in {".xml", ".jats", ".html", ".htm"}:
+        result["structuredSource"] = structured["metadata"]
+    return result
 
 
 def ingest(path: str | os.PathLike[str], **kwargs: Any) -> dict[str, Any]:
