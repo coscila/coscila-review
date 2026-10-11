@@ -97,6 +97,25 @@ class StructuredTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "exactly one article"):
             self.ingest('<pmc-articleset/>')
 
+    def test_shared_range_endpoints_retain_all_interiors_and_original_anchors(self):
+        body = '<p>Finding <xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R3">3</xref>–<xref ref-type="bibr" rid="R5">5</xref>.</p>'
+        value = self.ingest(article(body, numbering=("1.", "2.", "3.", "4.", "5.")))
+        self.assertTrue(value["ingestion"]["complete"])
+        cluster = value["citationClusters"][0]
+        self.assertEqual(["R1", "R2", "R3", "R4", "R5"], cluster["sourceTargets"])
+        self.assertEqual(3, len(cluster["sourceAnchors"]))
+        self.assertEqual("1–3–5", cluster["sourceMarker"])
+        reverse = body.replace('rid="R5">5', 'rid="R2">2')
+        self.assertFalse(self.ingest(article(reverse, numbering=(1, 2, 3, 4, 5)))["ingestion"]["complete"])
+
+    def test_malformed_printed_numeric_label_is_retained_and_blocks_range(self):
+        body = '<p>Finding <xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R3">3</xref>.</p>'
+        value = self.ingest(article(body, numbering=("1.", "&gt;2.", "3.")))
+        self.assertEqual(">2.", value["bibliographyEntries"][1]["sourceIdentity"]["printedLabel"])
+        self.assertFalse(value["ingestion"]["complete"])
+        self.assertIn("<missing-label:2>", value["citationClusters"][0]["unresolvedMarkers"])
+        self.assertEqual(2, value["structuredSource"]["ownedAnchors"])
+
     def test_publisher_html_uses_target_identity_not_numbering(self):
         text = '''<html><head><meta name="citation_doi" content="10.1234/review"></head><body><article><h2>Background</h2><p>Finding <sup><a href="#ref-B" class="bibr">7</a></sup>. Other <a href="#ref-A" class="bibr">3</a>.</p><ol class="references"><li id="ref-A" data-label="3">Alpha A. First source. <a href="https://doi.org/10.1234/source1">DOI</a></li><li id="ref-B" data-label="7">Beta B. Second source. <a href="https://doi.org/10.1234/source2">DOI</a></li></ol></article></body></html>'''
         value = self.ingest(text, ".html")

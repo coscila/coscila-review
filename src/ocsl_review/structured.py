@@ -213,20 +213,26 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
 
     def emit(node: ET.Element, *, stop_blocks: bool = True) -> None:
         raw = re.sub(r"[ \t\r\n]+", " ", serialize(node, stop_blocks=stop_blocks)).strip(" \t\r\n")
-        # A pair of explicit endpoint anchors may print a numeric range.
-        pair = re.compile(r"\x1e(\d+)\x1f\s*[-–—]\s*\x1e(\d+)\x1f")
+        # Consecutive endpoint anchors may share a middle endpoint (1–3–5).
+        # Match the whole chain so non-overlapping replacements lose no range.
+        pair = re.compile(r"\x1e\d+\x1f(?:\s*[-–—]\s*\x1e\d+\x1f)+")
         def expand(match):
-            left, right = [markers[int(i)] for i in match.groups()]
-            if len(left["targets"]) != 1 or len(right["targets"]) != 1:
+            endpoints = [markers[int(marker.group(1))] for marker in _MARKER.finditer(match.group())]
+            if any(len(marker["targets"]) != 1 for marker in endpoints):
                 return match.group()
-            a, b = [_numeric_label(identities.get(m["targets"][0], {}).get("printedLabel", ""))
-                    for m in (left, right)]
-            if a is None or b is None or not 0 <= int(b) - int(a) <= 10000:
+            labels = [_numeric_label(identities.get(marker["targets"][0], {}).get("printedLabel", ""))
+                      for marker in endpoints]
+            if any(label is None for label in labels):
+                return match.group()
+            values = [int(label) for label in labels]
+            if any(b < a for a, b in zip(values, values[1:])) or values[-1] - values[0] > 10000:
+                warnings.append({"code": "invalid-structured-range", "message": "range endpoints are not ordered or bounded",
+                                 "affectsCompleteness": True})
                 return match.group()
             markers.append({"targets": [numeric_labels.get(str(i), f"<missing-label:{i}>")
-                                        for i in range(int(a), int(b) + 1)],
-                            "sourceMarker": f"{left['sourceMarker']}–{right['sourceMarker']}"})
-            markers[-1]["sourceAnchors"] = left["sourceAnchors"] + right["sourceAnchors"]
+                                        for i in range(values[0], values[-1] + 1)],
+                            "sourceMarker": "–".join(marker["sourceMarker"] for marker in endpoints)})
+            markers[-1]["sourceAnchors"] = [anchor for marker in endpoints for anchor in marker["sourceAnchors"]]
             return f"\x1e{len(markers) - 1}\x1f"
         raw = pair.sub(expand, raw)
         pieces, explicit, cursor, length = [], [], 0, 0
@@ -282,6 +288,10 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
     missed = [n for n in targets if used.get(n, 0) != 1]
     if missed:
         warnings.append({"code": "structured-anchor-ownership", "message": f"{len(missed)} anchors not owned exactly once",
+                         "affectsCompleteness": True})
+    unresolved = {target for marker in markers for target in marker["targets"] if target not in identities}
+    if unresolved:
+        warnings.append({"code": "unresolved-structured-target", "message": f"{len(unresolved)} bibliography targets unresolved",
                          "affectsCompleteness": True})
     blocks.append({"kind": "paragraph", "text": "References", "heading": True})
     for source_id, identity in identities.items():
