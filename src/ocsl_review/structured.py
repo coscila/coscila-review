@@ -57,6 +57,12 @@ def _text(node: ET.Element | None) -> str:
     return " ".join("".join(node.itertext()).split()) if node is not None else ""
 
 
+def _numeric_label(label: str) -> str | None:
+    """Normalize numeric lookup only; the original printed label stays intact."""
+    match = re.fullmatch(r"(?:\[(\d+)\]|(\d+)[.)]?)", label.strip())
+    return str(int(next(value for value in match.groups() if value is not None))) if match else None
+
+
 def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
     """Return ingestion blocks, reference identities, and coverage diagnostics."""
     if html:
@@ -143,6 +149,13 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
     by_label = {value["printedLabel"]: key for key, value in identities.items()}
     if len(by_label) != len(identities):
         raise ValidationError("structured bibliography has duplicate printed labels")
+    numeric_labels: dict[str, str] = {}
+    for key, identity in identities.items():
+        label = _numeric_label(identity["printedLabel"])
+        if label is not None:
+            if label in numeric_labels:
+                raise ValidationError("structured bibliography has ambiguous numeric labels")
+            numeric_labels[label] = key
     targets: dict[ET.Element, list[str]] = {}
     for content in content_roots:
         for node in content.iter():
@@ -165,7 +178,7 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         if match:
             low, high = map(int, match.groups())
             if 0 <= high - low <= 10000:
-                ids = [by_label.get(str(i), f"<missing-label:{i}>") for i in range(low, high + 1)]
+                ids = [numeric_labels.get(str(i), f"<missing-label:{i}>") for i in range(low, high + 1)]
             else:
                 warnings.append({"code": "invalid-structured-range", "message": printed,
                                  "affectsCompleteness": True})
@@ -194,10 +207,11 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             left, right = [markers[int(i)] for i in match.groups()]
             if len(left["targets"]) != 1 or len(right["targets"]) != 1:
                 return match.group()
-            a, b = [identities.get(m["targets"][0], {}).get("printedLabel", "") for m in (left, right)]
-            if not a.isdecimal() or not b.isdecimal() or not 0 <= int(b) - int(a) <= 10000:
+            a, b = [_numeric_label(identities.get(m["targets"][0], {}).get("printedLabel", ""))
+                    for m in (left, right)]
+            if a is None or b is None or not 0 <= int(b) - int(a) <= 10000:
                 return match.group()
-            markers.append({"targets": [by_label.get(str(i), f"<missing-label:{i}>")
+            markers.append({"targets": [numeric_labels.get(str(i), f"<missing-label:{i}>")
                                         for i in range(int(a), int(b) + 1)],
                             "sourceMarker": f"{left['sourceMarker']}–{right['sourceMarker']}"})
             markers[-1]["sourceAnchors"] = left["sourceAnchors"] + right["sourceAnchors"]
