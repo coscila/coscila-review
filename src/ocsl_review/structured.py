@@ -82,11 +82,18 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             raise ValidationError("structured XML is malformed") from exc
         for node in root.iter():
             node.tag = node.tag.rsplit("}", 1)[-1]
+        document_root = root
+        if root.tag == "pmc-articleset":
+            articles = list(root.findall("article"))
+            if len(articles) != 1:
+                raise ValidationError("PMC article set needs exactly one article")
+            root = articles[0]
         if root.tag != "article" or root.find("body") is None:
             raise ValidationError("structured XML needs an article body")
-    parents = {child: parent for parent in root.iter() for child in parent}
-    element_paths = {root: "/" + root.tag + "[1]"}
-    for parent in root.iter():
+    document_root = root if html else document_root
+    parents = {child: parent for parent in document_root.iter() for child in parent}
+    element_paths = {document_root: "/" + document_root.tag + "[1]"}
+    for parent in document_root.iter():
         counts: dict[str, int] = {}
         for child in parent:
             counts[child.tag] = counts.get(child.tag, 0) + 1

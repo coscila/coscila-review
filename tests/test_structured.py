@@ -85,6 +85,18 @@ class StructuredTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "ambiguous numeric labels"):
             self.ingest(article(body, numbering=("1", "1.", "3.")))
 
+    def test_single_pmc_article_set_preserves_identity_and_original_paths(self):
+        text = article('<p>Finding <xref ref-type="bibr" rid="R1">1</xref>.</p>')
+        value = self.ingest('<pmc-articleset>' + text + '</pmc-articleset>')
+        self.assertTrue(value["ingestion"]["complete"])
+        self.assertEqual("10.1234/review", value["structuredSource"]["publication"]["doi"])
+        anchor = value["citationClusters"][0]["sourceAnchors"][0]["elementPath"]
+        self.assertTrue(anchor.startswith('/pmc-articleset[1]/article[1]/body[1]/'))
+        with self.assertRaisesRegex(ValidationError, "exactly one article"):
+            self.ingest('<pmc-articleset>' + text + text + '</pmc-articleset>')
+        with self.assertRaisesRegex(ValidationError, "exactly one article"):
+            self.ingest('<pmc-articleset/>')
+
     def test_publisher_html_uses_target_identity_not_numbering(self):
         text = '''<html><head><meta name="citation_doi" content="10.1234/review"></head><body><article><h2>Background</h2><p>Finding <sup><a href="#ref-B" class="bibr">7</a></sup>. Other <a href="#ref-A" class="bibr">3</a>.</p><ol class="references"><li id="ref-A" data-label="3">Alpha A. First source. <a href="https://doi.org/10.1234/source1">DOI</a></li><li id="ref-B" data-label="7">Beta B. Second source. <a href="https://doi.org/10.1234/source2">DOI</a></li></ol></article></body></html>'''
         value = self.ingest(text, ".html")
