@@ -365,6 +365,26 @@ def build_parser() -> argparse.ArgumentParser:
         _set(command, "literature", f"cmd_{name}",
              READ_ONLY if name == "status" else WORKSPACE, state_required=False)
 
+    census = review_commands.add_parser("census", help="run resumable per-locus worker measurements")
+    census_commands = _subcommands(census, "census_command")
+    for name in ("prepare", "run", "status", "resume", "import", "export"):
+        command = census_commands.add_parser(name)
+        command.add_argument("--workspace", default=".")
+        if name == "prepare":
+            command.add_argument("--mode", choices=("abstract", "full-text", "panel"), required=True)
+            command.add_argument("--worker-config", required=True)
+            command.add_argument("--limit", type=int, help="explicitly labelled pilot subset")
+            command.add_argument("--reference-id", action="append", default=[])
+        else:
+            command.add_argument("--run", required=True)
+        if name == "run":
+            command.add_argument("--retry", action="store_true", help="new attempt for still-unaccepted tasks")
+        if name == "import":
+            command.add_argument("input", help="worker result JSONL inside the workspace")
+        if name == "export":
+            command.add_argument("--output", default="results/census")
+        _set(command, "census", f"cmd_{name}", WORKSPACE, state_required=False)
+
     audit_family = families.add_parser("audit", help="validate or summarize an audit graph")
     audit_commands = _subcommands(audit_family)
     audit_validate = audit_commands.add_parser("validate")

@@ -935,6 +935,21 @@ def record_assessments(workspace: Path, state: dict[str, Any], graph: dict[str, 
     _refresh_processed(graph)
     validate_audit_graph(graph)
     state["bindingSha256"] = _binding_digest(graph)
+    # Immutable history retains earlier abstract/full-text readings even when
+    # the active graph edge is replaced. A duplicate record is idempotent.
+    history = {
+        "schemaVersion": 1, "auditId": state["auditId"],
+        "scopeSha256": state["scopeSha256"], "record": copy.deepcopy(record),
+        "source": {key: source[key] for key in ("id", "artifactSha256", "textSha256", "accessLevel")}
+        if source else None,
+    }
+    history_id = digest(history)
+    history_path = _path(workspace, f".ocsl-review/literature/history/{history_id}.json")
+    if history_path.exists():
+        if history_path.stat().st_nlink != 1 or _read_json(history_path) != history:
+            raise ValidationError("immutable assessment history changed or shares inodes")
+    else:
+        atomic_json(history_path, history, mode=0o600)
 
 
 def cmd_record(args: Any) -> dict[str, Any]:

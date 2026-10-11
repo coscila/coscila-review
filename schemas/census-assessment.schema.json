@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One citation locus assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["supportVerdict", "supportConfidence", "rationale", "readUnitIds", "evidence", "abstractSufficientReason"],
+  "properties": {
+    "supportVerdict": {"enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
+    "supportConfidence": {"type": "number", "minimum": 0, "maximum": 100},
+    "rationale": {"type": "string", "minLength": 1},
+    "readUnitIds": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "abstractSufficientReason": {"type": "string"},
+    "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+      "required": ["unitId", "quote"], "properties": {"unitId": {"type": "string"}, "quote": {"type": "string", "minLength": 1}}}}
+  }
+}
