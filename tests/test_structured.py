@@ -61,6 +61,30 @@ class StructuredTests(unittest.TestCase):
         self.assertFalse(value["ingestion"]["complete"])
         self.assertEqual(["missing"], value["citationClusters"][1]["unresolvedMarkers"])
 
+    def test_punctuated_bibliography_labels_expand_both_range_forms(self):
+        # Real Frontiers markup uses labels such as "1.". Text remains original.
+        body = '<p>First findings (<xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R3">3</xref>).</p>'
+        body += '<p>Other findings <xref ref-type="bibr" rid="R1 R3">1–3</xref>.</p>'
+        for labels in [("1.", "2.", "3."), ("1)", "2)", "3)"), ("[1]", "[2]", "[3]")]:
+            with self.subTest(labels=labels):
+                value = self.ingest(article(body, numbering=labels))
+                self.assertTrue(value["ingestion"]["complete"])
+                self.assertEqual(2, len(value["citationClusters"]))
+                for cluster in value["citationClusters"]:
+                    self.assertEqual(["R1", "R2", "R3"], cluster["sourceTargets"])
+                    self.assertEqual(["ref-00001", "ref-00002", "ref-00003"], cluster["referenceIds"])
+                self.assertEqual(list(labels), [entry["sourceIdentity"]["printedLabel"]
+                                               for entry in value["bibliographyEntries"]])
+                self.assertEqual(3, value["structuredSource"]["ownedAnchors"])
+
+    def test_punctuated_ranges_do_not_hide_missing_or_ambiguous_members(self):
+        body = '<p>Findings <xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R2">3</xref>.</p>'
+        value = self.ingest(article(body, numbering=("1.", "3.")))
+        self.assertFalse(value["ingestion"]["complete"])
+        self.assertIn("<missing-label:2>", value["citationClusters"][0]["unresolvedMarkers"])
+        with self.assertRaisesRegex(ValidationError, "ambiguous numeric labels"):
+            self.ingest(article(body, numbering=("1", "1.", "3.")))
+
     def test_publisher_html_uses_target_identity_not_numbering(self):
         text = '''<html><head><meta name="citation_doi" content="10.1234/review"></head><body><article><h2>Background</h2><p>Finding <sup><a href="#ref-B" class="bibr">7</a></sup>. Other <a href="#ref-A" class="bibr">3</a>.</p><ol class="references"><li id="ref-A" data-label="3">Alpha A. First source. <a href="https://doi.org/10.1234/source1">DOI</a></li><li id="ref-B" data-label="7">Beta B. Second source. <a href="https://doi.org/10.1234/source2">DOI</a></li></ol></article></body></html>'''
         value = self.ingest(text, ".html")
