@@ -285,6 +285,21 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             walk(child)
     for content in content_roots:
         walk(content)
+    if html:
+        external_tables = set()
+        for anchor in article.iter("a"):
+            link = anchor.get("href", "")
+            if in_references(anchor) or not re.search(r"(?:^|/)tables/\d+(?:[/?#]|$)", link):
+                continue
+            containers = [node for node in ancestors(anchor) if node.tag in {"figure", "fig", "table-wrap"}]
+            if any(any(table.find(".//tr") is not None for table in container.iter("table"))
+                   for container in containers):
+                continue
+            external_tables.add(link)
+        if external_tables:
+            warnings.append({"code": "external-table-content-unprovided",
+                             "message": f"{len(external_tables)} linked tables are absent from supplied HTML",
+                             "targets": sorted(external_tables), "affectsCompleteness": True})
     missed = [n for n in targets if used.get(n, 0) != 1]
     if missed:
         warnings.append({"code": "structured-anchor-ownership", "message": f"{len(missed)} anchors not owned exactly once",
