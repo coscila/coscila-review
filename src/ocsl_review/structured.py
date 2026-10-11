@@ -122,8 +122,10 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         incoming = {n.get("href", "").rsplit("#", 1)[-1] for n in article.iter("a")
                     if "#" in n.get("href", "")}
         refs = [n for n in root.iter() if n.get("id") and in_references(n)
-                and (n.tag == "li" or n.get("id") in incoming)
-                and not any(a.tag == "li" and in_references(a) for a in ancestors(n))]
+                and (n.tag == "li" or n.get("id") in incoming
+                     or (n.tag == "p" and n.get("id", "").startswith("ref-")))
+                and not any(a.tag == "li" and a.get("id") and in_references(a)
+                            for a in ancestors(n))]
         content_roots = [article]
     else:
         refs = list(root.findall(".//ref-list/ref"))
@@ -137,6 +139,9 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         if source_id in identities:
             raise ValidationError("structured bibliography contains duplicate target IDs")
         label = _text(node.find("label")) or node.get("data-label", "")
+        if not label and html:
+            label = next((a.get("data-counter", "") for a in ancestors(node)
+                          if a.tag == "li" and a.get("data-counter")), "")
         if not label:
             match = re.match(r"\s*\[?(\d+)\]?[.)]?\s", _text(node))
             label = match.group(1) if match else str(number)
