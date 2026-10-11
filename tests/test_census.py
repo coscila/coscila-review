@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
 import sqlite3
 import unittest
 from pathlib import Path
@@ -224,6 +226,28 @@ class CensusTests(unittest.TestCase):
             self.configuration["modelProvider"]["authTokenEnv"] = "NEVER_WORKSPACE_KEY"
             with self.assertRaisesRegex(ValidationError, "public configuration"):
                 REAL_CONFIGURATION(self.args, self.workspace)
+
+    @unittest.skipUnless(shutil.which("node"), "helper execution regression requires Node")
+    def test_worker_helper_uses_selected_workspace_with_lab_repo_set(self):
+        self.prepare()
+        helper = self.workspace / "tools/ocsl-workers.mjs"
+        helper.parent.mkdir()
+        helper.write_text('console.log(JSON.stringify({source: "selected-workspace", command: process.argv[2]}));\n')
+        self.args.paths = Paths(HOME, None, self.workspace.parent / "lab-source-without-helper")
+        with patch.dict(os.environ, {"OCSL_WORKERS_CLI": "", "OCSL_WORKERS_NODE": shutil.which("node")}):
+            response = census._worker(self.args, self.workspace, "configs")
+        self.assertEqual({"source": "selected-workspace", "command": "configs"}, response)
+
+    @unittest.skipUnless(shutil.which("node"), "helper execution regression requires Node")
+    def test_worker_helper_honors_explicit_absolute_override(self):
+        self.prepare()
+        helper = self.workspace.parent / "explicit-worker.mjs"
+        helper.write_text('console.log(JSON.stringify({source: "explicit-override"}));\n')
+        with patch.dict(os.environ, {"OCSL_WORKERS_CLI": str(helper), "OCSL_WORKERS_NODE": shutil.which("node")}):
+            self.assertEqual({"source": "explicit-override"}, census._worker(self.args, self.workspace, "configs"))
+        with patch.dict(os.environ, {"OCSL_WORKERS_CLI": "relative-helper.mjs"}):
+            with self.assertRaisesRegex(ValidationError, "absolute helper path"):
+                census._worker(self.args, self.workspace, "configs")
 
     def test_operator_reading_progress_does_not_change_evidence_run(self):
         initial = self.prepare()

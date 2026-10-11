@@ -27,9 +27,10 @@ In the selected workspace, use the mapped review-literature environment:
 ```
 
 Select `census_worker_id` from the platform's configured workers, visible with
-`node "$OCSL_WORKERS_CLI" configs`. The helper lives in the deployed Lab's
-`tools/ocsl-workers.mjs`; the operator sets `OCSL_WORKERS_CLI` when its source
-path cannot be inferred from `OCSL_REPO`. The protected UNIX socket is provided
+`node tools/ocsl-workers.mjs configs`. The deployed Lab materializes the helper
+inside the selected chat workspace at `tools/ocsl-workers.mjs`; census resolves
+that exact workspace path by default. An operator may set `OCSL_WORKERS_CLI`
+to an explicit absolute helper path. The protected UNIX socket is provided
 by `PUPPENCLAW_ORCHESTRATION_SOCKET`. Credentials stay with the broker.
 
 Prepare reads only the broker's public configuration. It pins the selected

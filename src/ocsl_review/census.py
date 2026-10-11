@@ -264,9 +264,11 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
 def _worker(args: Any, workspace: Path, *command: str) -> dict[str, Any]:
     helper = os.environ.get("OCSL_WORKERS_CLI")
     if not helper:
-        if not args.paths.lab_repo:
-            raise ValidationError("platform worker helper unavailable; set OCSL_WORKERS_CLI")
-        helper = str(args.paths.lab_repo / "tools/ocsl-workers.mjs")
+        helper = str(L._path(workspace, "tools/ocsl-workers.mjs", exists=True))
+    elif not Path(helper).expanduser().is_absolute():
+        raise ValidationError("explicit OCSL_WORKERS_CLI must be an absolute helper path")
+    else:
+        helper = str(Path(helper).expanduser())
     if not Path(helper).is_file():
         raise ValidationError("platform worker helper is not installed")
     try:
