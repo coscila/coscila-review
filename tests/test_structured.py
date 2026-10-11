@@ -105,6 +105,23 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(["10.1234/source2"], value["bibliographyEntries"][1]["identifiers"]["doi"])
         self.assertEqual("10.1234/review", value["structuredSource"]["publication"]["citation_doi"])
 
+    def test_publisher_paragraph_targets_inside_unidentified_reference_items(self):
+        text = '''<html><body><article><p>Finding <a href="#ref-CR1">1</a>–<a href="#ref-CR3">3</a>.</p>
+        <section data-title="References"><ol class="c-article-references">
+        <li class="c-article-references__item" data-counter="1."><p class="c-article-references__text" id="ref-CR1">Alpha A. Source one. <a href="https://doi.org/10.1234/source1">DOI</a></p></li>
+        <li class="c-article-references__item" data-counter="2."><p class="c-article-references__text" id="ref-CR2">Beta B. Source two.</p></li>
+        <li class="c-article-references__item" data-counter="3."><p class="c-article-references__text" id="ref-CR3">Gamma C. Source three.</p></li>
+        <li class="c-article-references__item" data-counter="4."><p class="c-article-references__text" id="ref-CR4">Delta D. Uncited source four.</p></li>
+        </ol></section></article></body></html>'''
+        value = self.ingest(text, '.html')
+        self.assertTrue(value["ingestion"]["complete"])
+        self.assertEqual(4, len(value["bibliographyEntries"]))
+        self.assertEqual(["ref-CR1", "ref-CR2", "ref-CR3"], value["citationClusters"][0]["sourceTargets"])
+        self.assertEqual(["1.", "2.", "3.", "4."], [entry["sourceIdentity"]["printedLabel"]
+                                                  for entry in value["bibliographyEntries"]])
+        self.assertEqual(["10.1234/source1"], value["bibliographyEntries"][0]["identifiers"]["doi"])
+        self.assertEqual(1, len(value["citationClusters"]))
+
     def test_entities_and_html_without_article_are_rejected(self):
         with self.assertRaises(ValidationError):
             self.ingest('<!DOCTYPE article [<!ENTITY x "x">]>' + article('<p>&x;</p>'))
