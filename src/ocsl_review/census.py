@@ -6,6 +6,7 @@ panel passes are immutable observations, never replacement scientific truth.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -52,6 +53,8 @@ def _database(workspace: Path) -> sqlite3.Connection:
       CREATE TABLE IF NOT EXISTS assessments(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
         accepted INTEGER NOT NULL, payload TEXT NOT NULL, recorded_at TEXT NOT NULL,
         FOREIGN KEY(task_id,run_id) REFERENCES tasks(id,run_id));
+      CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+        kind TEXT NOT NULL, task_ids TEXT NOT NULL, attempt INTEGER NOT NULL, parent_job TEXT);
       CREATE TRIGGER IF NOT EXISTS assessment_no_update BEFORE UPDATE ON assessments
         BEGIN SELECT RAISE(ABORT, 'assessment history is append-only'); END;
       CREATE TRIGGER IF NOT EXISTS assessment_no_delete BEFORE DELETE ON assessments
@@ -60,6 +63,10 @@ def _database(workspace: Path) -> sqlite3.Connection:
         BEGIN SELECT RAISE(ABORT, 'task inputs are immutable'); END;
       CREATE TRIGGER IF NOT EXISTS task_no_delete BEFORE DELETE ON tasks
         BEGIN SELECT RAISE(ABORT, 'task inputs are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS job_no_update BEFORE UPDATE ON jobs
+        BEGIN SELECT RAISE(ABORT, 'job provenance is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS job_no_delete BEFORE DELETE ON jobs
+        BEGIN SELECT RAISE(ABORT, 'job provenance is immutable'); END;
     """)
     return connection
 
@@ -68,7 +75,10 @@ def _run(connection: sqlite3.Connection, run_id: str) -> dict[str, Any]:
     row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if row is None:
         raise ValidationError("unknown census run")
-    return {**dict(row), "spec": json.loads(row["spec"])}
+    result = {**dict(row), "spec": json.loads(row["spec"])}
+    if "census-" + L.digest(result["spec"])[:24] != run_id:
+        raise ValidationError("pinned census run configuration changed")
+    return result
 
 
 def _task_rows(connection: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
@@ -97,6 +107,52 @@ def _validate_sources(workspace: Path, tasks: list[dict[str, Any]]) -> None:
         seen.add(source["id"])
 
 
+def _configuration(args: Any, workspace: Path) -> tuple[int, dict[str, Any]]:
+    catalog = _worker(args, workspace, "configs")
+    revision = catalog.get("revision")
+    workers = catalog.get("workers")
+    if not isinstance(revision, int) or isinstance(revision, bool) or not isinstance(workers, list):
+        raise ValidationError("worker catalog omitted its configuration revision")
+    matches = [worker for worker in workers if isinstance(worker, dict) and worker.get("id") == args.worker_config]
+    if len(matches) != 1:
+        raise ValidationError("select one configured platform worker ID")
+    snapshot = matches[0]
+    fields = {"id", "assignment", "agent", "effort", "modelProvider", "providerId", "model", "bulkAvailable"}
+    provider_fields = {"id", "model", "kind", "label", "reasoningProfile"}
+    if set(snapshot) - fields or not isinstance(snapshot.get("modelProvider"), dict) or set(snapshot["modelProvider"]) - provider_fields:
+        raise ValidationError("worker catalog exposed fields outside its public configuration contract")
+    if not isinstance(snapshot.get("bulkAvailable"), bool):
+        raise ValidationError("worker catalog omitted transport capability")
+    return revision, snapshot
+
+
+def _check_configuration(args: Any, workspace: Path, run: dict[str, Any]) -> None:
+    selected = copy.copy(args)
+    selected.worker_config = run["spec"]["workerConfigId"]
+    revision, snapshot = _configuration(selected, workspace)
+    if revision != run["spec"]["workerConfigRevision"] or L.digest(snapshot) != run["spec"]["workerConfigSha256"]:
+        raise ValidationError("worker settings changed; prepare an independently pinned census run")
+
+
+def _schema(workspace: Path, run: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    path = L._path(workspace, f"{ROOT}/{run['id']}/output-schema.json", exists=True)
+    value = L._read_json(path)
+    if L.digest(value) != run["spec"]["outputSchemaSha256"]:
+        raise ValidationError("pinned worker output schema changed")
+    return path, value
+
+
+def _authorize(args: Any, workspace: Path, run: dict[str, Any], tasks: list[dict[str, Any]]) -> None:
+    _validate_sources(workspace, tasks)
+    plan, selected = load_scholarly_context(args.paths, os.environ, cwd=workspace)
+    if selected != workspace:
+        raise ValidationError("census dispatch requires an exact scholarly workspace context")
+    event = authorize_egress(provider="platform-worker:" + run["spec"]["workerConfigId"],
+                             operation="citation_census", arguments={"manuscriptEvidence": [t["input"] for t in tasks],
+                                                                       "workerAssignment": run["spec"]["workerConfig"]["assignment"]}, plan=plan)
+    append_egress_event(workspace, event)
+
+
 def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str, Any]) -> dict[str, Any]:
     L._require_confirmation(ledger)
     manuscript = L._read_json(L._path(workspace, ledger["manuscriptPath"], exists=True))
@@ -106,7 +162,11 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
     schema_path = args.paths.home / "schemas/census-assessment.schema.json"
     prompt = prompt_path.read_text(encoding="utf-8")
     schema = json.loads(schema_path.read_text())
+    jsonschema.Draft202012Validator.check_schema(schema)
+    revision, configuration = _configuration(args, workspace)
     entries = {entry["referenceId"]: entry for entry in ledger["entries"]}
+    if set(args.reference_id) - set(entries):
+        raise ValidationError("pilot filter contains an unknown manuscript reference ID")
     references = {reference["id"]: reference for reference in graph["references"]}
     clusters = {cluster["id"]: cluster for cluster in graph["citationClusters"]}
     tasks = []
@@ -145,6 +205,9 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
                     reason = reason or "source extraction incomplete"
                 if not document:
                     source = None
+                elif source:
+                    source = copy.deepcopy(source)
+                    source["readUnitIds"] = []  # Operator reading progress does not change pinned evidence.
                 task_id = "task-" + L.digest([claim["id"], cluster_id, reference_id])[:24]
                 context = []
                 anchor = next((c for c in manuscript["citationClusters"] if c["id"] == cluster_id), None)
@@ -166,13 +229,16 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
                               "referenceId": reference_id, "citationClusterId": cluster_id,
                               "source": source, "blockedReason": reason,
                               "input": {"messages": messages}, "inputSha256": L.digest(messages)})
-    if args.limit:
+    if args.limit is not None:
         if args.limit < 1:
             raise ValidationError("pilot limit must be positive")
         tasks = tasks[:args.limit]
     if not tasks:
         raise ValidationError("census has no citation loci in its selected scope")
     spec = {"schemaVersion": 1, "mode": args.mode, "workerConfigId": args.worker_config,
+            "workerConfigRevision": revision, "workerConfig": configuration,
+            "workerConfigSha256": L.digest(configuration),
+            "transport": "bulk" if configuration["bulkAvailable"] else "agent",
             "scopeSha256": ledger["scopeSha256"], "bindingSha256": ledger["bindingSha256"],
             "promptSha256": sha256_file(prompt_path), "outputSchemaSha256": L.digest(schema),
             "taskSetSha256": L.digest(sorted(tasks, key=lambda task: task["id"])), "samplingDesign": "pilot" if args.limit or args.reference_id else "all-bound-loci",
@@ -255,10 +321,7 @@ def import_results(args: Any, workspace: Path, connection: sqlite3.Connection, r
         raise ValidationError("worker results need object records with string task IDs")
     if len({record.get("id") for record in records}) != len(records) or any(record.get("id") not in tasks for record in records):
         raise ValidationError("worker results contain duplicate or unknown task IDs")
-    schema_path = L._path(workspace, f"{ROOT}/{args.run}/output-schema.json", exists=True)
-    if L.digest(json.loads(schema_path.read_text())) != run["spec"]["outputSchemaSha256"]:
-        raise ValidationError("pinned worker output schema changed")
-    schema = json.loads(schema_path.read_text())
+    _, schema = _schema(workspace, run)
     counts = {"accepted": 0, "rejected": 0, "duplicates": 0}
     for record in records:
         if record.get("state") not in {"completed", "failed", "cancelled", "interrupted"}:
@@ -268,7 +331,7 @@ def import_results(args: Any, workspace: Path, connection: sqlite3.Connection, r
         try:
             if record["state"] != "completed":
                 raise ValidationError("worker task did not complete")
-            if not isinstance(record.get("model"), str) or not record["model"] or not isinstance(record.get("providerId"), str) or not record["providerId"]:
+            if not isinstance(record.get("model"), str) or not record["model"] or record["model"] == "unknown" or not isinstance(record.get("providerId"), str) or not record["providerId"]:
                 raise ValidationError("worker did not record actual provider and model")
             if not re.fullmatch(r"[a-f0-9]{64}", str(record.get("promptSha256", ""))):
                 raise ValidationError("worker did not record its actual prompt digest")
@@ -298,49 +361,141 @@ def cmd_prepare(args: Any) -> dict[str, Any]:
         return prepare(args, workspace, ledger, graph)
 
 
+def _jobs(connection: sqlite3.Connection, run_id: str) -> list[dict[str, Any]]:
+    rows = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE run_id=? ORDER BY rowid", (run_id,))]
+    for row in rows:
+        row["task_ids"] = json.loads(row["task_ids"])
+    return rows
+
+
+def _remember_job(connection: sqlite3.Connection, run: dict[str, Any], response: dict[str, Any],
+                  kind: str, task_ids: list[str], attempt: int, parent_job: str | None = None) -> None:
+    job_id = response.get("jobId")
+    if not isinstance(job_id, str) or not job_id:
+        raise ValidationError("worker submission omitted jobId")
+    if response.get("configRevision") is not None and response["configRevision"] != run["spec"]["workerConfigRevision"]:
+        raise ValidationError("worker job revision disagrees with the pinned run")
+    expected = (job_id, run["id"], kind, json.dumps(sorted(task_ids)), attempt, parent_job)
+    old = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if old and tuple(old) != expected:
+        raise ValidationError("worker job replay changed its immutable provenance")
+    connection.execute("INSERT OR IGNORE INTO jobs VALUES(?,?,?,?,?,?)", expected)
+    connection.execute("UPDATE runs SET job=?,attempt=? WHERE id=?", (job_id, attempt, run["id"]))
+    connection.commit()  # Each accepted submission survives interruption before the next locus.
+
+
+def _job_results(args: Any, workspace: Path, connection: sqlite3.Connection, job: dict[str, Any],
+                 records: list[dict[str, Any]]) -> dict[str, Any]:
+    prepared = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValidationError("worker result records must be objects")
+        item = dict(record)
+        if job["kind"] == "agent":
+            if item.get("id") != job["id"] or len(job["task_ids"]) != 1:
+                raise ValidationError("native result does not belong to its recorded citation job")
+            item["workerItemId"] = item["id"]
+            item["id"] = job["task_ids"][0]
+        elif item.get("id") not in job["task_ids"]:
+            raise ValidationError("bulk result escaped its submitted citation task set")
+        item["workerJobId"] = job["id"]
+        prepared.append(item)
+    return import_results(args, workspace, connection, prepared)
+
+
 def cmd_run(args: Any) -> dict[str, Any]:
     workspace = L._workspace(args)
     with L._locked(workspace), _database(workspace) as connection:
         _, _, run = _load(args, workspace, connection)
-        if run["job"] and not args.retry:
-            return {"runId": args.run, "jobId": run["job"], "state": "already-submitted"}
         tasks = _task_rows(connection, args.run)
-        _validate_sources(workspace, tasks)
-        plan, selected = load_scholarly_context(args.paths, os.environ, cwd=workspace)
-        if selected != workspace:
-            raise ValidationError("census dispatch requires an exact scholarly workspace context")
         accepted_ids = {r[0] for r in connection.execute("SELECT task_id FROM assessments WHERE run_id=? AND accepted=1", (args.run,))}
         selected_tasks = [task for task in tasks if not task["blockedReason"] and task["id"] not in accepted_ids]
         if not selected_tasks:
             return {"runId": args.run, "state": "nothing-to-dispatch"}
-        event = authorize_egress(provider="platform-worker:" + run["spec"]["workerConfigId"],
-                                 operation="citation_census", arguments={"manuscriptEvidence": [t["input"] for t in selected_tasks]}, plan=plan)
-        append_egress_event(workspace, event)
         attempt = run["attempt"] + int(bool(args.retry))
+        submitted = {task_id for job in _jobs(connection, args.run) if job["attempt"] == attempt for task_id in job["task_ids"]}
+        selected_tasks = [task for task in selected_tasks if task["id"] not in submitted]
+        if not selected_tasks:
+            return {"runId": args.run, "jobId": run["job"], "state": "already-submitted"}
+        _authorize(args, workspace, run, selected_tasks)
+        _check_configuration(args, workspace, run)
+        schema_path, schema = _schema(workspace, run)
         items = L._path(workspace, f"{ROOT}/{args.run}/dispatch-{attempt}.jsonl")
         atomic_write(items, "".join(json.dumps({"id": task["id"], "input": task["input"]}, ensure_ascii=False) + "\n" for task in selected_tasks), mode=0o600)
-        schema_path = L._path(workspace, f"{ROOT}/{args.run}/output-schema.json", exists=True)
-        if L.digest(json.loads(schema_path.read_text())) != run["spec"]["outputSchemaSha256"]:
-            raise ValidationError("pinned schema changed before dispatch")
-        response = _worker(args, workspace, "bulk", "--config", run["spec"]["workerConfigId"],
-                           "--key", f"{args.run}:{attempt}", "--items", str(items), "--schema", str(schema_path))
-        if not isinstance(response.get("jobId"), str) or not response["jobId"]:
-            raise ValidationError("worker submission omitted jobId")
-        connection.execute("UPDATE runs SET job=?,attempt=? WHERE id=?", (response["jobId"], attempt, args.run))
-        return {"runId": args.run, **response}
+        if run["spec"]["transport"] == "bulk":
+            response = _worker(args, workspace, "bulk", "--config", run["spec"]["workerConfigId"],
+                               "--key", f"{args.run}:{attempt}", "--items", str(items), "--schema", str(schema_path))
+            _remember_job(connection, run, response, "bulk", [task["id"] for task in selected_tasks], attempt)
+            return {"runId": args.run, **response}
+        jobs = []
+        for task in selected_tasks:
+            task_path = L._path(workspace, f"{ROOT}/{args.run}/agent-{attempt}-{task['id']}.txt")
+            text = "Evaluate the following messages as one citation-support task. Return only the schema-conforming JSON result.\n"
+            text += json.dumps({"messages": task["input"]["messages"], "outputSchema": schema}, ensure_ascii=False)
+            atomic_write(task_path, text, mode=0o600)
+            response = _worker(args, workspace, "agent", "--config", run["spec"]["workerConfigId"],
+                               "--key", f"{args.run}:{attempt}:{task['id']}", "--task-file", str(task_path))
+            _remember_job(connection, run, response, "agent", [task["id"]], attempt)
+            jobs.append({"jobId": response["jobId"], "taskId": task["id"], "state": response.get("state")})
+        return {"runId": args.run, "state": "submitted", "transport": "agent", "jobs": jobs}
 
 
-def _poll(args: Any, *, resume: bool = False) -> dict[str, Any]:
+def _poll(args: Any, *, command: str = "status") -> dict[str, Any]:
     workspace = L._workspace(args)
     with L._locked(workspace), _database(workspace) as connection:
         _, _, run = _load(args, workspace, connection)
-        if not run["job"]:
+        jobs = _jobs(connection, args.run)
+        if getattr(args, "job", None):
+            jobs = [job for job in jobs if job["id"] == args.job]
+            if not jobs:
+                raise ValidationError("worker job does not belong to this census run")
+        else:
+            # Resumed jobs are new immutable jobs; poll the newest leaf in each chain.
+            parents = {job["parent_job"] for job in jobs if job["parent_job"]}
+            jobs = [job for job in jobs if job["id"] not in parents]
+        if not jobs:
             return {"runId": args.run, "state": "prepared", "tasks": len(_task_rows(connection, args.run))}
-        response = _worker(args, workspace, "resume" if resume else "status", "--job", run["job"])
-        results = response.get("results", [])
-        if results:
-            response["import"] = import_results(args, workspace, connection, results)
-        return {"runId": args.run, **response}
+        if command == "wait" and len(jobs) != 1:
+            raise ValidationError("wait is bounded to one job; select --job from census status")
+        if command == "resume":
+            selected_ids = {task_id for job in jobs for task_id in job["task_ids"]}
+            _authorize(args, workspace, run, [task for task in _task_rows(connection, args.run) if task["id"] in selected_ids])
+            _check_configuration(args, workspace, run)
+        responses = []
+        for job in jobs:
+            if command == "resume":
+                previous = _worker(args, workspace, "status", "--job", job["id"])
+                old_records = previous.pop("results", [])
+                if old_records:
+                    previous["import"] = _job_results(args, workspace, connection, job, old_records)
+                if previous.get("state") not in {"paused", "failed", "interrupted", "cancelled"}:
+                    responses.append(previous)
+                    continue
+            argv = [command, "--job", job["id"]]
+            results_path = None
+            if command == "wait":
+                timeout = args.timeout_ms
+                if not 1 <= timeout <= 60000:
+                    raise ValidationError("wait timeout must be from 1 to 60000 milliseconds")
+                results_path = L._path(workspace, f"{ROOT}/{args.run}/job-{job['id']}-results.jsonl")
+                argv.extend(["--timeout-ms", str(timeout), "--out", str(results_path)])
+            response = _worker(args, workspace, *argv)
+            observed = job
+            if command == "resume" and response.get("jobId") != job["id"]:
+                _remember_job(connection, run, response, job["kind"], job["task_ids"], job["attempt"], job["id"])
+                observed = {**job, "id": response["jobId"]}
+            if results_path is not None:
+                if Path(response.get("resultsFile", "")) != results_path:
+                    raise ValidationError("worker wait did not return the requested results artifact")
+                records = _read_results(L._path(workspace, results_path, exists=True))
+            else:
+                records = response.pop("results", [])
+            if records:
+                response["import"] = _job_results(args, workspace, connection, observed, records)
+            responses.append(response)
+        states = {response.get("state") for response in responses}
+        state = next((s for s in ("paused", "running", "queued", "failed", "interrupted", "cancelled", "completed") if s in states), "unknown")
+        return {"runId": args.run, "state": state, "jobs": responses}
 
 
 def cmd_status(args: Any) -> dict[str, Any]:
@@ -348,12 +503,34 @@ def cmd_status(args: Any) -> dict[str, Any]:
 
 
 def cmd_resume(args: Any) -> dict[str, Any]:
-    return _poll(args, resume=True)
+    return _poll(args, command="resume")
 
 
-def cmd_import(args: Any) -> dict[str, Any]:
+def cmd_wait(args: Any) -> dict[str, Any]:
+    return _poll(args, command="wait")
+
+
+def cmd_cancel(args: Any) -> dict[str, Any]:
+    return _poll(args, command="cancel")
+
+
+def cmd_list(args: Any) -> dict[str, Any]:
     workspace = L._workspace(args)
-    path = L._path(workspace, args.input, exists=True)
+    with L._locked(workspace), _database(workspace) as connection:
+        runs = []
+        for row in connection.execute("SELECT id FROM runs ORDER BY rowid"):
+            run = _run(connection, row["id"])
+            runs.append({"runId": run["id"], "mode": run["spec"]["mode"],
+                         "workerConfigId": run["spec"]["workerConfigId"],
+                         "workerConfigRevision": run["spec"]["workerConfigRevision"],
+                         "transport": run["spec"]["transport"], "attempt": run["attempt"],
+                         "jobIds": [job["id"] for job in _jobs(connection, run["id"])]})
+        return {"runs": runs}
+
+
+def _read_results(path: Path) -> list[dict[str, Any]]:
+    if path.stat().st_nlink != 1:
+        raise ValidationError("worker results share mutable inodes")
     if path.stat().st_size > L.MAX_STATE_BYTES:
         raise ValidationError("worker results exceed import size bound")
     try:
@@ -362,7 +539,19 @@ def cmd_import(args: Any) -> dict[str, Any]:
         raise ValidationError("worker result JSONL is invalid") from exc
     if not all(isinstance(record, dict) for record in records):
         raise ValidationError("worker results must be JSON objects")
+    return records
+
+
+def cmd_import(args: Any) -> dict[str, Any]:
+    workspace = L._workspace(args)
+    path = L._path(workspace, args.input, exists=True)
+    records = _read_results(path)
     with L._locked(workspace), _database(workspace) as connection:
+        if getattr(args, "job", None):
+            job = next((job for job in _jobs(connection, args.run) if job["id"] == args.job), None)
+            if not job:
+                raise ValidationError("worker import job does not belong to this census run")
+            return _job_results(args, workspace, connection, job, records)
         return import_results(args, workspace, connection, records)
 
 
@@ -384,7 +573,7 @@ def cmd_export(args: Any) -> dict[str, Any]:
         snapshots = []
         with sqlite3.connect(temp_path, factory=_Connection) as target:
             target.execute("CREATE TABLE measurements(task_id TEXT PRIMARY KEY, assessment_id TEXT, category TEXT, model TEXT, evidence_tier TEXT, source_sha256 TEXT)")
-            target.execute("CREATE TABLE worker_calls(assessment_id TEXT PRIMARY KEY, provider TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, prompt_sha256 TEXT)")
+            target.execute("CREATE TABLE worker_calls(assessment_id TEXT PRIMARY KEY, provider TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER, prompt_sha256 TEXT, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, usage_quality TEXT, usage_json TEXT)")
             for task in tasks:
                 row = connection.execute("SELECT * FROM assessments WHERE run_id=? AND task_id=? AND accepted=1 ORDER BY rowid DESC LIMIT 1", (args.run, task["id"])).fetchone()
                 payload = json.loads(row["payload"]) if row else None
@@ -399,13 +588,14 @@ def cmd_export(args: Any) -> dict[str, Any]:
             for snapshot in snapshots:
                 result = json.loads(snapshot["payload"])["result"]
                 usage = result.get("usage") or {}
-                def token_count(name):
-                    value = usage.get(name)
+                def token_count(name, alias=None):
+                    value = usage.get(name, usage.get(alias))
                     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-                target.execute("INSERT INTO worker_calls VALUES(?,?,?,?,?,?,?)", (
+                target.execute("INSERT INTO worker_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
                     snapshot["id"], result.get("providerId"), result.get("model"),
-                    token_count("inputTokens"), token_count("outputTokens"), token_count("totalTokens"),
-                    result.get("promptSha256")))
+                    token_count("input", "inputTokens"), token_count("output", "outputTokens"), token_count("total", "totalTokens"),
+                    result.get("promptSha256"), token_count("cacheRead"), token_count("cacheWrite"),
+                    token_count("reasoning"), usage.get("quality"), json.dumps(usage, ensure_ascii=False)))
         os.chmod(temp_path, 0o600)
         os.replace(temp_path, db_path)
         db_hash = sha256_file(db_path)
@@ -420,6 +610,11 @@ def cmd_export(args: Any) -> dict[str, Any]:
             "input_tokens_recorded": "SELECT SUM(input_tokens) FROM worker_calls",
             "output_tokens_recorded": "SELECT SUM(output_tokens) FROM worker_calls",
             "total_tokens_recorded": "SELECT SUM(total_tokens) FROM worker_calls",
+            "worker_calls": "SELECT COUNT(*) FROM worker_calls",
+            "calls_missing_total_tokens": "SELECT COUNT(*) FROM worker_calls WHERE total_tokens IS NULL",
+            "cache_read_tokens_recorded": "SELECT SUM(cache_read_tokens) FROM worker_calls",
+            "cache_write_tokens_recorded": "SELECT SUM(cache_write_tokens) FROM worker_calls",
+            "reasoning_tokens_recorded": "SELECT SUM(reasoning_tokens) FROM worker_calls",
         }
         facts = {}
         with sqlite3.connect(db_path.as_uri() + "?mode=ro&immutable=1", uri=True, factory=_Connection) as frozen:

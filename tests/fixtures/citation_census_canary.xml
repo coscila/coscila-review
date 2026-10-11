@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Original Apache-2.0 synthetic fixture. No actual research findings or publisher content. -->
+<article article-type="research-article">
+  <front><article-meta><article-id pub-id-type="doi">10.1234/synthetic-canary-v1</article-id>
+    <title-group><article-title>Synthetic citation workflow canary</article-title></title-group>
+  </article-meta></front>
+  <body><sec id="background"><title>Background</title>
+    <p id="p1">Samples were associated with improved outcomes<sup><xref ref-type="bibr" rid="R1">1</xref></sup>.</p>
+    <p id="p2">Related studies reported the association <xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R3">3</xref>.</p>
+    <p id="p3">The association has contextual limitations <xref ref-type="bibr" rid="R2">2</xref>.</p>
+    <p id="p4">The final paragraph retains its citation <xref ref-type="bibr" rid="R3">3</xref>.</p>
+    <fig id="F1"><caption><p>Display context retains a reference <xref ref-type="bibr" rid="R2">2</xref>.</p></caption></fig>
+    <table-wrap id="T1"><table><tr><td>Association</td><td><xref ref-type="bibr" rid="R1">1</xref></td></tr></table></table-wrap>
+    <fn id="N1"><p>Late footnote retains its reference <xref ref-type="bibr" rid="R3">3</xref>.</p></fn>
+  </sec></body>
+  <back><ref-list>
+    <ref id="R1"><label>1</label><mixed-citation>Smith A. Source observations. Example Journal. 2024. doi:<pub-id pub-id-type="doi">10.1234/example</pub-id></mixed-citation></ref>
+    <ref id="R2"><label>2</label><mixed-citation>Smith A. Source observations. Example Journal. 2024. doi:<pub-id pub-id-type="doi">10.1234/example</pub-id></mixed-citation></ref>
+    <ref id="R3"><label>3</label><mixed-citation>Smith A. Source observations. Example Journal. 2024. doi:<pub-id pub-id-type="doi">10.1234/example</pub-id></mixed-citation></ref>
+  </ref-list></back>
+</article>

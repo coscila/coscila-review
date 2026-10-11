@@ -367,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     census = review_commands.add_parser("census", help="run resumable per-locus worker measurements")
     census_commands = _subcommands(census, "census_command")
-    for name in ("prepare", "run", "status", "resume", "import", "export"):
+    for name in ("prepare", "run", "list", "status", "wait", "resume", "cancel", "import", "export"):
         command = census_commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         if name == "prepare":
@@ -375,8 +375,13 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--worker-config", required=True)
             command.add_argument("--limit", type=int, help="explicitly labelled pilot subset")
             command.add_argument("--reference-id", action="append", default=[])
-        else:
+        elif name != "list":
             command.add_argument("--run", required=True)
+        if name in {"status", "wait", "resume", "cancel", "import"}:
+            command.add_argument("--job", help="select a recorded worker job within this run")
+        if name == "wait":
+            command.add_argument("--timeout-ms", type=int, default=60000,
+                                 help="bounded wait, at most 60000 ms; results are written inside the workspace")
         if name == "run":
             command.add_argument("--retry", action="store_true", help="new attempt for still-unaccepted tasks")
         if name == "import":
