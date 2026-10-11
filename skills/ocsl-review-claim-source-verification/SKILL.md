@@ -30,6 +30,12 @@ Primary environment: `review-literature`
 
 ## Abstention rules
 
+For repeated or large-scope worker measurements, use
+`ocsl-review-citation-census` and `$OCSL_REVIEW_HOME/docs/citation-census.md`.
+Keep its abstract/full-text/panel observations separate; adjudicate evidence
+before promoting a worker finding into a peer-review audit edge. Ordinary
+`review literature record` calls also retain immutable, source-pinned history.
+
 Metadata never proves support. When full text is unavailable, inspect title and complete abstract and continue at lower confidence. A substantive abstract-based verdict requires an explicitly justified `abstract-sufficient` claim and complete abstract reading, with confidence at most `confident`. Methods, subgroups, tables, quotations, numbers, causal and priority claims still require full text; emit `abstain` with the missing evidence and next action. Apply the same evidence bar to adverse verdicts: limited access cannot prove `not-addressed` or `contradicted`. Partial source previews cannot establish complete examination.
 
 ## Confidentiality and role

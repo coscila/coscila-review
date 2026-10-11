@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Synthetic broker results validate mechanics, never live-model quality."""
 from __future__ import annotations
 

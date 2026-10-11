@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Apache-2.0 synthetic fixtures; no publisher content is redistributed."""
 from __future__ import annotations
 
@@ -73,6 +74,19 @@ class StructuredTests(unittest.TestCase):
             self.ingest('<!DOCTYPE article [<!ENTITY x "x">]>' + article('<p>&x;</p>'))
         with self.assertRaises(ValidationError):
             self.ingest('<html><body><p>Preview.</p></body></html>', '.html')
+
+    def test_front_abstract_back_footnote_and_original_anchor_paths_survive(self):
+        text = article('<p id="main">Body finding <xref ref-type="bibr" rid="R2">2</xref>.</p>')
+        text = text.replace('</article-meta>', '<abstract id="A1"><p>Abstract finding <xref ref-type="bibr" rid="R1">1</xref>.</p></abstract></article-meta>')
+        text = text.replace('<back>', '<back><fn-group><fn id="N1"><p>Back note <xref ref-type="bibr" rid="R3">3</xref>.</p></fn></fn-group>')
+        value = self.ingest(text)
+        self.assertEqual(3, len(value["citationClusters"]))
+        self.assertTrue(value["ingestion"]["complete"])
+        self.assertEqual(["ref-00001"], value["citationClusters"][0]["referenceIds"])
+        self.assertIn('/front[1]/article-meta[1]/abstract[1]/p[1]/xref[1]', value["citationClusters"][0]["sourceAnchors"][0]["elementPath"])
+        body = next(paragraph for paragraph in value["paragraphs"] if paragraph["text"].startswith('Body finding'))
+        self.assertEqual("main", body["sourceLocator"]["elementId"])
+        self.assertIn('/back[1]/fn-group[1]/fn[1]/p[1]/xref[1]', value["citationClusters"][-1]["sourceAnchors"][0]["elementPath"])
 
 
 if __name__ == "__main__":

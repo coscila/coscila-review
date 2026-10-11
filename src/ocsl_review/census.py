@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Resumable, per-locus citation census using the platform worker broker.
 
 Acquisition remains owned by literature.py. This module records model
@@ -218,6 +219,7 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
                                if sentence["paragraphId"] == sentences[index]["paragraphId"]]
                 payload = {"claim": claim["text"], "claimType": claim["claimType"],
                            "citationLocus": cluster, "context": context,
+                           "sourceAnchors": anchor.get("sourceAnchors", []) if anchor else [],
                            "citedWork": reference["identity"], "identifiers": reference["identifiers"],
                            "evidenceTier": source["accessLevel"] if source else "inaccessible",
                            "evidenceUnits": document["blocks"] if document else [],

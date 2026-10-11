@@ -68,6 +68,23 @@ acquired source bytes still require complete reading and a separate scientific
 judgment. Targeted gap sources keep their own source examinations and do not
 inflate the manuscript bibliography denominator.
 
+Structured JATS/publisher HTML extraction adds direct target binding, separate
+printed labels, text-tail preservation and single ownership of citations in
+paragraphs, captions, table cells, lists, boxes and footnotes. Synthetic cases
+in `test_structured.py` cover range interiors, repeated loci beyond three
+sentences, renumbered HTML identities, unresolved targets, unsafe XML entities
+and non-article pages. `test_census.py` exercises the original
+`fixtures/citation_census_canary.xml` through ingestion, independent source
+identity, every bound member, immutable observations and SQL/hash facts export.
+
+Census regression cases additionally cover complete evidence beyond old text
+caps, exact Unicode quotations, missing reading units, independent abstract and
+full-text histories, task/schema/source tampering, worker revision changes,
+native jobs, reconnection to replacement jobs, bounded wait files, retries that
+exclude accepted loci, confidentiality gates and unknown token counts. These
+tests establish mechanics using explicitly synthetic providers/models; they
+cannot establish live-model accuracy, population prevalence or scientific gold.
+
 Run the dependency-light suite from a source checkout with:
 
 ```bash

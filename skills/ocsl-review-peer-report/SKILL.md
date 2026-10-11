@@ -42,4 +42,9 @@ papers or combine correctness and completeness into an unsupported score.
 
 ## Boundary
 
+Census model observations are a separate measurement ledger. Do not promote
+their support counts into expert correctness claims without adjudication. For
+study prose, use the exported `facts.json` SQL/hash derivations with the writing
+companion's facts verifier when available; preserve NULL facts as unassessable.
+
 The reviewer report may recommend action but does not make the editor's accept/reject decision. Do not reveal reviewer notes or confidential manuscript content outside approved deliverables, shared caches, or public tools. Writing polish may be delegated to existing laboratory writing skills only after evidence links are frozen.

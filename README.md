@@ -15,7 +15,7 @@ oc-science-lab-bio/      bioinformatics capabilities, when installed
 oc-science-lab-review/   manuscript review and literature verification
 ```
 
-Installation is additive. It mirrors twenty `ocsl-review-*` skills into
+Installation is additive. It mirrors twenty-one `ocsl-review-*` skills into
 configured global skill roots and adds only `ocsl_review_catalog` and
 `ocsl_scholar` to deployment MCP configuration. It does not require tracked
 changes in either sibling repository.
@@ -27,6 +27,13 @@ Missing full text remains visible; complete abstracts can inform appropriate
 claims at lower confidence, while full-text questions still abstain. Numeric
 ranges such as `[1-10]` retain all ten members. See the runnable
 [literature workflow](docs/literature-review.md).
+
+For systematic model measurements, the [citation census](docs/citation-census.md)
+preserves independent abstract, full-text and panel runs, complete evidence,
+native or API worker jobs, configuration revisions and assessment history. Its
+SQL/hash facts export supports reproducible writing without treating model
+judgments as scientific ground truth. Local JATS and publisher HTML ingestion
+preserve citation targets and display loci before measurement.
 
 ## What the companion decides
 
@@ -138,6 +145,7 @@ commands on a deployment.
 - [Clean-room implementation boundary](docs/clean-room.md)
 - [Claim-citation evidence model](docs/evidence-model.md)
 - [Extensive literature workflow](docs/literature-review.md)
+- [Resumable citation-support census](docs/citation-census.md)
 - [Workflow regression applicability](docs/workflow-regressions.md)
 - [Confidential review and egress](docs/confidentiality.md)
 - [Review environments](docs/environments.md)
@@ -164,7 +172,12 @@ PYTHONPATH="$OCSL_REVIEW_HOME/src" \
 
 ## License and provenance
 
-This repository is licensed under the [MIT License](LICENSE). The adjacent
+The existing package is licensed under the [MIT License](LICENSE). The new
+`structured.py` and `census.py` modules, census prompt and assessment schema,
+structured/census tests and fixtures, census skill, and census guide are
+independently implemented Apache-2.0 originals, with the
+[Apache license text](LICENSES/Apache-2.0.txt) included. Existing MIT assets
+remain under MIT. The adjacent
 `reference/nature-review-studio` project has no project license and is excluded
 from the implementation corpus: no text, code, prompts, tests, fixtures, or
 taxonomies may be taken from it. Only abstract capabilities may be distilled,

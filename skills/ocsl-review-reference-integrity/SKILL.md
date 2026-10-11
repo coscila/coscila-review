@@ -45,6 +45,12 @@ an identifier to fill an unresolved entry.
 
 ## Verdict limits
 
+JATS/publisher HTML ingestion keeps original target IDs, printed numbering and
+publication identifiers in `sourceIdentity` and `structuredSource`. Reconcile
+those with canonical reference IDs and acquired version families; an anchor
+target alone does not certify the current publication. Census runs pin source
+hashes and public worker settings and retain earlier tier/version observations.
+
 Identity metadata establishes existence and status, not evidentiary support. A matching title or abstract may not yield a “supports” edge. If providers disagree or no authoritative identity is available, abstain on identity, mark the reference unresolved, and prevent an unconditional “cited correctly” result.
 
 ## Confidentiality and role

@@ -5,6 +5,11 @@ supports its claim, and whether the evidence selected for the claim is adequate.
 It obtains source material and validates recorded judgments; it does not create
 scientific verdicts automatically.
 
+For systematic platform-worker measurements with pinned prompts, complete
+evidence, resumable jobs, immutable tier-specific observations and SQL-derived
+facts, continue with [citation-census.md](citation-census.md) after acquisition.
+Its model outputs remain separate from expert audit-graph verdicts.
+
 ## Prepare the proposed scope locally
 
 Work inside the selected chat workspace. `OCSL_REVIEW_HOME` points to the
@@ -28,6 +33,12 @@ reference members in one citation occurrence. Repeated citations and duplicate
 DOIs retain distinct manuscript loci and bibliography entries. Table reference
 cells bind to rows. Ambiguous markers, missing range interiors, duplicate
 bibliography labels, and unreadable regions must remain visible.
+
+When supplied, local JATS XML and publisher HTML preserve direct reference
+targets, printed labels, article identifiers, text tails and citations in
+captions, table cells, boxes, lists and footnotes. Inspect `structuredSource`
+anchor ownership and original `sourceIdentity` alongside canonical numbering.
+Structural extraction does not itself establish scholarly identity or reading.
 
 Show the user the prepared bibliography and citation counts. Propose reading
 every accessible reference and investigating targeted missing or contrary
