@@ -156,6 +156,77 @@ class StructuredTests(unittest.TestCase):
         self.assertTrue(value["ingestion"]["complete"])
         self.assertEqual(2, value["structuredSource"]["ownedAnchors"])
 
+    def test_reference_sibling_links_reach_claim_inventory_without_crossing_entries(self):
+        text = '''<html><body><article><p>Finding <a href="#ref-1">1</a>–<a href="#ref-3">3</a>.</p>
+        <ol class="references">
+        <li data-counter="1."><p id="ref-1">Alpha A. First source.</p><p class="links">
+          <a href="https://doi.org/10.1234%2Fsource1">Article</a>
+          <a href="http://www.ncbi.nlm.nih.gov/entrez/query.fcgi?cmd=Retrieve&amp;db=PubMed&amp;list_uids=12345678">PubMed</a>
+          <a href="http://www.ncbi.nlm.nih.gov/pmc/articles/PMC1234567">PubMed Central</a>
+        </p></li>
+        <li data-counter="2."><p id="ref-2">Beta B. Second source.</p><p class="links">
+          <a href="https://doi.org/10.1234%2Fsource2">Article</a>
+          <a href="https://pubmed.ncbi.nlm.nih.gov/23456789/">PubMed</a>
+          <a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC2345678/">Full text</a>
+        </p></li>
+        <li data-counter="3."><p id="ref-3">Gamma C. Unidentified source.</p></li>
+        </ol></article></body></html>'''
+        value = self.ingest(text, '.html')
+        self.assertTrue(value["ingestion"]["complete"])
+        first, second, third = value["bibliographyEntries"]
+        self.assertEqual(["10.1234/source1"], first["identifiers"]["doi"])
+        self.assertEqual(["12345678"], first["identifiers"]["pmid"])
+        self.assertEqual(["PMC1234567"], first["identifiers"]["pmcid"])
+        self.assertEqual(["10.1234/source2"], second["identifiers"]["doi"])
+        self.assertEqual(["23456789"], second["identifiers"]["pmid"])
+        self.assertEqual(["PMC2345678"], second["identifiers"]["pmcid"])
+        self.assertEqual([], third["identifiers"]["doi"])
+        self.assertEqual([], third["identifiers"]["pmid"])
+        self.assertNotIn("PubMed", first["raw"])
+        self.assertEqual(["ref-1", "ref-2", "ref-3"], value["citationClusters"][0]["sourceTargets"])
+        self.assertEqual(2, value["structuredSource"]["ownedAnchors"])
+        graph = build_claim_inventory(value)
+        self.assertEqual("PMC1234567", graph["references"][0]["identifiers"]["pmcid"])
+
+    def test_reference_link_scope_rejects_ambiguous_shared_item_and_conflicting_dois(self):
+        text = '''<html><body><article><p>Findings <a href="#ref-1">1</a>, <a href="#ref-2">2</a>.</p>
+        <ol class="references"><li><p id="ref-1" data-label="1">Alpha A.</p>
+        <p id="ref-2" data-label="2">Beta B.</p><a href="https://doi.org/10.1234/shared">Article</a></li></ol>
+        </article></body></html>'''
+        value = self.ingest(text, '.html')
+        self.assertEqual([[], []], [entry["identifiers"]["doi"] for entry in value["bibliographyEntries"]])
+        text = text.replace('<p id="ref-1" data-label="1">Alpha A.</p>', '''<p id="ref-1" data-label="1">Alpha A.
+        <a href="https://doi.org/10.1234/first">Article</a><a href="https://doi.org/10.1234/other">Article</a></p>''')
+        value = self.ingest(text, '.html')
+        self.assertFalse(value["ingestion"]["complete"])
+        self.assertEqual([], value["bibliographyEntries"][0]["identifiers"]["doi"])
+        self.assertIn("conflicting-reference-identifiers", [w["code"] for w in value["ingestion"]["warnings"]])
+
+    def test_jats_explicit_pmc_ids_and_resolver_links_are_preserved(self):
+        text = article('<p>Finding <xref ref-type="bibr" rid="R1">1</xref>.</p>')
+        text = text.replace('<pub-id pub-id-type="doi">10.1234/source1</pub-id>', '''
+        <pub-id pub-id-type="pmc">PMC1234567</pub-id>
+        <ext-link xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://doi.org/10.1234%2Fsource1">Article</ext-link>
+        <ext-link xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://www.ncbi.nlm.nih.gov/pubmed/12345678">PubMed</ext-link>''')
+        value = self.ingest(text)
+        ids = value["bibliographyEntries"][0]["identifiers"]
+        self.assertEqual(["10.1234/source1"], ids["doi"])
+        self.assertEqual(["12345678"], ids["pmid"])
+        self.assertEqual(["PMC1234567"], ids["pmcid"])
+
+    def test_identifier_links_do_not_trust_search_queries_or_lookalike_hosts(self):
+        text = '''<html><body><article><p>Finding <a href="#ref-1">1</a>.</p><ol class="references">
+        <li id="ref-1" data-counter="1.">Alpha A.
+        <a href="https://pubmed.ncbi.nlm.nih.gov/?term=12345678">Search</a>
+        <a href="https://pubmed.ncbi.nlm.nih.gov.example.org/12345678/">PubMed</a>
+        <a href="https://www.ncbi.nlm.nih.gov/entrez/query.fcgi?db=PubMed&amp;list_uids=12345678,23456789">Search</a>
+        <a href="https://scholar.google.com/scholar_lookup?doi=10.1234%2Fsource1">Search</a>
+        <a href="https://doi.org.example.org/10.1234/source1">Article</a>
+        </li></ol></article></body></html>'''
+        value = self.ingest(text, '.html')
+        self.assertEqual({"doi": [], "pmid": [], "arxiv": []}, value["bibliographyEntries"][0]["identifiers"])
+        self.assertEqual("1.", value["bibliographyEntries"][0]["sourceIdentity"]["printedLabel"])
+
     def test_entities_and_html_without_article_are_rejected(self):
         with self.assertRaises(ValidationError):
             self.ingest('<!DOCTYPE article [<!ENTITY x "x">]>' + article('<p>&x;</p>'))

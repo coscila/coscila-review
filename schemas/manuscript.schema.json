@@ -603,6 +603,12 @@
             "type": "string"
           }
         },
+        "pmcid": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "arxiv": {
           "type": "array",
           "items": {
