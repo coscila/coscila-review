@@ -85,6 +85,15 @@ from a manuscript, commit author, or reviewer. Public HTTPS destinations and
 redirects are validated. Metadata has an 8 MiB response bound; source documents
 have a separate 100 MiB bound. Complete text extraction has no per-section cap.
 
+Advanced Lab workers use the attempt-scoped public-web broker supplied in
+`PUPPENCLAW_ORCHESTRATION_SOCKET`. The broker resolves and validates public
+destinations outside the isolated network namespace; the review client verifies
+TLS certificates through that connection. The same egress policy, redirect
+authorization, credential restrictions, response bounds and time limits still
+apply. A configured broker failure never falls back to direct network access.
+Outside that runtime, the client uses its existing public-address-pinned HTTPS
+connection. Ambient HTTP proxy variables do not override either route.
+
 Every bibliography entry remains in the ledger, including uncited entries,
 duplicates, unresolved identities, failures, and inaccessible sources. A shared
 identifier may reuse source bytes while retaining separate reference records.

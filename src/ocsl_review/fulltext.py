@@ -27,6 +27,7 @@ from .errors import ProviderError
 
 MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 MAX_REDIRECTS = 5
+MAX_BROKER_HEADERS = 64 * 1024
 _CREDENTIAL_QUERY_KEYS = frozenset(
     {"email", "mailto", "api_key", "apikey", "access_token", "authorization"}
 )
@@ -99,6 +100,66 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
         raise ProviderError("public HTTPS connection failed") from last_error
 
 
+class _BrokerHTTPSConnection(http.client.HTTPSConnection):
+    """Use the attempt's public-web broker without requiring sandbox DNS.
+
+    The broker validates and pins the public destination, excludes model
+    endpoints, and checks TLS SNI. The client still verifies the destination's
+    certificate and keeps the review egress gate above this transport.
+    """
+
+    def __init__(self, host: str, *, broker_socket: str, timeout: float,
+                 context: ssl.SSLContext):
+        if not os.path.isabs(broker_socket) or "\0" in broker_socket:
+            raise ProviderError("public-web broker requires an absolute Unix socket path")
+        # The broker compares CONNECT authority with TLS SNI, which uses the
+        # canonical hostname rather than a DNS name's optional trailing dot.
+        host = host.rstrip(".").lower()
+        super().__init__(host, 443, timeout=timeout, context=context)
+        self._broker_socket = broker_socket
+
+    def connect(self) -> None:
+        deadline = time.monotonic() + float(self.timeout)
+        raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock = raw
+
+        def remaining() -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise ProviderError("public-web broker exceeded the connection timeout")
+            return value
+
+        try:
+            raw.settimeout(remaining())
+            raw.connect(self._broker_socket)
+            authority = f"{self.host}:443"
+            raw.settimeout(remaining())
+            raw.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode("ascii"))
+            # Avoid buffered reads stealing bytes from the TLS stream. Unlike
+            # HTTPConnection._tunnel, enforce an aggregate header bound and an
+            # absolute deadline even if a peer keeps sending single bytes.
+            headers = bytearray()
+            while not headers.endswith(b"\r\n\r\n"):
+                if len(headers) >= MAX_BROKER_HEADERS:
+                    raise ProviderError("public-web broker response headers exceed their bound")
+                raw.settimeout(remaining())
+                chunk = raw.recv(1)
+                if not chunk:
+                    raise ProviderError("public-web broker closed before establishing the tunnel")
+                headers.extend(chunk)
+            status = bytes(headers).split(b"\r\n", 1)[0].split(b" ", 2)
+            if (len(status) < 2 or status[0] not in {b"HTTP/1.0", b"HTTP/1.1"}
+                    or len(status[1]) != 3 or not status[1].isdigit()):
+                raise ProviderError("public-web broker returned an invalid tunnel response")
+            if status[1] != b"200":
+                raise ProviderError(f"public-web broker rejected the destination (HTTP {int(status[1])})")
+            raw.settimeout(remaining())
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+        except Exception:
+            self.close()
+            raise
+
+
 class _Response:
     def __init__(self, response: http.client.HTTPResponse, connection: Any, url: str, deadline: float):
         self.response = response
@@ -139,7 +200,11 @@ def open_public_https(
     allow_cross_origin: bool = False,
     authorize_url: Callable[[str], None] | None = None,
 ) -> _Response:
-    """Open GET only, without proxies/cookies or cross-host credential forwarding."""
+    """Open GET only, directly or via the attempt's scoped public-web broker.
+
+    Ambient HTTP proxies and cookies are never inherited. A configured broker
+    is authoritative: failure does not fall back to direct network access.
+    """
 
     url = request.full_url
     initial = validate_public_url(url)
@@ -160,7 +225,14 @@ def open_public_https(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProviderError("HTTPS redirects exceeded the configured timeout")
-        connection = _PublicHTTPSConnection(parsed.hostname, 443, timeout=remaining, context=ssl.create_default_context())
+        broker = os.environ.get("PUPPENCLAW_ORCHESTRATION_SOCKET")
+        context = ssl.create_default_context()
+        connection = (
+            _BrokerHTTPSConnection(parsed.hostname, broker_socket=broker,
+                                   timeout=remaining, context=context)
+            if broker is not None else _PublicHTTPSConnection(parsed.hostname, 443,
+                                                  timeout=remaining, context=context)
+        )
         try:
             connection.request("GET", urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, "")), headers=headers)
             response = connection.getresponse()
