@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 from .errors import ValidationError
@@ -61,6 +62,71 @@ def _numeric_label(label: str) -> str | None:
     """Normalize numeric lookup only; the original printed label stays intact."""
     match = re.fullmatch(r"(?:\[(\d+)\]|(\d+)[.)]?)", label.strip())
     return str(int(next(value for value in match.groups() if value is not None))) if match else None
+
+
+def _linked_identifiers(link: str) -> dict[str, str]:
+    """Read identifiers asserted by resolver links, never by search-result text."""
+    try:
+        url = urlsplit(link)
+        host = (url.hostname or "").lower()
+    except ValueError:
+        return {}
+    if url.scheme not in {"http", "https", ""}:
+        return {}
+    path = unquote(url.path)
+    if host in {"doi.org", "www.doi.org", "dx.doi.org"}:
+        doi = path.lstrip("/")
+    else:
+        match = re.search(r"/doi/(?:abs/|full/|pdf/)?(10\.[^?#]+)", path, re.I)
+        doi = match.group(1) if match else ""
+    if re.fullmatch(r"10\.\d{4,9}/[^\s<>\"]+", doi, re.I):
+        return {"doi": doi}
+    if host not in {"pubmed.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov"}:
+        return {}
+    pmc = re.fullmatch(r"/(?:pmc/)?articles/(PMC\d+)/?", path, re.I)
+    if pmc:
+        return {"pmcid": pmc.group(1).upper()}
+    pmid = re.fullmatch(r"/(?:pubmed/)?(\d+)/?", path)
+    if pmid and (host == "pubmed.ncbi.nlm.nih.gov" or path.startswith("/pubmed/")):
+        return {"pmid": pmid.group(1)}
+    query = parse_qs(url.query)
+    if path == "/entrez/query.fcgi" and [v.lower() for v in query.get("db", [])] == ["pubmed"]:
+        values = query.get("list_uids", [])
+        if len(values) == 1 and re.fullmatch(r"\d+", values[0]):
+            return {"pmid": values[0]}
+    return {}
+
+
+def _reference_identifiers(node: ET.Element) -> tuple[dict[str, str], list[str]]:
+    """Keep only unambiguous identifiers within one bibliography entry."""
+    candidates: dict[str, dict[str, str]] = {}
+
+    def add(kind: str, value: str) -> None:
+        if kind == "pmc":
+            kind = "pmcid"
+        value = value.strip()
+        if kind == "doi":
+            value = _linked_identifiers(value).get("doi", value)
+            valid = re.fullmatch(r"10\.\d{4,9}/[^\s<>\"]+", value, re.I)
+        elif kind == "pmid":
+            valid = re.fullmatch(r"\d+", value)
+        elif kind == "pmcid":
+            value = value.upper()
+            valid = re.fullmatch(r"PMC\d+", value)
+        else:
+            return
+        if valid:
+            candidates.setdefault(kind, {}).setdefault(value.casefold(), value)
+
+    for child in node.iter():
+        if child.tag == "pub-id":
+            add(child.get("pub-id-type", ""), _text(child))
+        if child.tag in {"a", "ext-link"}:
+            link = child.get("href", "") or child.get("{http://www.w3.org/1999/xlink}href", "")
+            for kind, value in _linked_identifiers(link).items():
+                add(kind, value)
+    return ({kind: next(iter(values.values())) for kind, values in candidates.items() if len(values) == 1},
+            [kind for kind, values in candidates.items() if len(values) > 1])
 
 
 def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
@@ -134,11 +200,12 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         content_roots = [root]
     identities: dict[str, dict[str, Any]] = {}
     warnings: list[dict[str, Any]] = []
+    reference_nodes = set(refs)
     for number, node in enumerate(refs, 1):
         source_id = node.get("id") or f"unlabelled-{number}"
         if source_id in identities:
             raise ValidationError("structured bibliography contains duplicate target IDs")
-        label = _text(node.find("label")) or node.get("data-label", "")
+        label = _text(node.find("label")) or node.get("data-label", "") or node.get("data-counter", "")
         if not label and html:
             label = next((a.get("data-counter", "") for a in ancestors(node)
                           if a.tag == "li" and a.get("data-counter")), "")
@@ -146,14 +213,19 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
             match = re.match(r"\s*\[?(\d+)\]?[.)]?\s", _text(node))
             label = match.group(1) if match else str(number)
         printed = _text(node)
-        identifiers = {n.get("pub-id-type"): _text(n) for n in node.iter("pub-id")
-                       if n.get("pub-id-type") in {"doi", "pmid"}}
-        for anchor in node.iter("a"):
-            link = anchor.get("href", "")
-            match = re.search(r"(?:doi\.org/|/doi/)(10\.[^?#]+)", link, re.I)
-            if match:
-                from urllib.parse import unquote
-                identifiers["doi"] = unquote(match.group(1))
+        identifier_scope = node
+        if html and node.tag != "li":
+            # Publishers commonly put the target on a paragraph and its DOI /
+            # PubMed links in a sibling paragraph. Never cross an entry boundary
+            # or borrow links from a list item that owns multiple references.
+            item = next((a for a in ancestors(node) if a.tag == "li"), None)
+            if item is not None and reference_nodes.intersection(item.iter()) == {node}:
+                identifier_scope = item
+        identifiers, conflicts = _reference_identifiers(identifier_scope)
+        if conflicts:
+            warnings.append({"code": "conflicting-reference-identifiers", "targetId": source_id,
+                             "message": "multiple explicit identifiers for " + ", ".join(sorted(conflicts)),
+                             "affectsCompleteness": True})
         identities[source_id] = {"ordinal": number, "printedLabel": label,
                                  "raw": printed, "identifiers": identifiers}
     if not identities:
