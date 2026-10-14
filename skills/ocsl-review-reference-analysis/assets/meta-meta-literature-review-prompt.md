@@ -77,9 +77,12 @@ acquisition, evidence, worker and public-material authorization contracts before
 production. Prove a bounded complete path through accepted judgments and exported
 facts, then measure workload, tokens and throughput. The pilot is an execution
 check inside the full census, not the deliverable. Use existing operational
-commands only; report missing maintained capabilities precisely rather than
-inventing commands or bypassing a denied transport. A template does not repair
-an unavailable corpus scheduler or a failed deployment prerequisite.
+commands only. Build the corpus coordinator and import transformations in this
+workspace, using bounded submissions and the runner's worker-result continuation.
+Report failed deployment prerequisites precisely rather than inventing commands
+or bypassing a denied transport. The template's public-literature permission
+applies to approved execution and acquired public sources; private attachments
+retain their existing restrictions.
 
 Use bounded submissions and an explicit aggregate concurrency budget. Persist
 accepted observations, retries, provider/model receipts and phase checkpoints.

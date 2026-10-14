@@ -1,5 +1,35 @@
 # Confidential review and egress
 
+## Public literature workers
+
+Lab worker configurations can explicitly declare `evidencePolicy: public-literature`
+(the **Allow public literature evidence** option). This is stored in the versioned
+worker configuration and portable presets. It takes effect only for the controller
+in an approved execution attempt, never for planning or child workers.
+
+The census reads the authorization directly from the scoped broker, verifies the
+attempt, workspace and pinned worker configuration, then checks the published
+manuscript's nonconfidential declaration and acquired public evidence. Sources
+must have remote acquisition provenance, and payload evidence must match their
+verified hashes and extracted units. The receipt records attempt, configuration,
+source-manifest and payload hashes. Neither a local public flag nor a skill grants
+this permission. Explicit operator egress restrictions take precedence. Private
+attachments and confidential manuscripts continue to require the operator plan
+described below. This route does not relax metadata-provider egress rules.
+
+The approved controller remains responsible for correct public/private
+classification and acquisition provenance. These checks bind its declared public
+material to a configured permission; they are not an independent publisher
+attestation service. Manuscript classification and extracted content are pinned
+when the census is prepared, so relabelling or editing them afterwards requires
+a new run and cannot change an existing authorization.
+
+The `meta meta literature review` preset includes this permission for its public
+literature workers. Loading a preset does not execute any work or bypass normal
+plan approval. Changing permission requires preparing a new pinned census run.
+
+## Operator plans
+
 An uploaded, unpublished manuscript is confidential unless a person with the
 right authority records a different decision. Confidentiality is enforced at
 the provider-call boundary; it is not merely an instruction in a review skill.

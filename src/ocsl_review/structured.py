@@ -58,6 +58,16 @@ def _text(node: ET.Element | None) -> str:
     return " ".join("".join(node.itertext()).split()) if node is not None else ""
 
 
+def _reference_text(node: ET.Element) -> str:
+    """A bibliography label is a separate field; inline citation text is not."""
+    parts = [node.text or ""]
+    for child in node:
+        content = "".join(child.itertext())
+        parts.append(" " + content + " " if child.tag == "label" else content)
+        parts.append(child.tail or "")
+    return " ".join("".join(parts).split())
+
+
 def _numeric_label(label: str) -> str | None:
     """Normalize numeric lookup only; the original printed label stays intact."""
     match = re.fullmatch(r"(?:\[(\d+)\]|(\d+)[.)]?)", label.strip())
@@ -212,7 +222,7 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
         if not label:
             match = re.match(r"\s*\[?(\d+)\]?[.)]?\s", _text(node))
             label = match.group(1) if match else str(number)
-        printed = _text(node)
+        printed = _reference_text(node) if node.tag == "ref" else _text(node)
         identifier_scope = node
         if html and node.tag != "li":
             # Publishers commonly put the target on a paragraph and its DOI /

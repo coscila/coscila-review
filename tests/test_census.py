@@ -21,6 +21,8 @@ from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.util import atomic_json
 import test_literature as fixtures
+from test_fulltext import SourceTransport
+from ocsl_review.scholarly import ScholarlyClient
 
 HOME = Path(__file__).resolve().parents[1]
 REAL_CONFIGURATION = census._configuration
@@ -109,6 +111,17 @@ class CensusTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("UPDATE tasks SET spec='{}'")
 
+    def test_paginated_wait_and_full_status_records_are_the_same_assessment(self):
+        self.prepare()
+        record = self.result()
+        job = {"id": "synthetic-job", "kind": "bulk", "task_ids": [record["id"]]}
+        with census._database(self.workspace) as connection:
+            first = census._job_results(self.args, self.workspace, connection, job, [{**record, "revision": 8}])
+            second = census._job_results(self.args, self.workspace, connection, job, [record])
+            self.assertEqual(first["accepted"], 1)
+            self.assertEqual(second["duplicates"], 1)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM assessments").fetchone()[0], 1)
+
     def test_missing_units_invented_quotes_and_unrecorded_models_rejected(self):
         self.prepare()
         for mutate in (
@@ -142,6 +155,34 @@ class CensusTests(unittest.TestCase):
         self.assertEqual(1, self.ingest_result([self.result()])["accepted"])
         with census._database(self.workspace) as connection:
             self.assertEqual(2, connection.execute("SELECT COUNT(DISTINCT run_id) FROM assessments").fetchone()[0])
+
+    def test_real_acquisition_contract_dispatches_complete_abstract_beside_full_text(self):
+        manuscript_path = self.workspace / "manuscript.md"
+        manuscript_path.write_text(fixtures.TEXT.replace("Source observations", "Sample study"))
+        self.manuscript = ingest_manuscript(manuscript_path)
+        self.graph = build_claim_inventory(self.manuscript)
+        atomic_json(self.workspace / ".ocsl-review/manuscript.json", self.manuscript)
+        self.state, self.graph = literature.prepare_literature(self.workspace, self.manuscript, self.graph)
+        literature._save(self.workspace, self.state, self.graph, event="new-test-manuscript")
+        self.client = ScholarlyClient(transport=SourceTransport())
+        result = self.prepare(mode="abstract")
+        self.assertEqual(result["dispatchable"], 2)
+        self.assertEqual({self.state["sources"][entry["sourceId"]]["accessLevel"] for entry in self.state["entries"]}, {"full-text"})
+        task = self.task()
+        self.assertEqual(task["source"]["accessLevel"], "abstract-only")
+        self.assertTrue(task["source"]["sourceUrl"].startswith("https://"))
+        self.assertEqual(task["source"]["identifiers"]["doi"], "10.1234/example")
+        self.assertEqual(self.ingest_result([self.result()])["accepted"], 1)
+
+    def test_legacy_abstract_completeness_requires_reacquisition_not_flag_migration(self):
+        self.client.abstract_only = True
+        self.prepare(mode="abstract")
+        for entry in self.state["entries"]:
+            entry["abstractCandidates"] = [{"provider": "pubmed", "text": "Old complete-looking sentence.", "complete": True}]
+        result = census.prepare(self.args, self.workspace, self.state, self.graph)
+        self.assertEqual(result["dispatchable"], 0)
+        self.args.run = result["runId"]
+        self.assertIn("retry acquisition", self.task()["blockedReason"])
 
     def test_specific_abstract_claim_cannot_receive_support(self):
         self.prepare(mode="abstract")

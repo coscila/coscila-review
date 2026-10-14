@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Existing runtime and integration boundaries
 
-The new skill and database helper organize reusable research state. They do not
-by themselves repair the production identity resolver, acquisition-to-census
-schema, authorization handoff, corpus scheduler or orchestration lifecycle.
-Verify these capabilities in the deployment before advertising a full run.
+The skill and database helper organize reusable research state. Claude builds
+the corpus coordinator and database imports inside the research workspace,
+using the maintained acquisition and worker interfaces below. Verify a complete
+path through accepted judgments before scaling; source downloads alone are not
+an execution test.
 
 ## Maintained commands
 
@@ -44,22 +45,39 @@ automatically performs cross-corpus aggregation.
 
 ## Preflight on the real integration path
 
-Before scaling, verify provider-declared venue aliases survive reconciliation,
-all identifier candidates resolve to the acquired work, and complete abstracts
-carry the completeness fields consumed by census preparation. These defects
-blocked the October 2026 deployment despite successful source downloads.
+Before scaling, verify identity agreement, acquired source identity and abstract
+provenance. The maintained resolver preserves provider-declared venue aliases
+and ISSNs, reconciles printed identifier candidates, and selects publication
+status from verified identifiers. Complete abstracts carry structured-provider
+provenance and hashes shared by acquisition and census preparation. Older cached
+records lacking that provenance need an acquisition retry; do not patch in a
+completeness flag or change an already pinned run.
 
-The authorization check must use the exact selected workspace, approved public
-material, operation and worker provider. If it fails, report the relevant
-operation and scope to the operator; neither a local `--public` flag nor a
-study-scope confirmation is an egress bypass. Do not request repeated study
-approval when an implementation defect is preventing an existing authorization
-from reaching the gate.
+The saved template explicitly permits public literature evidence on its workers
+(`evidencePolicy: public-literature`). The broker enables this permission only
+for the controller in approved execution, binding the current chat, attempt and
+worker revision. The census verifies the published manuscript's public label,
+remote source provenance and evidence hashes, recording a disclosure receipt.
+A local `--public` flag alone grants no permission. Private attachments and
+confidential manuscripts retain the explicit operator-plan route, and operator
+restrictions always prevail. If a permission changes, prepare a new pinned run;
+do not rewrite the original run. No separate approval is needed for every paper
+inside the already authorized public study.
 
-Check aggregate concurrency across jobs; per-job concurrency limits can multiply
-unintentionally. Validate accepted real results and explicit uncertainty before
-scaling, then test interruption/resumption. No input, source or accepted
-assessment may be silently replaced while recovering a runner.
+Use byte-bounded job submissions below the broker's 64 MiB request bound and
+an explicit study concurrency budget. The broker also enforces its configured
+aggregate provider limit. Read compact progress with `status --job ID --view
+summary` and incremental outputs with `results --job ID --after CURSOR --limit
+100 --out work/result-page.jsonl`; persist the returned cursor only after the
+corresponding results are imported. Poll a single job or changed summaries,
+not the full accumulated history.
+
+The runner waits for submitted jobs and continues Claude in the same attempt.
+Use that continuation to integrate results and submit the next bounded batch.
+Claude can implement the corpus coordinator using these primitives; a new
+platform scheduler is not required. Do not launch an untracked background
+supervisor to keep the chat alive. Test interruption/resumption, retain accepted
+assessments and receipts, and make retry decisions explicit.
 
 For a fork, carry the database snapshot and source manifest, not credential
 files, sockets or broker job IDs. Pending execution requires new jobs owned by

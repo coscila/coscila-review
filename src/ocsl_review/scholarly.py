@@ -24,6 +24,7 @@ from typing import Any, Iterator
 
 from .confidentiality import EgressPlan, append_egress_event, authorize_egress
 from .errors import ProviderError, ReviewError
+from .evidence import abstract_candidate, complete_abstract
 from .fulltext import MAX_DOCUMENT_BYTES, open_public_https, parse_source_document, validate_public_url
 
 CROSSREF = "https://api.crossref.org"
@@ -256,6 +257,15 @@ def _crossref_year(item: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _journal_fields(names: list[Any], identifiers: list[Any]) -> dict[str, list[str]]:
+    """Retain only provider-declared aliases and well-formed ISSNs."""
+    return {
+        "containerAliases": sorted({value for name in names if (value := display_text(name))}),
+        "issns": sorted({str(value).upper().replace("-", "") for value in identifiers
+                         if re.fullmatch(r"\d{4}-?\d{3}[\dXx]", str(value or ""))}),
+    }
+
+
 def normalize_crossref(item: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "provider": "crossref",
@@ -267,6 +277,8 @@ def normalize_crossref(item: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "year": _crossref_year(item),
         "container": display_text(_first(item.get("container-title"))),
+        **_journal_fields(list(item.get("container-title") or []) + list(item.get("short-container-title") or []),
+                          list(item.get("ISSN") or [])),
         "volume": item.get("volume"),
         "issue": item.get("issue"),
         "pages": item.get("page") or item.get("article-number"),
@@ -288,6 +300,7 @@ def normalize_crossref(item: Mapping[str, Any]) -> dict[str, Any]:
 
 def normalize_europe_pmc(item: Mapping[str, Any]) -> dict[str, Any]:
     author_text = item.get("authorString") or ""
+    journal = (item.get("journalInfo") or {}).get("journal") or {}
     return {
         "provider": "europe-pmc",
         "id": item.get("id"),
@@ -299,6 +312,8 @@ def normalize_europe_pmc(item: Mapping[str, Any]) -> dict[str, Any]:
         "authors": [display_text(part) for part in author_text.split(",") if part.strip()],
         "year": int(item["pubYear"]) if str(item.get("pubYear", "")).isdigit() else None,
         "container": display_text(item.get("journalTitle") or item.get("journalInfo", {}).get("journal", {}).get("title")),
+        **_journal_fields([item.get("journalTitle"), journal.get("title"), journal.get("medlineAbbreviation"), journal.get("isoAbbreviation")],
+                          [journal.get("issn"), journal.get("essn"), item.get("journalIssn")]),
         "volume": item.get("journalVolume") or item.get("journalInfo", {}).get("volume"),
         "issue": item.get("issue") or item.get("journalInfo", {}).get("issue"),
         "pages": item.get("pageInfo"),
@@ -370,6 +385,8 @@ def parse_pubmed_record(body: bytes, pmid: str) -> dict[str, Any]:
         "authors": [" ".join(part for part in (node.findtext("ForeName"), node.findtext("LastName"), node.findtext("CollectiveName")) if part) for node in article.findall("AuthorList/Author")],
         "year": int(year) if year and year.isdigit() else None,
         "container": text(article.find("Journal/Title")),
+        **_journal_fields([text(article.find("Journal/Title")), text(article.find("Journal/ISOAbbreviation")), citation.findtext("MedlineJournalInfo/MedlineTA")],
+                          [node.text for node in article.findall("Journal/ISSN")] + [citation.findtext("MedlineJournalInfo/ISSNLinking")]),
         "volume": article.findtext("Journal/JournalIssue/Volume"), "issue": article.findtext("Journal/JournalIssue/Issue"),
         "pages": article.findtext("Pagination/MedlinePgn"),
         "publicationTypes": [text(node) for node in article.findall("PublicationTypeList/PublicationType")],
@@ -456,7 +473,7 @@ class ScholarlyClient:
         params: dict[str, Any] = {
             "query.bibliographic": query,
             "rows": rows,
-            "select": "DOI,title,author,published,container-title,volume,issue,page,type,relation,update-to,license,URL",
+            "select": "DOI,title,author,published,container-title,short-container-title,ISSN,volume,issue,page,type,relation,update-to,license,URL",
         }
         if self.contact_email:
             params["mailto"] = self.contact_email
@@ -547,6 +564,7 @@ class ScholarlyClient:
             "published": item.get("pubdate"),
             "year": int(match.group()) if (match := re.search(r"\b(?:18|19|20)\d{2}\b", item.get("pubdate") or "")) else None,
             "container": display_text(item.get("fulljournalname") or item.get("source")),
+            **_journal_fields([item.get("fulljournalname"), item.get("source")], [item.get("issn"), item.get("essn")]),
             "volume": item.get("volume"), "issue": item.get("issue"), "pages": item.get("pages"),
             "doi": next((value.get("value") for value in item.get("articleids", []) if value.get("idtype") == "doi"), None),
             "rawMetadata": dict(item),
@@ -738,7 +756,41 @@ class ScholarlyClient:
                     return f"invalid-doi:{value}"
             if field == "pmcid":
                 return str(value).strip().upper().removeprefix("PMC")
+            if field == "pages":
+                match = re.fullmatch(r"\s*([A-Za-z]*)(\d+)\s*[-–—]\s*([A-Za-z]*)(\d+)\s*", str(value))
+                if match:
+                    prefix, start, end_prefix, end = match.groups()
+                    if not end_prefix or end_prefix.casefold() == prefix.casefold():
+                        if len(end) < len(start):
+                            expanded = int(start[:-len(end)] + end)
+                            if expanded < int(start):
+                                expanded += 10 ** len(end)
+                            end = str(expanded)
+                        return f"{prefix.casefold()}{start}-{prefix.casefold()}{end}"
             return canonical_text(value)
+
+        # Alias and ISSN links are evidence supplied by the providers, not
+        # guesses based on initials or fuzzy similarity. Keep raw records above.
+        venues = [(record, {canonical_text(value) for value in
+                            [record.get("container"), *record.get("containerAliases", [])] if value},
+                   set(record.get("issns", []))) for record in records if record.get("container")]
+        connected_names: set[str] = set()
+        connected_issns: set[str] = set()
+        pending = list(venues)
+        if pending:
+            _, connected_names, connected_issns = pending.pop(0)
+            connected_names, connected_issns = set(connected_names), set(connected_issns)
+        changed = True
+        while pending and changed:
+            changed = False
+            for item in list(pending):
+                _, names, issns = item
+                if names & connected_names or issns & connected_issns:
+                    connected_names |= names
+                    connected_issns |= issns
+                    pending.remove(item)
+                    changed = True
+        venue_agreement = not pending
 
         providers = {str(record.get("provider")) for record in records if record.get("provider") not in (None, "", "unknown")}
         fields = ("doi", "pmid", "pmcid", "title", "year", "container", "volume", "pages")
@@ -754,18 +806,24 @@ class ScholarlyClient:
                 for record in records
                 if record.get(field) not in (None, "")
             }
-            if len(values) > 1:
+            if len(values) > 1 and not (field == "container" and venue_agreement):
                 differences.append({"field": field, "values": sorted(values)})
             observed_by = {str(record.get("provider")) for record in records if record.get(field) not in (None, "") and record.get("provider") in providers}
             if field in required and len(observed_by) < 2:
                 missing.append({"field": field, "reason": "fewer-than-two-provider-values"})
-            if printed.get(field) and values and canonical_field(field, printed[field]) not in values:
+            accepted_values = connected_names if field == "container" and venue_agreement else values
+            if printed.get(field) and values and canonical_field(field, printed[field]) not in accepted_values:
                 differences.append({"field": field, "printed": canonical_field(field, printed[field]), "values": sorted(values)})
+            if printed.get(field) and not values:
+                missing.append({"field": field, "reason": "printed-field-unconfirmed"})
             if printed_reference is not None and field in required and not printed.get(field):
                 raw = canonical_text(printed.get("raw"))
-                # An exact occurrence in the printed entry is useful; venue
-                # abbreviation guesses and title similarity are never repairs.
-                if len(values) != 1 or not raw or not any(f" {value} " in f" {raw} " for value in values):
+                # A declared venue alias may appear literally in the entry.
+                # Other fields retain their exact printed comparison.
+                printed_values = accepted_values if field == "container" else {
+                    canonical_text(record[field]) for record in records if record.get(field)}
+                consistent = venue_agreement if field == "container" else len(values) == 1
+                if not consistent or not raw or not any(f" {value} " in f" {raw} " for value in printed_values):
                     missing.append({"field": field, "reason": "printed-field-unconfirmed"})
         agreement = "conflict" if differences else "single-source" if len(providers) < 2 else "incomplete" if missing else "consistent"
         return {
@@ -1000,12 +1058,24 @@ class ScholarlyClient:
             resolved_pmid = pmid or (epmc or {}).get("pmid")
             resolved_doi = identifier.get("doi") or (epmc or {}).get("doi")
             if epmc and epmc.get("abstract"):
-                abstract_candidates.append({"provider": "europe-pmc", "text": epmc["abstract"]})
+                query = f'DOI:"{value}"' if key == "doi" else f"EXT_ID:{value} AND SRC:MED" if key == "pmid" else f"PMCID:{value}"
+                abstract_candidates.append(abstract_candidate(
+                    epmc, source_url=f"{EUROPE_PMC}/search?" + urllib.parse.urlencode({"query": query, "pageSize": 5, "resultType": "core", "format": "json"}),
+                    retrieved_at=utc_now()))
             if resolved_pmid:
                 try:
                     structured = self._pubmed_structured(str(resolved_pmid), "acquire_full_text")
-                    if structured.get("abstract"):
-                        abstract_candidates.append({"provider": "pubmed", "text": structured["abstract"]})
+                    try:
+                        conflicting = (resolved_doi and structured.get("doi")
+                                       and normalize_doi(str(structured["doi"])) != normalize_doi(str(resolved_doi)))
+                    except ReviewError:
+                        conflicting = True
+                    if conflicting:
+                        limitations.append("PubMed abstract DOI conflicts with the requested work; abstract excluded.")
+                    elif structured.get("abstract"):
+                        abstract_candidates.append(abstract_candidate(
+                            structured, source_url=f"{PUBMED}/efetch.fcgi?" + urllib.parse.urlencode({"db": "pubmed", "id": resolved_pmid, "retmode": "xml"}),
+                            retrieved_at=utc_now()))
                 except ProviderError as exc:
                     limitations.append(f"pubmed abstract: {exc}")
             if epmc and epmc.get("pmcid") and epmc.get("isOpenAccess"):
@@ -1062,11 +1132,11 @@ class ScholarlyClient:
                         if isinstance(exc, ConfidentialityError):
                             raise
                         limitations.append(f"unpaywall: {exc}")
-            abstract_record = max(abstract_candidates, key=lambda item: len(item["text"]), default=None)
+            abstract_record = max(abstract_candidates, key=lambda item: (complete_abstract(item), len(item["text"])), default=None)
             abstract = abstract_record["text"] if abstract_record else None
-            abstract_complete = bool(abstract and re.search(r"[.!?][\"')\]]*$", abstract.strip()))
+            abstract_complete = complete_abstract(abstract_record)
             if abstract and not abstract_complete:
-                limitations.append("Provider abstract may end mid-sentence; completeness is unproven.")
+                limitations.append("Complete structured provider abstract provenance is unavailable or indicates truncation.")
             for document in documents:
                 if document["supplements"]:
                     limitations.append("Supplement links were recorded; external supplement files require separate acquisition and examination.")

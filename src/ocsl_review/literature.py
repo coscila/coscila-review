@@ -23,6 +23,7 @@ from .audit import build_audit_summary, validate_audit_graph
 from .claim_inventory import build_claim_inventory
 from .confidentiality import _assert_no_symlink_components, load_scholarly_context
 from .errors import ConfidentialityError, ReviewError, ValidationError
+from .evidence import complete_abstract
 from .scholarly import ScholarlyClient, utc_now
 from .util import atomic_json, atomic_write, sha256_bytes, sha256_file
 
@@ -440,6 +441,11 @@ def _identifiers(reference: Mapping[str, Any]) -> dict[str, str]:
 
 def _resolve(client: ScholarlyClient, entry: dict[str, Any], reference: dict[str, Any]) -> None:
     identifiers = _identifiers(reference)
+    entry["candidateIdentifiers"] = dict(identifiers)
+    entry["verifiedIdentifiers"] = {}
+    entry.pop("publicationStatusEvidence", None)
+    reference["publicationStatus"] = {"state": "unknown", "checkedAt": None, "providers": [],
+                                      "details": ["Publication status requires verified work identifiers."]}
     if not identifiers:
         raise ConfidentialityError(
             "no public identifier: supply an identifier or a local source; printed titles "
@@ -451,7 +457,7 @@ def _resolve(client: ScholarlyClient, entry: dict[str, Any], reference: dict[str
     entry["records"] = records
     # Provider-normalized identity from a previous attempt is not independent
     # evidence of what the manuscript actually printed.
-    printed = {"raw": reference["raw"]}
+    printed = {"raw": reference["raw"], **identifiers}
     if entry.get("purposeClaimIds"):
         agreement = client.reconcile_identifier_metadata(records, doi=identifiers["doi"])
     else:
@@ -476,10 +482,12 @@ def _resolve(client: ScholarlyClient, entry: dict[str, Any], reference: dict[str
             for record in records:
                 for name in ("doi", "pmid", "pmcid"):
                     if record.get(name):
-                        reference["identifiers"][name] = str(record[name])
+                        entry["verifiedIdentifiers"][name] = str(record[name])
     entry["limitations"].extend(resolved.get("limitations", []))
-    status_ids = _identifiers(reference)
-    status_key = "pmid" if status_ids.get("pmid") else "doi" if status_ids.get("doi") else None
+    # Publication notices must concern the resolved work, not an unverified
+    # publisher link that happened to provide a PMID alongside its DOI.
+    status_ids = entry["verifiedIdentifiers"]
+    status_key = "doi" if status_ids.get("doi") else "pmid" if status_ids.get("pmid") else None
     if status_key:
         try:
             status_result = client.get_publication_status(**{status_key: status_ids[status_key]})
@@ -524,6 +532,7 @@ def fetch_literature(workspace: Path, state: dict[str, Any], graph: dict[str, An
             if reusable:
                 _verified_source(workspace, state["sources"][reusable["sourceId"]])
                 entry["sourceId"] = reusable["sourceId"]
+                entry["abstractCandidates"] = copy.deepcopy(reusable.get("abstractCandidates", []))
             else:
                 identifier_kind = next(iter(identifiers))
                 result = client.acquire_full_text(**{identifier_kind: identifiers[identifier_kind]})
@@ -537,10 +546,14 @@ def fetch_literature(workspace: Path, state: dict[str, Any], graph: dict[str, An
                         provider=result.get("provider", "multiple"))
                 elif result.get("abstract"):
                     abstract = result["abstract"]
-                    complete = result.get("abstractComplete", False)
+                    candidate = next((candidate for candidate in entry["abstractCandidates"]
+                                      if complete_abstract(candidate) and candidate["text"] == abstract), None)
+                    complete = candidate is not None
+                    provenance = candidate["provenance"] if candidate else {}
                     document = {
                         "body": abstract.encode("utf-8"), "mediaType": "text/plain",
-                        "sourceUrl": None, "complete": complete, "text": abstract,
+                        "sourceUrl": provenance.get("sourceUrl"), "complete": complete, "text": abstract,
+                        "identifiers": provenance.get("identifiers", {}), "abstractProvenance": provenance,
                         "blocks": [{"id": "abstract", "kind": "abstract", "locator": "Abstract",
                                     "text": abstract}],
                     }
@@ -847,22 +860,33 @@ def record_assessments(workspace: Path, state: dict[str, Any], graph: dict[str, 
                 if not isinstance(value, str) or not IDENTIFIER_PATTERNS[key].fullmatch(value):
                     raise ValidationError(f"invalid {key} identifier")
             reference["identifiers"].update(identifiers)
+            entry["candidateIdentifiers"] = dict(_identifiers(reference))
+            entry["verifiedIdentifiers"] = {}
+            entry.pop("publicationStatusEvidence", None)
+            reference["publicationStatus"] = {"state": "unknown", "checkedAt": None, "providers": [],
+                                              "details": ["Identifier changed; publication status requires fresh verification."]}
             reference["resolutionStatus"] = "unresolved"
             reference.pop("identityEvidence", None)
             entry["sourceId"] = None
             _acquisition(entry, reference, "pending", ["identifier-changed-requires-resolution"])
         if record.get("referenceRecords"):
             records = record["referenceRecords"]
+            entry.pop("publicationStatusEvidence", None)
+            reference["publicationStatus"] = {"state": "unknown", "checkedAt": None, "providers": [],
+                                              "details": ["Metadata changed; publication status requires fresh verification."]}
             if entry.get("purposeClaimIds"):
                 agreement = ScholarlyClient.reconcile_identifier_metadata(
                     records, doi=reference["identifiers"]["doi"])
             else:
                 agreement = ScholarlyClient.reconcile_reference_metadata(
-                    records, printed_reference={"raw": reference["raw"]})
+                    records, printed_reference={"raw": reference["raw"], **_identifiers(reference)})
             entry["records"] = copy.deepcopy(records)
             reference["identityEvidence"] = {key: agreement[key] for key in (
                 "agreementStrength", "providersCompared", "missingFields", "differences")}
             strength = agreement["agreementStrength"]
+            entry["candidateIdentifiers"] = dict(_identifiers(reference))
+            entry["verifiedIdentifiers"] = {name: str(item[name]) for item in records for name in ("doi", "pmid", "pmcid")
+                                            if strength == "strong" and item.get(name)}
             reference["resolutionStatus"] = ("resolved" if strength == "strong" else
                                                "ambiguous" if strength == "conflict" else "unresolved")
             if strength == "strong":

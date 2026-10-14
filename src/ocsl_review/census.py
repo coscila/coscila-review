@@ -20,7 +20,8 @@ import jsonschema
 
 from . import literature as L
 from .confidentiality import authorize_egress, append_egress_event, load_scholarly_context
-from .errors import ReviewError, ValidationError
+from .errors import ConfidentialityError, ReviewError, ValidationError
+from .evidence import complete_abstract
 from .scholarly import utc_now
 from .util import atomic_json, atomic_write, sha256_bytes, sha256_file
 
@@ -118,12 +119,17 @@ def _configuration(args: Any, workspace: Path) -> tuple[int, dict[str, Any]]:
     if len(matches) != 1:
         raise ValidationError("select one configured platform worker ID")
     snapshot = matches[0]
-    fields = {"id", "assignment", "agent", "effort", "modelProvider", "providerId", "model", "bulkAvailable"}
+    fields = {"id", "assignment", "agent", "effort", "modelProvider", "providerId", "model", "bulkAvailable", "evidencePolicy", "bulkConcurrencyLimit"}
     provider_fields = {"id", "model", "kind", "label", "reasoningProfile"}
     if set(snapshot) - fields or not isinstance(snapshot.get("modelProvider"), dict) or set(snapshot["modelProvider"]) - provider_fields:
         raise ValidationError("worker catalog exposed fields outside its public configuration contract")
     if not isinstance(snapshot.get("bulkAvailable"), bool):
         raise ValidationError("worker catalog omitted transport capability")
+    if "evidencePolicy" in snapshot and snapshot["evidencePolicy"] != "public-literature":
+        raise ValidationError("worker catalog has an unknown evidence policy")
+    limit = snapshot.get("bulkConcurrencyLimit")
+    if "bulkConcurrencyLimit" in snapshot and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+        raise ValidationError("worker catalog has an invalid bulk concurrency limit")
     return revision, snapshot
 
 
@@ -148,9 +154,19 @@ def _authorize(args: Any, workspace: Path, run: dict[str, Any], tasks: list[dict
     plan, selected = load_scholarly_context(args.paths, os.environ, cwd=workspace)
     if selected != workspace:
         raise ValidationError("census dispatch requires an exact scholarly workspace context")
-    event = authorize_egress(provider="platform-worker:" + run["spec"]["workerConfigId"],
-                             operation="citation_census", arguments={"manuscriptEvidence": [t["input"] for t in tasks],
-                                                                       "workerAssignment": run["spec"]["workerConfig"]["assignment"]}, plan=plan)
+    try:
+        event = authorize_egress(provider="platform-worker:" + run["spec"]["workerConfigId"],
+                                 operation="citation_census", arguments={"manuscriptEvidence": [t["input"] for t in tasks],
+                                                                           "workerAssignment": run["spec"]["workerConfig"]["assignment"]}, plan=plan)
+    except ConfidentialityError:
+        # Explicit operator restrictions always prevail. Workspace flags alone
+        # never authorize sending evidence to a worker.
+        if (os.environ.get("OCSL_REVIEW_EGRESS_PLAN")
+                or (workspace / ".ocsl-review/egress-plan.json").exists()
+                or run["spec"]["workerConfig"].get("evidencePolicy") != "public-literature"):
+            raise
+        from .public_literature import authorize_public_census
+        event = authorize_public_census(workspace, run, tasks)
     append_egress_event(workspace, event)
 
 
@@ -170,6 +186,9 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
         raise ValidationError("pilot filter contains an unknown manuscript reference ID")
     references = {reference["id"]: reference for reference in graph["references"]}
     clusters = {cluster["id"]: cluster for cluster in graph["citationClusters"]}
+    abstracts = {reference_id: next((candidate for candidate in entry.get("abstractCandidates", [])
+                                    if complete_abstract(candidate)), None)
+                 for reference_id, entry in entries.items()} if args.mode == "abstract" else {}
     tasks = []
     for claim in graph["claims"]:
         for cluster_id in claim["citationClusterIds"]:
@@ -183,20 +202,22 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
                 if cluster["bindingStatus"] != "exact" or reference["resolutionStatus"] != "resolved" or reference.get("identityEvidence", {}).get("agreementStrength") != "strong":
                     reason = "identity or citation binding is unverified"
                 if args.mode == "abstract":
-                    candidate = next((candidate for candidate in entry.get("abstractCandidates", [])
-                                      if candidate.get("complete") and candidate.get("text")), None)
-                    if source and source["accessLevel"] == "abstract-only":
+                    candidate = abstracts[reference_id]
+                    if candidate and source and source["accessLevel"] == "abstract-only" and source["textSha256"] == candidate["provenance"]["textSha256"]:
                         document = L._verified_source(workspace, source)
                     elif candidate:
                         text = candidate["text"]
                         document = {"body": text.encode("utf-8"), "text": text, "complete": True,
+                                    "sourceUrl": candidate["provenance"]["sourceUrl"],
+                                    "identifiers": candidate["provenance"]["identifiers"],
+                                    "abstractProvenance": candidate["provenance"],
                                     "blocks": [{"id": "abstract", "kind": "abstract", "locator": "Complete abstract", "text": text}]}
                         source_id = L._store_source(workspace, ledger, document, access_level="abstract-only", provider=candidate["provider"])
                         source = ledger["sources"][source_id]
                         document = L._verified_source(workspace, source)
                     else:
                         document = None
-                        reason = reason or "complete abstract unavailable"
+                        reason = reason or "complete abstract provenance unavailable; retry acquisition for legacy candidates"
                 elif source and source["accessLevel"] == "full-text":
                     document = L._verified_source(workspace, source)
                 else:
@@ -244,7 +265,8 @@ def prepare(args: Any, workspace: Path, ledger: dict[str, Any], graph: dict[str,
             "scopeSha256": ledger["scopeSha256"], "bindingSha256": ledger["bindingSha256"],
             "promptSha256": sha256_file(prompt_path), "outputSchemaSha256": L.digest(schema),
             "taskSetSha256": L.digest(sorted(tasks, key=lambda task: task["id"])), "samplingDesign": "pilot" if args.limit or args.reference_id else "all-bound-loci",
-            "sourceManuscriptSha256": manuscript["source"]["sha256"]}
+            "sourceManuscriptSha256": manuscript["source"]["sha256"],
+            "sourceManuscriptArtifactSha256": L.digest(manuscript)}
     run_id = "census-" + L.digest(spec)[:24]
     with _database(workspace) as connection:
         connection.execute("INSERT OR IGNORE INTO runs(id,spec) VALUES(?,?)", (run_id, json.dumps(spec)))
@@ -395,6 +417,10 @@ def _job_results(args: Any, workspace: Path, connection: sqlite3.Connection, job
         if not isinstance(record, dict):
             raise ValidationError("worker result records must be objects")
         item = dict(record)
+        # Result-page revision is a delivery cursor, not a new scientific
+        # assessment. Full status replies omit it; both routes must deduplicate
+        # the same immutable result and preserve real output/receipt changes.
+        item.pop("revision", None)
         if job["kind"] == "agent":
             if item.get("id") != job["id"] or len(job["task_ids"]) != 1:
                 raise ValidationError("native result does not belong to its recorded citation job")
