@@ -41,6 +41,16 @@ outputs = [".ocsl-review/literature-audit.json", ".ocsl-review/audit-graph.json"
 confidential_by_default = true
 
 [[skill]]
+id = "ocsl-review-reference-analysis"
+title = "Reproducible reference analysis"
+summary = "Build a reusable literature database, analyse a complete reference corpus, and resume or branch new questions with preserved evidence and assessment provenance."
+primary_environment = "review-literature"
+secondary_environments = ["review-statistics", "review-documents"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["work/literature/corpus.sqlite3", "results/literature-snapshot/manifest.json", "results/literature-snapshot/corpus.sqlite3"]
+confidential_by_default = true
+
+[[skill]]
 id = "ocsl-review-claim-source-verification"
 title = "Claim-to-source verification"
 summary = "Compare each cited clause against located source evidence, including population, direction, magnitude, and causal strength."

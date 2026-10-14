@@ -216,7 +216,7 @@ class EnvironmentLayerTests(unittest.TestCase):
             },
         )
         skills = [skill for item in catalog.values() for skill in item.skills]
-        self.assertEqual(len(skills), 21)
+        self.assertEqual(len(skills), 22)
         self.assertEqual(len(skills), len(set(skills)))
         for item in catalog.values():
             self.assertTrue(item.spec.is_file())

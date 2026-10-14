@@ -21,6 +21,7 @@ REQUIRED_SKILLS = (
     "ocsl-review-manuscript-ingest",
     "ocsl-review-claim-inventory",
     "ocsl-review-reference-integrity",
+    "ocsl-review-reference-analysis",
     "ocsl-review-claim-source-verification",
     "ocsl-review-citation-census",
     "ocsl-review-citation-completeness",

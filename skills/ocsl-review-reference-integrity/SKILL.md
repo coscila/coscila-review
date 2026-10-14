@@ -7,6 +7,11 @@ description: Reconcile reference identities, versions, metadata, and publication
 
 Use this skill to establish what each bibliography entry actually identifies before reading it as evidence.
 
+For a complete corpus or a reusable literature database, use this identity pass
+within `ocsl-review-reference-analysis`. Keep candidate identifiers, provider
+payloads, identity decisions and work versions in the corpus provenance rather
+than reducing them to a final corrected bibliography.
+
 ## Runtime
 
 Primary environment: `review-literature`

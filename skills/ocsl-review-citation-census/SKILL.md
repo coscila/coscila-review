@@ -11,6 +11,11 @@ Use for an explicitly scoped, systematic citation audit or a study of model
 judgments. This produces model measurements with evidence and uncertainty;
 human-adjudicated labels need separate provenance.
 
+For a multi-paper corpus and a database that can support future questions, start
+with `ocsl-review-reference-analysis`. This census skill supplies the existing
+per-manuscript measurement lifecycle; it does not itself schedule an entire
+corpus or transfer jobs when a chat is forked.
+
 ## Runtime
 
 Primary environment: `review-literature`
