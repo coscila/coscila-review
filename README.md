@@ -15,7 +15,7 @@ oc-science-lab-bio/      bioinformatics capabilities, when installed
 oc-science-lab-review/   manuscript review and literature verification
 ```
 
-Installation is additive. It mirrors twenty-one `ocsl-review-*` skills into
+Installation is additive. It mirrors twenty-two `ocsl-review-*` skills into
 configured global skill roots and adds only `ocsl_review_catalog` and
 `ocsl_scholar` to deployment MCP configuration. It does not require tracked
 changes in either sibling repository.
@@ -34,6 +34,14 @@ native or API worker jobs, configuration revisions and assessment history. Its
 SQL/hash facts export supports reproducible writing without treating model
 judgments as scientific ground truth. Local JATS and publisher HTML ingestion
 preserve citation targets and display loci before measurement.
+
+For a complete corpus and future research questions, the
+[reference-analysis skill](skills/ocsl-review-reference-analysis/SKILL.md)
+preserves source evidence, all citation loci and versioned assessments in a
+portable literature database. Its standard-library helper creates consistent
+snapshots and branches new analysis namespaces. The skill includes the earlier
+oncology census's verified workflow lessons and limitations; storage helpers do
+not replace acquisition, worker authorization or a corpus coordinator.
 
 ## What the companion decides
 

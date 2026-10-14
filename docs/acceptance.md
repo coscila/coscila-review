@@ -206,7 +206,7 @@ after seeing its errors.
 The companion is ready for production review only when all of the following are
 true for the target deployment:
 
-- all twenty-one skills are substantive, validate, and map to one of the six
+- all twenty-two skills are substantive, validate, and map to one of the six
   catalogued environments through the required `env run` contract;
 - all six real templates and both fork modes have current passing evidence;
 - pinned repositories and official standards stores verify as read-only;

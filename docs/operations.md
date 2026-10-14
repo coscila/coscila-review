@@ -182,7 +182,7 @@ Install only after the prerequisites are ready:
 Installation performs one transaction:
 
 1. resolve two distinct configured global skill roots;
-2. validate all twenty-one skill source directories and descriptors;
+2. validate all twenty-two skill source directories and descriptors;
 3. snapshot every pre-existing destination, including files, directories,
    symbolic links, empty directories, and modes;
 4. copy the namespaced skills and record hashes and ownership metadata;

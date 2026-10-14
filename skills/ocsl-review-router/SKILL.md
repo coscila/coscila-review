@@ -7,6 +7,13 @@ description: Route a scientific manuscript review into bounded evidence, methods
 
 Use this skill at the beginning of a manuscript, reference, revision, or evidence-check request. It plans work; it does not itself declare that a citation supports a claim.
 
+For a corpus-wide reference-analysis study or reuse of a saved literature
+database, route first to `ocsl-review-reference-analysis`. Keep the declared
+corpus, measurement protocol and outputs; do not automatically add manuscript
+peer-review lenses, missing-literature searches or journal-fit checks. Existing
+explicit authorization for the full corpus does not need repeated confirmation
+for each constituent review.
+
 ## Runtime
 
 Primary environment: `review-core`
