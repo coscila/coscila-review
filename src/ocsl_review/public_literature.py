@@ -16,6 +16,7 @@ from typing import Any
 from .confidentiality import _assert_no_symlink_components, _audit_event
 from .errors import ConfidentialityError
 from .util import is_within
+from .worker_configuration import matches_pinned_worker_configuration
 
 
 def broker_catalog() -> dict[str, Any]:
@@ -66,7 +67,7 @@ def authorize_public_census(workspace: Path, run: dict[str, Any],
     matches = [worker for worker in workers
                if isinstance(worker, dict) and worker.get("id") == spec["workerConfigId"]]
     if (catalog.get("revision") != spec["workerConfigRevision"] or len(matches) != 1
-            or L.digest(matches[0]) != spec["workerConfigSha256"]
+            or not matches_pinned_worker_configuration(spec, matches[0])
             or matches[0].get("evidencePolicy") != "public-literature"):
         raise ConfidentialityError("selected worker has no matching public-literature permission; enable it in Lab and prepare a new run")
 

@@ -68,6 +68,20 @@ schema embedded in the task and independently validated on import. Agent task
 files contain complete evidence. A provider context limit is a failure to
 resolve with a suitable configuration, never permission to trim the source.
 
+For bulk jobs, `run --concurrency N` requests a positive safe-integer number of
+concurrent calls (at most 9007199254740991). The broker still enforces its live
+capacity and aggregate provider limit; the flag cannot grant extra capacity.
+Omit it to retain the broker's default. This execution control does not change
+prompts, evidence, reasoning, schemas or the pinned scientific instrument, and
+is rejected for native agent jobs. It applies to a new submission, including
+`run --retry`, not an already submitted job.
+
+An operator may change the advertised `bulkConcurrencyLimit` without making an
+otherwise unchanged pinned worker configuration obsolete. The stored snapshot
+and its original hash remain intact and are still validated. Only that live
+capacity field is ignored when comparing settings; revision, model, assignment,
+reasoning and disclosure-policy changes continue to require a new prepared run.
+
 Wait is bounded to one job and writes the helper's `--out` JSONL inside the
 workspace, avoiding a huge stdout payload. For native or multi-job runs, select
 `--job ID` from status. Use `review census list --workspace "$PWD" --json` to

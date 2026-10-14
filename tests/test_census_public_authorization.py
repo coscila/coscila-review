@@ -67,10 +67,37 @@ class PublicCensusAuthorizationTests(unittest.TestCase):
             lambda c: c.update(revision=8),
             lambda c: c["workers"][0].pop("evidencePolicy"),
             lambda c: c["workers"][0]["modelProvider"].update(model="different-model"),
+            lambda c: c["workers"][0].update(assignment="different assessment"),
+            lambda c: c["workers"][0].update(effort="none"),
         ):
             altered = copy.deepcopy(catalog)
             mutation(altered)
             with self.assertRaises(ConfidentialityError):
+                self.authorize(run, tasks, altered)
+
+    def test_live_capacity_change_keeps_public_permission_and_pinned_receipt(self):
+        run, tasks, catalog = self.public_run()
+        original = copy.deepcopy(run)
+        catalog["workers"][0]["bulkConcurrencyLimit"] = 160
+        event = self.authorize(run, tasks, catalog)
+        self.assertEqual("allowed-configured-public-literature", event["decision"])
+        self.assertEqual(original["spec"]["workerConfigSha256"], event["workerConfigSha256"])
+        self.assertEqual(original, run)
+        # A capacity-only change cannot relax attempt ownership or disclosure.
+        catalog["authorization"]["publicLiteratureAllowed"] = False
+        with self.assertRaises(ConfidentialityError):
+            self.authorize(run, tasks, catalog)
+
+    def test_capacity_normalization_cannot_hide_corrupt_snapshot_or_invalid_capacity(self):
+        run, tasks, catalog = self.public_run()
+        corrupted = copy.deepcopy(run)
+        corrupted["spec"]["workerConfig"]["bulkConcurrencyLimit"] = 160
+        with self.assertRaises(ConfidentialityError):
+            self.authorize(corrupted, tasks, catalog)
+        for limit in (0, True, 1.5, "160", None, 2**53):
+            altered = copy.deepcopy(catalog)
+            altered["workers"][0]["bulkConcurrencyLimit"] = limit
+            with self.subTest(limit=limit), self.assertRaises(ConfidentialityError):
                 self.authorize(run, tasks, altered)
 
     def test_confidential_manuscripts_and_local_attachments_are_excluded(self):
