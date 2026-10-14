@@ -25,6 +25,7 @@ from ocsl_review.scholarly import (
     RawResponse,
     ScholarlyClient,
     normalize_crossref,
+    normalize_europe_pmc,
     parse_pubmed_record,
 )
 
@@ -311,6 +312,48 @@ class MetadataAndNoticeTests(unittest.TestCase):
         self.assertEqual(result["container"], "Food & Science")
         self.assertEqual(result["rawMetadata"], raw)
         self.assertEqual(result["pages"], "21-30")
+
+    def test_provider_venue_aliases_and_issns_resolve_without_fuzzy_guesses(self):
+        raw = {"DOI": "10.1234/example", "title": ["Study A"], "published": {"date-parts": [[2024]]},
+               "container-title": ["Journal of Example Medicine"], "short-container-title": ["J. Example Med."],
+               "ISSN": ["1234-567X"], "page": "123-127"}
+        first = normalize_crossref(raw)
+        second = normalize_europe_pmc({"doi": "10.1234/example", "title": "Study A", "pubYear": "2024",
+                                      "journalTitle": "J Example Med", "pageInfo": "123-7",
+                                      "journalInfo": {"journal": {"title": "Journal of Example Medicine", "issn": "1234-567X"}}})
+        printed = {"raw": "Study A. J Example Med. 2024; 123-7.", "doi": "10.1234/example", "pages": "123-7"}
+        self.assertEqual(ScholarlyClient.reconcile_reference_metadata([first, second], printed)["agreementStrength"], "strong")
+        self.assertEqual(first["rawMetadata"], raw)
+        self.assertEqual(first["issns"], ["1234567X"])
+        self.assertIn("J. Example Med.", first["containerAliases"])
+        second["container"] = "An unrelated journal"
+        second["containerAliases"] = ["An unrelated journal"]
+        second["issns"] = ["98765432"]
+        self.assertEqual(ScholarlyClient.reconcile_reference_metadata([first, second], printed)["agreementStrength"], "conflict")
+
+    def test_shared_issn_resolves_provider_venue_variants_but_never_year_conflicts(self):
+        first = {"provider": "crossref", "title": "Study A", "year": 2024,
+                 "container": "Journal of Example Medicine", "issns": ["1234567X"]}
+        second = {**first, "provider": "europe-pmc", "container": "J Example Med"}
+        printed = {"raw": "Study A. J Example Med. 2024."}
+        self.assertEqual(ScholarlyClient.reconcile_reference_metadata([first, second], printed)["agreementStrength"], "strong")
+        second["year"] = 2023
+        result = ScholarlyClient.reconcile_reference_metadata([first, second], printed)
+        self.assertEqual(result["agreementStrength"], "conflict")
+        self.assertIn("year", [difference["field"] for difference in result["differences"]])
+
+    def test_page_range_normalization_does_not_hide_different_pages(self):
+        first = {"provider": "crossref", "title": "Study A", "year": 2024, "container": "Journal", "pages": "S123-S127"}
+        for pages, expected in (("S123-7", "strong"), ("S123-8", "conflict"), ("123-127", "conflict")):
+            with self.subTest(pages=pages):
+                second = {**first, "provider": "pubmed", "pages": pages}
+                self.assertEqual(ScholarlyClient.reconcile_reference_metadata([first, second], first)["agreementStrength"], expected)
+
+    def test_pubmed_normalization_preserves_declared_journal_aliases(self):
+        xml = pubmed_xml("123").replace(b"<Title>Example Journal</Title>", b"<Title>Example Journal</Title><ISOAbbreviation>Example J</ISOAbbreviation><ISSN>1234-567X</ISSN>")
+        record = parse_pubmed_record(xml, "123")
+        self.assertIn("Example J", record["containerAliases"])
+        self.assertEqual(record["issns"], ["1234567X"])
 
     def test_discovered_identifier_agreement_requires_the_same_doi_everywhere(self):
         record = {"provider": "crossref", "doi": "10.1234/example", "title": "Sample", "year": 2024, "container": "Journal"}

@@ -16,6 +16,7 @@ from ocsl_review.audit import SCOPE_DIMENSIONS, build_audit_summary
 from ocsl_review.claim_inventory import build_claim_inventory
 from ocsl_review.cli import main
 from ocsl_review.errors import ProviderError, ValidationError
+from ocsl_review.evidence import abstract_candidate
 from ocsl_review.fulltext import parse_source_document
 from ocsl_review.ingest import ingest_manuscript
 from ocsl_review.scholarly import ScholarlyClient
@@ -64,10 +65,13 @@ class FakeScholar:
         if self.fail:
             raise ProviderError("synthetic outage")
         text = "Observed exposure was associated with the outcome.\n\nNo causal inference was made."
+        abstract = " ".join(text.split())
         return {"provider": "synthetic", "documents": [] if self.abstract_only else [
             parse_source_document(text.encode(), "text/plain", "https://example.org/source")],
-            "abstract": text, "abstractComplete": True, "abstractProvider": "pubmed",
-            "abstractCandidates": [{"provider": "pubmed", "text": text, "complete": True}],
+            "abstract": abstract, "abstractComplete": True, "abstractProvider": "europe-pmc",
+            "abstractCandidates": [abstract_candidate({"provider": "europe-pmc", "doi": "10.1234/example", "abstract": abstract,
+                                                        "rawMetadata": {"abstractText": abstract}},
+                                                       source_url="https://example.org/structured-abstract", retrieved_at="2026-09-09T00:00:00Z")],
             "attempts": [], "limitations": []}
 
 
@@ -139,10 +143,49 @@ class LiteratureTests(unittest.TestCase):
         literature.fetch_literature(self.workspace, self.state, self.graph, self.client)
         source = next(iter(self.state["sources"].values()))
         self.assertEqual(source["accessLevel"], "abstract-only")
-        self.assertEqual(source["provider"], "pubmed")
-        self.assertEqual(self.state["entries"][0]["abstractCandidates"][0]["provider"], "pubmed")
+        self.assertEqual(source["provider"], "europe-pmc")
+        self.assertEqual(self.state["entries"][0]["abstractCandidates"][0]["provider"], "europe-pmc")
         self.assertTrue(source["complete"])
         self.assertEqual(source["readUnitIds"], [])
+        self.assertEqual(source["sourceUrl"], "https://example.org/structured-abstract")
+        self.assertEqual(source["identifiers"], {"doi": "10.1234/example"})
+
+    def test_candidate_identifier_conflicts_do_not_fetch_wrong_publication_status(self):
+        self.confirm()
+        first = self.graph["references"][0]
+        for name, wrong in (("pmid", "999"), ("pmcid", "PMC999")):
+            with self.subTest(name=name):
+                first["identifiers"] = {"doi": "10.1234/example", name: wrong}
+                with patch.object(self.client, "get_publication_status") as status:
+                    literature.fetch_literature(self.workspace, self.state, self.graph, self.client,
+                                               reference_ids=[first["id"]], retry=True)
+                status.assert_not_called()
+                self.assertEqual(first["resolutionStatus"], "ambiguous")
+                self.assertEqual(first["publicationStatus"]["state"], "unknown")
+                self.assertEqual(self.state["entries"][0]["verifiedIdentifiers"], {})
+                self.assertEqual(self.state["entries"][0]["candidateIdentifiers"][name], wrong)
+                self.assertEqual(first["identifiers"][name], wrong)
+
+    def test_verified_status_doi_and_abstract_reuse_do_not_overwrite_printed_identifiers(self):
+        self.confirm()
+        with patch.object(self.client, "get_publication_status", wraps=self.client.get_publication_status) as status:
+            literature.fetch_literature(self.workspace, self.state, self.graph, self.client)
+        self.assertEqual([call.kwargs for call in status.call_args_list], [{"doi": "10.1234/example"}] * 2)
+        self.assertEqual(self.graph["references"][0]["identifiers"], {"doi": "10.1234/example"})
+        self.assertEqual(self.state["entries"][0]["verifiedIdentifiers"]["pmid"], "12345")
+        self.assertEqual(self.state["entries"][0]["abstractCandidates"], self.state["entries"][1]["abstractCandidates"])
+
+    def test_missing_candidate_identifier_cannot_become_verified_from_other_fields(self):
+        records = self.client.resolve_identifier()["records"]
+        for record in records:
+            record.pop("pmid")
+        self.graph["references"][0]["identifiers"]["pmid"] = "999"
+        self.confirm()
+        with patch.object(self.client, "resolve_identifier", return_value={"records": records, "limitations": []}), patch.object(self.client, "get_publication_status") as status:
+            literature.fetch_literature(self.workspace, self.state, self.graph, self.client,
+                                       reference_ids=[self.graph["references"][0]["id"]])
+        status.assert_not_called()
+        self.assertEqual(self.graph["references"][0]["identityEvidence"]["agreementStrength"], "weak")
 
     def test_retry_refreshes_old_abstract_and_deduplicates_only_new_download(self):
         self.confirm()

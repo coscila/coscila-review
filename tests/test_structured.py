@@ -43,6 +43,16 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(7, value["structuredSource"]["ownedAnchors"])
         self.assertEqual(7, len(build_claim_inventory(value)["citationClusters"]))
 
+    def test_bibliography_label_separation_preserves_inline_text(self):
+        xml = article('<p>Finding <xref ref-type="bibr" rid="R1">1</xref>.</p>')
+        xml = xml.replace("Example source 1", "H<sup>2</sup>O source")
+        value = self.ingest(xml)
+        first = value["bibliographyEntries"][0]
+        self.assertIn("1 Author1 A.", first["raw"])
+        self.assertIn("H2O source", first["raw"])
+        self.assertNotIn("1Author", first["raw"])
+        self.assertEqual(first["sourceIdentity"]["printedLabel"], "1")
+
     def test_ranges_and_display_blocks_owned_once(self):
         body = '<p>Findings <xref ref-type="bibr" rid="R1">1</xref>–<xref ref-type="bibr" rid="R3">3</xref>.</p>'
         body += '<table-wrap><caption><p>Caption <xref ref-type="bibr" rid="R2">2</xref>.</p></caption><table><tr><td>Cell <xref ref-type="bibr" rid="R1">1</xref>.</td></tr></table></table-wrap>'

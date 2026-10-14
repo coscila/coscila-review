@@ -69,6 +69,8 @@
         "abstractCandidates": {"type": "array", "items": {"type": "object"}},
         "limitations": {"$ref": "#/$defs/strings"},
         "acquiredIdentifiers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "candidateIdentifiers": {"type": "object", "additionalProperties": {"type": "string"}},
+        "verifiedIdentifiers": {"type": "object", "additionalProperties": {"type": "string"}},
         "publicationStatusEvidence": {"type": "object"}
         ,"purposeClaimIds": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
       }
