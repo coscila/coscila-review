@@ -384,6 +384,8 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="bounded wait, at most 60000 ms; results are written inside the workspace")
         if name == "run":
             command.add_argument("--retry", action="store_true", help="new attempt for still-unaccepted tasks")
+            command.add_argument("--concurrency", type=int,
+                                 help="positive safe-integer bulk concurrency request; broker capacity limits still apply")
         if name == "import":
             command.add_argument("input", help="worker result JSONL inside the workspace")
         if name == "export":

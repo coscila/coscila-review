@@ -210,6 +210,7 @@ class CensusTests(unittest.TestCase):
 
     def test_dispatch_denies_confidential_egress_before_broker_and_submits_once(self):
         self.prepare()
+        self.args.concurrency = 160
         with patch.object(census, "load_scholarly_context", return_value=(EgressPlan(), self.workspace)), \
                 patch.object(census, "_worker") as worker:
             with self.assertRaises(ConfidentialityError):
@@ -220,6 +221,62 @@ class CensusTests(unittest.TestCase):
             self.assertEqual("synthetic-job", census.cmd_run(self.args)["jobId"])
             self.assertEqual("already-submitted", census.cmd_run(self.args)["state"])
             worker.assert_called_once()
+
+    def test_cli_forwards_bulk_concurrency_without_changing_pinned_inputs(self):
+        self.configuration["bulkConcurrencyLimit"] = 60
+        self.prepare()
+        manifest = self.workspace / census.ROOT / self.args.run / "manifest.json"
+        original = manifest.read_bytes()
+        # Capacity can change after preparation without changing the revision
+        # or the scientific settings of this already pinned run.
+        self.configuration["bulkConcurrencyLimit"] = 160
+        with patch.object(census, "load_scholarly_context", return_value=(EgressPlan(confidential=False), self.workspace)), \
+                patch.object(census, "_worker", return_value={"jobId": "concurrent-job", "state": "queued"}) as worker:
+            code, stdout, stderr = self.invoke("review", "census", "run", "--run", self.args.run,
+                                               "--concurrency", "160")
+            self.assertEqual(0, code, stderr)
+            self.assertEqual("concurrent-job", json.loads(stdout)["jobId"])
+            command = worker.call_args.args[2:]
+            self.assertEqual("bulk", command[0])
+            self.assertEqual("160", command[command.index("--concurrency") + 1])
+        self.assertEqual(original, manifest.read_bytes())
+        with census._database(self.workspace) as connection:
+            pinned = census._run(connection, self.args.run)["spec"]
+        self.assertEqual(json.loads(original), pinned)
+        self.assertEqual(60, pinned["workerConfig"]["bulkConcurrencyLimit"])
+
+    def test_omitted_concurrency_keeps_broker_default(self):
+        self.prepare()
+        with patch.object(census, "load_scholarly_context", return_value=(EgressPlan(confidential=False), self.workspace)), \
+                patch.object(census, "_worker", return_value={"jobId": "default-job", "state": "queued"}) as worker:
+            census.cmd_run(self.args)
+        self.assertNotIn("--concurrency", worker.call_args.args)
+
+    def test_invalid_concurrency_is_rejected_before_authorization_or_submission(self):
+        self.prepare()
+        for value in (0, -1, True, 1.5, "60", 2**53):
+            with self.subTest(value=value), patch.object(census, "_authorize") as authorize, \
+                    patch.object(census, "_worker") as worker:
+                self.args.concurrency = value
+                with self.assertRaisesRegex(ValidationError, "positive safe integer"):
+                    census.cmd_run(self.args)
+                authorize.assert_not_called()
+                worker.assert_not_called()
+        for value in ("0", "-1", str(2**53)):
+            code, _, stderr = self.invoke("review", "census", "run", "--run", self.args.run,
+                                          "--concurrency", value)
+            self.assertNotEqual(0, code)
+            self.assertIn("positive safe integer", stderr)
+
+    def test_native_transport_rejects_bulk_concurrency_control(self):
+        self.configuration["bulkAvailable"] = False
+        self.prepare()
+        self.args.concurrency = 2
+        with patch.object(census, "_authorize") as authorize, patch.object(census, "_worker") as worker:
+            with self.assertRaisesRegex(ValidationError, "only for bulk"):
+                census.cmd_run(self.args)
+            authorize.assert_not_called()
+            worker.assert_not_called()
 
     def test_source_and_pinned_schema_tampering_fail_closed(self):
         self.prepare()
@@ -254,6 +311,32 @@ class CensusTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "settings changed"):
                 census.cmd_run(self.args)
             worker.assert_not_called()
+
+    def test_capacity_comparison_preserves_instrument_and_snapshot_validation(self):
+        self.configuration.update(effort="xhigh", evidencePolicy="public-literature", bulkConcurrencyLimit=60)
+        self.prepare()
+        with census._database(self.workspace) as connection:
+            run = census._run(connection, self.args.run)
+        for limit in (1, 160, 2**53 - 1):
+            current = {**self.configuration, "bulkConcurrencyLimit": limit}
+            with patch.object(census, "_configuration", return_value=(7, current)):
+                census._check_configuration(self.args, self.workspace, run)
+        for field, value in (("assignment", "Changed assessment"), ("effort", "none"),
+                             ("model", "different-model"), ("providerId", "other-provider"),
+                             ("evidencePolicy", None), ("bulkAvailable", False)):
+            current = {**self.configuration, "bulkConcurrencyLimit": 160, field: value}
+            with self.subTest(field=field), patch.object(census, "_configuration", return_value=(7, current)):
+                with self.assertRaisesRegex(ValidationError, "settings changed"):
+                    census._check_configuration(self.args, self.workspace, run)
+        corrupted = copy.deepcopy(run)
+        corrupted["spec"]["workerConfig"]["bulkConcurrencyLimit"] = 160
+        with self.assertRaisesRegex(ValidationError, "settings changed"):
+            census._check_configuration(self.args, self.workspace, corrupted)
+        for limit in (0, True, 1.5, "160", None, 2**53):
+            current = {**self.configuration, "bulkConcurrencyLimit": limit}
+            with self.subTest(limit=limit), patch.object(census, "_worker", return_value={"revision": 7, "workers": [current]}):
+                with self.assertRaisesRegex(ValidationError, "concurrency limit"):
+                    REAL_CONFIGURATION(self.args, self.workspace)
 
     def test_public_configuration_rejects_credentials_and_unknown_worker(self):
         self.prepare()

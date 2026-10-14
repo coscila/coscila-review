@@ -24,6 +24,7 @@ from .errors import ConfidentialityError, ReviewError, ValidationError
 from .evidence import complete_abstract
 from .scholarly import utc_now
 from .util import atomic_json, atomic_write, sha256_bytes, sha256_file
+from .worker_configuration import is_positive_safe_integer, matches_pinned_worker_configuration
 
 ROOT = ".ocsl-review/census"
 SPECIFIC = {"numeric", "causal", "quotation", "method", "software", "dataset", "novelty"}
@@ -128,7 +129,7 @@ def _configuration(args: Any, workspace: Path) -> tuple[int, dict[str, Any]]:
     if "evidencePolicy" in snapshot and snapshot["evidencePolicy"] != "public-literature":
         raise ValidationError("worker catalog has an unknown evidence policy")
     limit = snapshot.get("bulkConcurrencyLimit")
-    if "bulkConcurrencyLimit" in snapshot and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 1):
+    if "bulkConcurrencyLimit" in snapshot and not is_positive_safe_integer(limit):
         raise ValidationError("worker catalog has an invalid bulk concurrency limit")
     return revision, snapshot
 
@@ -137,7 +138,8 @@ def _check_configuration(args: Any, workspace: Path, run: dict[str, Any]) -> Non
     selected = copy.copy(args)
     selected.worker_config = run["spec"]["workerConfigId"]
     revision, snapshot = _configuration(selected, workspace)
-    if revision != run["spec"]["workerConfigRevision"] or L.digest(snapshot) != run["spec"]["workerConfigSha256"]:
+    if (revision != run["spec"]["workerConfigRevision"]
+            or not matches_pinned_worker_configuration(run["spec"], snapshot)):
         raise ValidationError("worker settings changed; prepare an independently pinned census run")
 
 
@@ -434,9 +436,14 @@ def _job_results(args: Any, workspace: Path, connection: sqlite3.Connection, job
 
 
 def cmd_run(args: Any) -> dict[str, Any]:
+    concurrency = getattr(args, "concurrency", None)
+    if concurrency is not None and not is_positive_safe_integer(concurrency):
+        raise ValidationError("concurrency must be a positive safe integer (at most 9007199254740991)")
     workspace = L._workspace(args)
     with L._locked(workspace), _database(workspace) as connection:
         _, _, run = _load(args, workspace, connection)
+        if concurrency is not None and run["spec"]["transport"] != "bulk":
+            raise ValidationError("concurrency is supported only for bulk census jobs")
         tasks = _task_rows(connection, args.run)
         accepted_ids = {r[0] for r in connection.execute("SELECT task_id FROM assessments WHERE run_id=? AND accepted=1", (args.run,))}
         selected_tasks = [task for task in tasks if not task["blockedReason"] and task["id"] not in accepted_ids]
@@ -453,8 +460,9 @@ def cmd_run(args: Any) -> dict[str, Any]:
         items = L._path(workspace, f"{ROOT}/{args.run}/dispatch-{attempt}.jsonl")
         atomic_write(items, "".join(json.dumps({"id": task["id"], "input": task["input"]}, ensure_ascii=False) + "\n" for task in selected_tasks), mode=0o600)
         if run["spec"]["transport"] == "bulk":
+            options = ["--concurrency", str(concurrency)] if concurrency is not None else []
             response = _worker(args, workspace, "bulk", "--config", run["spec"]["workerConfigId"],
-                               "--key", f"{args.run}:{attempt}", "--items", str(items), "--schema", str(schema_path))
+                               "--key", f"{args.run}:{attempt}", "--items", str(items), "--schema", str(schema_path), *options)
             _remember_job(connection, run, response, "bulk", [task["id"] for task in selected_tasks], attempt)
             return {"runId": args.run, **response}
         jobs = []
