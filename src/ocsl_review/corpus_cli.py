@@ -15,7 +15,7 @@ from .errors import ValidationError
 def add_commands(families, register):
     family = families.add_parser("corpus", help="build, assess, resume and fork a complete literature corpus")
     commands = family.add_subparsers(dest="corpus_command", required=True)
-    for name in ("init", "import-manifest", "import-legacy", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate"):
+    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate"):
         command = commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         command.add_argument("--library", default="work/literature")
@@ -23,10 +23,10 @@ def add_commands(families, register):
             command.add_argument("--question", required=True)
             command.add_argument("--analysis", required=True)
             command.add_argument("--protocol", required=True)
-        if name in {"import-manifest", "import-legacy"}:
+        if name in {"import-manifest", "import-legacy", "import-snapshot"}:
             command.add_argument("input")
         if name == "import-legacy":
-            command.add_argument("--kind", choices=("historical", "census"), required=True)
+            command.add_argument("--kind", choices=("historical", "census", "evidence"), required=True)
         if name == "enumerate":
             command.add_argument("--query", required=True)
             command.add_argument("--label", required=True)
@@ -160,9 +160,16 @@ def _execute(args, repo, progress):
 
 def command(args):
     name = args.corpus_command
+    if name == "import-snapshot":
+        from .corpus_export import import_snapshot
+        return import_snapshot(Path(args.workspace).absolute(), args.library, args.input)
     if name == "init":
+        from .corpus_export import implementation_manifest, record_implementation
         protocol = json.loads(Path(args.protocol).read_text())
-        repo = CorpusRepository.create(Path(args.workspace).absolute(), args.library, args.question, args.analysis, protocol)
+        manifest = implementation_manifest()
+        repo = CorpusRepository.create(Path(args.workspace).absolute(), args.library, args.question, args.analysis, protocol,
+                                       "source-tree-sha256:" + manifest["sha256"])
+        record_implementation(repo, manifest)
         return repo.status()
     repo = repository(args)
     if name == "status":
@@ -172,11 +179,19 @@ def command(args):
     if name == "snapshot":
         return repo.library.snapshot(args.output)
     if name == "branch":
-        return repo.library.branch(args.output, args.question, args.analysis, json.loads(Path(args.protocol).read_text()))
+        from .corpus_export import implementation_manifest, record_implementation
+        manifest = implementation_manifest()
+        result = repo.library.branch(args.output, args.question, args.analysis, json.loads(Path(args.protocol).read_text()),
+                                     "source-tree-sha256:" + manifest["sha256"])
+        record_implementation(CorpusRepository(repo.workspace.root, args.output), manifest)
+        return result
     if name == "import-manifest":
         from .corpus_ingest import import_manifest
         return import_manifest(repo, Path(args.input))
     if name == "import-legacy":
+        if args.kind == "evidence":
+            from .corpus_seed import import_legacy_evidence
+            return import_legacy_evidence(repo, Path(args.input))
         from .corpus_import import import_legacy_scores, import_legacy_census
         return (import_legacy_scores if args.kind == "historical" else import_legacy_census)(repo, Path(args.input))
     if name == "enumerate":
