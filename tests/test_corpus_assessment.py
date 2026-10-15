@@ -123,6 +123,9 @@ class CorpusAssessmentTests(unittest.TestCase):
         self.assertEqual([one, two], originals)
         with self.assertRaisesRegex(AssessmentError, "invalid_batch"):
             build_messages([one, one], "abstract")
+        for tasks in ([], [task(str(i)) for i in range(41)]):
+            with self.subTest(count=len(tasks)), self.assertRaisesRegex(AssessmentError, "invalid_batch"):
+                AssessmentValidator().validate_response(tasks, {"items": []})
 
     def test_batch_validation_preserves_valid_peers_and_classifies_missing_and_bad_items(self):
         tasks = [task("good"), task("bad"), task("missing")]

@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from ocsl_review.corpus_seed import import_legacy_evidence, import_legacy_fulltext_cache
+from ocsl_review.corpus_seed import archive_file, import_legacy_evidence, import_legacy_fulltext_cache
 from ocsl_review.corpus_store import CorpusRepository
 from ocsl_review.errors import ValidationError
 
@@ -88,6 +88,32 @@ class CorpusSeedTests(unittest.TestCase):
         self.assertTrue(any(item['state']=='missing-or-outside-source-allowlist' for item in sources))
         with self.repo.connect() as db:
             self.assertIsNone(db.execute('SELECT sha256 FROM source_artifacts WHERE sha256=?', (hashlib.sha256(secret.read_bytes()).hexdigest(),)).fetchone())
+
+    def test_file_publication_recovers_after_interrupted_registry_insert(self):
+        body = b'Archived before registry transaction committed.'
+        source = self.legacy / 'input.txt'; source.write_bytes(body)
+        sha = hashlib.sha256(body).hexdigest()
+        (self.repo.root / 'sources' / sha).write_bytes(body)
+        self.assertEqual(sha, archive_file(self.repo, source, 'fixture'))
+        self.assertEqual(body, self.repo.read_artifact(sha))
+
+    def test_original_xml_accepts_optional_pmc_prefix_but_rejects_identifier_conflicts(self):
+        path = self.database()
+        directory = self.legacy / 'work/library'; directory.mkdir()
+        db = sqlite3.connect(path)
+        db.execute('ALTER TABLE works ADD COLUMN pmcid TEXT')
+        for slug, recorded, observed in [('one', '123', 'PMC123'), ('two', '999', 'PMC456')]:
+            name = 'work/library/' + slug + '.xml'
+            (self.legacy / name).write_text('<article><front><article-meta>'
+                '<article-id pub-id-type="doi">10.1234/' + slug + '</article-id>'
+                '<article-id pub-id-type="pmc">' + observed + '</article-id>'
+                '</article-meta></front><body><p>Original complete source text.</p></body></article>')
+            db.execute('UPDATE works SET pmcid=?,local_path=? WHERE doi=?',
+                       (recorded, name, '10.1234/' + slug))
+        db.commit(); db.close()
+        import_legacy_evidence(self.repo, path)
+        self.assertTrue(self.repo.evidence(self.repo.work({'doi': '10.1234/one'}), 'full-text')['complete'])
+        self.assertFalse(self.repo.evidence(self.repo.work({'doi': '10.1234/two'}), 'full-text')['complete'])
 
     def test_audited_text_exports_remain_explicitly_incomplete(self):
         directory = self.legacy / 'work/audit/panel'; directory.mkdir(parents=True)

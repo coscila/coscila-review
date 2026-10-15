@@ -27,6 +27,7 @@ def add_commands(families, register):
             command.add_argument("input")
         if name == "import-legacy":
             command.add_argument("--kind", choices=("historical", "census", "evidence"), required=True)
+            command.add_argument("--source-root")
         if name == "enumerate":
             command.add_argument("--query", required=True)
             command.add_argument("--label", required=True)
@@ -80,6 +81,7 @@ class Progress:
     def __init__(self, repo):
         self.repo, self.last = repo, 0.0
         self.phase, self.summary = "corpus", "Corpus acquisition and assessment are active"
+        self.state = "running"
         self.stop = threading.Event()
         self.lock = threading.Lock()
 
@@ -90,7 +92,7 @@ class Progress:
 
     def _heartbeat(self):
         while not self.stop.wait(30):
-            self(force=True, phase=self.phase, summary=self.summary)
+            self(force=True)
 
     def __exit__(self, kind, value, traceback):
         self.stop.set()
@@ -98,27 +100,35 @@ class Progress:
         if kind:
             self(force=True, state="failed", summary="Corpus controller stopped; durable results are saved. Inspect the command error and resume.")
 
-    def __call__(self, *, force=False, phase="corpus", state="running", summary="Corpus acquisition and assessment are active"):
+    def __call__(self, *, force=False, phase=None, state="running", summary=None):
         from .util import atomic_write
         from .corpus_library import now
-        if not force and time.monotonic() - self.last < 15:
-            return
-        self.last = time.monotonic()
-        status = self.repo.status()
-        tasks = status["taskStates"]
-        total = sum(t["count"] for t in tasks)
-        completed = sum(t["count"] for t in tasks if t["state"] == "completed")
-        self.phase, self.summary = phase, summary
-        value = {"version": 1, "phase": phase, "state": state, "summary": summary,
-                 "unit": "citation assessments",
-                 "warnings": [], "intermediateRelativePath": self.repo.relative + "/corpus.sqlite3",
-                 "updatedAt": now(), "expectedUpdateIntervalSeconds": 60}
-        if total:
-            value.update(numerator=completed, denominator=total)
-        directory = self.repo.workspace.path("results/.ocsl")
-        directory.mkdir(parents=True, exist_ok=True)
-        atomic_write(directory / "progress.json", json.dumps(value) + "\n")
-        atomic_write(directory / "corpus-status.json", json.dumps(status) + "\n")
+        with self.lock:
+            # A queued heartbeat must never replace the terminal checkpoint.
+            if self.state != "running":
+                return
+            if state == "running" and not force and time.monotonic() - self.last < 15:
+                return
+            self.last = time.monotonic()
+            status = self.repo.status()
+            tasks = status["taskStates"]
+            total = sum(t["count"] for t in tasks)
+            completed = sum(t["count"] for t in tasks if t["state"] == "completed")
+            self.phase = phase if phase is not None else self.phase
+            self.summary = summary if summary is not None else self.summary
+            value = {"version": 1, "phase": self.phase, "state": state, "summary": self.summary,
+                     "unit": "citation assessments",
+                     "warnings": [], "intermediateRelativePath": self.repo.relative + "/corpus.sqlite3",
+                     "updatedAt": now(), "expectedUpdateIntervalSeconds": 60}
+            if total:
+                value.update(numerator=completed, denominator=total)
+            directory = self.repo.workspace.path("results/.ocsl")
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic_write(directory / "progress.json", json.dumps(value) + "\n")
+            atomic_write(directory / "corpus-status.json", json.dumps(status) + "\n")
+            self.state = state
+            if state != "running":
+                self.stop.set()
 
 
 def execute(args, repo):
@@ -191,7 +201,7 @@ def command(args):
     if name == "import-legacy":
         if args.kind == "evidence":
             from .corpus_seed import import_legacy_evidence
-            return import_legacy_evidence(repo, Path(args.input))
+            return import_legacy_evidence(repo, Path(args.input), source_root=Path(args.source_root) if args.source_root else None)
         from .corpus_import import import_legacy_scores, import_legacy_census
         return (import_legacy_scores if args.kind == "historical" else import_legacy_census)(repo, Path(args.input))
     if name == "enumerate":

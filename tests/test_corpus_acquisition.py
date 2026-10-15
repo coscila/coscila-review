@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import tempfile
 import threading
@@ -74,7 +75,10 @@ class CorpusAcquisitionTests(unittest.TestCase):
         search = [call for call in transport.calls if call[0].endswith("/search")]
         crossref = [call for call in transport.calls if "crossref" in call[0]]
         self.assertEqual(1, len(search))
-        self.assertEqual(1, len(crossref))
+        self.assertEqual(0, len(crossref))
+        self.assertFalse(any("eutils.ncbi" in call[0] for call in transport.calls))
+        self.assertEqual("provider-index-only", result["publicationStatus"]["coverage"])
+        self.assertEqual("unknown", result["publicationStatus"]["state"])
         original_count = len(transport.calls)
         reopened = self.acquirer(transport)
         self.assertEqual("abstract-only", reopened.fetch_work({"doi": "10.1234/example"})["outcome"])
@@ -88,6 +92,68 @@ class CorpusAcquisitionTests(unittest.TestCase):
         result = self.acquirer(transport).fetch_work({"doi": "10.1234/example"}, include_full_text=True)
         self.assertEqual("available", result["outcome"])
         self.assertTrue(result["documents"])
+        self.assertFalse(any("crossref" in call[0] or "eutils.ncbi" in call[0] for call in transport.calls))
+        self.assertEqual(1, sum("fullTextXML" in call[0] for call in transport.calls))
+        self.assertTrue(any("Supplement links" in text for text in result["limitations"]))
+
+    def test_one_hundred_complete_exact_dois_need_two_batches_and_no_per_work_requests(self):
+        class Batched:
+            def __init__(self):
+                self.calls = []
+            def get(self, url, *, params=None, headers=None):
+                self.calls.append((url, params, headers))
+                if not url.endswith("/search"):
+                    raise AssertionError("Unexpected per-work provider request")
+                dois = re.findall(r'"(10\.[^"]+)"', params["query"])
+                records = [{"id": str(i + 1), "source": "MED", "doi": doi,
+                            "title": "Complete study " + doi, "pubYear": "2024",
+                            "abstractText": "The complete structured abstract.", "isRetracted": "N"}
+                           for i, doi in enumerate(dois)]
+                return RawResponse(json.dumps({"hitCount": len(records), "resultList": {"result": records}}).encode(), 200, {})
+        transport = Batched()
+        acquirer = self.acquirer(transport)
+        dois = [f"10.1234/study-{i}" for i in range(100)]
+        self.assertEqual(2, acquirer.prefetch_dois(dois)["batches"])
+        results = [acquirer.fetch_work({"doi": doi}) for doi in dois]
+        self.assertEqual(2, len(transport.calls))
+        self.assertTrue(all(r["abstractComplete"] for r in results))
+        self.assertTrue(all(r["identityResolution"]["method"] == "exact-index-identifier-and-title" for r in results))
+        self.assertTrue(all(r["publicationStatus"]["state"] == "unknown" for r in results))
+        self.assertTrue(all(r["publicationStatus"]["providerFlags"][0]["isRetractedKnown"] for r in results))
+        self.assertTrue(all(r["cacheProvenance"] for r in results))
+
+    def test_absent_or_conflicting_index_fields_and_explicit_verification_use_full_resolver(self):
+        class Conflicting(SourceTransport):
+            def get(self, url, **kwargs):
+                response = super().get(url, **kwargs)
+                if url.endswith("/search"):
+                    payload = response.json()
+                    record = payload["resultList"]["result"][0]
+                    payload["resultList"]["result"].append({**record, "title": "Conflicting identity"})
+                    return RawResponse(json.dumps(payload).encode(), 200, {})
+                return response
+        for name, transport, options in (("missing", SourceTransport(abstract=""), {}),
+                                         ("conflict", Conflicting(), {}),
+                                         ("explicit", SourceTransport(), {"verify_independently": True}),
+                                         ("title", SourceTransport(), {})):
+            with self.subTest(name=name):
+                supplied = {"doi": "10.1234/example"}
+                if name == "title":
+                    supplied["title"] = "Different expected title"
+                result = self.acquirer(transport, path=name + ".sqlite3").fetch_work(supplied, **options)
+                self.assertTrue(any("crossref" in call[0] for call in transport.calls))
+                self.assertNotEqual(result["identityResolution"].get("method"), "exact-index-identifier-and-title")
+
+    def test_index_retraction_flags_are_positive_evidence_and_missing_flags_are_unknown(self):
+        class Retracted(SourceTransport):
+            def get(self, url, **kwargs):
+                response = super().get(url, **kwargs)
+                payload = response.json()
+                payload["resultList"]["result"][0]["isRetracted"] = "Y"
+                return RawResponse(json.dumps(payload).encode(), 200, {})
+        result = self.acquirer(Retracted()).fetch_work({"doi": "10.1234/example"})
+        self.assertEqual("retracted", result["publicationStatus"]["state"])
+        self.assertFalse(result["publicationStatus"]["independentSurveillancePerformed"])
 
     def test_unverified_extra_pmcid_is_not_used(self):
         transport = PublisherTransport()
@@ -162,6 +228,65 @@ class CorpusAcquisitionTests(unittest.TestCase):
         with self.assertRaises(ConfidentialityError):
             restricted.fetch_work({"doi": "10.1234/example"})
         self.assertEqual(count, len(transport.calls))
+
+    def test_credentials_reach_transport_but_not_cache_or_portable_metadata(self):
+        key = "fixture-key-do-not-persist"
+        token = "fixture-bearer-do-not-persist=="
+        cookie = "fixture-cookie-do-not-persist"
+        class CredentialTransport:
+            def __init__(self):
+                self.calls = []
+            def get(self, url, *, params=None, headers=None):
+                self.calls.append((url, params, headers))
+                return RawResponse(b'{"scientific":"x=1"}', 200,
+                                   {"Content-Type": "application/json", "Set-Cookie": cookie},
+                                   "https://api.example/record?api_key=" + key)
+        transport = CredentialTransport()
+        acquirer = self.acquirer(transport)
+        headers = {"Authorization": "Bearer " + token, "Cookie": "session=" + cookie, "X-API-Key": key}
+        with acquirer.cache.capture() as provenance:
+            acquirer.cache.get("https://api.example/record?access_token=" + token,
+                               params={"api_key": key, "id": "123"}, headers=headers)
+        self.assertEqual(transport.calls[0][1]["api_key"], key)
+        self.assertEqual(transport.calls[0][2]["Authorization"], "Bearer " + token)
+        stored = json.dumps(provenance)
+        for path in self.root.rglob("*"):
+            if path.is_file():
+                stored += path.read_bytes().decode("utf-8", errors="ignore")
+        for secret in (key, token, cookie):
+            self.assertNotIn(secret, stored)
+        request = provenance[0]["request"]
+        self.assertEqual(request["params"]["api_key"], "[redacted]")
+        self.assertNotIn("authorization", request["headers"])
+        self.assertEqual(len(request["authorizationScopeSha256"]), 64)
+        first = acquirer.cache.request_key("https://api.example/record", params={"api_key": key})[0]
+        second = acquirer.cache.request_key("https://api.example/record", params={"api_key": key + "-rotated"})[0]
+        self.assertNotEqual(first, second)
+
+    def test_provider_errors_do_not_copy_supplied_credentials_into_receipts(self):
+        secret = "fixture-secret-error-sentinel"
+        class Failure:
+            def get(self, url, **kwargs):
+                raise ProviderError("provider HTTP 403 for api_key=" + secret)
+        acquirer = self.acquirer(Failure())
+        with acquirer.cache.capture():
+            for _ in range(2):
+                with self.assertRaises(ProviderError) as caught:
+                    acquirer.cache.get("https://api.example/record", params={"api_key": secret})
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertIn("[redacted]", str(caught.exception))
+
+    def test_response_that_echoes_request_credentials_is_not_persisted(self):
+        secret = "fixture-secret-reflected-in-body"
+        class Echo:
+            def get(self, url, **kwargs):
+                return RawResponse(json.dumps({"api_key": secret}).encode(), 200, {})
+        acquirer = self.acquirer(Echo())
+        with self.assertRaisesRegex(ProviderError, "echoes request credentials"):
+            acquirer.cache.get("https://api.example/record", params={"api_key": secret})
+        with acquirer.cache._db() as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM responses").fetchone()[0])
+        self.assertEqual([], list(acquirer.cache.artifacts.iterdir()))
 
     def test_transient_failure_is_recorded_but_not_cached_as_missing(self):
         class Flaky:

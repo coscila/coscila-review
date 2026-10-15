@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 
 from .corpus_import import _completed, _finish, _namespace, _observation, _observations, _regular, _stat
 from .corpus_store import CorpusRepository, canonical, identity
-from .corpus_library import now
+from .corpus_library import now, digest_file
 from .errors import ProviderError, ReviewError, ValidationError
 from .evidence import abstract_candidate, complete_abstract
 from .fulltext import parse_source_document
@@ -52,7 +52,8 @@ def archive_file(repo: CorpusRepository, source: Path, kind: str, media_type="ap
         try:
             os.link(temporary, destination)
         except FileExistsError:
-            repo.verify_artifact(sha)
+            if digest_file(destination) != sha:
+                raise ValidationError("stored source artifact hash mismatch")
         with repo.connect(write=True) as connection:
             connection.execute("INSERT OR IGNORE INTO source_artifacts VALUES(?,?,?,?,?,?)",
                 (sha, "sources/" + sha, before[1], media_type, kind, now()))
@@ -70,7 +71,9 @@ def _metadata(record):
         except ReviewError:
             value["legacyInvalidDoi"] = value.pop("doi")
     if value.get("pmcid"):
-        value["pmcid"] = str(value["pmcid"]).upper()
+        pmcid = str(value["pmcid"]).strip().upper()
+        digits = re.fullmatch(r"(?:PMC)?([0-9]+)", pmcid)
+        value["pmcid"] = "PMC" + digits[1] if digits else pmcid
     return value
 
 
@@ -175,6 +178,8 @@ def _raw_core(repo, root, progress):
                 if not record.get("abstract") or not any(record.get(k) for k in ("doi", "pmid", "pmcid")):
                     continue
                 candidate = abstract_candidate(record, source_url=url, retrieved_at=imported_at)
+                candidate["provenance"].update(retrievedAtBasis="import-of-retained-provider-response", originalRetrievedAt=None,
+                                                sourceUrlBasis="reconstructed-from-retained-request")
                 verified = complete_abstract(candidate)
                 work = _work(connection, record, "legacy-raw-" + identity(sha, index))
                 _document(connection, work, sha, record["abstract"], "abstract", "europe-pmc",
@@ -276,7 +281,7 @@ def import_legacy_evidence(repo: CorpusRepository, source_db: Path, *, source_ro
                         continue  # Preserve bytes; OCR/extraction is an explicit later operation.
                     document = parse_source_document(repo.read_artifact(retained["sha256"]), retained["mediaType"])
                     expected = _metadata(record)
-                    observed = document.get("identifiers", {})
+                    observed = _metadata(document.get("identifiers", {}))
                     shared = [k for k in ("doi", "pmid", "pmcid") if expected.get(k) and observed.get(k)]
                     matched = bool(shared) and all(str(observed[k]).casefold() == str(expected[k]).casefold() for k in shared)
                     with repo.connect(write=True) as connection:

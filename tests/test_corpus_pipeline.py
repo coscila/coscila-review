@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import closing
 from pathlib import Path
 import tempfile
+import sqlite3
 import unittest
 
 from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.corpus_acquisition import CorpusAcquirer
 from ocsl_review.corpus_pipeline import acquire_corpus, acquire_escalations, prepare_tasks, register_acquisition
 from ocsl_review.corpus_store import CorpusRepository, canonical
+from ocsl_review.corpus_seed import import_legacy_evidence
 from ocsl_review.errors import ProviderError, ValidationError
 from ocsl_review.scholarly import RawResponse, ScholarlyClient
 from test_corpus_acquisition import PublisherTransport
@@ -60,6 +63,78 @@ class CorpusPipelineTests(unittest.TestCase):
         with self.repo.connect() as db:
             return {r["entry_id"]: dict(r) for r in db.execute("SELECT * FROM bibliography_entries")}
 
+    def legacy_abstract(self, *, structured=True, conflicting=False):
+        root = self.root / "legacy"
+        (root / "work/reviews").mkdir(parents=True)
+        path = root / "work/reviews/nrco_citation_db.sqlite3"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript("CREATE TABLE works(work_key TEXT,doi TEXT,title TEXT,year INT,abstract TEXT,abstract_source TEXT,local_path TEXT,origin_url TEXT,fulltext_format TEXT);"
+                             "CREATE TABLE papers(doi TEXT,title TEXT,year INT,path_xml TEXT);"
+                             "CREATE TABLE bib_refs(doi TEXT,label TEXT,printed TEXT,work_key TEXT);")
+            db.execute("INSERT INTO works VALUES(?,?,?,?,?,?,NULL,NULL,NULL)", ("doi:10.1234/example", "10.1234/example", "Sample study", 2024, "Legacy field only.", "europepmc"))
+        if structured:
+            directory = root / "work/raw/epmc_abs"
+            directory.mkdir(parents=True)
+            raw = {"id": "123", "source": "MED", "doi": "10.1234/example",
+                   "title": "Conflicting work" if conflicting else "Sample study", "pubYear": "2024",
+                   "abstractText": "Complete retained provider abstract."}
+            payload = {"request": {"resultType": "core", "queryString": "DOI:10.1234/example", "pageSize": 1},
+                       "resultList": {"result": [raw]}}
+            (directory / "batch.json").write_text(json.dumps(payload))
+        return import_legacy_evidence(self.repo, path, source_root=root)
+
+    def test_imported_complete_provider_evidence_is_reused_before_doi_prefetch(self):
+        self.legacy_abstract()
+        self.entry("one", locus=True)
+        self.entry("conflict", identifiers={"doi": "10.1234/example", "pmid": "999"})
+        transport = TitleTransport(fail=True)
+        acquire_corpus(self.repo, self.acquirer(transport), workers=2)
+        self.assertEqual([], transport.calls)
+        self.assertEqual("verified", self.rows()["one"]["identity_state"])
+        self.assertEqual("conflict", self.rows()["conflict"]["identity_state"])
+        evidence = self.repo.evidence(self.rows()["one"]["resolved_work_id"], "abstract")
+        self.assertTrue(evidence["complete"])
+        self.assertEqual("Complete retained provider abstract.", evidence["evidenceUnits"][0]["text"])
+        with self.repo.connect() as db:
+            receipts = [json.loads(self.repo.read_artifact(r[0])) for r in db.execute("SELECT artifact_sha256 FROM retrievals")]
+        reused = next(r for r in receipts if r.get("operation") == "reuse_retained_abstract")
+        self.assertEqual("retained-provider-record-only", reused["publicationStatus"]["coverage"])
+        self.repo.verify_artifact(reused["retainedEvidence"]["sourceSha256"])
+
+    def test_unverified_legacy_abstract_field_and_conflicting_provider_identity_require_fetch(self):
+        for structured in (False, True):
+            with self.subTest(structured=structured):
+                # Each subtest gets its own store and imported seed.
+                with tempfile.TemporaryDirectory() as directory:
+                    old_root, old_repo, old_review = self.root, self.repo, self.review
+                    try:
+                        self.root = Path(directory)
+                        self.repo = CorpusRepository.create(self.root, "work/library", "Q", "v2", {})
+                        self.review = self.repo.review({"doi": "10.1234/review", "title": "Review"})
+                        self.repo.review_state(self.review, "binding", "completed")
+                        self.legacy_abstract(structured=structured, conflicting=True)
+                        self.entry("one")
+                        transport = TitleTransport()
+                        acquire_corpus(self.repo, self.acquirer(transport), workers=1)
+                        self.assertTrue(transport.calls)
+                        self.assertEqual("verified", self.rows()["one"]["identity_state"])
+                    finally:
+                        self.root, self.repo, self.review = old_root, old_repo, old_review
+
+    def test_portable_v2_provider_receipt_reuse_keeps_original_artifacts(self):
+        self.entry("one", identifiers={"doi": "10.1234/example", "pmid": "123"})
+        acquire_corpus(self.repo, self.acquirer(TitleTransport()), workers=1)
+        self.repo.library.snapshot("results/snapshot")
+        CorpusRepository(self.root, "results/snapshot").library.branch("work/fork", "New question", "fork", {})
+        self.repo = CorpusRepository(self.root, "work/fork")
+        self.entry("new-occurrence", identifiers={"pmid": "123"})
+        transport = TitleTransport(fail=True)
+        acquire_corpus(self.repo, self.acquirer(transport), workers=1)
+        self.assertEqual([], transport.calls)
+        self.assertEqual("verified", self.rows()["new-occurrence"]["identity_state"])
+        self.repo.library.snapshot("results/fork")
+        CorpusRepository(self.root, "results/fork").library.verify(require_snapshot=True)
+
     def test_abstract_acquisition_reuses_work_and_survives_minor_bibliographic_disagreement(self):
         self.entry("one", locus=True)
         self.entry("two", locus=True)
@@ -90,6 +165,21 @@ class CorpusPipelineTests(unittest.TestCase):
         self.assertEqual("conflict", rows["conflict"]["identity_state"])
         with self.repo.connect() as db:
             self.assertIsNone(db.execute("SELECT * FROM work_identifiers WHERE scheme='pmid' AND value='999'").fetchone())
+
+    def test_worker_cited_work_has_only_bibliographic_metadata(self):
+        self.entry("one", locus=True)
+        acquire_corpus(self.repo, self.acquirer(TitleTransport()), workers=1)
+        work = self.rows()["one"]["resolved_work_id"]
+        with self.repo.connect(write=True) as db:
+            metadata = json.loads(db.execute("SELECT metadata_json FROM works WHERE work_id=?", (work,)).fetchone()[0])
+            metadata.update(raw={"abstractText": "duplicated raw evidence"}, abstract="duplicated abstract", container="Journal")
+            db.execute("UPDATE works SET metadata_json=? WHERE work_id=?", (canonical(metadata), work))
+        prepare_tasks(self.repo)
+        spec = self.repo.tasks("v2")[0]["spec"]
+        self.assertLessEqual(set(spec["citedWork"]), {"title", "year", "authors", "doi", "pmid", "pmcid", "journal"})
+        self.assertEqual(spec["citedWork"]["journal"], "Journal")
+        self.assertTrue(spec["evidenceUnits"])
+        self.assertNotIn("duplicated", canonical(spec["citedWork"]))
 
     def test_provider_title_conflict_is_not_a_minor_metadata_discrepancy(self):
         class ConflictingTitle(TitleTransport):
