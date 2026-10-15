@@ -182,6 +182,8 @@ class AssessmentValidator:
                 "evidenceDigest": prepared["evidenceDigest"]}
 
     def validate_response(self, tasks: list[dict[str, Any]], output: Any) -> dict[str, Any]:
+        if not isinstance(tasks, list) or not 1 <= len(tasks) <= MAX_BATCH_ITEMS:
+            raise AssessmentError("invalid_batch", f"a batch needs 1–{MAX_BATCH_ITEMS} tasks")
         prepared = [self.planner.prepare(task) for task in tasks]
         by_id = {task["id"]: task for task in prepared}
         if len(by_id) != len(prepared):
@@ -226,7 +228,8 @@ def validate_item(task: dict[str, Any], output: Any) -> dict[str, Any]:
 
 def plan_escalation(assessment: dict[str, Any], coverage: dict[str, Any]) -> dict[str, str]:
     """Route an accepted observation; never replay unchanged evidence indefinitely."""
-    if not isinstance(coverage, dict) or not isinstance(assessment.get("escalate"), bool):
+    if (not isinstance(coverage, dict) or not isinstance(assessment, dict)
+            or not isinstance(assessment.get("escalate"), bool)):
         raise AssessmentError("invalid_escalation", "assessment and coverage must be explicit")
     if not assessment["escalate"]:
         return {"action": "none", "reason": "supplied evidence settled the assessment"}

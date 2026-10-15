@@ -101,7 +101,7 @@ class CorpusRepository:
 
     def analysis(self, analysis_id: str | None = None) -> dict[str, Any]:
         if analysis_id is None:
-            analysis_id = json.loads((self.root / "bundle.json").read_text())["active_analysis_id"]
+            analysis_id = self.library.active_analysis_id()
         with self.connect() as connection:
             row = connection.execute("SELECT a.*,r.protocol_json,r.protocol_sha256,r.corpus_id,r.code_revision FROM analyses a JOIN runs r USING(run_id) WHERE a.analysis_id=?", (analysis_id,)).fetchone()
         if row is None:
@@ -172,9 +172,9 @@ class CorpusRepository:
             connection.execute("INSERT OR IGNORE INTO works VALUES (?,?,?,?)", (work_id,
                                metadata.get("title") or "Unresolved work", metadata.get("year"), canonical(metadata)))
             old = connection.execute("SELECT metadata_json,title FROM works WHERE work_id=?", (work_id,)).fetchone()
-            if old[1] == "Unresolved work" and metadata.get("title"):
-                enriched = {**json.loads(old[0]), **metadata}
-                connection.execute("UPDATE works SET title=?,publication_year=?,metadata_json=? WHERE work_id=?", (metadata["title"], metadata.get("year"), canonical(enriched), work_id))
+            if metadata.get("title") and metadata["title"] != "Unresolved work":
+                enriched = {**json.loads(old[0]), **{k:v for k,v in metadata.items() if v not in (None, "")}}
+                connection.execute("UPDATE works SET title=?,publication_year=?,metadata_json=? WHERE work_id=?", (enriched["title"], enriched.get("year"), canonical(enriched), work_id))
         return work_id
 
     def review(self, metadata: dict[str, Any], *, inclusion: str = "included", reason: str = "manifest",
@@ -186,8 +186,14 @@ class CorpusRepository:
         work_id = self.work(metadata, key=None if any(metadata.get(k) for k in ("doi", "pmid", "pmcid")) else str(key).lower())
         review_id = "review-" + identity(analysis["corpus_id"], work_id)
         with self.connect(write=True) as connection:
+            prior = connection.execute("SELECT inclusion_state FROM reviews WHERE review_id=?", (review_id,)).fetchone()
+            if prior and prior[0] not in ("unresolved", inclusion):
+                raise ValidationError("review eligibility is already resolved differently; retain this corpus and start a distinct selection")
             connection.execute("INSERT OR IGNORE INTO reviews VALUES (?,?,?,?,?,?)", (review_id, analysis["corpus_id"], work_id, inclusion,
                                canonical({k: metadata[k] for k in ("journal", "label", "stratum", "date") if k in metadata}), reason))
+            if prior and prior[0] == "unresolved" and inclusion != "unresolved":
+                connection.execute("UPDATE reviews SET inclusion_state=?,selection_reason=?,strata_json=? WHERE review_id=?", (
+                    inclusion, reason, canonical({k: metadata[k] for k in ("journal", "label", "stratum", "date") if k in metadata}), review_id))
             connection.execute("INSERT OR IGNORE INTO corpus_reviews(review_id,updated_at) VALUES (?,?)", (review_id, library.now()))
         return review_id
 

@@ -16,7 +16,7 @@
         "required": ["id", "supportVerdict", "rationale", "evidence", "escalate", "escalationReason"],
         "properties": {
           "id": {"type": "string", "minLength": 1},
-          "supportVerdict": {"enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
+          "supportVerdict": {"type": "string", "enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
           "rationale": {"type": "string", "minLength": 1, "maxLength": 400},
           "evidence": {
             "type": "array",

@@ -61,6 +61,60 @@ class CacheIntegrityError(RuntimeError):
     """Fatal local corruption; must not be swallowed as remote unavailability."""
 
 
+def _credential_name(name):
+    compact = re.sub(r"[^a-z0-9]", "", str(name).lower())
+    return (compact in {"apikey", "xapikey", "authorization", "proxyauthorization", "cookie", "setcookie",
+                        "token", "accesstoken", "refreshtoken", "secret", "clientsecret", "password",
+                        "credential", "credentials", "signature", "sig"}
+            or compact.startswith("xamz") and any(word in compact for word in ("credential", "token", "signature")))
+
+
+def _safe_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    query = urllib.parse.urlencode([(key, "[redacted]" if _credential_name(key) else value)
+                                   for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)])
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+
+
+def _request_metadata(url, params=None, headers=None, document=False):
+    parsed = urllib.parse.urlsplit(url)
+    private = {"query": [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if _credential_name(k)],
+               "params": {k: v for k, v in (params or {}).items() if v is not None and _credential_name(k)},
+               "headers": {k.lower(): v for k, v in (headers or {}).items() if _credential_name(k)},
+               "userinfo": parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""}
+    request = {"url": _safe_url(url),
+               "params": {k: "[redacted]" if _credential_name(k) else v for k, v in (params or {}).items() if v is not None},
+               "headers": {k.lower(): v for k, v in (headers or {}).items() if not _credential_name(k)},
+               "document": document}
+    if any(private.values()):
+        request["authorizationScopeSha256"] = hashlib.sha256(_json(private).encode()).hexdigest()
+    return request, private
+
+
+def _private_values(private):
+    values = [str(v) for _, v in private["query"]]
+    values += [str(v) for v in private["params"].values()]
+    for name, value in private["headers"].items():
+        value = str(value)
+        values.append(value)
+        if value.lower().startswith(("bearer ", "basic ")):
+            values.append(value.split(" ", 1)[1])
+        if name in {"cookie", "set-cookie"}:
+            values.extend(part.split("=", 1)[1].strip() for part in value.split(";") if "=" in part)
+    values.append(private["userinfo"])
+    return sorted(set(values), key=len, reverse=True)
+
+
+def _safe_provider_error(error, private):
+    message = str(error)
+    for value in _private_values(private):
+        if value:
+            for spelling in (value, urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value)):
+                message = message.replace(spelling, "[redacted]")
+    return ProviderError(message)
+
+
 class CorpusResponseCache:
     """SQLite-coordinated requests and rate reservations, shared across clients.
 
@@ -125,9 +179,7 @@ class CorpusResponseCache:
 
     @staticmethod
     def request_key(url: str, params=None, headers=None, document=False) -> tuple[str, str]:
-        request = _json({"url": url, "params": {k: v for k, v in (params or {}).items() if v is not None},
-                         "headers": {k.lower(): v for k, v in (headers or {}).items()},
-                         "document": document})
+        request = _json(_request_metadata(url, params, headers, document)[0])
         return hashlib.sha256(request.encode()).hexdigest(), request
 
     def _artifact(self, body: bytes) -> str:
@@ -182,12 +234,17 @@ class CorpusResponseCache:
     def store(self, url: str, response: RawResponse, *, params=None, headers=None,
               document=False, derived_from: str | None = None) -> str:
         key, request = self.request_key(url, params, headers, document)
+        private = _request_metadata(url, params, headers, document)[1]
+        for value in _private_values(private):
+            if value and any(spelling.encode() in response.body for spelling in
+                             (value, urllib.parse.quote(value, safe=""), urllib.parse.quote_plus(value))):
+                raise ProviderError("provider response echoes request credentials; response was not cached")
         digest = self._artifact(response.body)
         kept = {k.lower(): v for k, v in response.headers.items()
                 if k.lower() in {"content-type", "etag", "last-modified", "content-length"}}
         with self._db() as db:
             db.execute("INSERT OR IGNORE INTO responses VALUES(?,?,?,?,?,?,?,?)",
-                       (key, request, digest, response.status, _json(kept), response.url or url,
+                       (key, request, digest, response.status, _json(kept), _safe_url(response.url or url),
                         utc_now(), derived_from))
         return key
 
@@ -248,13 +305,14 @@ class CorpusResponseCache:
             self.store(url, response, params=params, headers=headers, document=document)
             return self._read(key, max_response_bytes, authorize_url)
         except ProviderError as exc:
-            kind = failure_kind(exc)
+            safe = _safe_provider_error(exc, _request_metadata(url, params, headers, document)[1])
+            kind = failure_kind(safe)
             with self._db() as db:
                 db.execute("INSERT INTO failures(key,outcome,retryable,http_status,recorded_at) VALUES(?,?,?,?,?)",
                            (key, kind["outcome"], int(kind["retryable"]), kind["httpStatus"], utc_now()))
             if active is not None:
-                active[1][key] = str(exc)
-            raise
+                active[1][key] = str(safe)
+            raise safe from None
         finally:
             with self._db() as db:
                 db.execute("DELETE FROM request_leases WHERE key=? AND owner=?", (key, owner))
@@ -434,19 +492,121 @@ class CorpusAcquirer:
                 "abstractProvider": selected["provider"] if selected else None, "abstractCandidates": candidates,
                 "documents": [], "limitations": limitations, "attempts": []}
 
-    def fetch_work(self, identifiers: Mapping[str, str], *, include_full_text: bool = False) -> dict[str, Any]:
+    def _indexed_resolution(self, identifier: Mapping[str, str], expected_title: str | None = None):
+        """Use a complete exact index record; disagreement takes the broad path.
+
+        The lookup still authorizes cache access. Printed-reference title binding
+        remains the caller's responsibility; this is not independent identity or
+        exhaustive publication-notice surveillance.
+        """
+        key, value = next(iter(identifier.items()))
+        query = f'DOI:"{value}"' if key == "doi" else f"EXT_ID:{value} AND SRC:MED" if key == "pmid" else f"PMCID:{value}"
+        try:
+            records = self.client._europe_pmc_lookup(query, "resolve_identifier", identifier)
+        except ProviderError:
+            return None
+        def normalized(text):
+            return " ".join(re.findall(r"\w+", str(text or "").casefold()))
+        def matches(record):
+            try:
+                observed = record.get(key)
+                return (normalize_doi(str(observed)) == value if key == "doi"
+                        else str(observed or "").casefold() == value.casefold())
+            except ReviewError:
+                return False
+        if not records or not all(matches(record) for record in records):
+            return None
+        titles = {normalized(record.get("title")) for record in records}
+        if len(titles) != 1 or not next(iter(titles)) or (expected_title and normalized(expected_title) not in titles):
+            return None
+        for linked in ("doi", "pmid", "pmcid"):
+            values = {str(record[linked]).casefold() for record in records if record.get(linked)}
+            if len(values) > 1:
+                return None
+        source = f"{EUROPE_PMC}/search?" + urllib.parse.urlencode(
+            {"query": query, "pageSize": 5, "resultType": "core", "format": "json"})
+        candidates = [(record, abstract_candidate(record, source_url=source, retrieved_at=utc_now()))
+                      for record in records]
+        complete = [(record, candidate) for record, candidate in candidates if complete_abstract(candidate)]
+        if not complete or len({candidate["text"] for _, candidate in complete}) != 1:
+            return None
+        selected = complete[0][0]
+        ordered = [{**record, key: value} for record in [selected] + [record for record in records if record is not selected]]
+        result = self.client._envelope("resolve_identifier", "europe-pmc", ordered, limitations=[
+            "Identity uses an exact identifier and consistent title in Europe PMC; independent provider verification was not requested."])
+        result["method"] = "exact-index-identifier-and-title"
+        return result
+
+    @staticmethod
+    def _indexed_status(records):
+        flags, signals = [], []
+        for record in records:
+            raw = record.get("rawMetadata", {})
+            value = raw.get("isRetracted")
+            known = isinstance(value, bool) or value in ("Y", "N")
+            retracted = value is True or value == "Y"
+            types = record.get("publicationTypes") or []
+            flags.append({"id": record.get("id"), "source": record.get("source"),
+                          "isRetractedKnown": known, "isRetracted": retracted if known else None,
+                          "publicationTypes": types})
+            if retracted or any(str(t).casefold() == "retracted publication" for t in types):
+                signals.append({"provider": "europe-pmc", "kind": "retraction", "detail": "provider index flags this work"})
+        return {"operation": "get_publication_status", "state": "retracted" if signals else "unknown",
+                "coverage": "provider-index-only", "providersChecked": ["europe-pmc"],
+                "checkedAt": utc_now(), "signals": signals, "providerFlags": flags,
+                "independentSurveillancePerformed": False,
+                "limitations": ["Europe PMC index flags only; a missing or negative flag does not establish that a work is current or unretracted."]}
+
+    def _indexed_full_text(self, identifier, resolution, result):
+        record = resolution["records"][0]
+        pmcid = record.get("pmcid")
+        if not pmcid or not re.fullmatch(r"PMC\d+", str(pmcid).upper()):
+            return False
+        url = f"{EUROPE_PMC}/{urllib.parse.quote(str(pmcid).upper(), safe='')}/fullTextXML"
+        linked = {key: str(record[key]) for key in ("doi", "pmid", "pmcid") if record.get(key)}
+        linked.update(identifier)
+        try:
+            document = self.client._source_document(url, linked)
+        except ProviderError as exc:
+            result["attempts"].append({"provider": "europe-pmc", "sourceUrl": url, "status": "failed", "error": str(exc)})
+            return False
+        document.update(provider="europe-pmc", version="repository-copy", license=None)
+        result.update(operation="acquire_full_text", provider="europe-pmc", accessLevel="full-text", documents=[document])
+        result["attempts"].append({"provider": "europe-pmc", "sourceUrl": url, "status": "obtained", "sha256": document["sha256"]})
+        if document.get("supplements"):
+            result["limitations"].append("Supplement links were recorded; external supplement files require separate acquisition and examination.")
+        if document.get("visualAssets"):
+            result["limitations"].append("XML graphics/media links were recorded; their visual content requires separate acquisition and inspection where relevant.")
+        return True
+
+    def fetch_work(self, identifiers: Mapping[str, str], *, include_full_text: bool = False,
+                   verify_independently: bool = False) -> dict[str, Any]:
         identifier = self._identifier(identifiers)
         with self.cache.capture() as provenance:
-            resolution = self.client.resolve_identifier(**identifier)
-            records = resolution["records"]
-            reconciliation = self.client.reconcile_reference_metadata(records, identifier)
-            status_key = "doi" if identifier.get("doi") else "pmid" if identifier.get("pmid") else None
-            status = self.client.get_publication_status(**identifier) if status_key else None
-            result = self.client.acquire_full_text(**identifier) if include_full_text else self._abstract_only(identifier, resolution)
-            result.update(identityResolution=resolution, identityReconciliation=reconciliation,
-                          publicationStatus=status)
+            resolution = None if verify_independently else self._indexed_resolution(identifier, identifiers.get("title"))
+            fast = self._abstract_only(identifier, resolution) if resolution else None
+            if fast is not None and (not include_full_text or self._indexed_full_text(identifier, resolution, fast)):
+                fast.update(identityResolution=resolution,
+                            identityReconciliation=self.client.reconcile_reference_metadata(resolution["records"], identifier),
+                            publicationStatus=self._indexed_status(resolution["records"]))
+                result = fast
+            else:
+                result = self._fully_resolved_work(identifier, include_full_text)
+                if fast:
+                    result["attempts"] = fast["attempts"] + result.get("attempts", [])
         result["cacheProvenance"] = provenance
         self._outcome(result)
+        return result
+
+    def _fully_resolved_work(self, identifier, include_full_text):
+        resolution = self.client.resolve_identifier(**identifier)
+        records = resolution["records"]
+        reconciliation = self.client.reconcile_reference_metadata(records, identifier)
+        status_key = "doi" if identifier.get("doi") else "pmid" if identifier.get("pmid") else None
+        status = self.client.get_publication_status(**identifier) if status_key else None
+        result = self.client.acquire_full_text(**identifier) if include_full_text else self._abstract_only(identifier, resolution)
+        result.update(identityResolution=resolution, identityReconciliation=reconciliation,
+                      publicationStatus=status)
         return result
 
     @staticmethod

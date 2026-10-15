@@ -123,7 +123,7 @@ class Library:
         self.parent_root = None
         self.parent_sources = set()
         origin = workspace.path(f"{relative}/bundle.json")
-        if origin.exists():
+        if origin.exists() and not (self.root / "manifest.json").exists():
             metadata = json.loads(origin.read_text())
             parent = metadata.get("parent_snapshot")
             if parent:
@@ -205,8 +205,25 @@ class Library:
             for key in result:
                 if manifest[key] != result[key]:
                     raise ValueError(f"snapshot manifest {key} mismatch")
+            if "active_analysis_id" in manifest:
+                active = manifest["active_analysis_id"]
+                if not isinstance(active, str) or active not in {row["analysis_id"] for row in result["analyses"]}:
+                    raise ValueError("snapshot active analysis is not present in its database")
+                result["active_analysis_id"] = active
             result["manifest_sha256"] = digest_file(manifest_path)
         return result
+
+    def active_analysis_id(self):
+        """Resolve snapshot defaults from verified, portable metadata only."""
+        if (self.root / "manifest.json").exists():
+            result = self.verify(require_snapshot=True)
+            if "active_analysis_id" in result:
+                return result["active_analysis_id"]
+            analyses = result["analyses"]
+            if len(analyses) == 1:
+                return analyses[0]["analysis_id"]
+            raise ValueError("snapshot has no active analysis; specify an explicit analysis ID")
+        return json.loads((self.root / "bundle.json").read_text())["active_analysis_id"]
 
     def backup(self, destination):
         # SQLite backup includes committed WAL pages; a raw .sqlite file copy does not.
@@ -215,8 +232,7 @@ class Library:
             target.execute("PRAGMA journal_mode=DELETE")
 
     def snapshot(self, destination):
-        if self.workspace.path(f"{self.relative}/manifest.json").exists():
-            self.verify(require_snapshot=True)
+        active = self.active_analysis_id()
         with self.workspace.create(destination) as root:
             self.backup(root / "corpus.sqlite3")
             # Read the captured database, not a later state of the live writer.
@@ -229,8 +245,10 @@ class Library:
                         shutil.copyfileobj(source, output, length=1024 * 1024)
                     target.chmod(0o444)
             result = captured.inspect()  # Missing or changed source bytes fail the entire snapshot.
+            if active not in {row["analysis_id"] for row in result["analyses"]}:
+                raise ValueError("active analysis is not present in the captured database")
             manifest = {"format": "ocsl-literature-snapshot", "version": 1,
-                        "created_at": now(), **result,
+                        "created_at": now(), "active_analysis_id": active, **result,
                         "database": {"path": "corpus.sqlite3",
                                      "sha256": digest_file(captured.db),
                                      "byte_count": captured.db.stat().st_size}}

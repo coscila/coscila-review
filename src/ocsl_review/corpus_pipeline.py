@@ -15,7 +15,7 @@ from .corpus_library import now
 from .errors import ConfidentialityError, ProviderError, ReviewError, ValidationError
 from .evidence import complete_abstract
 from .corpus_acquisition import failure_kind
-from .scholarly import ScholarlyClient, normalize_doi
+from .scholarly import ScholarlyClient, normalize_doi, normalize_europe_pmc, parse_pubmed_record
 
 
 def _identifiers(value):
@@ -127,6 +127,80 @@ def _checkpoint(repo, analysis, entry, state, checkpoint):
                            (analysis, entry, "citation-acquisition", state, canonical(checkpoint), now()))
 
 
+def _retained_abstract(repo, identifiers):
+    """Reuse complete source fields, never upgrade legacy text or old verdicts.
+
+    The original provider record establishes identity again; a cached work ID or
+    alias is only a lookup hint. Printed-reference reconciliation still follows.
+    """
+    candidate_ids = {"work-" + identity(f"{scheme}:{value.lower()}") for scheme, value in identifiers.items()}
+    with repo.connect() as connection:
+        for scheme, value in identifiers.items():
+            for row in connection.execute("SELECT * FROM work_identifiers WHERE scheme=? AND value=?", (scheme, value.lower())):
+                # Proof registration and content integrity are checked even
+                # though the structured provider record is re-read below.
+                proof = row[3]
+                if proof:
+                    repo.verify_artifact(proof)
+                    candidate_ids.add(row["work_id"])
+        rows = []
+        for work_id in candidate_ids:
+            row = connection.execute("SELECT work_id,metadata_json FROM works WHERE work_id=?", (work_id,)).fetchone()
+            if row:
+                rows.append(dict(row))
+    if len(rows) != 1:
+        return None
+    work = rows[0]
+    metadata = json.loads(work["metadata_json"])
+    known_ids = _identifiers(metadata)
+    if not metadata.get("title") or any(known_ids[k].casefold() != value.casefold()
+                                      for k, value in identifiers.items() if k in known_ids):
+        return None
+    evidence = repo.evidence(work["work_id"], "abstract")
+    if not evidence or not evidence["complete"]:
+        return None
+    with repo.connect() as connection:
+        row = connection.execute("SELECT metadata_json FROM corpus_documents WHERE document_id=?", (evidence["documentId"],)).fetchone()
+    document_metadata = json.loads(row[0])
+    source = json.loads(repo.read_artifact(evidence["sourceSha256"]))
+    candidate = document_metadata.get("completeAbstractCandidate") or source.get("provenance")
+    if not complete_abstract(candidate):
+        return None
+    if "\n\n".join(unit["text"] for unit in evidence["evidenceUnits"]) != candidate["text"]:
+        return None
+    original_receipt = source.get("acquisitionReceiptSha256")
+    if document_metadata.get("completeAbstractCandidate"):
+        # A legacy normalized column, even labelled Europe PMC, is insufficient.
+        if candidate["rawMetadata"] not in source.get("resultList", {}).get("result", []):
+            return None
+    elif original_receipt:
+        receipt = json.loads(repo.read_artifact(original_receipt))
+        if receipt.get("abstract") != candidate["text"] or candidate not in receipt.get("abstractCandidates", []):
+            return None
+        for item in receipt.get("cacheProvenance", []):
+            repo.verify_artifact(item.get("sha256") or item.get("artifactSha256"))
+    else:
+        return None
+    if candidate["provider"] == "europe-pmc":
+        record = normalize_europe_pmc(candidate["rawMetadata"])
+    else:
+        record = parse_pubmed_record(candidate["rawMetadata"]["xml"].encode(), candidate["provenance"]["identifiers"]["pmid"])
+    if (not _matches(record, identifiers)
+            or _identifiers(record) != _identifiers(candidate["provenance"]["identifiers"])
+            or _text(record.get("title")) != _text(metadata["title"])):
+        return None
+    return {"operation": "reuse_retained_abstract", "outcome": "acquired", "retryable": False,
+            "abstract": candidate["text"], "abstractComplete": True, "abstractCandidates": [candidate],
+            "abstractProvider": candidate["provider"], "documents": [], "cacheProvenance": [],
+            "retrievedAt": candidate["provenance"]["retrievedAt"],
+            "identityResolution": {"records": [record], "method": "retained-structured-provider-identity"},
+            "retainedEvidence": {"workId": work["work_id"], "documentId": evidence["documentId"],
+                                 "sourceSha256": evidence["sourceSha256"], "acquisitionReceiptSha256": original_receipt},
+            "publicationStatus": {"state": "unknown", "coverage": "retained-provider-record-only",
+                                  "currentSurveillancePerformed": False},
+            "limitations": ["Reused complete structured abstract and identity from retained evidence; publication status was not refreshed."]}
+
+
 def acquire_corpus(repo: CorpusRepository, acquirer, *, workers: int = 12, retry: bool = False,
                    progress=None) -> dict:
     if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
@@ -135,6 +209,15 @@ def acquire_corpus(repo: CorpusRepository, acquirer, *, workers: int = 12, retry
         reviews = [dict(r) for r in connection.execute("SELECT r.review_id,w.work_id,w.metadata_json,c.phase,c.state FROM reviews r JOIN works w USING(work_id) JOIN corpus_reviews c USING(review_id) WHERE inclusion_state='included'")]
     selected = [r for r in reviews if r["phase"] == "pending" or r["state"] == "failed" or retry and r["state"] == "blocked"]
     analysis = repo.analysis()["analysis_id"]
+    from .corpus_review_reuse import retained_review_sources, reuse_review
+    retained = retained_review_sources(repo, selected)
+    missing = []
+    for row in selected:
+        if not reuse_review(repo, row, retained.get(row["work_id"], {})):
+            missing.append(row)
+        if progress:
+            progress()
+    selected = missing
 
     def review_fetch(row):
         try:
@@ -205,12 +288,20 @@ def acquire_corpus(repo: CorpusRepository, acquirer, *, workers: int = 12, retry
                                                [(lookup["state"], proof, entry["entry_id"]) for entry in group])
                     for entry in group:
                         _checkpoint(repo, analysis, entry["entry_id"], "failed" if lookup.get("retryable") else "blocked", {"titleResolutionSha256": proof})
-    prefetch = acquirer.prefetch_dois(g["identifiers"]["doi"] for g in groups.values() if g["identifiers"].get("doi"))
+    for group in groups.values():
+        retained = _retained_abstract(repo, group["identifiers"])
+        if retained:
+            # Keep only a digest in the population-sized queue, not all abstracts.
+            group["retainedReceiptSha256"] = repo.json_artifact(retained, "acquisition-receipt")
+    prefetch = acquirer.prefetch_dois(g["identifiers"]["doi"] for g in groups.values()
+                                    if g["identifiers"].get("doi") and not g.get("retainedReceiptSha256"))
     _cache_artifacts(repo, prefetch.get("cacheProvenance", []))
     repo.json_artifact(prefetch, "corpus-prefetch-receipt")
 
     def work_fetch(group):
         try:
+            if group.get("retainedReceiptSha256"):
+                return group, json.loads(repo.read_artifact(group["retainedReceiptSha256"])), None
             return group, acquirer.fetch_work(group["identifiers"]), None
         except ReviewError as exc:
             if isinstance(exc, ConfidentialityError):
@@ -308,9 +399,14 @@ def prepare_tasks(repo: CorpusRepository, *, tier: str = "abstract", context_cha
             locator = json.loads(row["locator"])
         except ValueError:
             locator = {"locator": row["locator"], "bindingStatus": "exact"}
+        metadata = json.loads(row["metadata_json"] or "{}")
+        cited_work = {key: metadata[key] for key in ("title", "year", "authors", "doi", "pmid", "pmcid", "journal")
+                      if metadata.get(key) is not None}
+        if not cited_work.get("journal") and metadata.get("container"):
+            cited_work["journal"] = metadata["container"]
         spec = {**evidence, "claim": row["claim_text"], "context": json.loads(row["context_text"]),
                 "citationLocus": {"id": row["locus_id"], **locator}, "claimType": locator.get("claimType", "background"),
-                "citedWork": json.loads(row["metadata_json"] or "{}"),
+                "citedWork": cited_work,
                 "identifiers": json.loads(row["candidate_identifiers_json"]).get("identifiers", {}),
                 "identityVerified": row["identity_state"] == "verified", "reviewId": row["review_id"],
                 "reviewProof": json.loads(row["checkpoint_json"])}

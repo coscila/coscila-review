@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 
@@ -91,6 +92,24 @@ class CorpusWorkflowTests(unittest.TestCase):
         self.assertNotIn("denominator", value)
         self.assertEqual(value["state"], "running")
         self.assertIn("+", value["updatedAt"])
+
+    def test_terminal_progress_survives_queued_heartbeats_and_stops_thread(self):
+        with Progress(self.repo) as progress:
+            progress(force=True, phase="validation", summary="Validation running")
+            progress(state="completed", summary="Saved all results")
+            path = self.root / "results/.ocsl/progress.json"
+            terminal = path.read_bytes()
+            threads = [threading.Thread(target=lambda: progress(force=True)) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(path.read_bytes(), terminal)
+            self.assertTrue(progress.stop.is_set())
+            self.assertEqual(json.loads(terminal)["state"], "completed")
+            self.assertEqual(json.loads(terminal)["phase"], "validation")
+        self.assertFalse(progress.thread.is_alive())
 
     def test_cli_routes_and_state_independent_init(self):
         parsed = build_parser().parse_args(["corpus", "execute", "--worker-config", "w1", "--low-worker-config", "w2"])
