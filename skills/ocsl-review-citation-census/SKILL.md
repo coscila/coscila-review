@@ -13,8 +13,11 @@ human-adjudicated labels need separate provenance.
 
 For a multi-paper corpus and a database that can support future questions, start
 with `ocsl-review-reference-analysis`. This census skill supplies the existing
-per-manuscript measurement lifecycle; it does not itself schedule an entire
-corpus or transfer jobs when a chat is forked.
+per-manuscript **v1** measurement lifecycle. New corpus studies use the maintained
+`ocsl-review corpus` v2 workflow through that reference-analysis skill. The v1
+rules below remain pinned for reproducibility; do not apply them to v2 or
+rewrite old assessments when changing instruments. Neither path transfers live
+broker jobs when a chat is forked.
 
 ## Runtime
 

@@ -38,10 +38,12 @@ preserve citation targets and display loci before measurement.
 For a complete corpus and future research questions, the
 [reference-analysis skill](skills/ocsl-review-reference-analysis/SKILL.md)
 preserves source evidence, all citation loci and versioned assessments in a
-portable literature database. Its standard-library helper creates consistent
-snapshots and branches new analysis namespaces. The skill includes the earlier
-oncology census's verified workflow lessons and limitations; storage helpers do
-not replace acquisition, worker authorization or a corpus coordinator.
+portable literature database. The maintained [`ocsl-review corpus` workflow](docs/corpus-review.md)
+acquires shared sources, schedules per-locus v2 assessments, resumes durable
+queues and creates verified snapshots and analysis branches. It keeps legacy
+results separate and calibrates small batches before enabling them. The skill
+includes the earlier oncology census's measured workflow lessons and limitations;
+deployment authorization and live throughput still require their own checks.
 
 ## What the companion decides
 

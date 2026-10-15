@@ -46,12 +46,41 @@ visible in a new study. Full-text follow-up covered 8,969 entries, not all
    The historical paper's five figures cover pipeline/cost, distributions,
    extremes, validation and the reusable score database.
 
-The historical run used 40-entry paper batches, temperature zero, no reasoning
-for the main judge, and 60 concurrent streams for audit reruns. It reported
-40.3–51.3 judged entries/second. Those are historical measurements, **not new
-defaults**: per-locus tasks, longer evidence and a changed validation protocol
-have different costs. Record response-side model identity; an endpoint alias
-such as `chat` does not identify the underlying model.
+The historical run used 40-entry paper batches, temperature zero and no reasoning
+for the main judge. The original judge configuration used 160 concurrent calls;
+the corrected audit reruns used 60. Its recorded audit reruns processed 36,331
+entries in 902 seconds and 69,047 in 1,347 seconds (40.3–51.3 entries/second).
+These durations describe inference phases over prepared inputs, not a complete
+fresh acquisition-to-manuscript run. These are historical measurements, **not
+v2 performance results**. Per-locus tasks, complete abstracts and changed
+validation have different costs. Record response-side model identity; an
+endpoint alias such as `chat` does not identify the underlying model.
+
+## Lessons from the later slow run
+
+The October 14 investigation found structural work amplification, not evidence
+that the earlier corpus was impossible. The inspected production state contained
+2,493 dispatchable abstract tasks, including 1,042 (41.8%) whose claim types
+triggered a blanket full-text requirement. All 565 accepted observations in that
+specific-claim subset were abstentions by construction. Calls to this subset
+used 55.7% of the 20.4 million tokens in completed production calls. The classifier
+also treated any bare number as a quantitative claim, including protein names,
+dates and list labels. These figures describe that stopped run, not a new study.
+
+The v2 instrument removes that predetermined outcome: explicitly quoted
+abstract statements may support abstract alignment. Details absent from the
+abstract escalate once to suitable evidence. Only affected invalid items need
+format repair; missing evidence does not become repeated inference. The full-text
+pilot also rejected responses solely for omitting the echo of hundreds of unit
+IDs. V2 instead checks the exact units actually quoted and records supplied
+coverage mechanically, without claiming that an ID list proves attention.
+
+In the inspected completed production receipts, about 95% of output tokens
+were reasoning tokens under `xhigh`. The v2 template starts abstract work at
+`none` and targeted full-text work at `low`, with small-batch calibration before
+scaling. There is no paired historical-versus-v2 accuracy result yet. Reducing
+known waste is justified; preserved quality and a new completion time require
+measurement. Retain all original v1 judgments and protocol versions separately.
 
 ## What not to reproduce
 
@@ -65,10 +94,11 @@ recommendations:
 - Historical full-text follow-up used targeted 11,000-character windows. This
   is excerpt-based examination, not demonstrated reading of a complete paper.
   Retain such runs under their actual evidence tier when importing history.
-- Forty-item calls showed substantial position/batch effects. Prefer one locus
-  per task; any multi-item inference must preserve item position and validate
-  its effect. Bulk transport may carry many independent tasks without combining
-  them into one model prompt.
+- Forty-item calls showed substantial position/batch effects. Keep one locus
+  per scientific task and start one task per model call. V2 tests four-item
+  calls against single-item and reordered controls before enabling that batch
+  size. Preserve every item identity and position; transport grouping must not
+  merge repeated occurrences or their judgments.
 - Abstract silence on a specific claim cannot prove that the full paper fails
   to support it. Keep escalation and inaccessible evidence uncertain; report
   abstract alignment separately from full-text support.
@@ -100,3 +130,11 @@ workflow), `paper_nature.tex` (Methods, five figures and limitations),
 `defects_catalogue.tsv`, `audit_facts.json` and the original immutable database
 manifest. Use them as evidence for historical assertions, not as instructions
 that override the current approved study.
+
+The timing evidence is in `work/audit/logs/n4_nrco_v2.log` and
+`work/audit/logs/n4_frontiers_gain.log`; original batch geometry is in
+`work/reviews/tools/judge_llm.py`. The slow-run figures come from workspace
+`08d43c92-2286-4f4c-aeb8-a8a6872a8c6a`, its per-review census databases under
+`work/corpus/ws/*/.ocsl-review/census/`, the pinned v1 assessments and broker
+receipts. These private research artifacts are provenance identifiers, not
+runtime dependencies or redistributed package inputs.
