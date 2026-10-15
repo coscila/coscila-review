@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0; citation-support-v2 item-preserving response",
+  "title": "Citation support v2 observations",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "supportVerdict", "rationale", "evidence", "escalate", "escalationReason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "supportVerdict": {"enum": ["direct-support", "scope-caveat", "partial-indirect", "contradicted", "not-addressed", "abstain"]},
+          "rationale": {"type": "string", "minLength": 1, "maxLength": 400},
+          "evidence": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["unitId", "quote"],
+              "properties": {
+                "unitId": {"type": "string", "minLength": 1},
+                "quote": {"type": "string", "minLength": 1, "maxLength": 1200}
+              }
+            }
+          },
+          "escalate": {"type": "boolean"},
+          "escalationReason": {"type": "string", "maxLength": 240}
+        }
+      }
+    }
+  }
+}
