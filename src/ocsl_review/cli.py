@@ -411,6 +411,8 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--output")
     calibrate.add_argument("--workspace", default=".")
     _set(calibrate, "calibration", "cmd_calibrate", WORKSPACE, state_required=False)
+    from .corpus_cli import add_commands
+    add_commands(families, _set)
     return parser
 
 

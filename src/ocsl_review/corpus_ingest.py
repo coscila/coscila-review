@@ -71,6 +71,8 @@ def bind_manuscript(repo: CorpusRepository, review_id: str, manuscript: dict,
                                (entry_id, review_id, label, reference["raw"], canonical(candidate)))
             entries[label] = entry_id
         clusters = {c["id"]: c for c in graph["citationClusters"]}
+        sentences = manuscript.get("sentences", [])
+        positions = {s["id"]: index for index, s in enumerate(sentences)}
         loci = 0
         unbound = set()
         for claim in graph["claims"]:
@@ -80,12 +82,16 @@ def bind_manuscript(repo: CorpusRepository, review_id: str, manuscript: dict,
                     unbound.add(cluster_id)
                     continue
                 for ref_id in cluster["referenceIds"]:
+                    sentence_id = claim["locator"].get("anchor", "").split(":c", 1)[0]
+                    index = positions.get(sentence_id)
+                    context = [s["text"] for s in sentences[max(0, index-1):index+2]
+                               if s["sectionId"] == sentences[index]["sectionId"]] if index is not None else []
                     locator = canonical({"claim": claim["id"], "cluster": cluster_id, "locator": claim["locator"],
                                          "claimType": claim["claimType"], "bindingStatus": "exact"})
                     locus_id = "locus-" + identity(entries[ref_id], manuscript_sha, locator)
                     connection.execute("INSERT OR IGNORE INTO claim_loci VALUES (?,?,?,?,?,?,?)",
                                        (locus_id, entries[ref_id], manuscript_sha, locator, claim["text"],
-                                        canonical([]), "structured-inventory-v2"))
+                                        canonical(context), "structured-inventory-v2"))
                     loci += 1
     checkpoint = {"manuscriptSha256": manuscript_sha, "graphSha256": graph_sha, "rawSourceSha256": source_sha,
                   "sourceUrl": source_url, "provider": provider, "public": manuscript.get("confidential") is False,

@@ -50,6 +50,7 @@ class CorpusRepository:
             if version not in (1, 2):
                 raise ValidationError("unsupported corpus database version")
         self.version = version
+        self._verified_artifacts = {}
 
     @classmethod
     def create(cls, workspace: Path, relative: str, question: str, analysis_id: str,
@@ -140,15 +141,23 @@ class CorpusRepository:
         return self.artifact(canonical(json_safe(value)).encode(), kind)
 
     def read_artifact(self, digest: str) -> bytes:
+        path = self.verify_artifact(digest)
+        return path.read_bytes()
+
+    def verify_artifact(self, digest: str) -> Path:
         with self.connect() as connection:
             item = connection.execute("SELECT * FROM source_artifacts WHERE sha256=?", (digest,)).fetchone()
         if item is None:
             raise ValidationError("artifact is not registered")
         path = self.library.source(item)
-        body = path.read_bytes()
-        if hashlib.sha256(body).hexdigest() != digest:
+        stat = path.stat()
+        signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        if self._verified_artifacts.get(digest) == signature:
+            return path
+        if library.digest_file(path) != digest:
             raise ValidationError("registered artifact hash mismatch")
-        return body
+        self._verified_artifacts[digest] = signature
+        return path
 
     def work(self, metadata: dict[str, Any], *, key: str | None = None) -> str:
         identifiers = {k: str(metadata[k]).strip().lower() for k in ("doi", "pmid", "pmcid") if metadata.get(k)}
@@ -158,9 +167,14 @@ class CorpusRepository:
             for scheme, value in identifiers.items():
                 existing = connection.execute("SELECT work_id FROM work_identifiers WHERE scheme=? AND value=?", (scheme, value)).fetchone()
                 if existing:
-                    return existing[0]
+                    work_id = existing[0]
+                    break
             connection.execute("INSERT OR IGNORE INTO works VALUES (?,?,?,?)", (work_id,
                                metadata.get("title") or "Unresolved work", metadata.get("year"), canonical(metadata)))
+            old = connection.execute("SELECT metadata_json,title FROM works WHERE work_id=?", (work_id,)).fetchone()
+            if old[1] == "Unresolved work" and metadata.get("title"):
+                enriched = {**json.loads(old[0]), **metadata}
+                connection.execute("UPDATE works SET title=?,publication_year=?,metadata_json=? WHERE work_id=?", (metadata["title"], metadata.get("year"), canonical(enriched), work_id))
         return work_id
 
     def review(self, metadata: dict[str, Any], *, inclusion: str = "included", reason: str = "manifest",
@@ -210,8 +224,8 @@ class CorpusRepository:
             row = connection.execute("SELECT * FROM corpus_documents WHERE work_id=? AND evidence_tier=? ORDER BY complete DESC,created_at DESC,document_id DESC LIMIT 1", (work_id, tier)).fetchone()
             if row is None:
                 return None
-            units = [dict(r) for r in connection.execute("SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM source_sections WHERE artifact_sha256=? ORDER BY rowid", (row["artifact_sha256"],))]
-        self.read_artifact(row["artifact_sha256"])
+            units = [dict(r) for r in connection.execute("SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM source_sections WHERE artifact_sha256=? AND work_id=? ORDER BY rowid", (row["artifact_sha256"], work_id))]
+        self.verify_artifact(row["artifact_sha256"])
         return {"documentId": row["document_id"], "sourceSha256": row["artifact_sha256"], "evidenceTier": tier,
                 "evidenceUnits": units, "complete": bool(row["complete"]), "provider": row["provider"], "sourceUrl": row["source_url"]}
 
