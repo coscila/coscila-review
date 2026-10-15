@@ -5,7 +5,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
-from ocsl_review.claim_inventory import build_claim_inventory
+from ocsl_review.claim_inventory import _claim_type, build_claim_inventory
 from ocsl_review.ingest import ingest_manuscript
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +13,31 @@ FIXTURE = ROOT / "tests" / "fixtures" / "manuscript_with_citations.md"
 
 
 class ClaimInventoryTests(unittest.TestCase):
+    def test_digits_in_protein_names_dates_lists_and_stages_are_not_measurements(self):
+        for claim, expected in (
+            ("IL-6 is expressed in stromal cells", "fact"),
+            ("IL-6 induces proliferation", "causal"),
+            ("The study appeared in 2024", "fact"),
+            ("1. Tumours express PD-L1", "fact"),
+            ("The patients had type 2 diabetes", "fact"),
+            ("Stage 3 disease responds to treatment", "fact"),
+            ("First-line therapy remains standard", "fact"),
+            ("The first study reported novel evidence", "novelty"),
+        ):
+            with self.subTest(claim=claim):
+                self.assertEqual(_claim_type(claim), expected)
+
+    def test_actual_counts_effects_and_measurements_remain_numeric(self):
+        for claim in (
+            "The abstract reports n = 60", "Reference: Kopp; Number of patients: 60",
+            "Participants: 56", "Events: 14", "The trial enrolled 60",
+            "Expression increased 30-fold", "Mortality fell by 17%",
+            "The hazard ratio was 0.61", "P < 0.05", "The dose was 10 mg",
+            "The study followed patients for 3 years", "There were 15–20 patients",
+        ):
+            with self.subTest(claim=claim):
+                self.assertEqual(_claim_type(claim), "numeric")
+
     def test_results_are_not_automatically_flagged_for_external_citation(self):
         text = """# Results
 

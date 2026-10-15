@@ -94,14 +94,33 @@ def _split_method_coordination(text: str) -> list[str]:
 
 def _claim_type(text: str) -> str:
     lowered = text.casefold()
-    if re.search(r"\b(first|earliest|novel|unprecedented|no previous|never before)\b", lowered):
+    if re.search(
+        r"\b(?:novel|unprecedented|no previous|never before)\b|"
+        r"\b(?:first|earliest)\s+(?:(?:ever|known|reported)\s+)?"
+        r"(?:study|report|evidence|demonstration|description|trial|discovery|time)\b",
+        lowered,
+    ):
         return "novelty"
     if re.search(r"[\"“”].+[\"“”]", text):
         return "quotation"
-    if re.search(
-        r"\b\d+(?:\.\d+)?\s*(?:%|percent|fold|mg|kg|ml|mm|cm|hz|p\s*[<=>])?\b",
-        lowered,
-    ):
+    # A digit is not a quantitative assertion: gene names (IL-6), dates, list
+    # markers and disease stages contain digits too. Require a measurement,
+    # count or statistical context. This is a routing hint, not an evidence gate.
+    number = r"\d+(?:\.\d+)?(?:\s*[–−-]\s*\d+(?:\.\d+)?)?"
+    quantity = (
+        rf"(?<![\w-]){number}\s*[-–]?\s*(?:%|percent\b|fold\b|times\b|"
+        r"(?:mg|kg|µg|μg|ng|ml|µl|μl|mm|cm|nm|hz|days?|months?|years?)\b|"
+        r"(?:patients?|participants?|subjects?|samples?|events?|deaths?|cases?)\b)"
+    )
+    statistic = (
+        rf"\b(?:n|p|hr|or|rr|hazard ratio|odds ratio|risk ratio)\s*(?:=|<|>|≤|≥|of|was|is)\s*{number}"
+    )
+    count = (
+        rf"\b(?:participants|patients|subjects|events|deaths|cases|sample size|"
+        rf"number of [a-z ]{{1,35}}|enrolled|included|recruited)\s*"
+        rf"(?:(?:was|were|is|are|of|=|:)\s*)?{number}\b"
+    )
+    if any(re.search(pattern, lowered) for pattern in (quantity, statistic, count)):
         return "numeric"
     if re.search(
         r"\b(causes?|caused|drives?|led to|results? in|mediates?|prevents?|induces?)\b",
