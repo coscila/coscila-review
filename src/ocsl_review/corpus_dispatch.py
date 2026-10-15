@@ -152,6 +152,11 @@ class CorpusExecutor:
 
     def _pin(self, catalog, worker, tier, batch_size):
         # Capacity may change; the scientific model, prompt and schema may not.
+        revision = self.repo.analysis(self.analysis)["code_revision"]
+        if revision and revision.startswith("source-tree-sha256:"):
+            from .corpus_export import implementation_manifest
+            if revision != "source-tree-sha256:" + implementation_manifest()["sha256"]:
+                raise ValidationError("implementation changed; branch a new analysis with the current code")
         scientific = {k: v for k, v in worker.items() if k != "bulkConcurrencyLimit"}
         pin = {"worker": scientific, "revision": catalog["revision"],
                "promptSha256": hashlib.sha256(PROMPT_PATH.read_bytes()).hexdigest(),
