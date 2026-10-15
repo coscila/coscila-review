@@ -7,7 +7,9 @@ does not retain the evidence needed to ask a different scientific question.
 
 ## Separate evidence from interpretation
 
-The bundled `assets/literature-schema.sql` defines the initial schema. It keeps
+The bundled `assets/literature-schema.sql` defines the initial schema; the
+maintained `schemas/corpus-v2.sql` adds corpus document, task, batch and import
+ledgers without rewriting original observations. The shared library keeps
 the population and works (`corpora`, `works`, `reviews`), verified identifiers
 (`work_identifiers`), retrieval provenance and immutable source artifacts
 (`retrievals`, `source_artifacts`, `source_sections`), printed reference slots
@@ -29,42 +31,47 @@ remain tied to the question, locus, evidence and instrument that generated
 them. Use explicit analysis filters in every analytical query. Never obtain a
 new question's results by silently selecting the last judgment for each DOI.
 
-The schema is an interchange foundation. Existing `.ocsl-review` ledgers and
-census exports require an explicit, verified import mapping; `init` does not
-magically populate this database or import the historical oncology results.
-Preserve source IDs and external run IDs as provenance, never as live job
-ownership. Store import code, row-count reconciliation and rejected rows.
+Existing `.ocsl-review` ledgers and historical exports enter through
+`corpus import-legacy --kind census|historical`; `init` does not populate the
+database. Import reconciliation and raw inputs remain registered provenance.
+Historical records never satisfy fresh v2 task completion. Preserve external
+run IDs as provenance, never as live job ownership.
 
-## Included helper
+For original evidence databases and raw source captures, use the supported
+`corpus import-legacy --kind evidence` adapter. An external verified seed is
+imported with `corpus import-snapshot /operator/supplied/seed --workspace .
+--library work/seed`, then branched into the new analysis. Obtain the actual
+seed path from the operator; no historical absolute path is a runtime default.
+These imports retain source bytes and provenance without completing new tasks.
 
-The helper uses Python's standard library and writes only within the explicitly
-selected workspace. It creates, verifies and branches bundles; it performs no
-network requests or model calls. Resolve its path through `$OCSL_REVIEW_HOME`:
+## Maintained corpus commands
+
+Use the maintained command from `$OCSL_REVIEW_HOME/bin/ocsl-review`. Storage
+commands below do not call models or providers; `corpus acquire`, `calibrate`
+and `run` have their separate authorized execution contracts.
 
 ```bash
-literature_db="$OCSL_REVIEW_HOME/skills/ocsl-review-reference-analysis/scripts/literature_db.py"
-python3 "$literature_db" --workspace "$PWD" init work/literature \
-  --analysis-id citation-support-v1 \
+"$OCSL_REVIEW_HOME/bin/ocsl-review" corpus init \
+  --workspace "$PWD" --library work/literature --analysis citation-support-v2 \
   --protocol work/study-specification.json \
   --question "How does citation support vary across the declared journal strata?"
 ```
 
-Create the approved `work/study-specification.json` before initialization; add
-`--code-revision` when the implementation revision is known. Capture the returned
+Create the approved `work/study-specification.json` before initialization and
+record the actual code revision in that specification. Capture the returned
 `analysis_id` in the controller handoff. Protocol and analysis records are
-append-only. Omitting the protocol creates an explicitly unconfigured run,
-which is a storage scaffold, not permission to judge; configure a fresh analysis
-with its actual protocol before inference. Populate the database through the
-approved, versioned import/analysis code. Source files,
+append-only. Populate the database through maintained corpus import, acquisition
+and assessment commands. Source files,
 raw responses, specification, prompts, schemas, environment locks and analysis
 code needed for reproduction should all be registered in the bundle.
 
 Create a consistent snapshot, including live SQLite WAL data, and verify it:
 
 ```bash
-python3 "$literature_db" --workspace "$PWD" snapshot \
-  work/literature results/literature-snapshot
-python3 "$literature_db" --workspace "$PWD" verify results/literature-snapshot
+"$OCSL_REVIEW_HOME/bin/ocsl-review" corpus snapshot \
+  --workspace "$PWD" --library work/literature --output results/literature-snapshot
+"$OCSL_REVIEW_HOME/bin/ocsl-review" corpus verify \
+  --workspace "$PWD" --library results/literature-snapshot
 ```
 
 The manifest records the schema version, database hash, registered artifact
@@ -92,9 +99,9 @@ For a **different question**, make the verified snapshot available within the
 destination chat's authorized workspace, then branch it:
 
 ```bash
-python3 "$literature_db" --workspace "$PWD" branch \
-  results/literature-snapshot work/followup \
-  --analysis-id evidence-trends-v1 \
+"$OCSL_REVIEW_HOME/bin/ocsl-review" corpus branch \
+  --workspace "$PWD" --library results/literature-snapshot --output work/followup \
+  --analysis evidence-trends-v1 \
   --protocol work/followup-specification.json \
   --question "How have the study designs of the cited evidence changed over time?"
 ```
@@ -107,9 +114,12 @@ branch. Historical records stay labelled history; the new question's tasks do
 not become complete. The parent is unchanged. New extractions, provider updates
 and judgments receive new versioned records, while verified evidence can be
 read again without downloading it. A different question requires its own task
-schema and method version. The helper currently supports core database schema
-version 1; changing that core requires a compatible helper and a tested,
-versioned migration. Do not increment `user_version` without that support.
+schema and method version. The maintained storage module supports core schema
+versions 1 and 2. V2 migration is additive and preserves a v1 backup; immutable
+snapshots must be branched before migration. Never increment `user_version` by
+hand. The original skill-local `scripts/literature_db.py` remains a storage-only
+compatibility entry point using that same maintained module; existing command
+spelling there is unchanged.
 
 For work-level questions such as trial design or cohort size, use
 `work_observations` with the new analysis ID, work ID, property, structured value,

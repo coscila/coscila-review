@@ -42,18 +42,33 @@ outcomes with bounded backoff.
 Keep full acquired abstracts and full text. Record completeness and extraction
 limitations in machine-readable fields, with the actual source passed to the
 worker. A selected excerpt remains an excerpt even if its parent PDF is stored.
-For a claim requiring methods, numbers, causality, priority or exact quotations,
-obtain adequate full text or abstain. Absence from an abstract is not evidence
-of absence from the paper. Never merge separate evidence tiers into one score
-without a declared aggregation rule.
+Under `citation-support-v2`, an explicit statement in a complete abstract can
+support abstract alignment, including numbers and methods. Protein identifiers,
+dates and list numbering are not quantitative results merely because they
+contain digits. Assess the actual bound claim and quoted evidence. A missing
+detail requires full-text escalation, not a predetermined negative verdict or
+another identical abstract call. Absence from an abstract is not evidence of
+absence from the paper. Never merge separate evidence tiers into one score
+without a declared aggregation rule. Keep v1 observations under their original
+stricter policy; changing the instrument creates a new analysis.
+
+A full-text excerpt may directly support or contradict a claim if its exact
+quoted passage establishes that result. Record the excerpt coverage explicitly.
+`not-addressed` requires complete full-text coverage. If more text is needed,
+retrieve additional relevant sections; preserve the full acquired source and
+the exact selected units. Oversized or unavailable evidence remains uncertain
+when the required coverage cannot be supplied.
 
 Pin the protocol, prompt hash, schema, provider/model, reasoning and sampling
 settings, item order where relevant, evidence hashes, task ID and attempt ID.
 Qwen judgment workers receive evidence and return schema-constrained records,
-including quotes and uncertainty. Validate quote substrings and identity links;
-preserve rejected responses and diagnostics. Reading declarations are validation
-signals, not proof of model attention. Keep independent validations blind to
-earlier judgments when the study calls for that design.
+including short rationales, exact quote/unit pairs and explicit escalation.
+Validate quote substrings, supplied unit IDs and identity links; preserve
+rejected responses and diagnostics. Do not request confidence scores or require
+an echo of hundreds of source-unit IDs. Those fields do not establish reading.
+Validate each item in a batch independently and retry only its eligible failures;
+accepted peers remain accepted. Keep selected replications blind to earlier
+judgments when the study calls for that design.
 
 ## One controller, durable execution
 
@@ -67,10 +82,16 @@ for every reference or hold the corpus in the controller's conversation.
 Before the full run, exercise representative papers through **accepted real
 judgments and facts export**, including an unavailable source, a retry and a
 checkpoint/resume. A successful download or mocked dispatch is insufficient.
-Benchmark the current task geometry, then continue the approved full manifest;
-the canary is not an alternative deliverable. If the maintained coordinator or
-authorization handoff is absent, record the exact blocker rather than claiming
-the skill itself supplies that capability.
+Benchmark the current task geometry with the bounded `corpus calibrate` command,
+then continue the approved full manifest;
+the canary is not an alternative deliverable. Start at batch size one, Qwen
+reasoning `none` for abstract alignment and `low` for targeted full-text follow-up,
+with shared provider capacity 60 for this template. Record actual receipts and
+throughput; these are starting settings, not a measured capacity or speed claim.
+Batch size four requires the calibration acceptance gate and recorded results.
+Keep additional validation inside a predeclared budget, stratify the sample and
+keep selected extreme examples separate. Do not create an uncapped second census
+in the name of checking the first.
 
 Define stop conditions by effect: isolate a missing source and continue other
 work; stop an affected stage on systematic wrong identity/extraction, changed

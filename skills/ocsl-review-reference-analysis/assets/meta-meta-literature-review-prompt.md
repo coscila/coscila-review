@@ -2,7 +2,7 @@
 # meta meta literature review
 
 Use Claude as the main controller and load the saved advanced-orchestration
-preset **meta meta literature review**. The preset stores Qwen worker assignments;
+preset **meta meta literature review — v2**. The preset stores Qwen worker assignments;
 the main model and this study prompt are selected separately in the Lab.
 
 ## Controller prompt
@@ -45,10 +45,14 @@ or human ground truth.
 - Measure all bibliography entries and all attributable citation occurrences.
   Preserve separate review, reference-entry, unique-work and locus denominators.
   Repeated citations share acquired source material, not context-specific verdicts.
-- Preserve paired abstract and full-paper observations, source versions,
-  verified quotes, uncertainty and reasons. Abstract alignment is an observation
-  about the supplied abstract; correctness claims requiring the paper cannot be
-  inferred from its abstract. Never turn absent evidence into an adverse verdict.
+- Preserve abstract observations and targeted, matched full-text follow-up,
+  source versions, verified quotes, uncertainty and reasons. In v2, an explicit
+  numerical or methodological statement can establish alignment with a complete
+  abstract. Missing detail requires escalation. Do not require full text merely
+  because the classifier sees a number; do not infer absence from the paper from
+  abstract silence. Label full-text excerpts honestly and reserve `not-addressed`
+  for complete full-text coverage. A full-paper census of every locus is a
+  separate scientific scope and cost, not an implicit consequence of pairing.
 - Pin eligibility, extraction/identity versions, evidence policy, class mapping,
   aggregation, validation and uncertainty methods before judging. Apply one
   instrument to both cohorts. Use review-clustered uncertainty and report access
@@ -65,9 +69,9 @@ worker IDs and capabilities from the configured broker. Use bulk inference for
 independent assessment tasks and reserve tool-driven agents for tasks that need
 them. The three configured roles are not three independent model families.
 
-The configured validation is **Qwen-only**: adversarial checks, explicitly blind
-replicates where specified, matched tier transitions, and a predeclared stratified
-sample. Keep extremes separate from population calibration. Do not claim Claude,
+The configured validation is **Qwen-only**: selected adversarial checks, explicitly
+blind replicates, matched tier transitions and a predeclared stratified sample.
+Keep extremes separate from population calibration. Do not claim Claude,
 OpenAI or human benchmark judgments unless the study is explicitly amended and
 those observations actually exist. Claude remains the controller and author.
 
@@ -76,15 +80,41 @@ authorized work under the existing lifecycle. Check the actual installed
 acquisition, evidence, worker and public-material authorization contracts before
 production. Prove a bounded complete path through accepted judgments and exported
 facts, then measure workload, tokens and throughput. The pilot is an execution
-check inside the full census, not the deliverable. Use existing operational
-commands only. Build the corpus coordinator and import transformations in this
-workspace, using bounded submissions and the runner's worker-result continuation.
+check inside the full census, not the deliverable. Use the maintained
+`ocsl-review corpus` commands: `init`, `import-manifest`, `import-legacy`, `import-snapshot`,
+`enumerate`, `acquire`, `prepare`, `calibrate`, `execute`, `run`, `resume`,
+`validate`, `status`, `export`, `snapshot`, `verify` and `branch`. Read their installed help
+and `docs/corpus-review.md`; use `execute` for the maintained full-workflow loop,
+do not reconstruct a bespoke corpus coordinator in the workspace. Retain the
+eligible manifest, shared source library and durable per-locus task queue.
 Report failed deployment prerequisites precisely rather than inventing commands
 or bypassing a denied transport. The template's public-literature permission
 applies to approved execution and acquired public sources; private attachments
 retain their existing restrictions.
 
-Use bounded submissions and an explicit aggregate concurrency budget. Persist
+The template's primary role uses Qwen reasoning `none`; targeted full-text
+escalation uses `low`; selected blind replication uses `none`. Discover the
+actual worker IDs and pin their revisions. Start with one item per call and an
+aggregate capacity of 60 shared across all roles. These are launch settings,
+not a claim about measured capacity or throughput.
+
+Run the bounded calibration on up to 300 unique loci using none/one-item,
+none/four-item, reordered none/four-item, and low/one-item variants: at most
+1,200 item judgments before separately recorded bounded format repair. Enable
+four-item primary calls only with at least 99% valid individual items and 95%
+exact paired verdict agreement against the single-item baseline and the
+reordered position check. Otherwise keep one-item calls. After the primary
+population is available, use `corpus validate` for the frozen blind sample
+under the separate 1,000-unique-locus cap. Preserve its stratified and targeted
+selection labels and compare them separately. Do not automatically expand that
+sample on later invocations. Report actual task, call and token budgets.
+Agreement is stability, not accuracy.
+`calibrate` and `validate` without `--execute` only prepare/report; use
+`--execute --until-complete` for the maintained polling loop with durable
+recovery and a provider-pause stop. Do not
+claim the live calibration has passed until those measurements exist.
+
+Use bounded submissions and the runner's normal continuation. Persist
 accepted observations, retries, provider/model receipts and phase checkpoints.
 Advance the complete approved manifest while recording item-local failures.
 Stop the affected stage for systematic extraction or identity errors. Follow the
@@ -93,6 +123,13 @@ detached heartbeat is not a managed workflow. Show measured progress separately
 for reviews, entries, loci, verified sources, evidence tiers and accepted
 judgments. Do not extrapolate the old 40-item-batch throughput to a new per-locus
 or complete-paper instrument without measurement.
+
+Validate each returned item independently, including exact quotations from the
+named supplied units. Preserve accepted peers when another item fails; retry
+only bounded format failures, never a missing-evidence condition by resending
+the same source. Do not require confidence scores or a complete unit-ID echo.
+Keep old v1 and historical scores under their original protocols; they are
+comparators and reusable provenance, not completed v2 judgments.
 
 ### Reusable database and future forks
 
@@ -111,9 +148,10 @@ inherited judgments as newly generated, or assume citation-support labels answer
 another scientific question. Database availability does not establish full-text
 coverage or source redistribution rights.
 
-Create and verify the skill's SQLite/database-and-source snapshot handoff, data
+Use `corpus snapshot` and `corpus verify` for the SQLite/database-and-source
+handoff, data
 dictionary, protocol, software/prompt versions and checksums under `results/`.
-Use the Lab's normal chat fork and the database branch procedure to support a
+Use the Lab's normal chat fork and `corpus branch` to support a
 different research question. Keep credentials, broker job ownership and runtime
 permissions out of the portable scientific bundle. A fork receives fresh runtime
 accounting and must establish its own authorized execution.

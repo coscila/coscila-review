@@ -20,7 +20,7 @@ Primary environment: `review-literature`
 "$OCSL_REVIEW_HOME/bin/ocsl-review" env run \
   --skill ocsl-review-reference-analysis \
   --workspace "$PWD" \
-  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" review census --help
+  -- "$OCSL_REVIEW_HOME/bin/ocsl-review" corpus --help
 ```
 
 1. Establish whether this is a **new study**, **resume of the same analysis**, or
@@ -32,7 +32,7 @@ Primary environment: `review-literature`
    validation design, model roles and output requirements in one versioned
    study specification. Counts are measured outcomes, not fixed success targets.
 3. For the oncology study, use the deployed advanced-orchestration template
-   **meta meta literature review** and its study prompt. The skill itself is
+   **meta meta literature review — v2** and its study prompt. The skill itself is
    reusable for other journals, corpora and questions. A template does not prove
    that provider access or corpus execution works in this deployment.
    For a different question over an inherited corpus, use the user's new
@@ -58,9 +58,12 @@ before initialization, export or reuse.
   manuscript versions merely by reference number, drop range interiors or
   classify a parser omission as an unsupported citation.
 - Store complete acquired evidence and exact provenance before inference.
-  Abstract agreement, excerpt-based assessment and full-text verification are
-  distinct measurements. Specific claims require adequate full text; abstain
-  when it is missing. Do not silently shorten evidence to fit a model.
+  In `citation-support-v2`, complete abstracts can establish abstract alignment
+  for an explicitly stated number, method or other specific claim. Claim type
+  alone never forces abstention. Missing detail requires escalation; abstract
+  silence cannot establish absence from the paper. Label selected full-text
+  passages as excerpts; only complete full-text coverage permits `not-addressed`.
+  Preserve distinct abstract, excerpt and complete-paper measurements.
 - For this template, Claude owns executable code, orchestration decisions,
   statistics, figures and manuscript prose. Qwen workers return bounded,
   structured evidence assessments through the configured bulk worker path;
@@ -69,17 +72,28 @@ before initialization, export or reuse.
 - Pin prompts, schemas, provider/model receipts and evidence hashes; persist
   accepted and rejected attempts. Resume incomplete work without relabelling
   historical judgments as fresh or repeating already accepted assessments.
+- Use maintained `ocsl-review corpus` acquisition, queue and import commands.
+  Start one locus per call; try four only after the bounded calibration gate.
+  The template uses Qwen `none` for primary abstract work, `low` for targeted
+  full-text escalation, and `none` for selected blind replication. All roles
+  share one aggregate capacity budget. Discover actual worker IDs before use.
+- Validate exact quote/unit pairs and each returned item separately. A bad item
+  must not discard valid peers. Missing evidence is an acquisition/escalation
+  outcome, not a reason to repeat the same model call. Do not require confidence
+  scores or an echo of every evidence-unit ID as proof of reading.
 - Advance one study through durable stage checkpoints with a bounded provider
   queue. Measure concurrency and costs on the current protocol; historical
   throughput is not a guarantee. A routine assistant reply is not completion.
 
 Use `ocsl-review-reference-integrity` for identity and publication status,
-`ocsl-review-citation-census` for the existing per-manuscript worker lifecycle,
+`ocsl-review-citation-census` to resume the unchanged v1 per-manuscript lifecycle,
 and the writing companion, when installed, for a manuscript derived from
 verified facts. Real commands and deployment boundaries are documented in
-[runtime integration](references/runtime-integration.md). The database helper
-bundled here stores and forks research state; it does not implement acquisition,
-automated corpus scheduling or a new MCP server.
+[runtime integration](references/runtime-integration.md). The maintained corpus
+workflow stores sources once, schedules per-locus tasks across reviews, imports
+results incrementally and snapshots research state. Its storage-only legacy
+helper remains available for existing bundles. Do not rebuild a coordinator
+inside each chat or migrate historical v1 judgments into fresh v2 results.
 
 Unpublished material is confidential by default. Every provider call and
 worker submission must carry the deployment's authorization for the actual
@@ -90,11 +104,11 @@ workspace and evidence; never bypass a refusal with another networking path.
 Deliver a verified database **and its source bundle**, study specification,
 versioned code/environment information, worker receipts, reproducible facts and
 requested reports. A scores-only table cannot support a new scientific question.
-Use the bundled snapshot helper and retain its manifest digest in the handoff.
+Use `corpus snapshot` and `corpus verify`; retain the manifest digest in the handoff.
 For a different question, branch the saved corpus into a new analysis namespace:
 reuse verified sources and identities, retain old judgments as labelled history,
 and produce new task definitions, assessments and outputs. Lab chat forks
-preserve workspace files, but use the snapshot helper for a verified SQLite
+preserve workspace files, but use a verified snapshot for a consistent SQLite
 handoff. Forks do not transfer live broker jobs or authorize new data disclosure.
 
 Report completion only when every eligible paper, reference and required locus
