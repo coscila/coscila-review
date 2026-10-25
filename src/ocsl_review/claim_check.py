@@ -49,7 +49,7 @@ from .corpus_assessment import (
 from .errors import ConfidentialityError, ValidationError
 from .integrity import INTEGRITY_VERSION
 from .retrieval import RETRIEVAL_VERSION, TOKENIZER, EvidenceIndex, EvidenceUnit, canonical, sha256_text
-from .sanitize import SANITIZER_VERSION, assert_prompt_clean, sanitize_text
+from .sanitize import SANITIZER_VERSION, assert_prompt_clean, residual_findings, sanitize_text
 
 TASK = "claim-check@1"
 HOME = Path(__file__).resolve().parents[2]
@@ -779,20 +779,34 @@ def plan_tasks(connection: sqlite3.Connection, context: CheckContext, claims: Se
                 if unit_cache[unit.unit_id]:
                     units.append({"id": unit.unit_id, "text": unit_cache[unit.unit_id]})
             work = context.works.get(work_id)
-            title = sanitize_text(getattr(work, "title", "") or "", scope="cited-title").text
+
+            def clean(value: Any, scope: str, subject: str) -> str:
+                # Every string that reaches the prompt passes the sanitizer; what it removes is recorded.
+                result = sanitize_text(str(value or ""), scope=scope)
+                _sanitization_rows(connection, context.analysis_id, scope, subject, result)
+                return result.text
+            title = clean(getattr(work, "title", ""), "cited-title", work_id)
             task = {
                 "id": task_key, "claim": clean_claim.text, "claimType": claim.claim_type,
-                "citationLocus": {"bindingStatus": "exact", "marker": citation.marker, "anchor": claim.anchor,
-                                  "section": claim.section},
+                "citationLocus": {"bindingStatus": "exact", "marker": clean(citation.marker, "marker", task_key),
+                                  "anchor": claim.anchor, "section": clean(claim.section, "section", claim.claim_id)},
                 "context": clean_context,
-                "citedWork": {key: value for key, value in (("title", title), ("year", getattr(work, "year", None)),
-                                                            ("container", getattr(work, "container", ""))) if value},
-                "identifiers": dict(getattr(work, "identifiers", {}) or {}),
+                "citedWork": {key: value for key, value in (
+                    ("title", title), ("year", getattr(work, "year", None)),
+                    ("container", clean(getattr(work, "container", ""), "cited-container", work_id))) if value},
+                "identifiers": {key: clean(value, "identifier", f"{work_id}#{key}")
+                                for key, value in dict(getattr(work, "identifiers", {}) or {}).items()},
                 "evidenceTier": selection.tier, "complete": selection.complete, "evidenceUnits": units,
                 "sourceSha256": work_evidence_digest(selection.units),
             }
             if identity.get("state") == "resolved":
                 task["identityVerified"] = True
+            residual = residual_findings({key: value for key, value in task.items() if key != "id"})
+            if residual:
+                # Defence in depth: a field the sanitizer left unclean blocks this task, never the whole screen.
+                _blocked(connection, context, task_key, "prompt fields carry unsanitized content",
+                         {"entryId": citation.entry_id, "findings": sorted({f"{f['kind']}:{f['rule']}" for f in residual})})
+                continue
             decision = planner.plan(task, selection.tier)
             if decision["action"] != "judge":
                 _blocked(connection, context, task_key, decision["reason"], {"entryId": citation.entry_id})
@@ -839,7 +853,15 @@ def judge_tasks(connection: sqlite3.Connection, context: CheckContext, planned: 
                     break
                 tasks = [item.task for item in pending.values()]
                 messages = planner.build_messages(tasks, tier)
-                assert_prompt_clean(messages)
+                try:
+                    assert_prompt_clean(messages)
+                except ValueError as error:
+                    # The planner checked every task; a batch that still fails is blocked with its reason, uncalled.
+                    for task_id in pending:
+                        _blocked(connection, context, task_id, "judge prompt carries unsanitized content",
+                                 {"message": str(error)[:200]})
+                    summary["blockedBatches"] = summary.get("blockedBatches", 0) + 1
+                    break
                 settings = judge_settings(len(tasks))
                 request = canonical({"model": getattr(judge, "model", ""), "messages": messages, "settings": settings}).encode()
                 context.policy.authorize_model(context.ledger, judge, payload_sha256=sha256_bytes(request), items=len(tasks))
