@@ -85,11 +85,36 @@ def fetch_abstracts(works: Mapping[str, Mapping[str, Any]], get: Callable[[dict[
     return out
 
 
+def looked_up(work: Mapping[str, Any]) -> bool:
+    """Whether a work already has a definitive Europe PMC outcome (a failed lookup is not one)."""
+    outcome = work.get("europePmcOutcome") or (work.get("abstractSource") if str(work.get("abstractSource", "")).startswith(
+        "europe-pmc-") else None)
+    return bool(outcome) and outcome != "europe-pmc-failed"
+
+
 def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[str, Any] | None], *,
                 overwrite: bool = False) -> dict[str, Any]:
-    """A review record whose works carry Europe PMC abstracts (existing abstracts kept unless ``overwrite``)."""
+    """A review record whose works carry Europe PMC abstracts, the one provider for every journal.
+
+    Every work not yet looked up (all works with ``overwrite``) is queried. A Europe PMC abstract replaces
+    whatever the work carried; where Europe PMC definitively has none, an abstract supplied from another
+    provider is kept as a recorded fallback (``abstractSource`` = ``fallback:<provider>``). A failed lookup
+    changes nothing but ``europePmcOutcome`` and is retried on the next run.
+    """
     works = {key: dict(work) for key, work in (record.get("works") or {}).items()}
-    wanted = {key: work for key, work in works.items() if overwrite or not work.get("abstract")}
+    wanted = {key: work for key, work in works.items() if overwrite or not looked_up(work)}
     for key, found in fetch_abstracts(wanted, get).items():
-        works[key].update(found)
+        work, outcome = works[key], found["abstractSource"]
+        work["europePmcOutcome"] = outcome
+        if outcome == "europe-pmc-failed":
+            continue
+        work["abstractRetrievedAt"] = found["abstractRetrievedAt"]
+        if found["abstract"]:
+            work["abstract"], work["abstractSource"] = found["abstract"], outcome
+        elif work.get("abstract"):
+            source = str(work.get("abstractSource") or "supplied")
+            if not source.startswith(("europe-pmc-", "fallback:")):
+                work["abstractSource"] = "fallback:" + source
+        else:
+            work["abstract"], work["abstractSource"] = None, outcome
     return {**record, "works": works}
