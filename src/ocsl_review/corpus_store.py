@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import ctypes
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -75,6 +76,20 @@ def sync_batch(directory: Path, paths: list[Path]) -> None:
     with ThreadPoolExecutor(max_workers=min(16, len(paths))) as pool:
         list(pool.map(lambda path: _fsync_path(path, os.O_NOFOLLOW), paths))
     _fsync_path(directory, os.O_DIRECTORY)
+
+
+@contextmanager
+def controller_lock(repo):
+    """Exclusive ownership of one library by a controller: dispatch, calibration or migration."""
+    with (repo.root / "controller.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValidationError("another corpus controller owns this library") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def canonical(value: Any) -> str:
@@ -150,24 +165,26 @@ class CorpusRepository:
         if (self.root / "manifest.json").exists():
             raise ValidationError("branch or copy an immutable snapshot before migrating")
         steps = []
-        while self.version < SCHEMA_VERSION:
-            backup = self._backup_path(self.version)
-            self.library.backup(backup)
-            self._check_backup(backup, self.version)
-            with self.connect(write=True) as connection:
-                connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATIONS[self.version].read_text() + "\nCOMMIT;")
-                reached = connection.execute("PRAGMA user_version").fetchone()[0]
-            if reached != self.version + 1:
-                raise ValidationError("schema migration did not reach its declared version")
-            steps.append({"from": self.version, "to": reached, "backup": backup.name})
-            self.version = reached
-        if rebuild_counters:
-            # Counters are derived data; recomputing them needs no evidence backup.
-            with self.connect(write=True) as connection:
-                expected = library.expected_progress_counters(connection)
-                connection.execute("DELETE FROM progress_counters")
-                connection.executemany("INSERT INTO progress_counters VALUES (?,?,?,?,?)",
-                                       [(*key, value) for key, value in sorted(expected.items())])
+        # No controller may write between the backup and the migration it protects.
+        with controller_lock(self):
+            while self.version < SCHEMA_VERSION:
+                backup = self._backup_path(self.version)
+                self.library.backup(backup)
+                self._check_backup(backup, self.version)
+                with self.connect(write=True) as connection:
+                    connection.executescript("BEGIN IMMEDIATE;\n" + MIGRATIONS[self.version].read_text() + "\nCOMMIT;")
+                    reached = connection.execute("PRAGMA user_version").fetchone()[0]
+                if reached != self.version + 1:
+                    raise ValidationError("schema migration did not reach its declared version")
+                steps.append({"from": self.version, "to": reached, "backup": backup.name})
+                self.version = reached
+            if rebuild_counters:
+                # Counters are derived data; recomputing them needs no evidence backup.
+                with self.connect(write=True) as connection:
+                    expected = library.expected_progress_counters(connection)
+                    connection.execute("DELETE FROM progress_counters")
+                    connection.executemany("INSERT INTO progress_counters VALUES (?,?,?,?,?)",
+                                           [(*key, value) for key, value in sorted(expected.items())])
         return {"schemaVersion": self.version, "migrations": steps, "countersRebuilt": rebuild_counters}
 
     @contextmanager
