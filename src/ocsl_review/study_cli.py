@@ -224,7 +224,7 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
 
 def prepare(run: Any, source: Path) -> dict[str, Any]:
     """Prepare reviews one record at a time; a review that cannot be read or extracted is recorded, not fatal."""
-    from .census_runner import abstract_lookup_failed, iter_records, read_document
+    from .census_runner import abstract_lookup_failed, iter_records, read_document, read_table_pages
     counts: dict[str, int] = {}
     problems = []
     for record in iter_records(source):
@@ -234,11 +234,12 @@ def prepare(run: Any, source: Path) -> dict[str, Any]:
         else:
             try:
                 document = read_document(source.parent, record)
+                tables = read_table_pages(source.parent, record)
             except (OSError, ValidationError) as error:
                 result = run.record_unavailable(record, f"{type(error).__name__}: {error}")
             else:
                 try:
-                    result = run.prepare_review(record, document)
+                    result = run.prepare_review(record, document, tables)
                 except ValidationError as error:
                     # An inconsistent record (unknown work, changed document): kept in coverage with its reason.
                     result = {**run.record_unavailable(record, f"input refused: {error}"), "state": "input-refused"}

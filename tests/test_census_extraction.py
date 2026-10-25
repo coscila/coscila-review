@@ -114,6 +114,44 @@ class HtmlExtractionTests(unittest.TestCase):
         self.assertFalse(X.cross_validation_gate([])["ok"])
 
 
+class TablePageTests(unittest.TestCase):
+    """Tables rendered on pages of their own: the article page carries only the caption and a link."""
+
+    def setUp(self):
+        self.article = (FIXTURES / "review_table_caption.html").read_bytes()
+        self.page = (FIXTURES / "review_table_1.html").read_bytes()
+
+    def test_without_the_table_page_its_citations_are_missing_and_reported(self):
+        result = X.extract_review(self.article, html=True)
+        entries = {entry.label: entry for entry in result["entries"]}
+        self.assertFalse(entries["14"].cited_in_body)
+        self.assertEqual(([1], [1], []), (result["diagnostics"]["linkedTables"],
+                                          result["diagnostics"]["tablePagesMissing"], result["diagnostics"]["tablePages"]))
+
+    def test_table_page_cells_become_table_loci_after_the_body(self):
+        result = X.extract_review(self.article, html=True, table_pages=[(1, self.page)])
+        entries = {entry.label: entry for entry in result["entries"]}
+        cell = entries["14"].loci
+        self.assertEqual(1, len(cell))
+        self.assertEqual(("Table 1", True, "td"), (cell[0].section, "table" in cell[0].flags, cell[0].unit_tag))
+        body_units = max(locus.unit for entry in result["entries"] for locus in entry.loci if locus.section != "Table 1")
+        self.assertGreater(cell[0].unit, body_units, "table-page units follow the body")
+        # A range in a cell expands to its members; a footnote cites an entry the body never cites.
+        for label in ("5", "6", "7"):
+            self.assertEqual(["Table 1"], [l.section for l in entries[label].loci if l.section == "Table 1"])
+        self.assertEqual(["Table 1"], [l.section for l in entries["17"].loci])
+        # The caption is on both pages and counts once; links outside the table (navigation, footer) are no loci.
+        self.assertEqual(1, len(entries["13"].loci))
+        self.assertEqual(len(X.extract_review(self.article, html=True)["entries"][1].loci), len(entries["2"].loci))
+        diagnostics = result["diagnostics"]
+        self.assertEqual((0, [], 1), (diagnostics["uncovered"], diagnostics["tablePagesMissing"], len(diagnostics["tablePages"])))
+        self.assertEqual(5, diagnostics["tablePages"][0]["anchors"])
+
+    def test_table_pages_need_a_publisher_html_review(self):
+        with self.assertRaises(ValidationError):
+            X.extract_review((FIXTURES / "review.xml").read_bytes(), table_pages=[(1, self.page)])
+
+
 class IdentityTests(unittest.TestCase):
     def setUp(self):
         self.entries = {entry.label: entry for entry in review()["entries"]}

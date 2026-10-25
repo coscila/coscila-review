@@ -106,7 +106,8 @@ neighbouring abstracts in their call are no longer cut.
 ```json
 {"journal": "...", "doi": "...", "title": "...", "year": 2021, "firstOnline": "2021-03-01",
  "stratum": "Review", "provenanceClass": "public",
- "document": {"path": "reviews/x.xml", "kind": "jats", "sha256": "..."},
+ "document": {"path": "reviews/x.xml", "kind": "jats", "sha256": "...",
+              "tables": [{"number": 1, "path": "reviews/x-table-1.html", "sha256": "..."}]},
  "works": {"work-key": {"doi": "...", "pmid": "...", "pmcid": "...", "title": "...", "venue": "...",
                         "year": 2019, "retracted": false, "abstract": "...", "abstractSource": "europe-pmc-core"}},
  "identities": {"12": {"workKey": "work-key", "identity": "resolved", "method": "supplied"}}}
@@ -120,7 +121,13 @@ query with a PMID fallback, and records the provider outcome per work
 identifiers only.
 
 Document paths are relative to the manifest. A review without a document is
-recorded with provenance class `unavailable`. Extraction is
+recorded with provenance class `unavailable`. Some publishers render a table's
+body on a page of its own and leave only the caption and a link on the article
+page: `document.tables` supplies those pages for an HTML review. Their cells,
+captions and table footnotes become citing units in section `Table N` with the
+table flag, after the body; a caption already on the article page counts once.
+The extraction diagnostics list the linked tables, the pages supplied and the
+linked tables still missing (`tablePagesMissing`). Extraction is
 `structured.extract` (recursive serialisation, range expansion, tables,
 legends, boxes and lists, each anchor owned by exactly one block). Each citing
 unit is rendered with one marker per target, written `⟨target⟩`, typographic

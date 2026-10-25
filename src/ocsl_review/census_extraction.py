@@ -250,8 +250,14 @@ def _render(text: str, citations: Sequence[Mapping[str, Any]], *, html: bool = F
     return rendered, located
 
 
-def extract_review(body: bytes, *, html: bool = False) -> dict[str, Any]:
-    """Printed entries with in-body loci, review metadata and extraction diagnostics."""
+def extract_review(body: bytes, *, html: bool = False,
+                   table_pages: Sequence[tuple[int, bytes]] = ()) -> dict[str, Any]:
+    """Printed entries with in-body loci, review metadata and extraction diagnostics.
+
+    ``table_pages`` are (table number, HTML) of tables a publisher renders on pages of their own; their
+    cells become citing units in section ``Table N`` with the table flag, ordered after the body. A
+    caption the article page already carries is not counted twice.
+    """
     value = structured.extract(body, html=html)
     by_path, parents = _paths(_tree(body, html))
     body_root = None
@@ -279,14 +285,36 @@ def extract_review(body: bytes, *, html: bool = False) -> dict[str, Any]:
         elif block.get("explicitCitations"):
             units.append((block["text"], block["explicitCitations"], block["sourceLocator"],
                           block["sourceLocator"].get("tag", "")))
-    outside = defaultdict(int)
-    unresolved_markers = 0
-    for index, (text, citations, locator, tag) in enumerate(units):
+    contexts = []
+    for text, citations, locator, tag in units:
         element = by_path.get(locator["elementPath"])
         if element is None:
             raise ValidationError("structured locator does not resolve in the document tree")
-        in_body, flags, section = (_html_context(element, parents, body_root) if html
-                                   else _jats_context(element, parents))
+        contexts.append(_html_context(element, parents, body_root) if html else _jats_context(element, parents))
+    pages, page_anchors, page_owned, page_warnings = [], 0, 0, set()
+    if table_pages:
+        if not html:
+            raise ValidationError("table pages belong to a publisher HTML review")
+        captions = {clean(_render(t, c, html=True)[0]) for (t, c, _, g), context in zip(units, contexts)
+                    if g in ("figcaption", "caption") and context[0]}
+        for number, page in table_pages:
+            table = structured.extract_table_page(page, identities)
+            page_anchors += table["metadata"]["anchors"]
+            page_owned += table["metadata"]["ownedAnchors"]
+            page_warnings.update(w.get("code", "") for w in table["warnings"])
+            added = 0
+            for block in table["blocks"]:
+                tag = block["sourceLocator"].get("tag", "")
+                if tag == "figcaption" and clean(_render(block["text"], block["explicitCitations"], html=True)[0]) in captions:
+                    continue        # the article page already carries this caption
+                units.append((block["text"], block["explicitCitations"], block["sourceLocator"], tag))
+                contexts.append((True, frozenset({"table"}), f"Table {number}"))
+                added += 1
+            pages.append({"number": number, "sha256": hashlib.sha256(page).hexdigest(), "units": added,
+                          "anchors": table["metadata"]["anchors"]})
+    outside = defaultdict(int)
+    unresolved_markers = 0
+    for index, ((text, citations, locator, tag), (in_body, flags, section)) in enumerate(zip(units, contexts)):
         rendered, located = _render(text, citations, html=html)
         spans = sentence_spans(rendered)
         for target, position in located:
@@ -303,14 +331,19 @@ def extract_review(body: bytes, *, html: bool = False) -> dict[str, Any]:
         entries[target].outside_body_loci = count
     metadata = value["metadata"]
     publication = metadata.get("publication", {})
-    anchors, owned = metadata.get("anchors", 0), metadata.get("ownedAnchors", 0)
+    anchors, owned = metadata.get("anchors", 0) + page_anchors, metadata.get("ownedAnchors", 0) + page_owned
     warnings = value.get("warnings", [])
+    linked = sorted({int(m.group(1)) for w in warnings if w.get("code") == "external-table-content-unprovided"
+                     for target in w.get("targets", []) for m in [re.search(r"tables/(\d+)", target)] if m})
+    supplied = {page["number"] for page in pages}
     diagnostics = {
         "representation": metadata.get("representation"),
         "anchors": anchors, "ownedAnchors": owned, "uncovered": anchors - owned,
         "unresolvedTargets": sum(1 for w in warnings if w.get("code") == "unresolved-structured-target"),
         "unresolvedMarkers": unresolved_markers,
-        "warnings": sorted({w.get("code", "") for w in warnings}),
+        "warnings": sorted({w.get("code", "") for w in warnings} | page_warnings),
+        "linkedTables": linked, "tablePages": pages,
+        "tablePagesMissing": [number for number in linked if number not in supplied],
         "entries": len(entries), "citedInBody": sum(1 for e in entries.values() if e.cited_in_body),
         "loci": sum(len(e.loci) for e in entries.values()),
         "outsideBodyLoci": sum(outside.values()),
