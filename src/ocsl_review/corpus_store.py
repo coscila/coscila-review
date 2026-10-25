@@ -248,11 +248,13 @@ class CorpusRepository:
             finally:
                 self._held = None
 
-    def analysis(self, analysis_id: str | None = None) -> dict[str, Any]:
+    def analysis(self, analysis_id: str | None = None, *, connection: sqlite3.Connection | None = None) -> dict[str, Any]:
         if analysis_id is None:
             analysis_id = self.library.active_analysis_id()
-        with self.connect() as connection:
-            row = connection.execute("SELECT a.*,r.protocol_json,r.protocol_sha256,r.corpus_id,r.code_revision FROM analyses a JOIN runs r USING(run_id) WHERE a.analysis_id=?", (analysis_id,)).fetchone()
+        if connection is None:
+            with self.connect() as own:
+                return self.analysis(analysis_id, connection=own)
+        row = connection.execute("SELECT a.*,r.protocol_json,r.protocol_sha256,r.corpus_id,r.code_revision FROM analyses a JOIN runs r USING(run_id) WHERE a.analysis_id=?", (analysis_id,)).fetchone()
         if row is None:
             raise ValidationError("unknown analysis")
         return {**dict(row), "protocol": json.loads(row["protocol_json"])}
@@ -644,12 +646,12 @@ class CorpusRepository:
             return {state: count for state, count in rows if count}
 
     def status(self, analysis_id: str | None = None) -> dict[str, Any]:
-        analysis = self.analysis(analysis_id)
         if self.version < 3:
-            return self._scanned_status(analysis)
+            return self._scanned_status(self.analysis(analysis_id))
         counts = dict.fromkeys(library.COUNTED_TABLES, 0)
         tasks, assessments, reviews = [], [], []
-        with self.connect() as connection:
+        with self.connect() as connection:   # one connection: a branch builds its overlay on every connect
+            analysis = self.analysis(analysis_id, connection=connection)
             counters = self.library.progress_counters(connection, analysis["analysis_id"])
         for (counter, dimension, state), value in counters.items():
             if counter == "rows" and dimension in counts:

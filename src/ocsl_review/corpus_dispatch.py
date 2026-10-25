@@ -86,6 +86,14 @@ class Broker:
             connection.close()
 
 
+def _rows_in(connection, table, column, values, chunk=500):
+    """Rows of ``table`` whose ``column`` is one of ``values``, in bounded IN-list queries."""
+    values = sorted(values)
+    for start in range(0, len(values), chunk):
+        part = values[start:start + chunk]
+        yield from connection.execute(f"SELECT * FROM {table} WHERE {column} IN ({','.join('?' * len(part))})", part)
+
+
 def authorize(repo, paths, catalog, worker, tasks, inputs):
     """Verify evidence before either explicit egress or configured-public permission."""
     by_id = {task["task_id"]: task for task in tasks}
@@ -106,14 +114,24 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
     classes = {provenance_class(task["spec"]) for task in tasks}
     if not all(may_receive(worker, task["spec"]) for task in tasks):
         raise ConfidentialityError("entitled evidence may reach only on-prem judges (evidence policy entitled-institutional)")
+    # One connection and batched reads for the whole job: a delta branch builds its overlay schema on every
+    # connection, so per-task connections would cap dispatch far below the import rate.
+    with repo.connect() as connection:
+        repo.read_artifacts([task["spec_sha256"] for task in tasks], connection=connection)
+        repo.verify_artifacts(sorted({task["spec"]["sourceSha256"] for task in tasks}), connection=connection)
+        loci = {row["locus_id"]: row for row in _rows_in(connection, "claim_loci", "locus_id",
+                                                         {task["locus_id"] for task in tasks})}
+        documents = {(row["artifact_sha256"], row["document_id"]): row for row in _rows_in(
+            connection, "corpus_documents", "artifact_sha256", {task["spec"]["sourceSha256"] for task in tasks})}
+        sections: dict[tuple[str, str], dict[str, dict]] = {}
+        for row in _rows_in(connection, "source_sections", "artifact_sha256",
+                            {task["spec"]["sourceSha256"] for task in tasks}):
+            sections.setdefault((row["artifact_sha256"], row["work_id"]), {})[row["section_id"]] = dict(row)
     for task in tasks:
         spec = task["spec"]
-        repo.read_artifact(task["spec_sha256"])
-        repo.verify_artifact(spec["sourceSha256"])
-        with repo.connect() as connection:
-            locus = connection.execute("SELECT * FROM claim_loci WHERE locus_id=?", (task["locus_id"],)).fetchone()
-            source = connection.execute("SELECT * FROM corpus_documents WHERE artifact_sha256=? AND document_id=?", (spec["sourceSha256"], spec.get("documentId"))).fetchone()
-            units = {r["section_id"]: dict(r) for r in connection.execute("SELECT * FROM source_sections WHERE artifact_sha256=? AND work_id=?", (spec["sourceSha256"], source["work_id"] if source else ""))}
+        locus = loci.get(task["locus_id"])
+        source = documents.get((spec["sourceSha256"], spec.get("documentId")))
+        units = sections.get((spec["sourceSha256"], source["work_id"] if source else ""), {})
         if locus is None or locus["claim_text"] != spec["claim"]:
             raise ValidationError("task claim differs from its stored citation locus")
         if any(u["id"] not in units or (u["text"] != units[u["id"]]["extracted_text"] and not (
@@ -144,9 +162,11 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
                 or worker.get("evidencePolicy") not in {PUBLIC_POLICY, ENTITLED_POLICY}):
             raise ConfidentialityError("corpus dispatch needs the active approved public-literature worker")
         allowed = PUBLIC_PROVIDERS | (ENTITLED_PROVIDERS if worker.get("evidencePolicy") == ENTITLED_POLICY else frozenset())
+        manuscripts = repo.read_artifacts(sorted({task["spec"].get("reviewProof", {}).get("manuscriptSha256", "")
+                                                  for task in tasks}))
         for task in tasks:
             spec, proof = task["spec"], task["spec"].get("reviewProof", {})
-            manuscript = json.loads(repo.read_artifact(proof.get("manuscriptSha256", "")))
+            manuscript = json.loads(manuscripts[proof.get("manuscriptSha256", "")])
             if (proof.get("public") is not True or manuscript.get("confidential") is not False
                     or proof.get("provider") not in allowed or not str(proof.get("sourceUrl", "")).startswith("https://")
                     or not any(proof.get("publication", {}).get(k) for k in ("doi", "citation_doi", "pmid", "pmcid", "pmc"))

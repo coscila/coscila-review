@@ -239,17 +239,23 @@ first. Until then, status of an older library scans its tables and says so. A
 delta branch keeps its parent snapshot's schema version: migrate the parent
 library, snapshot it and branch again. A branch's counters cover its own rows;
 its status adds the parent snapshot's counters and takes out the parent rows
-the branch has overridden, and a snapshot of a branch recounts them.
+the branch has overridden, and a snapshot of a branch recounts them. A branch
+counts each parent row it copies (copy-on-write) when it copies it, so its
+status reads those counts instead of scanning its tables; a branch made by an
+earlier version is scanned until `corpus migrate --rebuild-counters` adds them.
 `corpus verify` compares the counters with the stored rows; `corpus migrate
---rebuild-counters` recomputes them.
+--rebuild-counters` recomputes them. Dispatch authorization checks a whole
+job's tasks through one connection with batched reads.
 
 An opt-in synthetic benchmark generates a corpus in a new temporary workspace
-and reports preparation, import, status and egress-ledger rates against the
-execution targets (2,000 tasks/s, 1,000 results/s, 50 ms, 100,000 events in
-10 s). It uses an in-process broker and touches no deployment path:
+and reports preparation, import, the per-task checks of dispatch
+authorization, status and egress-ledger rates against the execution targets
+(2,000 tasks/s, 1,000 results/s, 50 ms, 100,000 events in 10 s); `--branch`
+repeats preparation, authorization, import and status in a delta branch of a
+snapshot. It uses an in-process broker and touches no deployment path:
 
 ```bash
-PYTHONPATH=src python3 tests/benchmark_corpus_executor.py --loci 200000
+PYTHONPATH=src python3 tests/benchmark_corpus_executor.py --loci 200000 --branch
 ```
 
 ## Resume, export and branch

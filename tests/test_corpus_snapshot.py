@@ -390,6 +390,19 @@ class BranchCounterTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
             own = dict(((c, d, s), v) for c, a, d, s, v in raw.execute("SELECT * FROM progress_counters"))
         self.assertEqual(own[("rows", "works", "")], 4, "the branch's triggers count only its own rows")
+        # The branch counted the parent rows it copied, so status reads them instead of scanning its tables.
+        self.assertEqual((1, 1, 1), (own[("overrides", "works", "")], own[("overrides", "claim_loci", "")],
+                                     own[("overrides-maintained", "", "")]))
+        self.assertEqual(2, sum(v for (c, d, s), v in own.items() if c == "override-reviews"))  # reviews 0 and 1
+        # A branch made before override counting (no marker) falls back to the scan with the same result.
+        with contextlib.closing(sqlite3.connect(branch.db)) as raw, raw:
+            raw.execute("DELETE FROM progress_counters WHERE counter IN ('overrides','override-reviews','overrides-maintained')")
+        self.assertStatusMatchesScan()
+        with self.assertRaisesRegex(ValueError, "progress counters disagree"):
+            branch.library.verify()
+        branch.migrate(rebuild_counters=True)
+        branch.library.verify()
+        self.assertStatusMatchesScan()
 
     def test_branch_snapshot_recomputes_counters_for_the_flattened_rows(self):
         self.branch.work({"doi": "10.1234/w0", "title": "Corrected title in the branch"})

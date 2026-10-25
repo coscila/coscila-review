@@ -36,6 +36,10 @@ SHARED = (
 )
 # Identities that must stay unique across parent and branch (a clash raises).
 STRICT = ("corpora", "runs", "analyses")
+# Tables whose row totals status reports; a branch counts the parent rows it copies (copy-on-write) so that
+# status can take them out of the union without scanning the branch tables.
+COUNTED = ("reviews", "bibliography_entries", "works", "claim_loci", "source_artifacts", "source_sections")
+OVERRIDES_MAINTAINED = ("overrides-maintained", "", "", "")
 
 
 def quote(name: str) -> str:
@@ -205,9 +209,19 @@ class Overlay:
                 # A changed key would leave the parent's row visible again under the old key.
                 key_guard = (f"SELECT RAISE(ABORT, '{name}: keys of shared rows cannot change in a branch') "
                              f"WHERE NOT ({same_key}); ")
+                copied = (f"FROM {PARENT}.{t} AS p WHERE {parent_old} "
+                          f"AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old})")
+                counting = ""
+                if name in COUNTED:
+                    counting = (f"INSERT INTO progress_counters SELECT 'overrides','','{name}','',1 {copied} "
+                                "ON CONFLICT(counter,analysis_id,dimension,state) DO UPDATE SET value=value+1; ")
+                elif name == "corpus_reviews":
+                    counting = (f"INSERT INTO progress_counters SELECT 'override-reviews','',p.phase,p.state,1 {copied} "
+                                "ON CONFLICT(counter,analysis_id,dimension,state) DO UPDATE SET value=value+1; ")
+                if counting and "progress_counters" not in self.tables:
+                    counting = ""
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_update_' + name)} INSTEAD OF UPDATE ON {t} BEGIN {key_guard}"
-                       f"{checks} INSERT INTO {d}({columns}) SELECT {parent_columns} FROM {PARENT}.{t} AS p "
-                       f"WHERE {parent_old} AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old}); "
+                       f"{checks} {counting}INSERT INTO {d}({columns}) SELECT {parent_columns} {copied}; "
                        f"UPDATE {d} SET {assignments} WHERE {old}; END;")
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_delete_' + name)} INSTEAD OF DELETE ON {t} BEGIN "
                        f"SELECT RAISE(ABORT, '{name}: rows of the parent snapshot are immutable') "

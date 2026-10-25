@@ -25,6 +25,17 @@ class CorpusBenchmarkSmokeTests(unittest.TestCase):
             self.assertGreater(report[stage]["seconds"], 0)
         self.assertGreater(report["status"]["afterImport"]["medianMilliseconds"], 0)
         self.assertEqual(set(report["acceptance"]), {"prepare", "import", "status", "egress", "thresholds"})
+        self.assertEqual(240, report["authorize"]["tasks"])
+        self.assertNotIn("branch", report)
+
+    def test_branch_run_measures_a_delta_branch_too(self):
+        with tempfile.TemporaryDirectory() as parent:
+            report = benchmark.run_benchmark(loci=120, egress_events=50, job_items=40, parent=Path(parent), branch=True)
+        branch = report["branch"]
+        self.assertEqual((120, 120, 120), (branch["prepare"]["tasks"], branch["import"]["results"],
+                                           branch["authorize"]["tasks"]))
+        self.assertGreater(branch["status"]["medianMilliseconds"], 0)
+        self.assertEqual({"prepare", "import", "status"}, set(report["branchAcceptance"]))
 
 
 if __name__ == "__main__":
