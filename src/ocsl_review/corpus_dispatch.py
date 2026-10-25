@@ -28,6 +28,27 @@ RESULT_PAGE_RECORDS = 100
 TERMINAL_RECORD_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled", "interrupted", "paused"})
 ACTIVE_BATCH_STATES = ("running", "prepared", "paused")
+# Provenance classes of dispatched evidence. Retained structured captures are licensed
+# (entitled) text: they may be judged, but only by on-prem judges, i.e. workers whose
+# broker configuration carries the entitled-institutional evidence policy.
+PUBLIC_PROVIDERS = frozenset({"pubmed", "europe-pmc", "unpaywall", "publisher"})
+ENTITLED_PROVIDERS = frozenset({"retained-structured-source"})
+PUBLIC_POLICY, ENTITLED_POLICY = "public-literature", "entitled-institutional"
+
+
+def provenance_class(spec):
+    """'public', 'entitled' or None, from the review manuscript and cited-evidence providers."""
+    providers = {spec.get("provider"), (spec.get("reviewProof") or {}).get("provider")}
+    if providers <= PUBLIC_PROVIDERS:
+        return "public"
+    if providers <= PUBLIC_PROVIDERS | ENTITLED_PROVIDERS:
+        return "entitled"
+    return None
+
+
+def may_receive(worker, spec):
+    """Entitled evidence is routed only to on-prem judges; other evidence is not restricted here."""
+    return provenance_class(spec) != "entitled" or worker.get("evidencePolicy") == ENTITLED_POLICY
 
 
 class Broker:
@@ -93,6 +114,9 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
             raise ValidationError("outgoing batch does not match its verified task inputs") from exc
     if sorted(sent) != sorted(by_id) or len(sent) != len(set(sent)):
         raise ValidationError("outgoing batch differs from its pinned task membership")
+    classes = {provenance_class(task["spec"]) for task in tasks}
+    if not all(may_receive(worker, task["spec"]) for task in tasks):
+        raise ConfidentialityError("entitled evidence may reach only on-prem judges (evidence policy entitled-institutional)")
     for task in tasks:
         spec = task["spec"]
         repo.read_artifact(task["spec_sha256"])
@@ -128,9 +152,9 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
                 or authority["attemptId"] != os.environ.get("PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID")
                 or not parent.is_absolute() or any(p.is_symlink() for p in (parent, *parent.parents))
                 or not is_within(repo.workspace.root, parent.resolve())
-                or worker.get("evidencePolicy") != "public-literature"):
+                or worker.get("evidencePolicy") not in {PUBLIC_POLICY, ENTITLED_POLICY}):
             raise ConfidentialityError("corpus dispatch needs the active approved public-literature worker")
-        allowed = {"pubmed", "europe-pmc", "unpaywall", "publisher"}
+        allowed = PUBLIC_PROVIDERS | (ENTITLED_PROVIDERS if worker.get("evidencePolicy") == ENTITLED_POLICY else frozenset())
         for task in tasks:
             spec, proof = task["spec"], task["spec"].get("reviewProof", {})
             manuscript = json.loads(repo.read_artifact(proof.get("manuscriptSha256", "")))
@@ -139,8 +163,10 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
                     or not any(proof.get("publication", {}).get(k) for k in ("doi", "citation_doi", "pmid", "pmcid", "pmc"))
                     or spec.get("provider") not in allowed or not str(spec.get("sourceUrl", "")).startswith("https://")):
                 raise ConfidentialityError("corpus public permission excludes unverified or local manuscript evidence")
-        event = _audit_event("platform-worker:" + worker["id"], "citation_census", arguments, decision="allowed-configured-public-literature")
+        decision = "allowed-configured-entitled-institutional" if "entitled" in classes else "allowed-configured-public-literature"
+        event = _audit_event("platform-worker:" + worker["id"], "citation_census", arguments, decision=decision)
         event.update(attemptId=authority["attemptId"], workerConfigRevision=catalog["revision"])
+    event["provenanceClasses"] = sorted(c for c in classes if c)
     append_egress_event(repo.workspace.root, event)
 
 
@@ -243,7 +269,8 @@ class CorpusExecutor:
             for row in prepared:
                 submitted.append(self._enqueue(row, catalog, worker))
             while self.in_flight() < limit:
-                tasks, held = self._select(tier, job_items * batch_size, task_order, lambda task: True)
+                tasks, held = self._select(tier, job_items * batch_size, task_order,
+                                           lambda task: may_receive(worker, task["spec"]))
                 if not tasks:
                     break
                 groups, consumed = [], []
