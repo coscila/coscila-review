@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Snapshots (closed DB, hard-linked packs, Merkle root) and delta branches over an attached parent."""
+"""Snapshots (closed DB, hard-linked packs, Merkle root), delta branches and the study root."""
 import contextlib
 import hashlib
 import json
@@ -225,6 +225,55 @@ class BranchTests(unittest.TestCase):
         self.parent.manifest_path.write_text(self.parent.manifest_path.read_text() + " ")
         with self.assertRaisesRegex(ValueError, "parent snapshot manifest has changed"):
             CorpusRepository(self.root, "work/branch")
+
+
+class RootTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        base = Path(self.directory.name)
+        self.workspace = base / "workspace"
+        self.study = base / "study-volume"
+        self.datasets = base / "datasets"
+        for path in (self.workspace, self.study, self.datasets):
+            path.mkdir()
+
+    def test_study_root_may_sit_outside_the_workspace(self):
+        with mock.patch.dict(os.environ, {library.STUDY_ROOT_ENV: str(self.study)}):
+            repo = CorpusRepository.create(self.workspace, str(self.study / "literature"), "Q", "study", {})
+            populate(repo, count=1)
+            self.assertTrue((self.study / "literature/corpus.sqlite3").is_file())
+            self.assertEqual(list(self.workspace.iterdir()), [])
+            repo.library.snapshot(str(self.study / "frozen"))
+            Library(Workspace(self.workspace), str(self.study / "frozen")).verify(level="deep")
+            outside = self.study.parent / "elsewhere"
+            outside.mkdir()
+            with self.assertRaisesRegex(ValueError, "workspace-relative"):
+                Workspace(self.workspace).path(str(outside / "library"))
+            with self.assertRaisesRegex(ValueError, "workspace-relative"):
+                Workspace(self.workspace).path(str(self.study))
+            (self.study / "link").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                Workspace(self.workspace).path(str(self.study / "link" / "library"))
+        with self.assertRaisesRegex(ValueError, "workspace-relative"):
+            Workspace(self.workspace).path(str(self.study / "literature"))
+        with mock.patch.dict(os.environ, {library.STUDY_ROOT_ENV: "relative/path"}):
+            with self.assertRaisesRegex(ValueError, "absolute"):
+                Workspace(self.workspace)
+
+    def test_parents_on_a_dataset_root_are_read_only(self):
+        seed = CorpusRepository.create(self.workspace, "seed-source", "Q", "seed", {})
+        populate(seed, count=2)
+        seed.library.snapshot("seed")
+        os.rename(self.workspace / "seed", self.datasets / "seed")
+        with mock.patch.dict(os.environ, {library.DATASET_ROOT_ENV: str(self.datasets)}):
+            workspace = Workspace(self.workspace)
+            parent = Library(workspace, str(self.datasets / "seed"))
+            parent.branch("work/followup", "Follow-up question", "followup", {})
+            branch = CorpusRepository(self.workspace, "work/followup")
+            self.assertEqual(branch.status()["counts"]["works"], 2)
+            with self.assertRaisesRegex(ValueError, "read-only"):
+                library.initialize(workspace, str(self.datasets / "new"), "Q", "x")
 
 
 class MigrationTests(unittest.TestCase):
