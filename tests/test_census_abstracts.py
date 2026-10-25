@@ -52,14 +52,33 @@ class AbstractTests(unittest.TestCase):
         self.assertEqual({"europe-pmc-failed"}, {r["abstractSource"] for r in result.values()})
         self.assertIsNone(result["w1"]["abstract"])
 
-    def test_fill_record_keeps_existing_abstracts(self):
-        record = {"doi": "x", "works": {"a": {"doi": "10.5555/n.1", "abstract": "Kept."}, "b": {"doi": "10.5555/n.2"}}}
+    def test_europe_pmc_comes_first_and_other_providers_are_recorded_fallbacks(self):
+        record = {"doi": "x", "works": {
+            "a": {"doi": "10.5555/n.1", "abstract": "Other provider text.", "abstractSource": "semantic-scholar"},
+            "b": {"doi": "10.5555/n.10", "abstract": "Fallback text.", "abstractSource": "semantic-scholar"},
+            "c": {"doi": "10.5555/n.7"},
+            "d": {"doi": "10.5555/n.20", "abstract": "Supplied without a provider."}}}
+        filled = fill_record(record, FakeSearch())["works"]
+        self.assertEqual(("Abstract of 10.5555/n.1.", "europe-pmc-core"), (filled["a"]["abstract"], filled["a"]["abstractSource"]))
+        self.assertEqual(("Fallback text.", "fallback:semantic-scholar", "europe-pmc-no-hit"),
+                         (filled["b"]["abstract"], filled["b"]["abstractSource"], filled["b"]["europePmcOutcome"]))
+        self.assertEqual((None, "europe-pmc-no-abstract"), (filled["c"]["abstract"], filled["c"]["abstractSource"]))
+        self.assertEqual("fallback:supplied", filled["d"]["abstractSource"])
+        # Looked-up works are not queried again; overwrite queries them again and still keeps the fallbacks.
         search = FakeSearch()
-        filled = fill_record(record, search)
-        self.assertEqual("Kept.", filled["works"]["a"]["abstract"])
-        self.assertEqual("Abstract of 10.5555/n.2.", filled["works"]["b"]["abstract"])
-        self.assertEqual(1, search.queries[0]["query"].count("DOI:"))
-        self.assertEqual("Abstract of 10.5555/n.1.", fill_record(record, FakeSearch(), overwrite=True)["works"]["a"]["abstract"])
+        again = fill_record({"doi": "x", "works": filled}, search)["works"]
+        self.assertEqual([], search.queries)
+        self.assertEqual(filled, again)
+        refreshed = fill_record({"doi": "x", "works": filled}, FakeSearch(), overwrite=True)["works"]
+        self.assertEqual(("Fallback text.", "fallback:semantic-scholar"), (refreshed["b"]["abstract"], refreshed["b"]["abstractSource"]))
+
+    def test_failed_lookups_change_nothing_and_are_retried(self):
+        record = {"doi": "x", "works": {"a": {"doi": "10.5555/n.1", "abstract": "Other.", "abstractSource": "semantic-scholar"}}}
+        failed = fill_record(record, FakeSearch(failing=True))["works"]["a"]
+        self.assertEqual(("Other.", "semantic-scholar", "europe-pmc-failed"),
+                         (failed["abstract"], failed["abstractSource"], failed["europePmcOutcome"]))
+        retried = fill_record({"doi": "x", "works": {"a": failed}}, FakeSearch())["works"]["a"]
+        self.assertEqual(("Abstract of 10.5555/n.1.", "europe-pmc-core"), (retried["abstract"], retried["abstractSource"]))
 
 
 if __name__ == "__main__":
