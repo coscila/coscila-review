@@ -151,10 +151,11 @@ directory, allowed provider requests append an event to the non-symlinked,
 owner-only ledger directory:
 
 ```text
-<workspace>/.ocsl-review/egress-events.json
+<workspace>/.ocsl-review/egress-events.jsonl          active segment
+<workspace>/.ocsl-review/egress-events.000001.jsonl   sealed segments, read-only
 ```
 
-The file is created with private permissions. Each event contains:
+The files are created with private permissions. Each event contains:
 
 - timestamp, provider, operation, and policy decision;
 - the sorted names of arguments;
@@ -164,6 +165,30 @@ The argument values themselves are not written. The digest supports later
 correlation without creating another copy of an identifier or search concept.
 It is not proof that a query was scientifically adequate; adequacy belongs in a
 search-run record in the audit graph.
+
+The ledger is append-only. Each line is one canonical JSON record holding the
+event, its index and the SHA-256 of the previous record, so editing, reordering
+or removing an earlier event breaks the chain. Appends are serialized by a lock
+file and never rewrite earlier lines. When a segment would exceed 8 MiB it is
+sealed read-only under the next number and the chain continues in a new active
+segment. A ledger written by earlier versions as one JSON array
+(`egress-events.json`) is never rewritten; it remains readable, and the chain
+starts from its SHA-256. `verify_egress_ledger` checks every segment and link,
+and `read_egress_events` returns all events in order after that check.
+
+`ocsl-review screen` keeps its own chained `egress.jsonl` in the run directory
+(see [claim screen](claim-check.md)) and appends every one of its decisions to
+the workspace ledger as well (`source: claim-check@1`, linked by
+`runLedgerSha256`): judge calls, registry checks and refusals. Provider
+fetches are recorded once there, by the scholarly client.
+
+Each event reaches the operating system before the request it authorizes is
+sent, so it survives a crash of the process. The ledger calls `fdatasync` at
+most once per second per process and at the latest one second after an
+unsynced event, when a segment is sealed and at interpreter exit; a power
+failure can therefore lose at most about the last second of events at the end
+of the ledger, never an event inside the chain. An incomplete final line is
+refused, not repaired automatically.
 
 The extensive CLI workflow uses this same validated context and ledger. Its
 user confirmation records permission for the review's scope; it does not

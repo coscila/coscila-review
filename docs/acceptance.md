@@ -39,6 +39,24 @@ A passing local suite is necessary but intentionally uses synthetic providers,
 temporary roots, and controlled subprocesses. It is not a substitute for the
 operator checks below.
 
+The claim screen's plan acceptance runs inside this suite with synthetic
+fixtures and mocked judges (see [the claim-screen guide](claim-check.md)): the
+three attribution cases in Markdown, DOCX and JATS; author-year resolution
+precision of at least 0.98 and recall of at least 0.95 on at least 200 citations
+from deterministically generated JATS; a 300-locus report within five minutes;
+and no manuscript text in any outbound request or egress-ledger event in
+confidential mode. Live judge throughput and provider behaviour still require
+deployment-specific checks.
+
+The `citation-census@1` code-fidelity tests (byte-identical prompts, parser
+results, windows and geometry on synthetic fixtures; system-prompt digests) run
+in the same suite and never read verdicts. Two acceptance measurements are
+opt-in because they build large synthetic stores: the corpus executor benchmark
+(`tests/benchmark_corpus_executor.py --loci 200000 --check`, see
+[corpus review](corpus-review.md)) and the storage benchmark
+(`scripts/storage_benchmark.py --out NEW_DIR`, see [storage](storage.md)). Both
+report only what they measure on the store they just generated.
+
 ### 3. Environment acceptance
 
 For every one of the six catalogued environments on the target platform:

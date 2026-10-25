@@ -31,18 +31,22 @@ Primary environment: `review-literature`
    identity versions, evidence tiers, estimands, denominator definitions,
    validation design, model roles and output requirements in one versioned
    study specification. Counts are measured outcomes, not fixed success targets.
-3. For the oncology study, use the deployed advanced-orchestration template
-   **meta meta literature review — v2** and its study prompt. The skill itself is
-   reusable for other journals, corpora and questions. A template does not prove
-   that provider access or corpus execution works in this deployment.
+3. A study started from a deployed advanced-orchestration template follows that
+   template's study prompt and the instruments it pins. The instrument decides
+   the workflow: an entry-level census with a registered census instrument
+   (`ocsl-review instruments list`, for example `citation-census@1`) runs
+   through `ocsl-review study` (see `$OCSL_REVIEW_HOME/docs/census-instrument.md`);
+   per-locus claim-to-source analyses run through `ocsl-review corpus`. The skill
+   itself is reusable for other journals, corpora and questions. A template does
+   not prove that provider access or execution works in this deployment.
    For a different question over an inherited corpus, use the user's new
-   scientific scope and deliverables; do not reapply the oncology census prompt
-   or its five-figure paper requirement. Pin task-appropriate worker assignments,
+   scientific scope and deliverables; do not reapply the parent study's prompt
+   or its paper requirements. Pin task-appropriate worker assignments,
    schemas and protocol in the new analysis, retaining the code ownership and
    evidence-provenance boundaries.
 
-Read [the historical solution and its limits](references/claude-census-lessons.md)
-when planning the first run or comparing against the earlier oncology paper.
+Read [the census workflow lessons and limits](references/census-workflow-lessons.md)
+when planning the first run.
 Read [the corpus protocol](references/corpus-protocol.md) before extraction or
 judging, and [the database and fork contract](references/database-and-forks.md)
 before initialization, export or reuse.
@@ -68,22 +72,23 @@ before initialization, export or reuse.
   statistics, figures and manuscript prose. Qwen workers return bounded,
   structured evidence assessments through the configured bulk worker path;
   they do not write or modify scripts. Validation model roles come from the
-  approved study specification, not a historical paper's benchmark design.
+  approved study specification.
 - Pin prompts, schemas, provider/model receipts and evidence hashes; persist
-  accepted and rejected attempts. Resume incomplete work without relabelling
-  historical judgments as fresh or repeating already accepted assessments.
-- Use maintained `ocsl-review corpus` acquisition, queue and import commands.
-  Start one locus per call; try four only after the bounded calibration gate.
-  The template uses Qwen `none` for primary abstract work, `low` for targeted
-  full-text escalation, and `none` for selected blind replication. All roles
+  accepted and rejected attempts. Resume incomplete work of the same study
+  without repeating already accepted assessments.
+- A registered census instrument fixes its own evidence policy, batch geometry
+  and request settings; run it unchanged with `ocsl-review study` and report
+  its predeclared sensitivities. For per-locus analyses use the maintained
+  `ocsl-review corpus` acquisition, queue and import commands: start one locus
+  per call and try four only after the bounded calibration gate. All roles
   share one aggregate capacity budget. Discover actual worker IDs before use.
 - Validate exact quote/unit pairs and each returned item separately. A bad item
   must not discard valid peers. Missing evidence is an acquisition/escalation
   outcome, not a reason to repeat the same model call. Do not require confidence
   scores or an echo of every evidence-unit ID as proof of reading.
 - Advance one study through durable stage checkpoints with a bounded provider
-  queue. Measure concurrency and costs on the current protocol; historical
-  throughput is not a guarantee. A routine assistant reply is not completion.
+  queue. Measure concurrency and costs on the current protocol; throughput
+  measured elsewhere is not a guarantee. A routine assistant reply is not completion.
 
 Use `ocsl-review-reference-integrity` for identity and publication status,
 `ocsl-review-citation-census` to resume the unchanged v1 per-manuscript lifecycle,

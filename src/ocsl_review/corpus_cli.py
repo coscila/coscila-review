@@ -15,14 +15,18 @@ from .errors import ValidationError
 def add_commands(families, register):
     family = families.add_parser("corpus", help="build, assess, resume and fork a complete literature corpus")
     commands = family.add_subparsers(dest="corpus_command", required=True)
-    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate"):
+    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "pack", "calibrate", "validate", "migrate"):
         command = commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         command.add_argument("--library", default="work/literature")
+        if name == "migrate":
+            command.add_argument("--rebuild-counters", action="store_true",
+                                 help="recompute progress counters from the stored rows")
         if name in {"init", "branch"}:
             command.add_argument("--question", required=True)
             command.add_argument("--analysis", required=True)
             command.add_argument("--protocol", required=True)
+            command.add_argument("--study-prompt", help="study prompt file, pinned by digest in the study bundle")
         if name in {"import-manifest", "import-legacy", "import-snapshot"}:
             command.add_argument("input")
         if name == "import-legacy":
@@ -41,7 +45,8 @@ def add_commands(families, register):
             command.add_argument("--concurrency", type=int, default=60)
         if name in {"run", "execute"}:
             command.add_argument("--batch-size", type=int, default=1)
-            command.add_argument("--max-jobs", type=int, default=4)
+            command.add_argument("--max-jobs", type=int, default=3,
+                                 help="jobs of this analysis kept in flight (at most 3); each asks for the group limit")
         if name in {"execute", "calibrate"}:
             command.add_argument("--low-worker-config", required=True)
         if name in {"execute", "calibrate", "validate"}:
@@ -59,11 +64,18 @@ def add_commands(families, register):
             command.add_argument("--until-complete", action="store_true")
         if name in {"export", "snapshot", "branch"}:
             command.add_argument("--output", required=True)
+        if name == "verify":
+            command.add_argument("--level", choices=("light", "standard", "deep"), default="standard",
+                                 help="light: manifest, database and Merkle root; deep: every blob and row hash")
         register(command, "corpus_cli", "command", "read-only" if name in {"status", "verify"} else "workspace", state_required=False)
 
 
 def repository(args):
     return CorpusRepository(Path(args.workspace).absolute(), args.library)
+
+
+def _study_prompt(args):
+    return Path(args.study_prompt).read_bytes() if getattr(args, "study_prompt", None) else b""
 
 
 def acquirer(args, repo):
@@ -110,6 +122,8 @@ class Progress:
             if state == "running" and not force and time.monotonic() - self.last < 15:
                 return
             self.last = time.monotonic()
+            # Schema 3 status reads only the progress counters, so a heartbeat never
+            # scans the evidence or queue tables, whatever the corpus size.
             status = self.repo.status()
             tasks = status["taskStates"]
             total = sum(t["count"] for t in tasks)
@@ -149,19 +163,25 @@ def _execute(args, repo, progress):
     executor = CorpusExecutor(repo, args.paths)
     for tier, worker, size in (("abstract", args.worker_config, args.batch_size), ("full-text", args.low_worker_config, 1)):
         if tier == "full-text":
-            acquire_escalations(repo, acquisition, progress=progress)
+            acquire_escalations(repo, acquisition, workers=args.acquisition_workers, progress=progress)
         prepare_tasks(repo, tier=tier)
         while True:
             result = executor.resume()
             if any(job["state"] == "paused" for job in result["jobs"]):
                 progress(force=True, phase=tier, state="waiting_input", summary="Worker provider paused; accepted results are saved")
                 return {"state": "paused", **result}
-            executor.submit(worker, tier=tier, batch_size=size, concurrency=args.concurrency, max_jobs=args.max_jobs)
+            submission = executor.submit(worker, tier=tier, batch_size=size, concurrency=args.concurrency, max_jobs=args.max_jobs)
             progress(phase=tier)
-            with repo.connect() as connection:
-                remaining = connection.execute("SELECT count(*) FROM corpus_tasks WHERE analysis_id=? AND tier=? AND state IN ('pending','running')", (executor.analysis, tier)).fetchone()[0]
-            if not remaining:
+            counts = repo.task_counts(executor.analysis, tier)
+            if not counts.get("pending", 0) + counts.get("running", 0):
                 break
+            if not submission["submitted"] and not executor.in_flight():
+                # Nothing runs and nothing can be sent: report it instead of polling forever.
+                held = submission.get("heldForRouting", 0)
+                summary = (f"{held} tasks with entitled evidence wait for an on-prem judge worker (entitled-institutional)"
+                           if held else "Pending tasks could not be submitted; accepted results are saved")
+                progress(force=True, phase=tier, state="waiting_input", summary=summary)
+                return {"state": "waiting_input", "tier": tier, "heldForRouting": held, **result}
             time.sleep(args.poll_seconds)
     result = export_corpus(repo)
     progress(force=True, state="complete", summary="Corpus processing finished; evidence limits and blocked items are recorded")
@@ -174,26 +194,37 @@ def command(args):
         from .corpus_export import import_snapshot
         return import_snapshot(Path(args.workspace).absolute(), args.library, args.input)
     if name == "init":
-        from .corpus_export import implementation_manifest, record_implementation
+        from .corpus_export import STUDY_BUNDLE_PREFIX, implementation_manifest, record_implementation, record_study_bundle, study_bundle
         protocol = json.loads(Path(args.protocol).read_text())
         manifest = implementation_manifest()
+        bundle = study_bundle(protocol, study_prompt=_study_prompt(args), manifest=manifest)
         repo = CorpusRepository.create(Path(args.workspace).absolute(), args.library, args.question, args.analysis, protocol,
-                                       "source-tree-sha256:" + manifest["sha256"])
+                                       STUDY_BUNDLE_PREFIX + bundle["sha256"])
         record_implementation(repo, manifest)
+        record_study_bundle(repo, args.analysis, bundle)
         return repo.status()
     repo = repository(args)
     if name == "status":
         return repo.status()
+    if name == "migrate":
+        return repo.migrate(rebuild_counters=args.rebuild_counters)
     if name == "verify":
-        return repo.library.verify()
+        return repo.library.verify(level=args.level)
+    if name == "pack":
+        return repo.library.pack_loose()
     if name == "snapshot":
         return repo.library.snapshot(args.output)
     if name == "branch":
-        from .corpus_export import implementation_manifest, record_implementation
+        from .corpus_export import STUDY_BUNDLE_PREFIX, implementation_manifest, record_implementation, record_study_bundle, study_bundle
+        protocol = json.loads(Path(args.protocol).read_text())
         manifest = implementation_manifest()
-        result = repo.library.branch(args.output, args.question, args.analysis, json.loads(Path(args.protocol).read_text()),
-                                     "source-tree-sha256:" + manifest["sha256"])
-        record_implementation(CorpusRepository(repo.workspace.root, args.output), manifest)
+        parent = repo.library.verify(require_snapshot=True, level="light")
+        bundle = study_bundle(protocol, study_prompt=_study_prompt(args), manifest=manifest,
+                              dataset_versions={"parentSnapshot": parent.get("merkle_root") or parent["manifest_sha256"]})
+        result = repo.library.branch(args.output, args.question, args.analysis, protocol, STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        branch = CorpusRepository(repo.workspace.root, args.output)
+        record_implementation(branch, manifest)
+        record_study_bundle(branch, args.analysis, bundle)
         return result
     if name == "import-manifest":
         from .corpus_ingest import import_manifest
@@ -211,7 +242,7 @@ def command(args):
         from .corpus_pipeline import acquire_corpus, acquire_escalations
         acquisition = acquirer(args, repo)
         if args.tier == "full-text":
-            return acquire_escalations(repo, acquisition, progress=Progress(repo))
+            return acquire_escalations(repo, acquisition, workers=args.acquisition_workers, progress=Progress(repo))
         return acquire_corpus(repo, acquisition, workers=args.acquisition_workers, retry=args.retry_acquisition, progress=Progress(repo))
     if name == "prepare":
         from .corpus_pipeline import prepare_tasks
