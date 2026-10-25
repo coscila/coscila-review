@@ -615,7 +615,12 @@ class CensusRun:
                 "ON r.journal=c.journal AND r.doi=c.doi WHERE c.model_judged=1 AND c.abs_escalated=1 AND c.cited_inbody=1 "
                 "AND c.identity IN ('resolved','resolved_unverified') AND c.ft_retrieval IS NULL "
                 "ORDER BY r.review_order, c.ordinal")]
-            works = {r["work_key"]: dict(r) for r in self.connection.execute("SELECT * FROM works")}
+            needed = sorted({row["cited_work_key"] for row in rows})
+            works = {}
+            for start in range(0, len(needed), 500):
+                chunk = needed[start:start + 500]
+                works.update({r["work_key"]: dict(r) for r in self.connection.execute(
+                    f"SELECT * FROM works WHERE work_key IN ({','.join('?' * len(chunk))})", chunk)})
         groups = C.full_text_groups(rows, self.seed, review=lambda row: row["doi"])
         allow_entitled = bool(getattr(self.transport, "on_premises", False))
         totals = {"escalated": len(rows), "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0}
