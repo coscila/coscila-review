@@ -2,8 +2,6 @@
 """Durable corpus batches through the scoped Lab broker, with per-item recovery."""
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
 import hashlib
 import http.client
 import json
@@ -14,12 +12,45 @@ import socket
 import urllib.parse
 
 from .confidentiality import authorize_egress, append_egress_event, load_scholarly_context, _audit_event
-from .corpus_store import CorpusRepository, canonical, identity
+from .corpus_store import CorpusRepository, canonical, controller_lock, identity, json_safe
 from .corpus_library import now
 from .corpus_assessment import AssessmentValidator, AssessmentError, build_messages, output_schema, PROMPT_PATH
 from .errors import ConfidentialityError, ReviewError, ValidationError
 from .public_literature import broker_catalog
 from .util import is_within
+
+# Jobs in flight per analysis; each is sized to the worker's capacity-group limit and
+# the broker's limiter queues items globally, so the next job starts while one drains.
+MAX_JOBS_IN_FLIGHT = 3
+RESULT_PAGE_RECORDS = 100
+# Result pages staged behind one shared durability barrier; each page still commits in
+# its own transaction, in order, together with its cursor.
+BARRIER_PAGES = 10
+MAX_REQUEST_GROUP_BYTES = 6 * 1024 * 1024
+TERMINAL_RECORD_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled", "interrupted", "paused"})
+ACTIVE_BATCH_STATES = ("running", "prepared", "paused")
+# Provenance classes of dispatched evidence. Retained structured captures are licensed
+# (entitled) text: they may be judged, but only by on-prem judges, i.e. workers whose
+# broker configuration carries the entitled-institutional evidence policy.
+PUBLIC_PROVIDERS = frozenset({"pubmed", "europe-pmc", "unpaywall", "publisher"})
+ENTITLED_PROVIDERS = frozenset({"retained-structured-source"})
+PUBLIC_POLICY, ENTITLED_POLICY = "public-literature", "entitled-institutional"
+
+
+def provenance_class(spec):
+    """'public', 'entitled' or None, from the review manuscript and cited-evidence providers."""
+    providers = {spec.get("provider"), (spec.get("reviewProof") or {}).get("provider")}
+    if providers <= PUBLIC_PROVIDERS:
+        return "public"
+    if providers <= PUBLIC_PROVIDERS | ENTITLED_PROVIDERS:
+        return "entitled"
+    return None
+
+
+def may_receive(worker, spec):
+    """Entitled evidence is routed only to on-prem judges; other evidence is not restricted here."""
+    return provenance_class(spec) != "entitled" or worker.get("evidencePolicy") == ENTITLED_POLICY
 
 
 class Broker:
@@ -55,19 +86,6 @@ class Broker:
             connection.close()
 
 
-@contextmanager
-def controller_lock(repo):
-    with (repo.root / "controller.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValidationError("another corpus controller owns this library") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-
-
 def authorize(repo, paths, catalog, worker, tasks, inputs):
     """Verify evidence before either explicit egress or configured-public permission."""
     by_id = {task["task_id"]: task for task in tasks}
@@ -85,6 +103,9 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
             raise ValidationError("outgoing batch does not match its verified task inputs") from exc
     if sorted(sent) != sorted(by_id) or len(sent) != len(set(sent)):
         raise ValidationError("outgoing batch differs from its pinned task membership")
+    classes = {provenance_class(task["spec"]) for task in tasks}
+    if not all(may_receive(worker, task["spec"]) for task in tasks):
+        raise ConfidentialityError("entitled evidence may reach only on-prem judges (evidence policy entitled-institutional)")
     for task in tasks:
         spec = task["spec"]
         repo.read_artifact(task["spec_sha256"])
@@ -120,9 +141,9 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
                 or authority["attemptId"] != os.environ.get("PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID")
                 or not parent.is_absolute() or any(p.is_symlink() for p in (parent, *parent.parents))
                 or not is_within(repo.workspace.root, parent.resolve())
-                or worker.get("evidencePolicy") != "public-literature"):
+                or worker.get("evidencePolicy") not in {PUBLIC_POLICY, ENTITLED_POLICY}):
             raise ConfidentialityError("corpus dispatch needs the active approved public-literature worker")
-        allowed = {"pubmed", "europe-pmc", "unpaywall", "publisher"}
+        allowed = PUBLIC_PROVIDERS | (ENTITLED_PROVIDERS if worker.get("evidencePolicy") == ENTITLED_POLICY else frozenset())
         for task in tasks:
             spec, proof = task["spec"], task["spec"].get("reviewProof", {})
             manuscript = json.loads(repo.read_artifact(proof.get("manuscriptSha256", "")))
@@ -131,8 +152,10 @@ def authorize(repo, paths, catalog, worker, tasks, inputs):
                     or not any(proof.get("publication", {}).get(k) for k in ("doi", "citation_doi", "pmid", "pmcid", "pmc"))
                     or spec.get("provider") not in allowed or not str(spec.get("sourceUrl", "")).startswith("https://")):
                 raise ConfidentialityError("corpus public permission excludes unverified or local manuscript evidence")
-        event = _audit_event("platform-worker:" + worker["id"], "citation_census", arguments, decision="allowed-configured-public-literature")
+        decision = "allowed-configured-entitled-institutional" if "entitled" in classes else "allowed-configured-public-literature"
+        event = _audit_event("platform-worker:" + worker["id"], "citation_census", arguments, decision=decision)
         event.update(attemptId=authority["attemptId"], workerConfigRevision=catalog["revision"])
+    event["provenanceClasses"] = sorted(c for c in classes if c)
     append_egress_event(repo.workspace.root, event)
 
 
@@ -142,6 +165,7 @@ class CorpusExecutor:
         self.broker, self.authorization = broker or Broker(), authorization
         self.validator = AssessmentValidator()
         self.analysis = repo.analysis(analysis_id)["analysis_id"]
+        self._batches = {}
 
     def _catalog_worker(self, worker_id):
         catalog = self.broker.catalog()
@@ -168,7 +192,44 @@ class CorpusExecutor:
                 raise ValidationError("worker, prompt, schema or batching changed; start a new analysis namespace")
             connection.execute("INSERT OR IGNORE INTO processing_state VALUES (?,?,?,'completed',0,?,?)", (self.analysis, key, "pin", canonical(pin), now()))
 
-    def submit(self, worker_id, *, tier="abstract", batch_size=1, concurrency=60, max_jobs=4, job_items=250, task_order=None):
+    @staticmethod
+    def _job_concurrency(worker, requested):
+        """A job asks for the worker's capacity-group limit, never more than requested."""
+        limit = worker.get("bulkConcurrencyLimit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 1:
+            return min(requested, limit)
+        return requested
+
+    def in_flight(self):
+        """Batches of this analysis that hold tasks: prepared, running or paused."""
+        with self.repo.connect() as connection:
+            return connection.execute("SELECT count(*) FROM corpus_batches WHERE analysis_id=? AND state IN (?,?,?)",
+                                      (self.analysis, *ACTIVE_BATCH_STATES)).fetchone()[0]
+
+    def _select(self, tier, wanted, task_order, eligible):
+        """Pending tasks in queue order that the worker may receive, and how many were held back."""
+        if task_order is not None:
+            if len(set(task_order)) != len(task_order):
+                raise ValidationError("task ordering contains duplicate IDs")
+            pending = {t["task_id"]: t for t in self.repo.tasks(self.analysis, state="pending", tier=tier)}
+            ordered = [pending[t] for t in task_order if t in pending]
+            allowed = [task for task in ordered if eligible(task)]
+            return allowed[:wanted], len(ordered) - len(allowed)
+        selected, held, after = [], 0, None
+        while len(selected) < wanted:
+            rows = self.repo.tasks(self.analysis, state="pending", tier=tier, limit=wanted, after=after)
+            if not rows:
+                break
+            after = rows[-1]["task_id"]
+            for task in rows:
+                if not eligible(task):
+                    held += 1
+                elif len(selected) < wanted:
+                    selected.append(task)
+        return selected, held
+
+    def submit(self, worker_id, *, tier="abstract", batch_size=1, concurrency=60, max_jobs=MAX_JOBS_IN_FLIGHT, job_items=250, task_order=None):
+        """Keep up to min(max_jobs, 3) jobs of this analysis in flight, each sized to the group limit."""
         if not 1 <= batch_size <= 40 or not 1 <= concurrency <= 2**53-1 or not 1 <= max_jobs <= 100 or not 1 <= job_items <= 1000:
             raise ValidationError("invalid batch size, concurrency or job bound")
         catalog, worker = self._catalog_worker(worker_id)
@@ -188,30 +249,21 @@ class CorpusExecutor:
         owner = catalog.get("authorization", {}).get("attemptId")
         if not owner:
             raise ValidationError("broker omitted active attempt ownership")
-        submitted = []
-        with controller_lock(self.repo):
+        limit, job_concurrency = min(max_jobs, MAX_JOBS_IN_FLIGHT), self._job_concurrency(worker, concurrency)
+        submitted, held = [], 0
+        with controller_lock(self.repo), self.repo.held_open():
             # A prepared request is persisted before enqueue, so retrying it is safe.
             with self.repo.connect() as connection:
                 prepared = [dict(r) for r in connection.execute("SELECT * FROM corpus_batches WHERE analysis_id=? AND state='prepared' AND owner_attempt=? AND worker_id=?", (self.analysis, owner, worker_id))]
             for row in prepared:
                 submitted.append(self._enqueue(row, catalog, worker))
-            while len(submitted) < max_jobs:
-                with self.repo.connect() as connection:
-                    active = [r[0] for r in connection.execute("SELECT input_sha256 FROM corpus_batches WHERE state IN ('running','prepared','paused')")]
-                reserved = sum(json.loads(self.repo.read_artifact(digest)).get("concurrency", 0) for digest in active)
-                allocation = max(0, concurrency - reserved)
-                if not allocation:
-                    break
-                tasks = self.repo.tasks(self.analysis, state="pending", tier=tier, limit=job_items * batch_size)
-                if task_order is not None:
-                    if len(set(task_order)) != len(task_order):
-                        raise ValidationError("task ordering contains duplicate IDs")
-                    pending = {t["task_id"]: t for t in self.repo.tasks(self.analysis, state="pending", tier=tier)}
-                    tasks = [pending[t] for t in task_order if t in pending][:job_items * batch_size]
+            while self.in_flight() < limit:
+                tasks, held = self._select(tier, job_items * batch_size, task_order,
+                                           lambda task: may_receive(worker, task["spec"]))
                 if not tasks:
                     break
                 groups, consumed = [], []
-                cursor = 0
+                cursor, encoded = 0, 2  # canonical size of the group list: brackets, items, commas
                 while cursor < len(tasks) and len(groups) < job_items:
                     size = 1 if tasks[cursor]["attempts"] else batch_size
                     chunk = tasks[cursor:cursor+size]
@@ -220,13 +272,14 @@ class CorpusExecutor:
                     messages = build_messages([t["spec"] for t in chunk], tier)
                     group = {"id": "item-" + identity([t["task_id"] for t in chunk], [t["attempts"] for t in chunk]),
                              "input": {"messages": messages}, "taskIds": [t["task_id"] for t in chunk]}
-                    if len(canonical(groups + [group]).encode()) > 6 * 1024 * 1024:
+                    grown = encoded + len(canonical(group).encode()) + (1 if groups else 0)
+                    if grown > MAX_REQUEST_GROUP_BYTES:
                         if not groups:
                             raise ValidationError("single evidence batch exceeds the broker request bound")
                         break
-                    groups.append(group); consumed.extend(chunk); cursor += len(chunk)
+                    groups.append(group); consumed.extend(chunk); cursor += len(chunk); encoded = grown
                 payload = {"items": [{"id": g["id"], "input": g["input"]} for g in groups],
-                           "schema": output_schema(), "concurrency": allocation, "configId": worker_id}
+                           "schema": output_schema(), "concurrency": job_concurrency, "configId": worker_id}
                 batch_id = "batch-" + identity(self.analysis, owner, payload)
                 payload["idempotencyKey"] = batch_id
                 digest = self.repo.json_artifact(payload, "worker-request")
@@ -234,12 +287,12 @@ class CorpusExecutor:
                     connection.execute("INSERT OR IGNORE INTO corpus_batches VALUES (?,?,?,?,?,?,?,?,?,?,0,0,?,?)", (
                         batch_id, self.analysis, worker_id, catalog["revision"], canonical(worker), digest,
                         canonical([{k:v for k,v in g.items() if k != "input"} for g in groups]), None, owner, "prepared", now(), now()))
-                    for task in consumed:
-                        connection.execute("UPDATE corpus_tasks SET state='running',attempts=attempts+1,updated_at=? WHERE task_id=?", (now(), task["task_id"]))
+                    connection.executemany("UPDATE corpus_tasks SET state='running',attempts=attempts+1,updated_at=? WHERE task_id=?",
+                                           [(now(), task["task_id"]) for task in consumed])
                 with self.repo.connect() as connection:
                     row = dict(connection.execute("SELECT * FROM corpus_batches WHERE batch_id=?", (batch_id,)).fetchone())
                 submitted.append(self._enqueue(row, catalog, worker))
-        return {"submitted": submitted}
+        return {"submitted": submitted, "heldForRouting": held}
 
     def _enqueue(self, row, catalog, worker):
         if row["worker_id"] != worker["id"] or row["worker_revision"] != catalog["revision"]:
@@ -262,67 +315,142 @@ class CorpusExecutor:
         return {"batchId": row["batch_id"], "jobId": job, "tasks": len(ids)}
 
     def _tasks(self, ids):
+        """Task rows with verified specs, loaded through one connection."""
+        if not ids:
+            return []
         with self.repo.connect() as connection:
-            rows = [dict(connection.execute("SELECT * FROM corpus_tasks WHERE task_id=?", (i,)).fetchone()) for i in ids]
-        return [{**r, "spec": json.loads(self.repo.read_artifact(r["spec_sha256"]))} for r in rows]
+            rows = {}
+            for start in range(0, len(ids), 5000):
+                rows.update((r["task_id"], dict(r)) for r in connection.execute(
+                    "SELECT * FROM corpus_tasks WHERE task_id IN (SELECT value FROM json_each(?))",
+                    (json.dumps(ids[start:start + 5000]),)))
+            if any(task_id not in rows for task_id in ids):
+                raise ValidationError("batch refers to a task that is not stored")
+            bodies = self.repo.read_artifacts([rows[i]["spec_sha256"] for i in ids], connection=connection)
+        return [{**rows[i], "spec": json.loads(bodies[rows[i]["spec_sha256"]])} for i in ids]
 
-    def import_record(self, batch, record):
-        record = {k:v for k,v in record.items() if k != "revision"}
-        groups = {g["id"]: g for g in json.loads(batch["task_ids_json"])}
-        if record.get("id") not in groups:
-            raise ValidationError("worker result escaped its pinned batch")
-        if record.get("state") not in {"completed", "failed", "cancelled", "interrupted"}:
-            return
-        tasks = self._tasks(groups[record["id"]]["taskIds"])
-        receipt_sha = self.repo.json_artifact(record, "worker-response")
-        receipt_id = "receipt-" + identity(batch["batch_id"], receipt_sha)
+    def _batch(self, batch):
+        """Parse a pinned batch request once: item groups, expected input digests and worker."""
+        key = (batch["batch_id"], batch["input_sha256"])
+        context = self._batches.get(key)
+        if context is None:
+            request = json.loads(self.repo.read_artifact(batch["input_sha256"]))
+            pinned = json.loads(batch["worker_json"])
+            context = {
+                "groups": {g["id"]: g for g in json.loads(batch["task_ids_json"])},
+                "inputs": {item["id"]: hashlib.sha256(json.dumps(item["input"], ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+                           for item in request["items"]},
+                "worker": pinned,
+                "provider": pinned.get("providerId") or (pinned.get("modelProvider") or {}).get("id"),
+            }
+            if len(self._batches) >= 8:
+                self._batches.clear()
+            self._batches[key] = context
+        return context
+
+    def _judge(self, context, record, tasks):
         accepted, rejected = {}, {}
         try:
             if record["state"] != "completed":
                 raise AssessmentError("transport_failure", record.get("error", "worker did not complete"), retryable=True)
             if not record.get("providerId") or record.get("model") in (None, "", "unknown") or not re.fullmatch(r"[a-f0-9]{64}", str(record.get("promptSha256", ""))):
                 raise AssessmentError("missing_receipt", "worker omitted actual model/provider/prompt provenance")
-            pinned = json.loads(batch["worker_json"])
-            if record["providerId"] != (pinned.get("providerId") or (pinned.get("modelProvider") or {}).get("id")):
+            if record["providerId"] != context["provider"]:
                 raise AssessmentError("wrong_provider", "receipt provider differs from the pinned worker")
-            request = json.loads(self.repo.read_artifact(batch["input_sha256"]))
-            submitted = next(i["input"] for i in request["items"] if i["id"] == record["id"])
-            expected_input = hashlib.sha256(json.dumps(submitted, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-            if record.get("inputSha256") != expected_input:
+            if record.get("inputSha256") != context["inputs"].get(record["id"]):
                 raise AssessmentError("wrong_input", "receipt input digest differs from the pinned request")
             validated = self.validator.validate_response([t["spec"] for t in tasks], record.get("output"))
             accepted, rejected = validated["accepted"], validated["rejected"]
         except AssessmentError as exc:
             rejected = {t["task_id"]: {"code": exc.code, "message": str(exc), "retryable": exc.retryable} for t in tasks}
+        return accepted, rejected
+
+    def import_record(self, batch, record):
+        self.import_page(batch, [record])
+
+    def import_page(self, batch, records, *, cursor=None):
+        """Import one result page in one transaction, together with the advanced cursor.
+
+        Receipts are content addressed, so replaying a page imports nothing twice and
+        an accepted task never returns to another state.
+        """
+        written = []
+        staged = self._stage_page(batch, records, written)
+        if staged is None and cursor is None:
+            return
+        self.repo.sync_staged(written)
+        self._commit_page(batch, staged, cursor)
+
+    def _stage_page(self, batch, records, written):
+        """Validate a page and write its receipt files; durability comes from the caller's barrier."""
+        context = self._batch(batch)
+        terminal = []
+        for record in records:
+            record = {k: v for k, v in record.items() if k != "revision"}
+            if record.get("id") not in context["groups"]:
+                raise ValidationError("worker result escaped its pinned batch")
+            if record.get("state") in TERMINAL_RECORD_STATES:
+                terminal.append(record)
+        if not terminal:
+            return None
+        loaded = {task["task_id"]: task for task in self._tasks(
+            list(dict.fromkeys(t for r in terminal for t in context["groups"][r["id"]]["taskIds"])))}
+        receipts = self.repo.stage_artifacts(((canonical(json_safe(record)).encode(), "worker-response", "application/json")
+                                              for record in terminal), pending=written)
+        judged = []
+        for record, receipt in zip(terminal, receipts):
+            tasks = [loaded[t] for t in context["groups"][record["id"]]["taskIds"]]
+            judged.append((record, receipt[0], tasks, *self._judge(context, record, tasks)))
+        return receipts, judged
+
+    def _commit_page(self, batch, staged, cursor):
+        context = self._batch(batch)
+        receipts, judged = staged if staged is not None else ([], [])
         with self.repo.connect(write=True) as connection:
-            if connection.execute("SELECT 1 FROM model_receipts WHERE receipt_id=?", (receipt_id,)).fetchone():
-                return
-            connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
-                receipt_id, self.analysis, record["id"], batch["input_sha256"], receipt_sha,
-                record.get("providerId") or "unrecorded", record.get("model") or "unrecorded",
-                canonical({"worker": json.loads(batch["worker_json"]), "promptSha256": record.get("promptSha256"), "batchId": batch["batch_id"], "jobId": batch["job_id"]}),
-                canonical(record.get("usage") or {}), "completed" if accepted else "failed", batch["created_at"], now()))
-            for task in tasks:
-                task_id = task["task_id"]
-                good = task_id in accepted
-                observation = accepted[task_id] if good else rejected[task_id]
-                assessment_id = "assessment-" + identity(receipt_id, task_id)
-                connection.execute("INSERT OR IGNORE INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", (
-                    assessment_id, self.analysis, task["locus_id"], receipt_id, "citation-support-v2", task["tier"],
-                    canonical(observation), "accepted" if good else "rejected", now()))
-                if good:
-                    for quote in observation["evidence"]:
-                        connection.execute("INSERT OR IGNORE INTO assessment_evidence VALUES (?,?,?,?)", (assessment_id, quote["unitId"], quote["quote"], quote["unitId"]))
-                state = "completed" if good else "pending" if observation.get("retryable") and task["attempts"] < 2 else "blocked"
-                # Accepted work cannot be lost if an earlier response is replayed later.
-                connection.execute("UPDATE corpus_tasks SET state=?,reason=?,updated_at=? WHERE task_id=? AND state!='completed'", (
-                    state, None if good else canonical(observation), now(), task_id))
+            self.repo.register_artifacts(connection, receipts)
+            ids = ["receipt-" + identity(batch["batch_id"], receipt_sha) for _, receipt_sha, *_ in judged]
+            known = {row[0] for row in connection.execute(
+                "SELECT receipt_id FROM model_receipts WHERE receipt_id IN (SELECT value FROM json_each(?))", (json.dumps(ids),))}
+            receipt_rows, assessment_rows, evidence_rows, state_rows = [], [], [], []
+            for receipt_id, (record, receipt_sha, tasks, accepted, rejected) in zip(ids, judged):
+                if receipt_id in known:
+                    continue
+                known.add(receipt_id)
+                receipt_rows.append((
+                    receipt_id, self.analysis, record["id"], batch["input_sha256"], receipt_sha,
+                    record.get("providerId") or "unrecorded", record.get("model") or "unrecorded",
+                    canonical({"worker": context["worker"], "promptSha256": record.get("promptSha256"), "batchId": batch["batch_id"], "jobId": batch["job_id"]}),
+                    canonical(record.get("usage") or {}), "completed" if accepted else "failed", batch["created_at"], now()))
+                for task in tasks:
+                    task_id = task["task_id"]
+                    good = task_id in accepted
+                    observation = accepted[task_id] if good else rejected[task_id]
+                    assessment_id = "assessment-" + identity(receipt_id, task_id)
+                    assessment_rows.append((assessment_id, self.analysis, task["locus_id"], receipt_id, "citation-support-v2",
+                                            task["tier"], canonical(observation), "accepted" if good else "rejected", now()))
+                    if good:
+                        evidence_rows += [(assessment_id, quote["unitId"], quote["quote"], quote["unitId"]) for quote in observation["evidence"]]
+                    state = "completed" if good else "pending" if observation.get("retryable") and task["attempts"] < 2 else "blocked"
+                    state_rows.append((state, None if good else canonical(observation), now(), task_id))
+            connection.executemany("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", receipt_rows)
+            connection.executemany("INSERT OR IGNORE INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", assessment_rows)
+            connection.executemany("INSERT OR IGNORE INTO assessment_evidence VALUES (?,?,?,?)", evidence_rows)
+            # Accepted work cannot be lost if an earlier response is replayed later.
+            connection.executemany("UPDATE corpus_tasks SET state=?,reason=?,updated_at=? WHERE task_id=? AND state!='completed'", state_rows)
+            if cursor is not None:
+                connection.execute("UPDATE corpus_batches SET cursor=?,updated_at=? WHERE batch_id=?", (cursor, now(), batch["batch_id"]))
+
+    def _results(self, batch):
+        page = self.broker.request("GET", f"/jobs/{batch['job_id']}/results?after={batch['cursor']}&limit={RESULT_PAGE_RECORDS}")
+        cursor = page.get("nextCursor")
+        valid = isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= batch["cursor"]
+        return page, cursor if valid else None
 
     def resume(self):
         harvested = []
-        with controller_lock(self.repo):
+        with controller_lock(self.repo), self.repo.held_open():
             with self.repo.connect() as connection:
-                batches = [dict(r) for r in connection.execute("SELECT * FROM corpus_batches WHERE analysis_id=? AND state IN ('running','prepared','paused')", (self.analysis,))]
+                batches = [dict(r) for r in connection.execute("SELECT * FROM corpus_batches WHERE analysis_id=? AND state IN (?,?,?)", (self.analysis, *ACTIVE_BATCH_STATES))]
             owner = self.broker.catalog().get("authorization", {}).get("attemptId")
             for batch in batches:
                 if not batch["job_id"]:
@@ -336,27 +464,32 @@ class CorpusExecutor:
                             self._release(batch, "interrupted")
                     if not batch["job_id"]:
                         continue
-                while True:
-                    page = self.broker.request("GET", f"/jobs/{batch['job_id']}/results?after={batch['cursor']}&limit=100")
-                    cursor = page.get("nextCursor")
-                    if not isinstance(cursor, int) or cursor < batch["cursor"]:
-                        raise ValidationError("invalid broker result cursor")
-                    for record in page.get("results", []):
-                        self.import_record(batch, record)
-                    with self.repo.connect(write=True) as connection:
-                        connection.execute("UPDATE corpus_batches SET cursor=?,updated_at=? WHERE batch_id=?", (cursor, now(), batch["batch_id"]))
-                    if page.get("hasMore") and cursor == batch["cursor"]:
+                more = True
+                while more:
+                    # Stage up to BARRIER_PAGES pages, make their receipts durable once,
+                    # then commit each page in order in its own transaction.
+                    staged, written, stuck = [], [], False
+                    while more and len(staged) < BARRIER_PAGES and not stuck:
+                        page, cursor = self._results(batch)
+                        if cursor is None:
+                            raise ValidationError("invalid broker result cursor")
+                        staged.append((self._stage_page(batch, page.get("results", []), written), cursor))
+                        more = bool(page.get("hasMore"))
+                        stuck = more and cursor == batch["cursor"]
+                        batch["cursor"] = cursor
+                    self.repo.sync_staged(written)
+                    for page_staged, cursor in staged:
+                        self._commit_page(batch, page_staged, cursor)
+                    if stuck:
                         raise ValidationError("broker result cursor failed to advance")
-                    batch["cursor"] = cursor
-                    if not page.get("hasMore"):
-                        break
                 summary = self.broker.request("GET", f"/jobs/{batch['job_id']}?view=summary")
                 state = summary.get("state")
-                if state in {"completed", "failed", "cancelled", "interrupted", "paused"}:
+                if state in TERMINAL_JOB_STATES:
                     # Drain once more after observing terminal state to close completion races.
-                    page = self.broker.request("GET", f"/jobs/{batch['job_id']}/results?after={batch['cursor']}&limit=100")
-                    for record in page.get("results", []):
-                        self.import_record(batch, record)
+                    page, cursor = self._results(batch)
+                    self.import_page(batch, page.get("results", []), cursor=cursor)
+                    if cursor is not None:
+                        batch["cursor"] = cursor
                     if page.get("hasMore"):
                         continue
                     if state == "paused" and batch["owner_attempt"] == owner:
@@ -402,7 +535,6 @@ class CorpusExecutor:
     def _release(self, batch, state):
         with self.repo.connect(write=True) as connection:
             connection.execute("UPDATE corpus_batches SET state=?,updated_at=? WHERE batch_id=?", (state, now(), batch["batch_id"]))
-            for group in json.loads(batch["task_ids_json"]):
-                for task_id in group["taskIds"]:
-                    connection.execute("UPDATE corpus_tasks SET state=CASE WHEN attempts<2 THEN 'pending' ELSE 'blocked' END,reason=?,updated_at=? WHERE task_id=? AND state='running'", (
-                        "worker job ended without an accepted item: " + state, now(), task_id))
+            connection.executemany("UPDATE corpus_tasks SET state=CASE WHEN attempts<2 THEN 'pending' ELSE 'blocked' END,reason=?,updated_at=? WHERE task_id=? AND state='running'", [
+                ("worker job ended without an accepted item: " + state, now(), task_id)
+                for group in json.loads(batch["task_ids_json"]) for task_id in group["taskIds"]])

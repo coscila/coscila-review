@@ -13,6 +13,7 @@ from ocsl_review.confidentiality import (
     EgressPlan,
     append_egress_event,
     load_scholarly_context,
+    read_egress_events,
 )
 from ocsl_review.errors import ValidationError
 from ocsl_review.scholar_server import make_dispatch
@@ -114,18 +115,8 @@ class ScholarContextTests(unittest.TestCase):
         append_egress_event(selected_a, {"operation": "workspace-a"})
         self.assertFalse((workspace_b / ".ocsl-review").exists())
         append_egress_event(selected_b, {"operation": "workspace-b"})
-        ledger_a = json.loads(
-            (self.workspace / ".ocsl-review" / "egress-events.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        ledger_b = json.loads(
-            (workspace_b / ".ocsl-review" / "egress-events.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(ledger_a, [{"operation": "workspace-a"}])
-        self.assertEqual(ledger_b, [{"operation": "workspace-b"}])
+        self.assertEqual(read_egress_events(self.workspace), [{"operation": "workspace-a"}])
+        self.assertEqual(read_egress_events(workspace_b), [{"operation": "workspace-b"}])
 
     def test_cwd_uses_only_its_fixed_optional_plan_without_parent_search(self) -> None:
         parent_plan = self.workspace_root / ".ocsl-review" / "egress-plan.json"
@@ -301,7 +292,7 @@ class ScholarContextTests(unittest.TestCase):
     def test_ledger_rejects_symlink_escape_without_touching_external_data(self) -> None:
         external = self.root / "external-ledger"
         external.mkdir()
-        sentinel = external / "egress-events.json"
+        sentinel = external / "egress-events.jsonl"
         sentinel.write_bytes(b"external-before\n")
         (self.workspace / ".ocsl-review").symlink_to(external, target_is_directory=True)
         with self.assertRaisesRegex(ValidationError, "symlink component"):
@@ -311,15 +302,23 @@ class ScholarContextTests(unittest.TestCase):
     def test_ledger_is_private_and_malformed_existing_content_is_not_overwritten(self) -> None:
         append_egress_event(self.workspace, {"operation": "first"})
         audit_root = self.workspace / ".ocsl-review"
-        ledger = audit_root / "egress-events.json"
+        ledger = audit_root / "egress-events.jsonl"
         self.assertEqual(audit_root.stat().st_mode & 0o777, 0o700)
         self.assertEqual(ledger.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(json.loads(ledger.read_text(encoding="utf-8")), [{"operation": "first"}])
-        ledger.write_bytes(b'{"not":"an event array"}\n')
+        self.assertEqual(read_egress_events(self.workspace), [{"operation": "first"}])
+        ledger.write_bytes(b'{"not":"a chained event"}\n')
         before = ledger.read_bytes()
-        with self.assertRaisesRegex(ValidationError, "event array"):
+        with self.assertRaisesRegex(ValidationError, "hash chain"):
             append_egress_event(self.workspace, {"operation": "second"})
         self.assertEqual(ledger.read_bytes(), before)
+        legacy_workspace = self.workspace_root / "chat-legacy"
+        (legacy_workspace / ".ocsl-review").mkdir(parents=True)
+        legacy = legacy_workspace / ".ocsl-review" / "egress-events.json"
+        legacy.write_bytes(b'{"not":"an event array"}\n')
+        with self.assertRaisesRegex(ValidationError, "event array"):
+            append_egress_event(legacy_workspace, {"operation": "second"})
+        self.assertEqual(legacy.read_bytes(), b'{"not":"an event array"}\n')
+        self.assertFalse((legacy_workspace / ".ocsl-review" / "egress-events.jsonl").read_bytes())
 
     def test_invalid_context_stops_dispatch_construction_before_network(self) -> None:
         environment = {

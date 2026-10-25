@@ -2,6 +2,7 @@
 """Corpus-wide acquisition, local identity reconciliation and durable task planning."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
@@ -361,67 +362,143 @@ def _escalated_loci(connection, analysis):
     return assessed | missing
 
 
+PLANNER_PAGE_ROWS = 5000
+EVIDENCE_CACHE_WORKS = 20000
+REVIEW_PROOF_CACHE = 20000
+# Keyset page over citation loci; review checkpoints are loaded once per review.
+_LOCUS_PAGE = ("SELECT l.rowid AS locus_rowid,l.*,b.resolved_work_id,b.identity_state,b.candidate_identifiers_json,"
+               "b.review_id,w.metadata_json FROM claim_loci l JOIN bibliography_entries b USING(entry_id) "
+               "LEFT JOIN works w ON w.work_id=b.resolved_work_id JOIN corpus_reviews c USING(review_id) "
+               "WHERE l.rowid>? ORDER BY l.rowid LIMIT ?")
+
+
+class _EvidenceCache:
+    """Evidence per cited work for one planning pass: each work is loaded once (bounded LRU)."""
+
+    def __init__(self, repo: CorpusRepository, tier: str, capacity: int = EVIDENCE_CACHE_WORKS):
+        self.repo, self.tier, self.capacity = repo, tier, capacity
+        self.items: OrderedDict[str, dict | None] = OrderedDict()
+        self.loaded = 0
+
+    def get_many(self, connection, work_ids) -> dict[str, dict | None]:
+        wanted = list(dict.fromkeys(work for work in work_ids if work))
+        missing = [work for work in wanted if work not in self.items]
+        if missing:
+            self.loaded += len(missing)
+            self.items.update(self.repo.evidence_many(missing, self.tier, connection=connection))
+        result = {}
+        for work in wanted:
+            self.items.move_to_end(work)
+            result[work] = self.items[work]
+        while len(self.items) > self.capacity:
+            self.items.popitem(last=False)
+        return result
+
+
+def _review_proofs(connection, cache: OrderedDict, review_ids) -> dict[str, dict]:
+    missing = [review for review in review_ids if review not in cache]
+    if missing:
+        for row in connection.execute("SELECT review_id,checkpoint_json FROM corpus_reviews "
+                                      "WHERE review_id IN (SELECT value FROM json_each(?))", (json.dumps(missing),)):
+            cache[row["review_id"]] = json.loads(row["checkpoint_json"])
+    result = {}
+    for review in review_ids:
+        cache.move_to_end(review)
+        result[review] = cache[review]
+    while len(cache) > REVIEW_PROOF_CACHE:
+        cache.popitem(last=False)
+    return result
+
+
+def _planned_loci(connection, analysis: str, tier: str, locus_ids: list[str]) -> set[str]:
+    """Loci of this page that already have a live task or an accepted assessment at this tier."""
+    ids = json.dumps(locus_ids)
+    done = {row[0] for row in connection.execute(
+        "SELECT locus_id FROM corpus_tasks WHERE analysis_id=? AND tier=? AND state IN ('completed','pending','running') "
+        "AND locus_id IN (SELECT value FROM json_each(?))", (analysis, tier, ids))}
+    done.update(row[0] for row in connection.execute(
+        "SELECT locus_id FROM assessments WHERE analysis_id=? AND evidence_level=? AND validation_state='accepted' "
+        "AND locus_id IN (SELECT value FROM json_each(?))", (analysis, tier, ids)))
+    return done
+
+
+def _plan_locus(planner, row, tier: str, context_chars: int, evidence: dict | None, proof: dict):
+    """One locus to (locus_id, tier, spec, blocked reason); the task specification is unchanged."""
+    reason = None if row["identity_state"] == "verified" else "cited work identity is " + row["identity_state"]
+    if not evidence:
+        reason = reason or tier + " evidence unavailable"
+        evidence = {"evidenceTier": tier, "evidenceUnits": [], "complete": False}
+    units = evidence["evidenceUnits"]
+    if sum(len(u["text"]) for u in units) > context_chars:
+        # Persist a deterministic cited-text window and label it incomplete.
+        terms = set(re.findall(r"\w{4,}", row["claim_text"].lower()))
+        ranked = sorted(enumerate(units), key=lambda p: (-len(terms & set(re.findall(r"\w{4,}", p[1]["text"].lower()))), p[0]))
+        selected, used = [], 0
+        for index, unit in ranked:
+            remaining = context_chars - used
+            if remaining <= 0:
+                break
+            excerpt = unit if len(unit["text"]) <= remaining else {**unit, "text": unit["text"][:remaining], "excerpt": True}
+            selected.append((index, excerpt)); used += len(excerpt["text"])
+        evidence = {**evidence, "evidenceUnits": [u for _, u in sorted(selected)], "complete": False}
+    try:
+        locator = json.loads(row["locator"])
+    except ValueError:
+        locator = {"locator": row["locator"], "bindingStatus": "exact"}
+    metadata = json.loads(row["metadata_json"] or "{}")
+    cited_work = {key: metadata[key] for key in ("title", "year", "authors", "doi", "pmid", "pmcid", "journal")
+                  if metadata.get(key) is not None}
+    if not cited_work.get("journal") and metadata.get("container"):
+        cited_work["journal"] = metadata["container"]
+    spec = {**evidence, "claim": row["claim_text"], "context": json.loads(row["context_text"]),
+            "citationLocus": {"id": row["locus_id"], **locator}, "claimType": locator.get("claimType", "background"),
+            "citedWork": cited_work,
+            "identifiers": json.loads(row["candidate_identifiers_json"]).get("identifiers", {}),
+            "identityVerified": row["identity_state"] == "verified", "reviewId": row["review_id"],
+            "reviewProof": proof}
+    planned = planner.plan({**spec, "id": row["locus_id"], "blockedReason": reason})
+    return row["locus_id"], tier, spec, reason or planned["reason"]
+
+
 def prepare_tasks(repo: CorpusRepository, *, tier: str = "abstract", context_chars: int = 100000) -> dict:
+    """Plan tasks over keyset pages of loci; memory stays bounded by one page and two caches."""
     from .corpus_assessment import TaskPlanner
     if tier not in {"abstract", "full-text"} or context_chars < 1000:
         raise ValidationError("invalid evidence tier or context limit")
     analysis = repo.analysis()["analysis_id"]
+    planner, evidence, proofs = TaskPlanner(), _EvidenceCache(repo, tier), OrderedDict()
     with repo.connect() as connection:
-        rows = [dict(r) for r in connection.execute("SELECT l.*,b.resolved_work_id,b.identity_state,b.candidate_identifiers_json,b.review_id,w.metadata_json,c.checkpoint_json FROM claim_loci l JOIN bibliography_entries b USING(entry_id) LEFT JOIN works w ON w.work_id=b.resolved_work_id JOIN corpus_reviews c USING(review_id)")]
-        done = {(r[0], r[1]) for r in connection.execute("SELECT locus_id,tier FROM corpus_tasks WHERE analysis_id=? AND state IN ('completed','pending','running')", (analysis,))}
-        done.update((r[0], r[1]) for r in connection.execute("SELECT locus_id,evidence_level FROM assessments WHERE analysis_id=? AND validation_state='accepted'", (analysis,)))
-        escalated = _escalated_loci(connection, analysis)
+        escalated = _escalated_loci(connection, analysis) if tier == "full-text" else None
     count = blocked = 0
-    for row in rows:
-        if (row["locus_id"], tier) in done:
-            continue
-        if tier == "full-text" and row["locus_id"] not in escalated:
-            continue
-        evidence = repo.evidence(row["resolved_work_id"], tier) if row["resolved_work_id"] else None
-        reason = None if row["identity_state"] == "verified" else "cited work identity is " + row["identity_state"]
-        if not evidence:
-            reason = reason or tier + " evidence unavailable"
-            evidence = {"evidenceTier": tier, "evidenceUnits": [], "complete": False}
-        units = evidence["evidenceUnits"]
-        if sum(len(u["text"]) for u in units) > context_chars:
-            # Persist a deterministic cited-text window and label it incomplete.
-            terms = set(re.findall(r"\w{4,}", row["claim_text"].lower()))
-            ranked = sorted(enumerate(units), key=lambda p: (-len(terms & set(re.findall(r"\w{4,}", p[1]["text"].lower()))), p[0]))
-            selected, used = [], 0
-            for index, unit in ranked:
-                remaining = context_chars - used
-                if remaining <= 0:
+    after = 0
+    with repo.held_open():
+        while True:
+            with repo.connect() as connection:
+                page = connection.execute(_LOCUS_PAGE, (after, PLANNER_PAGE_ROWS)).fetchall()
+                if not page:
                     break
-                excerpt = unit if len(unit["text"]) <= remaining else {**unit, "text": unit["text"][:remaining], "excerpt": True}
-                selected.append((index, excerpt)); used += len(excerpt["text"])
-            evidence = {**evidence, "evidenceUnits": [u for _, u in sorted(selected)], "complete": False}
-        try:
-            locator = json.loads(row["locator"])
-        except ValueError:
-            locator = {"locator": row["locator"], "bindingStatus": "exact"}
-        metadata = json.loads(row["metadata_json"] or "{}")
-        cited_work = {key: metadata[key] for key in ("title", "year", "authors", "doi", "pmid", "pmcid", "journal")
-                      if metadata.get(key) is not None}
-        if not cited_work.get("journal") and metadata.get("container"):
-            cited_work["journal"] = metadata["container"]
-        spec = {**evidence, "claim": row["claim_text"], "context": json.loads(row["context_text"]),
-                "citationLocus": {"id": row["locus_id"], **locator}, "claimType": locator.get("claimType", "background"),
-                "citedWork": cited_work,
-                "identifiers": json.loads(row["candidate_identifiers_json"]).get("identifiers", {}),
-                "identityVerified": row["identity_state"] == "verified", "reviewId": row["review_id"],
-                "reviewProof": json.loads(row["checkpoint_json"])}
-        planned = TaskPlanner().plan({**spec, "id": row["locus_id"], "blockedReason": reason})
-        reason = reason or planned["reason"]
-        task_id = repo.add_task(analysis, row["locus_id"], tier, spec, reason)
-        if not reason:
-            with repo.connect(write=True) as connection:
-                connection.execute("UPDATE corpus_tasks SET state='cancelled',reason='superseded by acquired evidence',updated_at=? WHERE analysis_id=? AND locus_id=? AND tier=? AND task_id!=? AND state='blocked'",
-                                   (now(), analysis, row["locus_id"], tier, task_id))
-        count += 1; blocked += bool(reason)
+                after = page[-1]["locus_rowid"]
+                done = _planned_loci(connection, analysis, tier, [row["locus_id"] for row in page])
+                rows = [row for row in page if row["locus_id"] not in done
+                        and (escalated is None or row["locus_id"] in escalated)]
+                works = evidence.get_many(connection, [row["resolved_work_id"] for row in rows])
+                reviews = _review_proofs(connection, proofs, list(dict.fromkeys(row["review_id"] for row in rows)))
+            items = [_plan_locus(planner, row, tier, context_chars,
+                                 works.get(row["resolved_work_id"]) if row["resolved_work_id"] else None,
+                                 reviews[row["review_id"]]) for row in rows]
+            repo.add_tasks(analysis, items, supersede_blocked=True)
+            count += len(items); blocked += sum(1 for item in items if item[3])
     return {"analysisId": analysis, "tier": tier, "tasks": count, "blocked": blocked}
 
 
-def acquire_escalations(repo: CorpusRepository, acquirer, *, progress=None) -> dict:
+def acquire_escalations(repo: CorpusRepository, acquirer, *, workers: int = 12, progress=None) -> dict:
+    """Fetch full text for escalated works in a bounded thread pool; results are stored in order of arrival.
+
+    A failed fetch stops new submissions; finished fetches are still registered before
+    the first error is raised, so a resume repeats only the missing works.
+    """
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        raise ValidationError("acquisition workers must be a positive integer")
     with repo.connect() as connection:
         loci = _escalated_loci(connection, repo.analysis()["analysis_id"])
         # Iterate the binding index rather than constructing a SQL IN list that
@@ -430,13 +507,30 @@ def acquire_escalations(repo: CorpusRepository, acquirer, *, progress=None) -> d
         for row in connection.execute("SELECT l.locus_id,w.work_id,w.metadata_json FROM claim_loci l JOIN bibliography_entries b USING(entry_id) JOIN works w ON w.work_id=b.resolved_work_id WHERE b.identity_state='verified'"):
             if row["locus_id"] in loci:
                 rows[row["work_id"]] = dict(row)
-    acquired = 0
-    for row in rows.values():
-        if repo.evidence(row["work_id"], "full-text"):
-            continue
-        result = acquirer.fetch_work(_identifiers(json.loads(row["metadata_json"])), include_full_text=True)
-        register_acquisition(repo, row["work_id"], result)
-        acquired += 1
-        if progress:
-            progress()
+        targets = []
+        works = list(rows)
+        for start in range(0, len(works), PLANNER_PAGE_ROWS):
+            chunk = works[start:start + PLANNER_PAGE_ROWS]
+            present = repo.evidence_many(chunk, "full-text", connection=connection)
+            targets += [rows[work] for work in chunk if not present[work]]
+
+    def fetch(row):
+        return row, acquirer.fetch_work(_identifiers(json.loads(row["metadata_json"])), include_full_text=True)
+
+    acquired, failure = 0, None
+    pending = iter(targets)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while failure is None and (chunk := [row for _, row in zip(range(workers * 4), pending)]):
+            for future in as_completed([pool.submit(fetch, row) for row in chunk]):
+                try:
+                    row, result = future.result()
+                except Exception as exc:
+                    failure = failure or exc
+                    continue
+                register_acquisition(repo, row["work_id"], result)
+                acquired += 1
+                if progress:
+                    progress()
+    if failure is not None:
+        raise failure
     return {"targetedWorks": len(rows), "acquisitionAttempts": acquired}

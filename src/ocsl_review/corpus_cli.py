@@ -15,10 +15,13 @@ from .errors import ValidationError
 def add_commands(families, register):
     family = families.add_parser("corpus", help="build, assess, resume and fork a complete literature corpus")
     commands = family.add_subparsers(dest="corpus_command", required=True)
-    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate"):
+    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate", "migrate"):
         command = commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         command.add_argument("--library", default="work/literature")
+        if name == "migrate":
+            command.add_argument("--rebuild-counters", action="store_true",
+                                 help="recompute progress counters from the stored rows")
         if name in {"init", "branch"}:
             command.add_argument("--question", required=True)
             command.add_argument("--analysis", required=True)
@@ -41,7 +44,8 @@ def add_commands(families, register):
             command.add_argument("--concurrency", type=int, default=60)
         if name in {"run", "execute"}:
             command.add_argument("--batch-size", type=int, default=1)
-            command.add_argument("--max-jobs", type=int, default=4)
+            command.add_argument("--max-jobs", type=int, default=3,
+                                 help="jobs of this analysis kept in flight (at most 3); each asks for the group limit")
         if name in {"execute", "calibrate"}:
             command.add_argument("--low-worker-config", required=True)
         if name in {"execute", "calibrate", "validate"}:
@@ -110,6 +114,8 @@ class Progress:
             if state == "running" and not force and time.monotonic() - self.last < 15:
                 return
             self.last = time.monotonic()
+            # Schema 3 status reads only the progress counters, so a heartbeat never
+            # scans the evidence or queue tables, whatever the corpus size.
             status = self.repo.status()
             tasks = status["taskStates"]
             total = sum(t["count"] for t in tasks)
@@ -149,19 +155,25 @@ def _execute(args, repo, progress):
     executor = CorpusExecutor(repo, args.paths)
     for tier, worker, size in (("abstract", args.worker_config, args.batch_size), ("full-text", args.low_worker_config, 1)):
         if tier == "full-text":
-            acquire_escalations(repo, acquisition, progress=progress)
+            acquire_escalations(repo, acquisition, workers=args.acquisition_workers, progress=progress)
         prepare_tasks(repo, tier=tier)
         while True:
             result = executor.resume()
             if any(job["state"] == "paused" for job in result["jobs"]):
                 progress(force=True, phase=tier, state="waiting_input", summary="Worker provider paused; accepted results are saved")
                 return {"state": "paused", **result}
-            executor.submit(worker, tier=tier, batch_size=size, concurrency=args.concurrency, max_jobs=args.max_jobs)
+            submission = executor.submit(worker, tier=tier, batch_size=size, concurrency=args.concurrency, max_jobs=args.max_jobs)
             progress(phase=tier)
-            with repo.connect() as connection:
-                remaining = connection.execute("SELECT count(*) FROM corpus_tasks WHERE analysis_id=? AND tier=? AND state IN ('pending','running')", (executor.analysis, tier)).fetchone()[0]
-            if not remaining:
+            counts = repo.task_counts(executor.analysis, tier)
+            if not counts.get("pending", 0) + counts.get("running", 0):
                 break
+            if not submission["submitted"] and not executor.in_flight():
+                # Nothing runs and nothing can be sent: report it instead of polling forever.
+                held = submission.get("heldForRouting", 0)
+                summary = (f"{held} tasks with entitled evidence wait for an on-prem judge worker (entitled-institutional)"
+                           if held else "Pending tasks could not be submitted; accepted results are saved")
+                progress(force=True, phase=tier, state="waiting_input", summary=summary)
+                return {"state": "waiting_input", "tier": tier, "heldForRouting": held, **result}
             time.sleep(args.poll_seconds)
     result = export_corpus(repo)
     progress(force=True, state="complete", summary="Corpus processing finished; evidence limits and blocked items are recorded")
@@ -184,6 +196,8 @@ def command(args):
     repo = repository(args)
     if name == "status":
         return repo.status()
+    if name == "migrate":
+        return repo.migrate(rebuild_counters=args.rebuild_counters)
     if name == "verify":
         return repo.library.verify()
     if name == "snapshot":
@@ -211,7 +225,7 @@ def command(args):
         from .corpus_pipeline import acquire_corpus, acquire_escalations
         acquisition = acquirer(args, repo)
         if args.tier == "full-text":
-            return acquire_escalations(repo, acquisition, progress=Progress(repo))
+            return acquire_escalations(repo, acquisition, workers=args.acquisition_workers, progress=Progress(repo))
         return acquire_corpus(repo, acquisition, workers=args.acquisition_workers, retry=args.retry_acquisition, progress=Progress(repo))
     if name == "prepare":
         from .corpus_pipeline import prepare_tasks

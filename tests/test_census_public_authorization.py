@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from ocsl_review import census, literature, public_literature
-from ocsl_review.confidentiality import EgressPlan
+from ocsl_review.confidentiality import EgressPlan, read_egress_events
 from ocsl_review.errors import ConfidentialityError
 from ocsl_review.util import atomic_json
 from ocsl_review.ingest import ingest_manuscript
@@ -50,7 +50,7 @@ class PublicCensusAuthorizationTests(unittest.TestCase):
         with patch.object(public_literature, "broker_catalog", return_value=catalog), \
                 patch.object(census, "load_scholarly_context", return_value=(EgressPlan(), self.workspace)):
             census._authorize(self.args, self.workspace, run, tasks)
-        events = json.loads((self.workspace / ".ocsl-review/egress-events.json").read_text())
+        events = read_egress_events(self.workspace)
         event = events[-1]
         self.assertEqual(event["decision"], "allowed-configured-public-literature")
         self.assertEqual(event["attemptId"], "approved-attempt")

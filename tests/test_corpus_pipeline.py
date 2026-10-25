@@ -5,14 +5,20 @@ import hashlib
 import json
 from contextlib import closing
 from pathlib import Path
+import re
 import tempfile
 import sqlite3
+import threading
 import unittest
+from unittest.mock import patch
 
+from ocsl_review import corpus_pipeline
 from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.corpus_acquisition import CorpusAcquirer
-from ocsl_review.corpus_pipeline import acquire_corpus, acquire_escalations, prepare_tasks, register_acquisition
-from ocsl_review.corpus_store import CorpusRepository, canonical
+from ocsl_review.corpus_assessment import TaskPlanner
+from ocsl_review.corpus_library import now
+from ocsl_review.corpus_pipeline import _escalated_loci, acquire_corpus, acquire_escalations, prepare_tasks, register_acquisition
+from ocsl_review.corpus_store import CorpusRepository, canonical, identity
 from ocsl_review.corpus_seed import import_legacy_evidence
 from ocsl_review.errors import ProviderError, ValidationError
 from ocsl_review.scholarly import RawResponse, ScholarlyClient
@@ -258,6 +264,224 @@ class CorpusPipelineTests(unittest.TestCase):
         task = self.repo.tasks("v2", tier="full-text")[0]["spec"]
         self.assertFalse(task["complete"])
         self.assertEqual(1000, sum(len(unit["text"]) for unit in task["evidenceUnits"]))
+
+
+def reference_plan(repo, tier="abstract", context_chars=100000):
+    """The planner as it was before keyset streaming, frozen as a test oracle; it never writes."""
+    analysis = repo.analysis()["analysis_id"]
+    with repo.connect() as connection:
+        rows = [dict(r) for r in connection.execute("SELECT l.*,b.resolved_work_id,b.identity_state,b.candidate_identifiers_json,b.review_id,w.metadata_json,c.checkpoint_json FROM claim_loci l JOIN bibliography_entries b USING(entry_id) LEFT JOIN works w ON w.work_id=b.resolved_work_id JOIN corpus_reviews c USING(review_id)")]
+        done = {(r[0], r[1]) for r in connection.execute("SELECT locus_id,tier FROM corpus_tasks WHERE analysis_id=? AND state IN ('completed','pending','running')", (analysis,))}
+        done.update((r[0], r[1]) for r in connection.execute("SELECT locus_id,evidence_level FROM assessments WHERE analysis_id=? AND validation_state='accepted'", (analysis,)))
+        escalated = _escalated_loci(connection, analysis)
+    planned = {}
+    for row in rows:
+        if (row["locus_id"], tier) in done:
+            continue
+        if tier == "full-text" and row["locus_id"] not in escalated:
+            continue
+        evidence = repo.evidence(row["resolved_work_id"], tier) if row["resolved_work_id"] else None
+        reason = None if row["identity_state"] == "verified" else "cited work identity is " + row["identity_state"]
+        if not evidence:
+            reason = reason or tier + " evidence unavailable"
+            evidence = {"evidenceTier": tier, "evidenceUnits": [], "complete": False}
+        units = evidence["evidenceUnits"]
+        if sum(len(u["text"]) for u in units) > context_chars:
+            terms = set(re.findall(r"\w{4,}", row["claim_text"].lower()))
+            ranked = sorted(enumerate(units), key=lambda p: (-len(terms & set(re.findall(r"\w{4,}", p[1]["text"].lower()))), p[0]))
+            selected, used = [], 0
+            for index, unit in ranked:
+                remaining = context_chars - used
+                if remaining <= 0:
+                    break
+                excerpt = unit if len(unit["text"]) <= remaining else {**unit, "text": unit["text"][:remaining], "excerpt": True}
+                selected.append((index, excerpt)); used += len(excerpt["text"])
+            evidence = {**evidence, "evidenceUnits": [u for _, u in sorted(selected)], "complete": False}
+        try:
+            locator = json.loads(row["locator"])
+        except ValueError:
+            locator = {"locator": row["locator"], "bindingStatus": "exact"}
+        metadata = json.loads(row["metadata_json"] or "{}")
+        cited_work = {key: metadata[key] for key in ("title", "year", "authors", "doi", "pmid", "pmcid", "journal")
+                      if metadata.get(key) is not None}
+        if not cited_work.get("journal") and metadata.get("container"):
+            cited_work["journal"] = metadata["container"]
+        spec = {**evidence, "claim": row["claim_text"], "context": json.loads(row["context_text"]),
+                "citationLocus": {"id": row["locus_id"], **locator}, "claimType": locator.get("claimType", "background"),
+                "citedWork": cited_work,
+                "identifiers": json.loads(row["candidate_identifiers_json"]).get("identifiers", {}),
+                "identityVerified": row["identity_state"] == "verified", "reviewId": row["review_id"],
+                "reviewProof": json.loads(row["checkpoint_json"])}
+        planned_task = TaskPlanner().plan({**spec, "id": row["locus_id"], "blockedReason": reason})
+        planned[row["locus_id"]] = ("task-" + identity(analysis, row["locus_id"], tier, spec), reason or planned_task["reason"])
+    return planned
+
+
+class PlannerEquivalenceTests(unittest.TestCase):
+    """The streamed planner must produce the task IDs and blocked reasons of the frozen planner."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.repo = CorpusRepository.create(self.root, "work/library", "Question", "v2", {"version": 2})
+        repo = self.repo
+        self.manuscript = repo.json_artifact({"confidential": False}, "review-manuscript")
+        reviews = []
+        for index in range(3):
+            review = repo.review({"doi": f"10.1234/review-{index}", "title": f"Review {index}"})
+            repo.review_state(review, "binding", "completed", checkpoint={
+                "manuscriptSha256": self.manuscript, "provider": "europe-pmc", "public": True,
+                "sourceUrl": f"https://europepmc.org/article/MED/{index}", "publication": {"doi": f"10.1234/review-{index}"}})
+            reviews.append(review)
+        works = {name: repo.work({"doi": f"10.1234/{name}", "title": f"Cited {name}", "year": 2020,
+                                  **({"container": "Container journal"} if name == "w1" else {"journal": "Journal"})})
+                 for name in ("w1", "w2", "w3", "w4", "w5")}
+        repo.document(works["w1"], {"text": "Sixty patients were randomised to treatment.", "complete": True,
+                                    "sourceUrl": "https://example.org/w1"}, "abstract", "europe-pmc")
+        repo.document(works["w2"], {"text": "A partial abstract", "complete": False,
+                                    "sourceUrl": "https://example.org/w2"}, "abstract", "pubmed")
+        repo.document(works["w5"], {"text": "Complete abstract of a cohort of mice.", "complete": True,
+                                    "sourceUrl": "https://example.org/w5a"}, "abstract", "europe-pmc")
+        repo.document(works["w5"], {"text": "A newer but incomplete abstract.", "complete": False,
+                                    "sourceUrl": "https://example.org/w5b"}, "abstract", "pubmed")
+        blocks = [{"id": f"s{i}", "text": (f"Section {i} reports randomised patients outcome. " * 12), "kind": "body"}
+                  for i in range(6)]
+        repo.document(works["w4"], {"text": "", "blocks": blocks, "complete": True,
+                                    "sourceUrl": "https://example.org/w4"}, "full-text", "europe-pmc")
+        entries = [("e1", reviews[0], works["w1"], "verified"), ("e2", reviews[0], works["w2"], "verified"),
+                   ("e3", reviews[1], works["w3"], "verified"), ("e4", reviews[1], works["w4"], "verified"),
+                   ("e5", reviews[2], works["w5"], "verified"), ("e6", reviews[2], None, "unresolved"),
+                   ("e7", reviews[2], works["w1"], "conflict")]
+        with repo.connect(write=True) as connection:
+            for entry, review, work, state in entries:
+                connection.execute("INSERT INTO bibliography_entries VALUES (?,?,?,?,?,?,?,?)", (
+                    entry, review, entry, f"Printed {entry}", canonical({"identifiers": {"doi": f"10.1234/{entry}"}}),
+                    work, state, self.manuscript if state == "verified" else None))
+            loci = []
+            for number, (entry, *_rest) in enumerate(entries * 2):
+                locator = canonical({"claimType": "numeric" if number % 2 else "fact", "bindingStatus": "exact",
+                                     "position": number}) if number % 5 else f"plain-locator-{number}"
+                loci.append((f"locus-{number:02d}", entry, self.manuscript, locator,
+                             f"Claim {number}: randomised patients outcome.", canonical([f"Context {number}."]), "fixture"))
+            connection.executemany("INSERT INTO claim_loci VALUES (?,?,?,?,?,?,?)", loci)
+        self.loci = [locus[0] for locus in loci]
+        # Earlier progress: one completed task, one accepted assessment and one stale blocked task.
+        repo.add_task("v2", self.loci[0], "abstract", {"claim": "earlier"}, None)
+        with repo.connect(write=True) as connection:
+            connection.execute("UPDATE corpus_tasks SET state='completed' WHERE locus_id=?", (self.loci[0],))
+            connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "receipt-1", "v2", "item", self.manuscript, self.manuscript, "fixture", "model", "{}", "{}",
+                "completed", now(), now()))
+            connection.execute("INSERT INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", (
+                "assessment-1", "v2", self.loci[1], "receipt-1", "fixture", "abstract",
+                canonical({"escalate": False}), "accepted", now()))
+            connection.execute("INSERT INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", (
+                "assessment-2", "v2", self.loci[3], "receipt-1", "fixture", "abstract",
+                canonical({"escalate": True}), "accepted", now()))
+        self.stale = repo.add_task("v2", self.loci[7], "abstract", {"claim": "stale"}, "abstract evidence unavailable")
+
+    def assert_equivalent(self, tier, context_chars=100000):
+        expected = reference_plan(self.repo, tier, context_chars)
+        result = prepare_tasks(self.repo, tier=tier, context_chars=context_chars)
+        self.assertEqual((result["tasks"], result["blocked"]),
+                         (len(expected), sum(1 for _, reason in expected.values() if reason)))
+        with self.repo.connect() as connection:
+            rows = {row["task_id"]: dict(row) for row in connection.execute(
+                "SELECT * FROM corpus_tasks WHERE analysis_id='v2' AND tier=?", (tier,))}
+        for locus, (task_id, reason) in expected.items():
+            with self.subTest(locus=locus):
+                self.assertEqual((rows[task_id]["locus_id"], rows[task_id]["reason"]), (locus, reason))
+                self.assertEqual(rows[task_id]["state"], "blocked" if reason else "pending")
+        return expected
+
+    def test_streamed_pages_and_evicting_cache_keep_task_ids_and_reasons(self):
+        with patch.object(corpus_pipeline, "PLANNER_PAGE_ROWS", 2), patch.object(corpus_pipeline, "EVIDENCE_CACHE_WORKS", 1):
+            expected = self.assert_equivalent("abstract")
+        self.assertNotIn(self.loci[0], expected)
+        self.assertNotIn(self.loci[1], expected)
+        reasons = {reason for _, reason in expected.values()}
+        self.assertTrue({None, "complete abstract is unavailable", "abstract evidence unavailable",
+                         "cited work identity is unresolved", "cited work identity is conflict"} <= reasons)
+        with self.repo.connect() as connection:
+            stale = connection.execute("SELECT state,reason FROM corpus_tasks WHERE task_id=?", (self.stale,)).fetchone()
+        self.assertEqual(tuple(stale), ("cancelled", "superseded by acquired evidence"))
+        self.assertEqual(prepare_tasks(self.repo)["tasks"], sum(1 for _, reason in expected.values() if reason))
+
+    def test_full_text_window_and_escalations_match_and_evidence_loads_once_per_work(self):
+        loads = []
+        original = CorpusRepository.evidence_many
+
+        def counting(repo, work_ids, tier, *, connection=None):
+            work_ids = list(work_ids)
+            loads.extend(work_ids)
+            return original(repo, work_ids, tier, connection=connection)
+
+        with patch.object(CorpusRepository, "evidence_many", counting):
+            expected = self.assert_equivalent("full-text", context_chars=1000)
+        self.assertIn(self.loci[3], expected)
+        self.assertEqual(len(loads), len(set(loads)))
+        task = next(t for t in self.repo.tasks("v2", tier="full-text") if t["task_id"] == expected[self.loci[3]][0])
+        self.assertFalse(task["spec"]["complete"])
+        self.assertEqual(sum(len(unit["text"]) for unit in task["spec"]["evidenceUnits"]), 1000)
+
+
+class EscalationFetchTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.repo = CorpusRepository.create(self.root, "work/library", "Question", "v2", {"version": 2})
+        review = self.repo.review({"doi": "10.1234/review", "title": "Review"})
+        self.repo.review_state(review, "binding", "completed")
+        manuscript = self.repo.json_artifact({"confidential": False}, "review-manuscript")
+        self.works = [self.repo.work({"doi": f"10.1234/w{i}", "title": f"Work {i}"}) for i in range(6)]
+        with self.repo.connect(write=True) as connection:
+            for index, work in enumerate(self.works):
+                connection.execute("INSERT INTO bibliography_entries VALUES (?,?,?,?,?,?,?,?)", (
+                    f"e{index}", review, str(index), "Printed", "{}", work, "verified", manuscript))
+                connection.execute("INSERT INTO claim_loci VALUES (?,?,?,?,?,?,?)", (
+                    f"l{index}", f"e{index}", manuscript, f"p{index}", "Claim.", "[]", "fixture"))
+
+    class Acquirer:
+        def __init__(self, parties, fail=()):
+            self.barrier = threading.Barrier(parties, timeout=10) if parties > 1 else None
+            self.fail, self.calls, self.lock = set(fail), [], threading.Lock()
+            self.active = self.peak = 0
+
+        def fetch_work(self, identifiers, include_full_text=False):
+            with self.lock:
+                self.calls.append(identifiers["doi"]); self.active += 1; self.peak = max(self.peak, self.active)
+            try:
+                if self.barrier:
+                    self.barrier.wait()
+                if identifiers["doi"] in self.fail:
+                    from ocsl_review.errors import ProviderError
+                    raise ProviderError("provider HTTP 503 temporary failure")
+                return {"outcome": "acquired", "retrievedAt": "2026-01-01T00:00:00+00:00", "documents": [
+                    {"text": "Full text of " + identifiers["doi"], "complete": True, "provider": "europe-pmc",
+                     "sourceUrl": "https://example.org/" + identifiers["doi"]}]}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    def test_escalated_works_are_fetched_concurrently_and_registered(self):
+        acquirer = self.Acquirer(parties=3)
+        result = acquire_escalations(self.repo, acquirer, workers=3)
+        self.assertEqual(result, {"targetedWorks": 6, "acquisitionAttempts": 6})
+        self.assertEqual(acquirer.peak, 3)
+        self.assertTrue(all(self.repo.evidence(work, "full-text")["complete"] for work in self.works))
+        self.assertEqual(acquire_escalations(self.repo, acquirer, workers=3)["acquisitionAttempts"], 0)
+
+    def test_failed_fetch_keeps_finished_results_and_resume_repeats_only_missing_works(self):
+        acquirer = self.Acquirer(parties=1, fail={"10.1234/w2"})
+        with self.assertRaisesRegex(Exception, "503"):
+            acquire_escalations(self.repo, acquirer, workers=2)
+        stored = [work for work in self.works if self.repo.evidence(work, "full-text")]
+        self.assertEqual(len(stored), 5)
+        retry = self.Acquirer(parties=1)
+        self.assertEqual(acquire_escalations(self.repo, retry, workers=2)["acquisitionAttempts"], 1)
+        self.assertEqual(retry.calls, ["10.1234/w2"])
 
 
 if __name__ == "__main__":
