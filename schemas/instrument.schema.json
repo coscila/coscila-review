@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coscila/coscila-review/schemas/instrument.schema.json",
+  "title": "Measurement instrument bundle",
+  "description": "instruments/<name>/<version>/instrument.json: prompt and schema files with digests, evidence policy, geometry, request settings, required model, validator and class map. The bundle digest covers this document, every file digest and every pinned module digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name", "version", "status", "description", "files", "tiers", "requiredModel", "validator", "classMap"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]*@[1-9][0-9]*$"},
+    "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]*$"},
+    "version": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["active", "frozen", "deferred"]},
+    "description": {"type": "string", "minLength": 1},
+    "unit": {"type": "string"},
+    "parameters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "description"],
+        "properties": {
+          "type": {"enum": ["string", "integer"]},
+          "description": {"type": "string"},
+          "token": {"type": "string"},
+          "required": {"type": "boolean"}
+        }
+      }
+    },
+    "files": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sha256"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"},
+          "repoPath": {"type": "string", "pattern": "^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mediaType": {"type": "string"}
+        },
+        "oneOf": [{"required": ["path"]}, {"required": ["repoPath"]}]
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["evidencePolicy", "geometry", "request"],
+        "properties": {
+          "worker": {"type": "string"},
+          "population": {"type": "string"},
+          "evidencePolicy": {"type": "object"},
+          "geometry": {"type": "object"},
+          "request": {"type": "object"},
+          "repair": {"type": "object"},
+          "transport": {"type": "object"}
+        }
+      }
+    },
+    "requiredModel": {
+      "type": "object",
+      "required": ["served", "fingerprint", "onMismatch"],
+      "properties": {
+        "served": {"type": "string", "minLength": 1},
+        "fingerprint": {"enum": ["required", "record-when-offered"]},
+        "onMismatch": {"enum": ["pause", "reject"]}
+      }
+    },
+    "validator": {
+      "type": "object",
+      "required": ["id", "module"],
+      "properties": {
+        "id": {"type": "string"},
+        "module": {"type": "string", "pattern": "^ocsl_review\\.[a-z_][a-z0-9_]*$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "builder": {
+      "type": "object",
+      "required": ["module"],
+      "properties": {
+        "module": {"type": "string", "pattern": "^ocsl_review\\.[a-z_][a-z0-9_]*$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "classMap": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}},
+    "deterministicRows": {"type": "object"},
+    "sensitivities": {"type": "object"},
+    "transport": {"type": "object"},
+    "notes": {"type": "array", "items": {"type": "string"}}
+  }
+}

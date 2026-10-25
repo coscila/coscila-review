@@ -1,0 +1,31 @@
+{
+  "id": "citation-support@2",
+  "name": "citation-support",
+  "version": 2,
+  "status": "active",
+  "description": "Per-locus citation support: one claim at one citation locus against one cited work, with exact quotes from supplied evidence units and explicit escalation. Used by the claim checker and kept for a later census variant.",
+  "unit": "claim at one citation locus against one cited work",
+  "files": {
+    "systemPrompt": {"repoPath": "prompts/citation-support-v2.txt", "sha256": "cf075fee7e7aeaad9acd73c25928dcb4f8604fd4c024248983f06e62cab531d6", "mediaType": "text/plain; charset=utf-8"},
+    "outputSchema": {"repoPath": "schemas/corpus-assessment-v2.schema.json", "sha256": "8547779a0ab620cbc74cf6a25bb015be145a3aa939644524146480aa89521b59", "mediaType": "application/schema+json"}
+  },
+  "tiers": {
+    "abstract": {
+      "evidencePolicy": {"evidence": "complete abstract as evidence units", "completeness": "complete abstract required; otherwise blocked"},
+      "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "calibrationRequiredAbove": 1},
+      "request": {"api": "broker bulk", "payload": "JSON items with protocol citation-support-v2"}
+    },
+    "full-text": {
+      "evidencePolicy": {"evidence": "supplied full-text units with explicit coverage", "absence": "not-addressed only with complete full-text coverage"},
+      "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "calibrationRequiredAbove": 1},
+      "request": {"api": "broker bulk", "payload": "JSON items with protocol citation-support-v2"}
+    }
+  },
+  "requiredModel": {"served": "pinned per analysis from the worker catalog", "fingerprint": "record-when-offered", "onMismatch": "reject"},
+  "validator": {"id": "citation-support-v2", "module": "ocsl_review.corpus_assessment"},
+  "builder": {"module": "ocsl_review.corpus_assessment"},
+  "classMap": {"id": "support-verdict@2",
+               "supported": ["direct-support", "scope-caveat"], "adverse": ["contradicted", "not-addressed"],
+               "uncertain": ["partial-indirect", "abstain"]},
+  "notes": ["Registered unchanged: the prompt, output schema, batch bound and protocol name are the constants of corpus_assessment.py, so analyses pinned to them still verify."]
+}
