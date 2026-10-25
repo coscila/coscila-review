@@ -90,7 +90,7 @@ class SyntheticBroker:
                                    "inputSha256": hashlib.sha256(canonical(item["input"]).encode()).hexdigest(),
                                    "output": output, "usage": {"inputTokens": 500, "outputTokens": 60},
                                    "revision": revision})
-        job["state"] = "completed"
+        job["state"], job["items"] = "completed", []  # the stand-in keeps only what it still serves
 
 
 def generate(repo: CorpusRepository, loci: int, *, loci_per_review: int = 50, entries_per_work: int = 2) -> dict:
