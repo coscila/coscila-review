@@ -58,6 +58,15 @@ class FactsExportTests(unittest.TestCase):
         self.assertEqual(1.0, self.fact("census.j1.ft_overturn_false_share")["value"])
         self.assertIsInstance(self.fact("census.j1.year.2021.n")["value"], int)
 
+    def test_coverage_cells_are_facts(self):
+        self.assertEqual(1, self.fact("census.j1.coverage.year.2020.reviews")["value"])
+        self.assertEqual(7, self.fact("census.j1.coverage.year.2021.d2_n")["value"])
+        self.assertEqual(4, self.fact("census.j1.coverage.year.2021.d2_false")["value"])
+        self.assertEqual(0, self.fact("census.j1.coverage.year.2022.reviews_read")["value"])
+        self.assertEqual(10, self.fact("census.j1.coverage.stratum.review.d2_n")["value"])
+        self.assertEqual(1, self.fact("census.j1.coverage.provenance.unavailable.reviews")["value"])
+        self.assertEqual(1, self.fact("census.j1.coverage.year.2021.entries_invalid")["value"])
+
     def test_interval_and_derivation_facts(self):
         lo, hi = self.fact("census.j1.headline_bootstrap_lo"), self.fact("census.j1.headline_bootstrap_hi")
         self.assertLessEqual(lo["value"], 0.5)

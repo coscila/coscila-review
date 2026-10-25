@@ -102,6 +102,35 @@ def _call_facts(journal: str) -> dict[str, tuple[str, str]]:
     }
 
 
+def _coverage_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
+    """Coverage cells by first-online year and stratum as direct SQL facts."""
+    j = _quote(journal)
+    facts = {}
+    dimensions = (("year", "year"), ("stratum", "stratum"), ("route", "route"), ("provenance", "provenance_class"))
+    for name, column in dimensions:
+        values = [r[0] for r in connection.execute(
+            f"SELECT DISTINCT {column} FROM reviews WHERE journal=? AND {column} IS NOT NULL ORDER BY {column}", (journal,))]
+        for value in values:
+            literal = str(value) if isinstance(value, int) else _quote(value)
+            cell = f"{column}={literal}"
+            reviews = f"(SELECT doi FROM reviews WHERE journal={j} AND {cell})"
+            c = f"FROM citations WHERE journal={j} AND doi IN {reviews}"
+            prefix = f"coverage.{name}.{value if isinstance(value, int) else slug(str(value))}"
+            facts.update({
+                f"{prefix}.reviews": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell}", f"reviews with {cell}"),
+                f"{prefix}.reviews_read": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell} AND document_sha256 IS NOT NULL",
+                                           f"reviews with {cell} and an extracted document"),
+                f"{prefix}.entries_printed": (f"SELECT COUNT(*) {c}", f"printed entries in reviews with {cell}"),
+                f"{prefix}.entries_cited_inbody": (f"SELECT COUNT(*) {c} AND cited_inbody=1", f"in-body entries, {cell}"),
+                f"{prefix}.d2_n": (f"SELECT COUNT(*) {c} AND {D2}", f"denominator 2, {cell}"),
+                f"{prefix}.d2_false": (f"SELECT COUNT(*) {c} AND {D2} AND abs_category='false'", f"denominator 2 F, {cell}"),
+                f"{prefix}.escalated": (f"SELECT COUNT(*) {c} AND model_judged=1 AND abs_escalated=1", f"escalated entries, {cell}"),
+                f"{prefix}.ft_read": (f"SELECT COUNT(*) {c} AND ft_class IS NOT NULL", f"full-text verdicts, {cell}"),
+                f"{prefix}.entries_invalid": (f"SELECT COUNT(*) {c} AND abs_basis LIKE 'invalid%'", f"invalid outputs, {cell}"),
+            })
+    return facts
+
+
 def _store(estimates: list[tuple], key: str, value: Any, estimand: str, journal: str | None, detail: Mapping[str, Any]) -> None:
     if value is None or isinstance(value, bool) or (isinstance(value, float) and not math.isfinite(value)):
         return
@@ -171,6 +200,7 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
             raise ValidationError("unknown journals: " + ", ".join(sorted(missing)))
         estimates, report = compute_estimates(frozen, journals, b=b, seed=seed, ratio_pair=ratio_pair,
                                               trend_years=trend_years, panels=panels)
+        coverage = {journal: _coverage_facts(frozen, journal) for journal in journals}
         frozen.execute("VACUUM INTO ?", (str(database),))
     scores_sha = scores_db.file_sha256(scores_path)
     revision = code_revision or _revision()
@@ -196,7 +226,7 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     queries: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     for journal in journals:
         s = slug(journal)
-        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal)}.items():
+        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **coverage[journal]}.items():
             queries[f"census.{s}.{name}"] = (sql, method, None)
     for key, _value, estimand, journal, detail in estimates:
         queries[key] = (f"SELECT value FROM estimates WHERE key={_quote(key)}", estimand, json.loads(detail))
