@@ -3,9 +3,11 @@
 
 Two kinds of content are removed before any text reaches a judge prompt:
 
-* hidden text: characters or markup that a reader of the document never sees (zero-width and
-  bidirectional controls, Unicode tag characters, DOCX runs marked vanish/white/tiny, HTML or
-  XML elements hidden by style or attribute, HTML comments in Markdown);
+* hidden text: characters or markup that a reader of the document never sees (zero-width,
+  bidirectional and other format characters, Unicode tag characters, DOCX runs hidden, white or
+  tiny through direct formatting or inherited styles, DOCX fallback content, HTML or XML elements
+  hidden by inline style, attribute or the document's own stylesheet, HTML comments and comment
+  link definitions in Markdown);
 * prompt-injection payloads: sentences that address a model rather than a reader (instruction
   overrides, role reassignment, verdict directives, chat control tokens, smuggled verdict JSON).
 
@@ -311,16 +313,170 @@ def assert_prompt_clean(messages: list[Mapping[str, str]]) -> None:
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _DTD = re.compile(br"<!(?:DOCTYPE|ENTITY)\b", re.I)
-_HIDDEN_STYLE = re.compile(
-    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|font-size\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?\s*(?:;|$)"
-    r"|opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)|color\s*:\s*(?:#f{3}(?:f{3})?\b|white\b|rgba?\(\s*255\s*,\s*255\s*,\s*255\s*[,)])"
-    r"|(?:height|width|max-height)\s*:\s*0(?:px)?\s*;[^\"']*overflow\s*:\s*hidden|clip\s*:\s*rect\(\s*0",
-    re.I,
-)
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_LENGTH = re.compile(r"^(-?\d*\.?\d+)\s*(px|pt|em|rem|%|ex|ch|vw|vh|cm|mm|in|pc)?$")
+
+
+def _declarations(style: str) -> dict[str, str]:
+    """CSS declarations of an inline style or rule body; later declarations win, values lowercased."""
+    found: dict[str, str] = {}
+    for part in re.sub(r"/\*.*?\*/", " ", style or "", flags=re.S).split(";"):
+        name, separator, value = part.partition(":")
+        if separator and name.strip():
+            found[name.strip().lower()] = re.sub(r"\s*!important\s*$", "", value.strip().lower())
+    return found
+
+
+def _length(value: str) -> tuple[float, str] | None:
+    match = _LENGTH.match((value or "").strip())
+    return (float(match.group(1)), match.group(2) or "") if match else None
+
+
+def _whiteish(value: str) -> bool:
+    value = (value or "").strip()
+    if value in ("white", "#fff", "#ffffff"):
+        return True
+    match = re.fullmatch(r"#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})", value)
+    if match:
+        return all(int(channel, 16) >= 0xf0 for channel in match.groups())
+    match = re.fullmatch(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+%?)\s*)?\)", value)
+    return bool(match) and all(int(channel) >= 240 for channel in match.groups()[:3])
+
+
+def _transparent(value: str) -> bool:
+    value = (value or "").strip()
+    if value == "transparent":
+        return True
+    match = re.fullmatch(r"(?:rgba|hsla)\(.*,\s*([\d.]+)(%?)\s*\)", value)
+    return bool(match) and float(match.group(1)) / (100 if match.group(2) else 1) < 0.05
+
+
+def _hiding(declarations: dict[str, str]) -> str | None:
+    """Why a set of CSS declarations hides its element's text from a reader, or None."""
+    d = declarations
+    if d.get("display") == "none" or d.get("visibility") in ("hidden", "collapse"):
+        return "display"
+    opacity = _length(d.get("opacity", ""))
+    if opacity is not None and opacity[0] < 0.05:
+        return "opacity"
+    size = _length(d.get("font-size", ""))
+    if size is not None and size[0] < {"px": 2, "pt": 1.5, "em": 0.15, "rem": 0.15, "%": 15, "": 2}.get(size[1], 0.1):
+        return "font-size"
+    color = d.get("color", "")
+    background = d.get("background-color", d.get("background", ""))
+    if _transparent(color) or (_whiteish(color) and (not background or _whiteish(background) or _transparent(background))):
+        return "color"
+    if d.get("position") in ("absolute", "fixed"):
+        for side in ("left", "top", "right", "bottom"):
+            offset = _length(d.get(side, ""))
+            if offset is not None and offset[0] <= -999:
+                return "off-screen"
+    indent = _length(d.get("text-indent", ""))
+    if indent is not None and indent[0] <= -999:
+        return "off-screen"
+    clip = d.get("clip", "").replace(" ", "")
+    if clip.startswith("rect(0") or clip in ("rect(1px,1px,1px,1px)", "rect(0,0,0,0)"):
+        return "clip"
+    clip_path = d.get("clip-path", "").replace(" ", "")
+    if re.fullmatch(r"inset\((?:[5-9]\d|100)%.*\)|circle\(0.*\)", clip_path):
+        return "clip"
+    if re.search(r"\bscale[xy]?\(\s*0(?:\.0+)?\s*[,)]", d.get("transform", "")):
+        return "transform"
+    if d.get("overflow", d.get("overflow-x", d.get("overflow-y", ""))) in ("hidden", "clip"):
+        for name in ("height", "max-height", "width", "max-width"):
+            box = _length(d.get(name, ""))
+            if box is not None and box[0] <= 1 and box[1] in ("", "px"):
+                return "zero-box"
+    return None
 
 
 def _style_hidden(style: str) -> bool:
-    return bool(_HIDDEN_STYLE.search(style or ""))
+    return _hiding(_declarations(style)) is not None
+
+
+_COMPOUND = re.compile(r"(?P<tag>\*|[a-zA-Z][\w-]*)?(?P<rest>(?:[.#][\w-]+|\[[\w-]+(?:[~|^$*]?=(?:\"[^\"]*\"|'[^']*'|[^\]]*))?\])*)")
+_SIMPLE = re.compile(r"([.#])([\w-]+)|\[([\w-]+)(?:([~|^$*]?=)(?:\"([^\"]*)\"|'([^']*)'|([^\]]*)))?\]")
+
+
+def _parse_selector(selector: str) -> list[tuple[str, tuple]] | None:
+    """[(combinator, (tag, ids, classes, attributes)), ...] for descendant/child chains of simple selectors."""
+    tokens = re.split(r"\s*(>)\s*|\s+", selector.strip())
+    chain, combinator = [], " "
+    for token in tokens:
+        if token is None or token == "":
+            continue
+        if token == ">":
+            combinator = ">"
+            continue
+        match = _COMPOUND.fullmatch(token)
+        if not match:
+            return None             # pseudo-classes, siblings and other selectors are not evaluated
+        tag = (match.group("tag") or "*").lower()
+        ids, classes, attributes = [], [], []
+        for simple in _SIMPLE.finditer(match.group("rest") or ""):
+            if simple.group(1) == "#":
+                ids.append(simple.group(2))
+            elif simple.group(1) == ".":
+                classes.append(simple.group(2))
+            else:
+                value = next((v for v in simple.group(5, 6, 7) if v is not None), None)
+                attributes.append((simple.group(3).lower(), simple.group(4), value))
+        chain.append((combinator, (tag, tuple(ids), tuple(classes), tuple(attributes))))
+        combinator = " "
+    return chain or None
+
+
+def _compound_matches(compound: tuple, tag: str, attributes: dict[str, str]) -> bool:
+    name, ids, classes, required = compound
+    if name != "*" and name != tag:
+        return False
+    if any(attributes.get("id") != identifier for identifier in ids):
+        return False
+    present = set(attributes.get("class", "").split())
+    if any(item not in present for item in classes):
+        return False
+    for attribute, operator, value in required:
+        actual = attributes.get(attribute)
+        if actual is None or (operator == "=" and actual != value) or (operator == "~=" and value not in actual.split()) \
+                or (operator == "^=" and not actual.startswith(value or "")) \
+                or (operator == "$=" and not actual.endswith(value or "")) or (operator == "*=" and (value or "") not in actual):
+            return False
+    return True
+
+
+def _chain_matches(chain: list, stack: list[tuple[str, dict[str, str]]], tag: str, attributes: dict[str, str]) -> bool:
+    if not _compound_matches(chain[-1][1], tag, attributes):
+        return False
+
+    def ancestors_match(position: int, depth: int) -> bool:
+        if position < 0:
+            return True
+        combinator = chain[position + 1][0]
+        compound = chain[position][1]
+        if combinator == ">":
+            return depth >= 0 and _compound_matches(compound, *stack[depth]) and ancestors_match(position - 1, depth - 1)
+        return any(_compound_matches(compound, *stack[level]) and ancestors_match(position - 1, level - 1)
+                   for level in range(depth, -1, -1))
+    return ancestors_match(len(chain) - 2, len(stack) - 1)
+
+
+def _stylesheet(text: str) -> tuple[list[tuple[list, str]], list[str]]:
+    """Hiding rules of the document's own <style> blocks and the selectors that cannot be evaluated."""
+    rules, unevaluated = [], []
+    for block in re.findall(r"<style\b[^>]*>(.*?)</style\s*>", text, flags=re.S | re.I):
+        css = re.sub(r"/\*.*?\*/", " ", block, flags=re.S)
+        css = re.sub(r"@(?:media|supports)[^{]*\{", " ", css)          # evaluate conditional groups unconditionally
+        for selectors, body in re.findall(r"([^{}@]+)\{([^{}]*)\}", css):
+            reason = _hiding(_declarations(body))
+            if reason is None:
+                continue
+            for selector in selectors.split(","):
+                chain = _parse_selector(selector)
+                if chain is None:
+                    unevaluated.append(selector.strip()[:80])
+                else:
+                    rules.append((chain, reason))
+    return rules, unevaluated
 
 
 def _document_removal(kind: str, text: str, rule: str, position: int) -> dict[str, Any]:
@@ -328,63 +484,97 @@ def _document_removal(kind: str, text: str, rule: str, position: int) -> dict[st
             "scope": "manuscript-document"}
 
 
-def _hiding_properties(properties: ET.Element | None) -> str | None:
-    if properties is None:
-        return None
-    for tag in ("vanish", "specVanish", "webHidden"):
-        node = properties.find(f"{{{_W}}}{tag}")
-        if node is not None and node.get(f"{{{_W}}}val", "true").lower() not in {"0", "false", "off"}:
-            return tag
-    return None
+class _DocxStyles:
+    """Run properties of a WordprocessingML document with style inheritance (basedOn) and document defaults."""
 
+    PROPERTIES = ("vanish", "specVanish", "webHidden", "color", "sz", "shd", "highlight")
 
-def _docx_hidden_styles(archive: zipfile.ZipFile) -> tuple[set[str], set[str]]:
-    """Character and paragraph style ids whose run properties hide text."""
-
-    try:
-        styles = archive.read("word/styles.xml")
-    except KeyError:
-        return set(), set()
-    if _DTD.search(styles):
-        raise ValidationError("DOCX word/styles.xml declares a DTD or entities; the document is refused")
-    try:
-        root = ET.fromstring(styles)
-    except ET.ParseError:
-        return set(), set()
-    character, paragraph = set(), set()
-    for style in root.iter(f"{{{_W}}}style"):
-        if _hiding_properties(style.find(f"{{{_W}}}rPr")):
-            identifier = style.get(f"{{{_W}}}styleId", "")
-            (paragraph if style.get(f"{{{_W}}}type") == "paragraph" else character).add(identifier)
-    return character, paragraph
-
-
-def _docx_hidden_reason(run: ET.Element, hidden_styles: set[str] = frozenset()) -> str | None:
-    properties = run.find(f"{{{_W}}}rPr")
-    if properties is None:
-        return None
-    style = properties.find(f"{{{_W}}}rStyle")
-    if style is not None and style.get(f"{{{_W}}}val", "") in hidden_styles:
-        return "hidden-style"
-    for tag in ("vanish", "specVanish", "webHidden"):
-        node = properties.find(f"{{{_W}}}{tag}")
-        if node is not None and node.get(f"{{{_W}}}val", "true").lower() not in {"0", "false", "off"}:
-            return tag
-    color = properties.find(f"{{{_W}}}color")
-    shading = properties.find(f"{{{_W}}}shd")
-    highlight = properties.find(f"{{{_W}}}highlight")
-    if color is not None and color.get(f"{{{_W}}}val", "").upper() in {"FFFFFF", "FEFEFE"}:
-        fill = (shading.get(f"{{{_W}}}fill", "") if shading is not None else "").upper()
-        if highlight is None and fill in {"", "AUTO", "FFFFFF"}:
-            return "white-text"
-    size = properties.find(f"{{{_W}}}sz")
-    if size is not None:
+    def __init__(self, archive: zipfile.ZipFile):
+        self.styles: dict[str, tuple[str, str | None, ET.Element | None]] = {}
+        self.defaults: ET.Element | None = None
+        self.default_paragraph: str | None = None
         try:
-            if int(size.get(f"{{{_W}}}val", "24")) < 4:
-                return "tiny-text"
-        except ValueError:
-            pass
-    return None
+            data = archive.read("word/styles.xml")
+        except KeyError:
+            return
+        if _DTD.search(data):
+            raise ValidationError("DOCX word/styles.xml declares a DTD or entities; the document is refused")
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError as error:
+            raise ValidationError("DOCX word/styles.xml is malformed; its hidden-text rules cannot be evaluated") from error
+        self.defaults = root.find(f"{{{_W}}}docDefaults/{{{_W}}}rPrDefault/{{{_W}}}rPr")
+        for style in root.iter(f"{{{_W}}}style"):
+            identifier = style.get(f"{{{_W}}}styleId", "")
+            based = style.find(f"{{{_W}}}basedOn")
+            self.styles[identifier] = (style.get(f"{{{_W}}}type", ""), based.get(f"{{{_W}}}val") if based is not None else None,
+                                       style.find(f"{{{_W}}}rPr"))
+            if style.get(f"{{{_W}}}type") == "paragraph" and style.get(f"{{{_W}}}default") in ("1", "true", "on"):
+                self.default_paragraph = identifier
+            # Conditional table-style formatting can hide text in a way this check does not resolve.
+            for conditional in style.iter(f"{{{_W}}}tblStylePr"):
+                if conditional.find(f".//{{{_W}}}vanish") is not None:
+                    raise ValidationError("DOCX table style hides text conditionally; the hidden-text check cannot "
+                                          "evaluate it, so the document is refused")
+
+    def chain(self, identifier: str | None) -> list[ET.Element]:
+        found, seen = [], set()
+        while identifier and identifier not in seen and identifier in self.styles:
+            seen.add(identifier)
+            _, based, properties = self.styles[identifier]
+            if properties is not None:
+                found.append(properties)
+            identifier = based
+        return found
+
+    def effective(self, run: ET.Element, paragraph: ET.Element | None) -> dict[str, tuple[ET.Element, str]]:
+        """Each property's element and where it came from: direct, character style, paragraph style or defaults."""
+        direct = run.find(f"{{{_W}}}rPr")
+        character = direct.find(f"{{{_W}}}rStyle").get(f"{{{_W}}}val") if direct is not None and \
+            direct.find(f"{{{_W}}}rStyle") is not None else None
+        paragraph_style = None
+        if paragraph is not None:
+            node = paragraph.find(f"{{{_W}}}pPr/{{{_W}}}pStyle")
+            paragraph_style = node.get(f"{{{_W}}}val") if node is not None else self.default_paragraph
+        layers = ([(direct, "direct")] if direct is not None else []) \
+            + [(properties, "style") for properties in self.chain(character)] \
+            + [(properties, "paragraph-style") for properties in self.chain(paragraph_style)] \
+            + ([(self.defaults, "default-style")] if self.defaults is not None else [])
+        found: dict[str, tuple[ET.Element, str]] = {}
+        for properties, origin in layers:
+            for name in self.PROPERTIES:
+                if name not in found:
+                    node = properties.find(f"{{{_W}}}{name}")
+                    if node is not None:
+                        found[name] = (node, origin)
+        return found
+
+    def hidden_reason(self, run: ET.Element, paragraph: ET.Element | None) -> str | None:
+        found = self.effective(run, paragraph)
+        suffix = {"direct": "", "style": "hidden-style", "paragraph-style": "hidden-paragraph-style",
+                  "default-style": "hidden-default-style"}
+        for name in ("vanish", "specVanish", "webHidden"):
+            if name in found and found[name][0].get(f"{{{_W}}}val", "true").lower() not in {"0", "false", "off"}:
+                return name if found[name][1] == "direct" else suffix[found[name][1]]
+        if "color" in found:
+            node = found["color"][0]
+            value = node.get(f"{{{_W}}}val", "").upper()
+            theme = node.get(f"{{{_W}}}themeColor", "").lower()
+            white = theme in ("background1", "bg1", "light1") or (
+                re.fullmatch(r"[0-9A-F]{6}", value) is not None and all(int(value[i:i + 2], 16) >= 0xf0 for i in (0, 2, 4)))
+            highlight = found.get("highlight", (None, ""))[0]
+            shading = found.get("shd", (None, ""))[0]
+            fill = (shading.get(f"{{{_W}}}fill", "") if shading is not None else "").upper()
+            if white and (highlight is None or highlight.get(f"{{{_W}}}val", "none") == "none") \
+                    and fill in {"", "AUTO", "FFFFFF"}:
+                return "white-text"
+        if "sz" in found:
+            try:
+                if int(found["sz"][0].get(f"{{{_W}}}val", "24")) <= 4:
+                    return "tiny-text"
+            except ValueError:
+                pass
+        return None
 
 
 def _sanitize_docx(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
@@ -401,16 +591,23 @@ def _sanitize_docx(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
         root = ET.fromstring(document)
     except ET.ParseError:
         return data, removals
+    styles = _DocxStyles(archive)
     parents = {child: parent for parent in root.iter() for child in parent}
-    character_styles, paragraph_styles = _docx_hidden_styles(archive)
-    hidden_paragraphs = set()
-    for paragraph in root.iter(f"{{{_W}}}p"):
-        style = paragraph.find(f"{{{_W}}}pPr/{{{_W}}}pStyle")
-        if style is not None and style.get(f"{{{_W}}}val", "") in paragraph_styles:
-            hidden_paragraphs.update(paragraph.iter(f"{{{_W}}}r"))
     position = 0
+    # Word renders the mc:Choice branch of alternate content; the fallback is never shown to a reader.
+    for alternate in list(root.iter(f"{{{_MC}}}AlternateContent")):
+        for fallback in list(alternate.findall(f"{{{_MC}}}Fallback")):
+            text = "".join(node.text or "" for node in fallback.iter(f"{{{_W}}}t"))
+            if text.strip():
+                removals.append(_document_removal("hidden-markup", text, "docx-mc-fallback", position))
+            alternate.remove(fallback)
+            position += 1
+    parents = {child: parent for parent in root.iter() for child in parent}
     for run in list(root.iter(f"{{{_W}}}r")):
-        reason = "hidden-paragraph-style" if run in hidden_paragraphs else _docx_hidden_reason(run, character_styles)
+        paragraph = parents.get(run)
+        while paragraph is not None and paragraph.tag != f"{{{_W}}}p":
+            paragraph = parents.get(paragraph)
+        reason = styles.hidden_reason(run, paragraph)
         text = "".join(node.text or "" for node in run.iter(f"{{{_W}}}t"))
         if reason and text:
             removals.append(_document_removal("hidden-markup", text, f"docx-{reason}", position))
@@ -436,9 +633,13 @@ _SKIPPED_BY_READERS = {"script", "style", "noscript"}
 
 
 class _HiddenFilter(HTMLParser):
-    """Re-emit HTML without hidden subtrees and comments; record what was dropped."""
+    """Re-emit HTML without hidden subtrees and comments; record what was dropped.
 
-    def __init__(self) -> None:
+    Hiding is read from inline styles, the hidden and aria-hidden attributes, templates and the document's
+    own stylesheet rules (descendant and child chains of tag, class, id and attribute selectors).
+    """
+
+    def __init__(self, rules: list[tuple[list, str]] = ()) -> None:
         super().__init__(convert_charrefs=False)
         self.output: list[str] = []
         self.removals: list[dict[str, Any]] = []
@@ -447,6 +648,8 @@ class _HiddenFilter(HTMLParser):
         self.hidden_text: list[str] = []
         self.hidden_rule = ""
         self.position = 0
+        self.rules = list(rules)
+        self.stack: list[tuple[str, dict[str, str]]] = []
 
     def _hidden(self, tag: str, attributes: list[tuple[str, str | None]]) -> str | None:
         values = {key.lower(): (value or "") for key, value in attributes}
@@ -460,6 +663,8 @@ class _HiddenFilter(HTMLParser):
             return "html-aria-hidden"
         if _style_hidden(values.get("style", "")):
             return "html-hidden-style"
+        if any(_chain_matches(chain, self.stack, tag, values) for chain, _ in self.rules):
+            return "html-hidden-stylesheet"
         return None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -471,6 +676,8 @@ class _HiddenFilter(HTMLParser):
         if rule and tag not in _VOID:
             self.hidden_depth, self.hidden_rule, self.hidden_text = 1, rule, []
             return
+        if tag not in _VOID:
+            self.stack.append((tag, {key.lower(): (value or "") for key, value in attrs}))
         self.output.append(self.get_starttag_text() or "")
 
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -486,6 +693,10 @@ class _HiddenFilter(HTMLParser):
                     self.removals.append(_document_removal("hidden-markup", text, self.hidden_rule, self.position))
                 self.position += 1
             return
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == tag:
+                del self.stack[index:]
+                break
         self.output.append(f"</{tag}>")
 
     def handle_data(self, data: str) -> None:
@@ -513,17 +724,25 @@ class _HiddenFilter(HTMLParser):
         return
 
 
-def _sanitize_html(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
+def _sanitize_html(data: bytes) -> tuple[bytes, list[dict[str, Any]], list[str]]:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        return data, []
-    parser = _HiddenFilter()
+        return data, [], []
+    rules, unevaluated = _stylesheet(text)
+    if unevaluated:
+        raise ValidationError("the document's stylesheet hides content with selectors the hidden-text check cannot "
+                              "evaluate (" + "; ".join(sorted(set(unevaluated))[:5]) + "); the document is refused")
+    limitations = []
+    if re.search(r"<link\b[^>]*\brel\s*=\s*[\"']?stylesheet", text, re.I):
+        limitations.append("html-external-stylesheet: stylesheets outside the document are not read, so text they "
+                           "hide is not detected; inline styles and the document's own <style> rules are checked")
+    parser = _HiddenFilter(rules)
     parser.feed(text)
     parser.close()
     if not parser.removals:
-        return data, []
-    return "".join(parser.output).encode("utf-8"), parser.removals
+        return data, [], limitations
+    return "".join(parser.output).encode("utf-8"), parser.removals, limitations
 
 
 def _sanitize_xml(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
@@ -566,7 +785,10 @@ def _sanitize_xml(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
 
 _MARKDOWN_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _MARKDOWN_HIDDEN_SPAN = re.compile(
-    r"<(?P<tag>span|div|p|font|small)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>", re.S | re.I)
+    r"<(?P<tag>[a-zA-Z][a-zA-Z0-9-]*)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)\s*>", re.S | re.I)
+# A link reference definition is never rendered; "[//]: # (text)" and "[comment]: <> (text)" are comment idioms.
+_MARKDOWN_REFERENCE_COMMENT = re.compile(
+    r"(?m)^ {0,3}\[[^\]\n]+\]:[ \t]*(?:#|<>|<#>)[ \t]*(?:\([^\n]*\)|\"[^\n]*\"|'[^\n]*')[ \t]*$")
 
 
 def _sanitize_markdown(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
@@ -583,13 +805,19 @@ def _sanitize_markdown(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
     def drop_hidden(match: re.Match[str]) -> str:
         attributes = match.group("attrs")
         style = re.search(r"style\s*=\s*[\"']([^\"']*)[\"']", attributes, re.I)
-        if (style and _style_hidden(style.group(1))) or re.search(r"\bhidden\b", attributes, re.I):
+        if (style and _style_hidden(style.group(1))) or re.search(r"(?:^|\s)hidden(?:\s|=|$)", attributes, re.I) \
+                or re.search(r"aria-hidden\s*=\s*[\"']?true", attributes, re.I) or match.group("tag").lower() == "template":
             removals.append(_document_removal("hidden-markup", match.group("body"), "markdown-hidden-html", match.start()))
             return ""
         return match.group()
 
+    def drop_reference(match: re.Match[str]) -> str:
+        removals.append(_document_removal("hidden-markup", match.group(), "markdown-reference-comment", match.start()))
+        return ""
+
     cleaned = _MARKDOWN_COMMENT.sub(drop_comment, text)
     cleaned = _MARKDOWN_HIDDEN_SPAN.sub(drop_hidden, cleaned)
+    cleaned = _MARKDOWN_REFERENCE_COMMENT.sub(drop_reference, cleaned)
     characters = sanitize_text(cleaned, mode="detect")
     invisible = [removal for removal in characters.removals if removal.kind != "prompt-injection"]
     if invisible:
@@ -618,7 +846,7 @@ def sanitize_document(data: bytes, suffix: str) -> tuple[bytes, list[dict[str, A
     if suffix == ".docx":
         cleaned, removals = _sanitize_docx(data)
     elif suffix in {".html", ".htm"}:
-        cleaned, removals = _sanitize_html(data)
+        cleaned, removals, limitations = _sanitize_html(data)
     elif suffix in {".xml", ".jats"}:
         cleaned, removals = _sanitize_xml(data)
     elif suffix in {".md", ".markdown", ".txt"}:

@@ -346,6 +346,17 @@ def _docx_blocks(
     body = root.find(f".//{{{_W}}}body")
     if body is None:
         raise IngestionError("DOCX document has no body")
+    # Word renders the mc:Choice branch of alternate content; mc:Fallback text is never shown to a reader.
+    compatibility = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    dropped = 0
+    for alternate in list(root.iter(f"{{{compatibility}}}AlternateContent")):
+        for fallback in list(alternate.findall(f"{{{compatibility}}}Fallback")):
+            dropped += bool("".join(node.text or "" for node in fallback.iter(f"{{{_W}}}t")).strip())
+            alternate.remove(fallback)
+    if dropped:
+        warnings.append({"code": "docx-fallback-content-ignored",
+                         "message": f"{dropped} alternate-content fallback blocks with text were not ingested",
+                         "affectsCompleteness": False})
     blocks: list[dict[str, Any]] = []
     if root.findall(".//{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath"):
         warnings.append(
