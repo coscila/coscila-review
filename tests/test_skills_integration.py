@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from ocsl_review import config as review_config
 from ocsl_review import integration, lifecycle, skills
 from ocsl_review.config import Paths
 from ocsl_review.errors import ReviewError, ValidationError
@@ -40,6 +41,19 @@ class ReviewPathsTestCase(unittest.TestCase):
         base = Path(self.temporary.name)
         self.state = base / "state"
         self.state.mkdir()
+        # Sibling checkouts come from this temporary tree, never from the directories next to this repository, so a test
+        # can neither write into nor depend on a real lab or bio checkout.
+        self.siblings = base / "siblings"
+        self.siblings.mkdir()
+        patcher = patch.object(
+            review_config,
+            "sibling_checkouts",
+            lambda home, names: tuple(
+                self.siblings / name for name in names if (self.siblings / name).is_dir()
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.paths = Paths(home=ROOT, state=self.state, lab_repo=None)
         self.native = base / "native-skills"
         self.codex = base / "codex-skills"
@@ -115,17 +129,17 @@ class SkillCatalogTests(ReviewPathsTestCase):
         self.assertTrue(skills.manifest_path(self.paths).is_file())
 
     def test_skill_roots_cannot_overlap_protected_source_or_state(self) -> None:
-        # The sibling bio checkout is named oc-science-lab-bio on the lab host and coscila-bio in development clones; CI
-        # checks out this repository alone.
-        bio = next(
-            (ROOT.parent / name for name in ("oc-science-lab-bio", "coscila-bio") if (ROOT.parent / name).is_dir()),
-            None,
-        )
-        if bio is None:
-            self.skipTest("sibling bio checkout not present")
+        # Bio and lab siblings keep their old names on the lab host and use the coscila-* names in development clones;
+        # both may exist at once and every one is protected.
+        siblings = [self.siblings / name for name in ("oc-science-lab-bio", "coscila-bio", "coscila")]
+        for sibling in siblings:
+            sibling.mkdir()
+        companion_root = ROOT / "untracked-skill-root"
+        self.assertFalse(companion_root.exists())
+        self.addCleanup(shutil.rmtree, companion_root, True)  # never leave anything behind, even on a regression
         unsafe_roots = (
-            ROOT / "untracked-skill-root",
-            bio / "untracked-skill-root",
+            companion_root,
+            *(sibling / "untracked-skill-root" for sibling in siblings),
             self.state / "skills",
             self.state.parent,
         )
