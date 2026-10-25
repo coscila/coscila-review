@@ -394,6 +394,8 @@ class CorpusExecutor:
                 raise ValidationError("worker result escaped its pinned batch")
             if record.get("state") in TERMINAL_RECORD_STATES:
                 terminal.append(record)
+        if not terminal and cursor is None:
+            return
         loaded = {task["task_id"]: task for task in self._tasks(
             list(dict.fromkeys(t for r in terminal for t in context["groups"][r["id"]]["taskIds"])))}
         receipts = self.repo.stage_artifacts((canonical(json_safe(record)).encode(), "worker-response", "application/json")
