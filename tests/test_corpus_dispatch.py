@@ -602,6 +602,36 @@ class CorpusDispatchTests(unittest.TestCase):
             authorize(self.repo, None, self.broker.catalog(), on_prem, tasks, inputs)
             self.assertEqual(audit.call_args.args[1]["provenanceClasses"], ["entitled"])
 
+    def test_execute_reports_tasks_held_for_an_on_prem_judge_instead_of_polling_forever(self):
+        from types import SimpleNamespace
+        from ocsl_review import corpus_cli
+
+        class CompletingBroker(FakeBroker):
+            def request(self, method, route, payload=None):
+                response = super().request(method, route, payload)
+                if method == "POST":
+                    self.complete(response["jobId"])
+                return response
+
+        broker = CompletingBroker(self.root)
+        public = self.add_tasks(2)
+        entitled = self.add_tasks(1, proof_provider="retained-structured-source")
+        args = SimpleNamespace(poll_seconds=0.1, skip_acquisition=True, acquisition_workers=2, retry_acquisition=False,
+                               worker_config="w1", low_worker_config="w1", batch_size=1, concurrency=60, max_jobs=3,
+                               paths=None)
+        executor = lambda repo, paths: CorpusExecutor(repo, paths, broker=broker, authorization=lambda *a: None)
+        with patch.object(corpus_cli, "acquirer", return_value=object()), \
+                patch("ocsl_review.corpus_dispatch.CorpusExecutor", executor), \
+                patch("ocsl_review.corpus_pipeline.prepare_tasks", return_value={}), \
+                patch("ocsl_review.corpus_export.export_corpus", side_effect=AssertionError("must not export")):
+            result = corpus_cli.execute(args, self.repo)
+        self.assertEqual((result["state"], result["tier"], result["heldForRouting"]), ("waiting_input", "abstract", 1))
+        self.assertEqual({self.states()[t] for t in public}, {("completed", 1)})
+        self.assertEqual(self.states()[entitled[0]], ("pending", 0))
+        progress = json.loads((self.root / "results/.ocsl/progress.json").read_text())
+        self.assertEqual(progress["state"], "waiting_input")
+        self.assertIn("on-prem judge", progress["summary"])
+
     def test_public_tasks_record_their_class_for_either_policy(self):
         tasks, inputs = self.authorization_inputs()
         for worker in (self.broker.settings["workers"][0], self.on_prem_worker()):
