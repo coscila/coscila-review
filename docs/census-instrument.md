@@ -94,7 +94,10 @@ the server fingerprint when the server offers one.
 at least one cut abstract are drawn with the protocol seed until the sample
 covers the declared number of entries (`sampleEntries`), then re-run unchanged
 except that abstracts are not cut. Verdicts go to the history as variant
-`no-truncation`; uncut entries in the same batches measure replay agreement.
+`no-truncation`. The sample is enriched for cut abstracts, so its share is
+compared only with the primary verdicts on the same entries (paired, for all,
+cut and uncut entries); uncut entries are no replay either, because the
+neighbouring abstracts in their call are no longer cut.
 
 ## Inputs and extraction
 

@@ -47,6 +47,32 @@ class FactsExportTests(unittest.TestCase):
     def fact(self, key):
         return self.bundle["facts"][key]
 
+    def test_paired_no_truncation_and_composite_classes(self):
+        from ocsl_review import estimands
+        with closing(scores_db.open_frozen(self.frozen)) as c:
+            comparison = estimands.no_truncation_comparison(c, "J1")
+            classes = estimands.three_classes(c, "J1")
+        for subset in ("all", "cut", "uncut"):
+            prefix = f"census.j1.sensitivity.no-truncation.{subset}"
+            self.assertEqual(comparison[subset]["n"], self.fact(prefix + ".n")["value"])
+            for name, key in (("primary_share", "primaryShare"), ("variant_share", "variantShare"),
+                              ("agreement", "agreement")):
+                if comparison[subset][key] is None:
+                    self.assertNotIn(f"{prefix}.{name}", self.bundle["facts"])
+                else:
+                    self.assertAlmostEqual(comparison[subset][key], self.fact(f"{prefix}.{name}")["value"])
+        # The enriched sample's share and the primary share on the same entries are both available.
+        self.assertEqual((0.5, 1.0), (self.fact("census.j1.sensitivity.no-truncation.all.primary_share")["value"],
+                                      self.fact("census.j1.sensitivity.no-truncation.all.variant_share")["value"]))
+        names = {"full text read": "full-text-read", "escalated, full text unavailable": "escalated-full-text-unavailable",
+                 "not escalated": "not-escalated"}
+        for stratum, counts in classes["composite"].items():
+            key = names[stratum]
+            self.assertEqual(sum(counts.values()), self.fact(f"census.j1.composite.{key}.n")["value"])
+            for klass, value in counts.items():
+                self.assertEqual(value, self.fact(f"census.j1.composite.{key}.{klass}")["value"])
+        self.assertIn("census.j1.composite.share_of_sure", self.bundle["facts"])
+
     def test_counts_and_headline(self):
         self.assertEqual(12, self.fact("census.j1.d2_n")["value"])
         self.assertEqual(6, self.fact("census.j1.d2_false")["value"])
