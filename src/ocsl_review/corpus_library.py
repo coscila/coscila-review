@@ -708,7 +708,7 @@ class Library:
                 missing = [(digest, size) for digest, size, packed in found if packed is None]
                 if missing:
                     # Loose artifacts (older libraries, legacy archives) are packed into the snapshot itself.
-                    staging = PackStore.create(root / ".packing", target_bytes=1 << 62)
+                    staging = PackStore.create(root / ".packing")
                     with staging.batch():
                         for digest, byte_count in missing:
                             staging.put(self.read_blob(digest, byte_count), digest)
