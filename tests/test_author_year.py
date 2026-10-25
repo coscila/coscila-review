@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -238,6 +239,26 @@ The World Health Organization (2019) recommends Z (WHO, 2019). A missing one (Do
                                                "1. Nolan A. A bounded association study. Journal of Example Methods. 2022.\n")
         self.assertEqual([["ref-00001"], ["ref-00001"]], [c["referenceIds"] for c in manuscript["citationClusters"]])
         self.assertEqual(["numeric", "author-year"], [c["style"] for c in manuscript["citationClusters"]])
+
+
+class ScaleTests(unittest.TestCase):
+    def test_large_reference_lists_ingest_without_quadratic_scans(self):
+        bodies, references = [], []
+        for seed in range(1, 31):
+            markdown, _, _ = F.jats_to_markdown(F.to_jats(F.build_article(seed)))
+            head, tail = markdown.split("## References", 1)
+            bodies.append(head.replace("# Introduction", "").strip())
+            references.append(tail.strip())
+        document = "# Introduction\n\n" + "\n\n".join(bodies) + "\n\n## References\n\n" + "\n\n".join(references) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.md"
+            path.write_text(document, encoding="utf-8")
+            started = time.perf_counter()
+            manuscript = ingest_manuscript(path)
+            elapsed = time.perf_counter() - started
+        self.assertGreater(len(manuscript["bibliographyEntries"]), 900)
+        self.assertGreater(len(manuscript["citationClusters"]), 1500)
+        self.assertLess(elapsed, 30.0)
 
 
 class LabelledCorpusAcceptanceTests(unittest.TestCase):

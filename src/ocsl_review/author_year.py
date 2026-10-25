@@ -17,6 +17,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Iterable, Mapping, Sequence
 
 RESOLVER_VERSION = "author-year-1"
@@ -95,6 +96,7 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+@lru_cache(maxsize=65536)
 def name_key(value: str) -> str:
     """Comparable surname key: diacritics, case, spacing and punctuation removed."""
 
@@ -103,6 +105,7 @@ def name_key(value: str) -> str:
     return "".join(ch for ch in text if ch.isalpha())
 
 
+@lru_cache(maxsize=65536)
 def core_key(value: str) -> str:
     """The surname key without leading particles ("van der Berg" -> "berg")."""
 
@@ -112,6 +115,7 @@ def core_key(value: str) -> str:
     return name_key(" ".join(tokens))
 
 
+@lru_cache(maxsize=16384)
 def corporate_key(value: str) -> str:
     return name_key(re.sub(r"^\s*the\s+", "", str(value or ""), flags=re.IGNORECASE))
 
@@ -351,10 +355,19 @@ def _segment_items(segment: str, offset: int, narrative: tuple[AuthorParse, ...]
     return items
 
 
+_WINDOW = 320
+_TOKEN = re.compile(rf"(?:[dDlL]['’])?{_LETTER}+(?:['’\-]{_LETTER}+)*\.?|&|\S")
+_NARRATIVE_ET_AL = re.compile(r"(?:,\s*)?\bet\s*al\.?$", re.IGNORECASE)
+_NARRATIVE_COLLEAGUES = re.compile(r"\s+and\s+(?:colleagues|co-?workers|collaborators|associates)$", re.IGNORECASE)
+_NARRATIVE_AND = re.compile(r"(?:\s+(?:and|&)\s+|\s*&\s*)$")
+_NARRATIVE_COMMA = re.compile(r",\s*$")
+
+
 def _unit_before(text: str, end: int, *, connectors: bool = False) -> tuple[int, str] | None:
     """The maximal capitalised name unit that ends at end (trailing spaces allowed)."""
 
-    tokens = list(re.finditer(rf"(?:[dDlL]['’])?{_LETTER}+(?:['’\-]{_LETTER}+)*\.?|&|\S", text[:end]))
+    window = max(0, end - _WINDOW)
+    tokens = list(_TOKEN.finditer(text, window, end))
     if not tokens or text[tokens[-1].end():end].strip():
         return None
     collected: list[re.Match[str]] = []
@@ -394,15 +407,15 @@ def _narrative_author(text: str, paren_start: int) -> tuple[int, int, list[Autho
         end -= 1
     phrase_end = end
     possessive = False
-    if re.search(r"['’]s$", text[:end]):
+    if text[max(0, end - 2):end] in ("'s", "’s"):
         end -= 2
         possessive = True
-    elif re.search(r"s['’]$", text[:end]):
+    elif text[max(0, end - 2):end] in ("s'", "s’"):
         end -= 1
         possessive = True
     et_al = False
-    match = re.search(r"(?:,\s*)?\bet\s*al\.?$", text[:end], re.IGNORECASE) or re.search(
-        r"\s+and\s+(?:colleagues|co-?workers|collaborators|associates)$", text[:end], re.IGNORECASE)
+    window = max(0, end - _WINDOW)
+    match = _NARRATIVE_ET_AL.search(text, window, end) or _NARRATIVE_COLLEAGUES.search(text, window, end)
     if match:
         et_al = True
         end = match.start()
@@ -413,14 +426,14 @@ def _narrative_author(text: str, paren_start: int) -> tuple[int, int, list[Autho
         return None
     units = [last]
     cursor = last[0]
-    connector = re.search(r"(?:\s+(?:and|&)\s+|\s*&\s*)$", text[:cursor])
+    connector = _NARRATIVE_AND.search(text, max(0, cursor - 16), cursor)
     if connector and not et_al:
         previous = _unit_before(text, connector.start())
         if previous is not None:
             units.append(previous)
             cursor = previous[0]
             while True:
-                comma = re.search(r",\s*$", text[:cursor])
+                comma = _NARRATIVE_COMMA.search(text, max(0, cursor - 8), cursor)
                 previous = _unit_before(text, comma.start()) if comma else None
                 if previous is None:
                     break
@@ -668,6 +681,24 @@ class ReferenceIndex:
             if 1 < len(members) <= 26 and not any(member.suffix for member in members):
                 for index, member in enumerate(members):
                     self._inferred[member.entry_id] = "abcdefghijklmnopqrstuvwxyz"[index]
+        # First-author keys narrow each lookup to the entries that can match at all.
+        self._by_key: dict[str, list[ParsedReference]] = {}
+        for reference in self.references:
+            if not reference.names:
+                continue
+            first = reference.names[0]
+            keys = {name_key(first), core_key(first)}
+            if reference.corporate:
+                keys |= {corporate_key(first)} | {name_key(alias) for alias in reference.aliases}
+            for key in keys - {""}:
+                self._by_key.setdefault(key, []).append(reference)
+
+    def _possible(self, cited: str) -> list[ParsedReference]:
+        found: dict[int, ParsedReference] = {}
+        for key in {name_key(cited), core_key(cited), corporate_key(cited)} - {""}:
+            for reference in self._by_key.get(key, []):
+                found[reference.ordinal] = reference
+        return [found[ordinal] for ordinal in sorted(found)]
 
     @staticmethod
     def _first_author(parse: AuthorParse, reference: ParsedReference) -> str | None:
@@ -686,7 +717,7 @@ class ReferenceIndex:
 
     def _candidates(self, parse: AuthorParse, item: CitedItem) -> tuple[list[ParsedReference], str]:
         matched: list[tuple[ParsedReference, str]] = []
-        for reference in self.references:
+        for reference in self._possible(parse.names[0]) if parse.names else []:
             how = self._first_author(parse, reference)
             if not how:
                 continue
