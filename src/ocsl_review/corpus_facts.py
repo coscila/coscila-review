@@ -108,6 +108,53 @@ def _call_facts(journal: str) -> dict[str, tuple[str, str]]:
     }
 
 
+def _sensitivity_facts(journal: str) -> dict[str, tuple[str, str]]:
+    """Paired no-truncation comparison and the secondary composite classes as direct SQL facts.
+
+    The no-truncation sample is enriched for cut abstracts, so its share is only comparable with the
+    primary verdicts on the same entries: both are exported, for all, cut and uncut entries. Uncut
+    entries are no replay either, since neighbouring abstracts in their call are no longer cut.
+    """
+    j = _quote(journal)
+    pairs = ("FROM history h JOIN citations c ON c.journal=h.journal AND c.doi=h.doi AND c.label=h.label "
+             f"WHERE h.journal={j} AND h.variant='no-truncation' AND h.outcome='accepted' AND c.model_judged=1 "
+             "AND c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') "
+             "AND c.abs_category IN ('true','false') AND h.category IN ('true','false')")
+    facts = {}
+    for subset, extra in (("all", ""), ("cut", " AND c.abs_cut=1"), ("uncut", " AND c.abs_cut=0")):
+        base = pairs + extra
+        prefix = f"sensitivity.no-truncation.{subset}"
+        facts.update({
+            f"{prefix}.n": (f"SELECT COUNT(*) {base}", f"no-truncation sample, {subset} entries with T/F in both runs"),
+            f"{prefix}.primary_false": (f"SELECT COUNT(*) {base} AND c.abs_category='false'",
+                                        f"primary F on the same {subset} entries"),
+            f"{prefix}.variant_false": (f"SELECT COUNT(*) {base} AND h.category='false'",
+                                        f"no-truncation F on the same {subset} entries"),
+            f"{prefix}.primary_share": (f"SELECT 1.0*SUM(c.abs_category='false')/NULLIF(COUNT(*),0) {base}",
+                                        f"primary F/(T+F) on the {subset} sampled entries (paired comparator)"),
+            f"{prefix}.variant_share": (f"SELECT 1.0*SUM(h.category='false')/NULLIF(COUNT(*),0) {base}",
+                                        f"no-truncation F/(T+F) on the same {subset} entries"),
+            f"{prefix}.agreement": (f"SELECT 1.0*SUM(c.abs_category=h.category)/NULLIF(COUNT(*),0) {base}",
+                                    f"share of {subset} entries with the same T/F in both runs"),
+        })
+    c = f"FROM citations WHERE journal={j} AND abs_class!='not_cited'"
+    strata = (("full-text-read", "ft_class IS NOT NULL", "ft_class"),
+              ("escalated-full-text-unavailable", "ft_class IS NULL AND abs_escalated=1", "'unsure'"),
+              ("not-escalated", "ft_class IS NULL AND COALESCE(abs_escalated,0)=0", "abs_class"))
+    for name, condition, value in strata:
+        facts[f"composite.{name}.n"] = (f"SELECT COUNT(*) {c} AND {condition}", f"composite availability stratum {name}")
+        for klass in ("sure_supported", "unsure", "sure_not_supported"):
+            facts[f"composite.{name}.{klass}"] = (f"SELECT COUNT(*) {c} AND {condition} AND {value}='{klass}'",
+                                                  f"composite class {klass} in stratum {name}")
+    composite = ("CASE WHEN ft_class IS NOT NULL THEN ft_class WHEN COALESCE(abs_escalated,0)=1 THEN 'unsure' "
+                 "ELSE abs_class END")
+    facts["composite.share_of_sure"] = (
+        f"SELECT 1.0*SUM({composite}='sure_not_supported')/NULLIF(SUM({composite} IN "
+        f"('sure_supported','sure_not_supported')),0) {c}",
+        "composite sure not supported among sure classes (full-text class, else non-escalated abstract class)")
+    return facts
+
+
 def _coverage_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
     """Coverage cells by first-online year and stratum as direct SQL facts."""
     j = _quote(journal)
@@ -178,7 +225,8 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
         replicate = result["replicate"]
         if replicate["entries"]:
             detail_r = {"estimand": "agreement of a stratified unchanged re-run with the primary verdicts"}
-            for name in ("entries", "categoryAgreement", "classAgreement", "trueFalsePairs", "trueFalseKappa"):
+            for name in ("entries", "categoryAgreement", "classAgreement", "trueFalsePairs", "trueFalseKappa",
+                         "primaryShare", "variantShare"):
                 _store(estimates, f"census.{s}.replicate.{slug(name)}", replicate[name], "replicate agreement", journal, detail_r)
         for step in result["ladder"]["steps"]:
             key = f"census.{s}.ladder.{slug(step['step'])}"
@@ -243,7 +291,8 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     queries: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     for journal in journals:
         s = slug(journal)
-        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **coverage[journal]}.items():
+        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **_sensitivity_facts(journal),
+                                    **coverage[journal]}.items():
             queries[f"census.{s}.{name}"] = (sql, method, None)
     for key, _value, estimand, journal, detail in estimates:
         queries[key] = (f"SELECT value FROM estimates WHERE key={_quote(key)}", estimand, json.loads(detail))
