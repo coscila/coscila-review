@@ -225,6 +225,25 @@ class PreparationTests(RunnerTestCase):
             "SELECT column_name FROM data_dictionary WHERE table_name='sanitizer_findings'")},
             {r["name"] for r in self.rows("SELECT name FROM pragma_table_info('sanitizer_findings')")})
 
+    def test_table_pages_of_an_html_review_are_prepared_as_table_loci(self):
+        from ocsl_review.census_runner import read_table_pages
+        folder = self.root / "input"
+        folder.mkdir()
+        (folder / "article.html").write_bytes((FIXTURES / "review_table_caption.html").read_bytes())
+        (folder / "table-1.html").write_bytes((FIXTURES / "review_table_1.html").read_bytes())
+        data = {**record(), "route": "html", "document": {"path": "article.html", "kind": "html",
+                                                          "tables": [{"number": 1, "path": "table-1.html"}]}}
+        pages = read_table_pages(folder, data)
+        run = self.run_census()
+        result = run.prepare_review(data, (folder / "article.html").read_bytes(), pages)
+        self.assertEqual(("prepared", 0), (result["state"], result["uncovered"]))
+        locus = self.rows("SELECT section, in_table, sent FROM loci WHERE label='14'")
+        self.assertEqual([("Table 1", 1, 1)], [(r["section"], r["in_table"], r["sent"]) for r in locus])
+        diagnostics = json.loads(self.rows("SELECT extraction_json FROM reviews")[0]["extraction_json"])
+        self.assertEqual(([], 1), (diagnostics["tablePagesMissing"], diagnostics["tablePages"][0]["number"]))
+        with self.assertRaises(ValidationError):
+            read_table_pages(folder, {"document": {"tables": [{"number": 0, "path": "table-1.html"}]}})
+
     def test_run_metadata_is_pinned(self):
         run = self.run_census()
         run.close()

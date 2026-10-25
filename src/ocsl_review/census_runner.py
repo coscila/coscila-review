@@ -272,8 +272,12 @@ class CensusRun:
         self._release()
 
     # ------------------------------------------------------------------ preparation
-    def prepare_review(self, record: Mapping[str, Any], document: bytes | None) -> dict[str, Any]:
-        """Extract one review, resolve identities, record loci, works, abstracts and deterministic rows."""
+    def prepare_review(self, record: Mapping[str, Any], document: bytes | None,
+                       table_pages: Sequence[tuple[int, bytes]] = ()) -> dict[str, Any]:
+        """Extract one review, resolve identities, record loci, works, abstracts and deterministic rows.
+
+        ``table_pages`` are the separately rendered table pages of a publisher HTML review (``document.tables``).
+        """
         journal, doi = record.get("journal"), (record.get("doi") or "").lower()
         if not journal or not doi:
             raise ValidationError("a review record needs journal and doi")
@@ -300,7 +304,7 @@ class CensusRun:
         if kind not in ("jats", "html"):
             raise ValidationError(f"{doi}: document kind must be jats or html")
         try:
-            review = extract_review(document, html=kind == "html")
+            review = extract_review(document, html=kind == "html", table_pages=table_pages)
         except (ValidationError, ET.ParseError, UnicodeError) as error:
             return self._record_unreadable(record, base, order, document_sha, kind, f"{type(error).__name__}: {error}")
         works = {key: dict(value) for key, value in (record.get("works") or {}).items()}
@@ -1189,17 +1193,34 @@ def abstract_lookup_failed(record: Mapping[str, Any]) -> list[str]:
                   if "europe-pmc-failed" in (work.get("europePmcOutcome"), work.get("abstractSource")))
 
 
-def read_document(base: Path, record: Mapping[str, Any]) -> bytes | None:
-    document = record.get("document")
-    if not document:
-        return None
-    relative = Path(document["path"])
+def _read_input(base: Path, entry: Mapping[str, Any]) -> bytes:
+    relative = Path(entry["path"])
     if relative.is_absolute() or ".." in relative.parts:
         raise ValidationError("census document paths must stay inside the input directory")
     path = (base / relative).resolve()
     if not path.is_relative_to(base.resolve()):
         raise ValidationError("census document path escapes the input directory")
     data = path.read_bytes()
-    if document.get("sha256") and hashlib.sha256(data).hexdigest() != document["sha256"]:
+    if entry.get("sha256") and hashlib.sha256(data).hexdigest() != entry["sha256"]:
         raise ValidationError(f"{relative}: document digest differs from the manifest")
     return data
+
+
+def read_document(base: Path, record: Mapping[str, Any]) -> bytes | None:
+    document = record.get("document")
+    if not document:
+        return None
+    return _read_input(base, document)
+
+
+def read_table_pages(base: Path, record: Mapping[str, Any]) -> list[tuple[int, bytes]]:
+    """``document.tables``: [{"number": 1, "path": ..., "sha256": ...}] for tables rendered on pages of their own."""
+    pages = []
+    for entry in (record.get("document") or {}).get("tables") or []:
+        number = entry.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise ValidationError("a table page needs a positive integer number")
+        pages.append((number, _read_input(base, entry)))
+    if len({number for number, _ in pages}) != len(pages):
+        raise ValidationError("table page numbers repeat")
+    return sorted(pages)
