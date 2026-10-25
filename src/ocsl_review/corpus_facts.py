@@ -121,7 +121,7 @@ def _sensitivity_facts(journal: str) -> dict[str, tuple[str, str]]:
              "AND c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') "
              "AND c.abs_category IN ('true','false') AND h.category IN ('true','false')")
     facts = {}
-    for subset, extra in (("all", ""), ("cut", " AND c.abs_cut=1"), ("uncut", " AND c.abs_cut=0")):
+    for subset, extra in (("all", ""), ("cut", " AND c.abs_cut=1"), ("uncut", " AND COALESCE(c.abs_cut,0)=0")):
         base = pairs + extra
         prefix = f"sensitivity.no-truncation.{subset}"
         facts.update({
