@@ -333,7 +333,8 @@ class PackStore:
         digest = hashlib.sha256(body).hexdigest()
         if sha256 is not None and sha256 != digest:
             raise PackIntegrityError("artifact bytes do not match their declared SHA-256")
-        if self.contains(digest):
+        # Outside a batch, known blobs return without the lock; a batch owner asks its writer.
+        if self._owner != threading.get_ident() and self.contains(digest):
             return digest
         codec, stored = encode(body, self.level)
         with self._locked() as writer:
@@ -341,13 +342,21 @@ class PackStore:
                 writer.append(digest, len(body), codec, stored)
         return digest
 
-    def put_encoded(self, sha256: str, raw_length: int, codec: int, stored: bytes) -> bool:
-        """Append bytes encoded by the caller (e.g. in worker threads); verifies them first."""
-        decode(sha256, codec, stored, raw_length)
-        if self.contains(sha256):
+    def put_encoded(self, sha256: str, raw_length: int, codec: int, stored: bytes, *, verified: bool = False,
+                    new: bool = False) -> bool:
+        """Append bytes encoded by the caller (e.g. in worker threads).
+
+        The encoding is decoded and hashed first unless the caller encoded bytes it
+        had just verified against ``sha256`` itself (``verified=True``). ``new`` skips
+        the duplicate lookup when the caller guarantees a blob is not stored yet
+        (a fresh store filled from distinct digests); the index still rejects duplicates.
+        """
+        if not verified:
+            decode(sha256, codec, stored, raw_length)
+        if not new and self._owner != threading.get_ident() and self.contains(sha256):
             return False
         with self._locked() as writer:
-            if writer.known(sha256):
+            if not new and writer.known(sha256):
                 return False
             writer.append(sha256, raw_length, codec, stored)
         return True
@@ -375,8 +384,12 @@ class PackStore:
         with self._locked() as writer:
             return writer.seal_all()
 
-    def sealed_digest(self, name: str, expected: str) -> str:
-        """Check a sealed pack by its stat signature, rehashing only when it changed."""
+    def sealed_digest(self, name: str, expected: str, *, remember: bool = False) -> str:
+        """Check a sealed pack by its stat signature, rehashing only when it changed.
+
+        Only writers (``remember=True``, e.g. a snapshot) refresh the stat cache;
+        verification itself never writes.
+        """
         path = self.pack_path(name)
         current = signature(path)
         row = None
@@ -389,7 +402,7 @@ class PackStore:
         digest, size = digest_path(path)
         if digest != expected or size != current[2]:
             raise PackIntegrityError(f"sealed pack changed after sealing: {name}")
-        if not self.readonly:
+        if remember and not self.readonly:
             self.remember(name, expected)
         return digest
 

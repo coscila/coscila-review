@@ -10,13 +10,12 @@ import base64
 from contextlib import contextmanager
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
-import tempfile
 from typing import Any, Iterator
 
 from . import corpus_library as library
+from .corpus_packs import PackIntegrityError
 from .errors import ValidationError
 
 
@@ -80,13 +79,15 @@ class CorpusRepository:
             raise ValidationError("immutable snapshots cannot be modified; branch first")
         if self.db.is_symlink() or (write and self.db.stat().st_nlink != 1):
             raise ValidationError("corpus database must not share mutable inodes")
-        connection = sqlite3.connect(self.db.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True, timeout=30)
+        # A branch connection also sees its parent snapshot (corpus_overlay); SQLite cannot
+        # enforce foreign keys across the two databases, so verification checks them.
+        connection = self.library.open(write=write, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA foreign_keys=OFF" if self.library.overlay else "PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         if write:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA main.journal_mode=WAL")
+            connection.execute("PRAGMA main.synchronous=NORMAL")
         try:
             if not write:
                 connection.execute("PRAGMA query_only=ON")
@@ -112,26 +113,11 @@ class CorpusRepository:
         if (self.root / "manifest.json").exists():
             raise ValidationError("immutable snapshots cannot be modified; branch first")
         digest = hashlib.sha256(body).hexdigest()
-        path = self.workspace.path(f"{self.relative}/sources/{digest}")
-        if path.exists():
-            if library.digest_file(path) != digest:
-                raise ValidationError("stored immutable artifact was modified")
-        else:
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as target:
-                    temporary = Path(target.name)
-                    target.write(body)
-                    target.flush()
-                    os.fsync(target.fileno())
-                temporary.chmod(0o444)
-                os.link(temporary, path)
-            except FileExistsError:
-                if library.digest_file(path) != digest:
-                    raise ValidationError("concurrent artifact write differs")
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
+        # Bytes are durable (pack fsync or loose file fsync) before the registry row exists.
+        try:
+            self.library.store_blob(body, digest)
+        except PackIntegrityError as error:
+            raise ValidationError(str(error)) from None
         with self.connect(write=True) as connection:
             connection.execute("INSERT OR IGNORE INTO source_artifacts VALUES (?,?,?,?,?,?)",
                                (digest, "sources/" + digest, len(body), media_type, kind, library.now()))
@@ -140,24 +126,39 @@ class CorpusRepository:
     def json_artifact(self, value: Any, kind: str) -> str:
         return self.artifact(canonical(json_safe(value)).encode(), kind)
 
-    def read_artifact(self, digest: str) -> bytes:
-        path = self.verify_artifact(digest)
-        return path.read_bytes()
-
-    def verify_artifact(self, digest: str) -> Path:
+    def _registered(self, digest: str):
         with self.connect() as connection:
             item = connection.execute("SELECT * FROM source_artifacts WHERE sha256=?", (digest,)).fetchone()
         if item is None:
             raise ValidationError("artifact is not registered")
-        path = self.library.source(item)
+        if item["relative_path"] != "sources/" + item["sha256"]:
+            raise ValidationError("artifact paths must be content-addressed sources/<sha256>")
+        return item
+
+    def read_artifact(self, digest: str) -> bytes:
+        item = self._registered(digest)
+        try:
+            return self.library.read_blob(digest, item["byte_count"])
+        except PackIntegrityError:
+            raise ValidationError("registered artifact hash mismatch") from None
+
+    def verify_artifact(self, digest: str):
+        """Check a registered artifact's bytes; repeated checks of unchanged storage are cached."""
+        item = self._registered(digest)
+        found = self.library.locate(digest)
+        if found is None:
+            raise ValueError(f"missing source: {item['relative_path']}")
+        path = found[1].pack_path(found[2].pack) if found[0] == "pack" else found[1]
         stat = path.stat()
         signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
         if self._verified_artifacts.get(digest) == signature:
-            return path
-        if library.digest_file(path) != digest:
-            raise ValidationError("registered artifact hash mismatch")
+            return found
+        try:
+            self.library.read_blob(digest, item["byte_count"])
+        except PackIntegrityError:
+            raise ValidationError("registered artifact hash mismatch") from None
         self._verified_artifacts[digest] = signature
-        return path
+        return found
 
     def work(self, metadata: dict[str, Any], *, key: str | None = None) -> str:
         identifiers = {k: str(metadata[k]).strip().lower() for k in ("doi", "pmid", "pmcid") if metadata.get(k)}
@@ -230,7 +231,8 @@ class CorpusRepository:
             row = connection.execute("SELECT * FROM corpus_documents WHERE work_id=? AND evidence_tier=? ORDER BY complete DESC,created_at DESC,document_id DESC LIMIT 1", (work_id, tier)).fetchone()
             if row is None:
                 return None
-            units = [dict(r) for r in connection.execute("SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM source_sections WHERE artifact_sha256=? AND work_id=? ORDER BY rowid", (row["artifact_sha256"], work_id))]
+            sections, order = self.library.ordered("source_sections")
+            units = [dict(r) for r in connection.execute(f"SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM {sections} WHERE artifact_sha256=? AND work_id=? ORDER BY {order}", (row["artifact_sha256"], work_id))]
         self.verify_artifact(row["artifact_sha256"])
         return {"documentId": row["document_id"], "sourceSha256": row["artifact_sha256"], "evidenceTier": tier,
                 "evidenceUnits": units, "complete": bool(row["complete"]), "provider": row["provider"], "sourceUrl": row["source_url"]}
