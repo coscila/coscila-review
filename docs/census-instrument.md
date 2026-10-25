@@ -228,7 +228,8 @@ a check against a private record set.
 
 - The direct chat-completions transport is for on-premises judges and probes;
   broker bulk jobs need a verbatim instrument mode before they can carry this
-  instrument unchanged.
+  instrument unchanged. Its calls are receipted in the scores database
+  (`calls`), not in the workspace egress ledger.
 - Model identity is the served model string and the server fingerprint when
   offered; there is no weights hash.
 - Country extraction is new and descriptive only; the topic map is a versioned
