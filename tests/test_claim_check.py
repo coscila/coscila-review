@@ -194,37 +194,59 @@ class PolicyAndLedgerTests(unittest.TestCase):
             self.assertNotIn("manuscript title", ledger.path.read_text(encoding="utf-8"))
             self.assertTrue(ledger.verify()["valid"])
 
-    def test_only_on_prem_judges_receive_text_in_confidential_mode(self):
+    def test_only_listed_on_prem_endpoints_receive_text_in_confidential_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             ledger = EgressLedger(Path(directory) / "egress.jsonl")
-            policy = ConfidentialPolicy()
-            on_prem = FunctionJudge(lambda m, s: "{}", location="on-prem", host="127.0.0.1")
-            lan = FunctionJudge(lambda m, s: "{}", location="on-prem", host="10.1.2.3")
-            spoofed = FunctionJudge(lambda m, s: "{}", location="on-prem", host="models.example.com")
-            external = FunctionJudge(lambda m, s: "{}", location="external", host="127.0.0.1")
-            self.assertEqual("on-prem-model", policy.authorize_model(ledger, on_prem, payload_sha256="0" * 64, items=1)["destinationClass"])
-            self.assertEqual("allowed", policy.authorize_model(ledger, lan, payload_sha256="0" * 64, items=1)["decision"])
-            for judge in (spoofed, external):
-                with self.assertRaises(ConfidentialityError):
+            relay = HttpJudge("http://127.0.0.1:18161/v1/chat/completions", "m")
+            # An address alone is not a reason to trust a judge: a loopback relay may forward to a hosted service.
+            with self.assertRaises(ConfidentialityError):
+                ConfidentialPolicy().authorize_model(ledger, relay, payload_sha256="0" * 64, items=1)
+            policy = ConfidentialPolicy.from_mapping({"onPremEndpoints": [
+                {"url": "http://127.0.0.1:18160/v1/chat/completions", "models": ["local-model"]},
+                "https://gpu-node.internal/judges/"]})
+            listed = HttpJudge("http://127.0.0.1:18160/v1/chat/completions", "local-model")
+            below = HttpJudge("https://gpu-node.internal:443/judges/a/chat/completions", "m")
+            lan = HttpJudge("http://10.20.30.40/v1/chat/completions", "m")
+            external = HttpJudge("http://127.0.0.1:18160/v1/chat/completions", "m", location="external")
+            in_process = FunctionJudge(lambda m, s: "{}", location="on-prem")
+            for judge in (listed, below, in_process):
+                self.assertEqual("on-prem-model", policy.authorize_model(ledger, judge, payload_sha256="0" * 64,
+                                                                         items=1)["destinationClass"])
+            for judge in (relay, lan, external):
+                with self.subTest(judge=judge.url), self.assertRaises(ConfidentialityError):
                     policy.authorize_model(ledger, judge, payload_sha256="0" * 64, items=1)
+            self.assertTrue(policy.served_model_allowed(listed, "local-model"))
+            self.assertFalse(policy.served_model_allowed(listed, "external-model"))
+            self.assertTrue(policy.served_model_allowed(below, "anything"))
             public = ConfidentialPolicy("public-literature")
-            self.assertEqual("external-model", public.authorize_model(ledger, external, payload_sha256="0" * 64, items=1)["destinationClass"])
-            self.assertEqual(["allowed", "allowed", "refused", "refused", "allowed"], [e["decision"] for e in ledger.events()])
+            self.assertEqual("external-model", public.authorize_model(ledger, external, payload_sha256="0" * 64,
+                                                                      items=1)["destinationClass"])
+            events = ledger.events()
+            self.assertEqual(["refused", "allowed", "allowed", "allowed", "refused", "refused", "refused", "allowed"],
+                             [e["decision"] for e in events])
+            self.assertEqual("http://127.0.0.1:18160/v1/chat/completions", events[1]["destination"])
+            self.assertEqual("local-model", events[1]["requestedModel"])
 
     def test_policy_file_digest_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "policy.json"
-            path.write_text(json.dumps({"mode": "confidential-manuscript", "onPremHosts": ["gpu-node.internal"]}), encoding="utf-8")
+            path.write_text(json.dumps({"version": 2, "mode": "confidential-manuscript",
+                                        "onPremEndpoints": ["https://gpu-node.internal/v1/"]}), encoding="utf-8")
             policy = ConfidentialPolicy.load(path)
-            self.assertTrue(policy.host_is_on_prem("gpu-node.internal"))
+            self.assertTrue(policy.endpoint_on_prem("https://GPU-node.internal:443/v1/chat/completions"))
+            self.assertFalse(policy.endpoint_on_prem("http://gpu-node.internal/v1/chat/completions"))
+            self.assertFalse(policy.endpoint_on_prem("https://gpu-node.internal/v2/chat/completions"))
             self.assertEqual(64, len(policy.digest))
             self.assertNotEqual(ConfidentialPolicy().digest, policy.digest)
-            path.write_text(json.dumps({"mode": "anything"}), encoding="utf-8")
-            with self.assertRaises(ValidationError):
-                ConfidentialPolicy.load(path)
-            path.write_text(json.dumps({"mode": "public-literature", "extra": 1}), encoding="utf-8")
-            with self.assertRaises(ValidationError):
-                ConfidentialPolicy.load(path)
+            self.assertEqual(["https://gpu-node.internal:443/v1/"], [e["url"] for e in policy.record()["onPremEndpoints"]])
+            for invalid in ({"mode": "anything"}, {"mode": "public-literature", "extra": 1},
+                            {"mode": "confidential-manuscript", "onPremHosts": ["gpu-node.internal"]},
+                            {"version": 1}, {"onPremEndpoints": ["https://user:secret@host/v1"]},
+                            {"onPremEndpoints": ["https://host/v1?key=1"]}, {"onPremEndpoints": ["ftp://host/v1"]}):
+                with self.subTest(invalid=invalid):
+                    path.write_text(json.dumps(invalid), encoding="utf-8")
+                    with self.assertRaises(ValidationError):
+                        ConfidentialPolicy.load(path)
 
     def test_ledger_hash_chain_detects_tampering(self):
         with tempfile.TemporaryDirectory() as directory:

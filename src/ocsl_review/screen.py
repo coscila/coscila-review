@@ -692,8 +692,7 @@ def cmd_screen(args: Any) -> dict[str, Any]:
     manuscript = _inside(workspace, args.input)
     policy = ConfidentialPolicy.load(_inside(workspace, args.policy) if args.policy else None)
     if args.public:
-        policy = ConfidentialPolicy("public-literature", policy.on_prem_hosts, policy.allow_private_networks,
-                                    policy.provider_hosts)
+        policy = policy.with_mode("public-literature")
     if args.evidence:
         works = load_store(_inside(workspace, args.evidence))
         evidence_name = Path(args.evidence).name

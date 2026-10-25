@@ -173,6 +173,51 @@ class ConfidentialEgressAcceptanceTests(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertEqual([("external-model", "refused")], [(e["destinationClass"], e["decision"]) for e in events])
 
+    def test_a_loopback_relay_is_not_on_prem_unless_the_policy_lists_its_endpoint(self):
+        from ocsl_review.claim_check import HttpJudge
+        sent = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, *args):
+                return json.dumps(self.payload).encode()
+
+        def relay(request, timeout):
+            sent.append(json.loads(request.data))
+            items = json.loads(sent[-1]["messages"][1]["content"])["items"]
+            return Response({"model": "external-model", "choices": [{"message": {"content": json.dumps(
+                {"items": [{"id": item["id"], "supportVerdict": "abstain", "escalate": False, "evidence": []} for item in items]})},
+                "finish_reason": "stop"}]})
+        url = "http://127.0.0.1:18161/v1/chat/completions"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "draft.md"
+            path.write_text(F.attribution_markdown(), encoding="utf-8")
+            works = load_store(F.write_store(root / "store.jsonl"))
+            with self.assertRaises(ConfidentialityError):
+                run_screen(path, run_root=root / "default", works=works, judge=HttpJudge(url, "local-model", opener=relay))
+            self.assertEqual([], sent, "nothing is sent to an endpoint the policy does not list")
+            refused = EgressLedger(root / "default" / "egress.jsonl").events()
+            self.assertEqual([(url, "refused")],
+                             [(e["destination"], e["decision"]) for e in refused])
+            policy = ConfidentialPolicy.from_mapping({"onPremEndpoints": [{"url": url, "models": ["local-model"]}]})
+            report = run_screen(path, run_root=root / "listed", works=works, policy=policy,
+                                judge=HttpJudge(url, "local-model", opener=relay))
+            self.assertTrue(sent)
+            events = EgressLedger(root / "listed" / "egress.jsonl").events()
+        # The endpoint answered with a model its entry does not name: every verdict is rejected and the refusal kept.
+        self.assertNotIn("judged", report["summary"]["verdictStates"])
+        self.assertIn("response-refused", {e["decision"] for e in events})
+        self.assertEqual({"external-model"}, {e["servedModel"] for e in events if e["decision"] == "response-refused"})
+
     def test_free_text_lookups_are_refused_without_a_request(self):
         transport = F.OfflineScholarlyTransport({})
         with tempfile.TemporaryDirectory() as directory:

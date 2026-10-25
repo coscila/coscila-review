@@ -67,7 +67,8 @@ claim-targeted window of at most 11,000 characters of the cited work's full
 text, in a dedicated FULL TEXT field: the opening paragraphs and the abstract,
 then paragraphs scored by the claim's keywords. Sources are Europe PMC
 fullTextXML by PMCID and entitled full text; entitled text is sent only when
-the transport is declared on premises. Calls hold five entries from one review;
+the transport is on premises: `--on-premises` with `--policy`, an operator egress
+policy whose `onPremEndpoints` lists the judge endpoint ([claim screen](claim-check.md)). Calls hold five entries from one review;
 the order is a seeded shuffle with the protocol seed, grouped by review in
 first-seen order; reasoning effort is `low`; there is no repair pass. A failed
 retrieval is recorded (`cache`, `europe-pmc-fulltextxml`, `entitled`,

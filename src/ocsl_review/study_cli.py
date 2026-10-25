@@ -53,7 +53,9 @@ def add_commands(families, register):
             command.add_argument("--api-key-env", help="environment variable holding the judge key")
             command.add_argument("--model", help="model name to request (defaults to the required served model)")
             command.add_argument("--concurrency", type=int, default=60)
-            command.add_argument("--on-premises", action="store_true", help="the judge runs on premises (entitled text allowed)")
+            command.add_argument("--on-premises", action="store_true",
+                                 help="the judge runs on premises (entitled text allowed); needs --policy naming its endpoint")
+            command.add_argument("--policy", help="operator egress policy (JSON, version 2) whose onPremEndpoints lists the judge")
             command.add_argument("--transport-retries", type=int, default=3,
                                  help="further passes over entries left open by an outage before the run pauses")
             command.add_argument("--transport-cooldown", type=float, default=60.0,
@@ -103,6 +105,15 @@ def add_commands(families, register):
 
 def _transport(args):
     from .census_runner import HttpChatTransport
+    if args.on_premises:
+        # Entitled text goes only to an endpoint the operator's policy lists, never on a self-declared flag.
+        from .claim_check import ConfidentialPolicy
+        from .errors import ConfidentialityError
+        if not args.policy:
+            raise ConfidentialityError("--on-premises needs --policy with the judge endpoint in onPremEndpoints")
+        endpoint = args.base_url.rstrip("/") + "/chat/completions"
+        if not ConfidentialPolicy.load(Path(args.policy)).endpoint_on_prem(endpoint):
+            raise ConfidentialityError(f"{endpoint} is not an on-prem endpoint of the policy")
     return HttpChatTransport(args.base_url, api_key_env=args.api_key_env, on_premises=args.on_premises)
 
 

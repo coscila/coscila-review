@@ -124,18 +124,27 @@ every adverse finding and verdict reads "check suggested".
 
 `ConfidentialPolicy` (`confidential-manuscript`, the default) lets only identifiers (DOI, PMID,
 PMCID) reach external providers, refuses free-text lookups before any request, and sends manuscript
-and cited text only to an on-prem judge: `--judge-location on-prem` on a host the policy allows
-(loopback, private addresses, or the policy's `onPremHosts`). Every decision, allowed or refused,
-is appended to the run's `egress.jsonl`: destination, destination class, operation, argument names,
-payload sha256 and policy digest, chained by hash. `ocsl-review replay` verifies the chain. A screen
-run in a workspace also appends each decision to the workspace's egress ledger
-([confidentiality](confidentiality.md)), linked by the run record's hash; allowed provider fetches
-appear there once, recorded by the scholarly client.
+and cited text only to an on-prem judge: `--judge-location on-prem` on an endpoint the operator's
+policy lists in `onPremEndpoints` (scheme, host, port and path; a path ending in `/` covers the
+paths below it). The list is empty by default, and an address alone never qualifies: a loopback or
+private-network relay can forward to a hosted service. An entry may name the served models the
+endpoint may answer with; a response from any other model is refused and none of its verdicts is
+used. Every decision, allowed or refused, is appended to the run's `egress.jsonl`: the full
+endpoint, destination class, operation, argument names, requested model, payload sha256 and policy
+digest, chained by hash; the served model is in each model receipt and in every refusal.
+`ocsl-review replay` verifies the chain. A screen run in a workspace also appends each decision to
+the workspace's egress ledger ([confidentiality](confidentiality.md)), linked by the run record's
+hash; allowed provider fetches appear there once, recorded by the scholarly client.
 
 ```json
-{"policy": "claim-check-egress", "version": 1, "mode": "confidential-manuscript",
- "onPremHosts": ["gpu-node.internal"], "allowPrivateNetworks": true}
+{"policy": "claim-check-egress", "version": 2, "mode": "confidential-manuscript",
+ "onPremEndpoints": [{"url": "http://127.0.0.1:18160/v1/chat/completions", "models": ["local-model"]},
+                     "https://gpu-node.internal/judges/"]}
 ```
+
+Version-1 policies, which inferred on-prem judges from loopback or private addresses, are refused.
+The census commands use the same file: `study judge --on-premises` (and the other tiers) needs
+`--policy` listing the judge endpoint before entitled text can be sent.
 
 ## Receipts and replay
 
