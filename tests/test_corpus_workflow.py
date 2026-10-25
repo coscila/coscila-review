@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -119,6 +121,16 @@ class CorpusWorkflowTests(unittest.TestCase):
         code = main(["corpus", "init", "--workspace", str(self.root), "--library", "work/cli", "--question", "Q", "--analysis", "cli", "--protocol", str(protocol)])
         self.assertEqual(code, 0)
         self.assertEqual(CorpusRepository(self.root, "work/cli").analysis()["analysis_id"], "cli")
+
+    def test_cli_migrate_is_explicit_and_idempotent(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = main(["corpus", "migrate", "--workspace", str(self.root), "--library", "work/literature"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["migrations"], [])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            main(["corpus", "migrate", "--workspace", str(self.root), "--library", "work/literature", "--rebuild-counters"])
+        self.assertTrue(json.loads(output.getvalue())["countersRebuilt"])
+        self.repo.library.verify()
 
 
 if __name__ == "__main__":
