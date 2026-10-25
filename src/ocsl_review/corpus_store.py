@@ -22,7 +22,6 @@ from pathlib import Path
 import sqlite3
 import stat
 import sys
-import tempfile
 from typing import Any, Iterable, Iterator
 
 from . import corpus_library as library
@@ -269,24 +268,27 @@ class CorpusRepository:
             if path.is_symlink() or not self._existing_matches(path, digest):
                 raise ValidationError("stored immutable artifact was modified")
             return False
-        temporary = None
+        temporary = sources / f".{digest[:16]}.{os.urandom(8).hex()}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
-            with tempfile.NamedTemporaryFile(dir=sources, delete=False) as target:
-                temporary = Path(target.name)
-                target.write(body)
+            try:
+                view = memoryview(body)
+                while view:
+                    view = view[os.write(descriptor, view):]
                 if durable:
-                    target.flush()
-                    os.fsync(target.fileno())
-            temporary.chmod(0o444)
-            os.link(temporary, path)
+                    os.fsync(descriptor)
+                os.fchmod(descriptor, 0o444)
+            finally:
+                os.close(descriptor)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if library.digest_file(path) != digest:
+                    raise ValidationError("concurrent artifact write differs")
+                return False
             return True
-        except FileExistsError:
-            if library.digest_file(path) != digest:
-                raise ValidationError("concurrent artifact write differs")
-            return False
         finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
 
     def artifact(self, body: bytes, kind: str, media_type: str = "application/json") -> str:
         sources = self._sources()
