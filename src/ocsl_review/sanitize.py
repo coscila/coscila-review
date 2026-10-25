@@ -163,13 +163,17 @@ def sanitize_text(text: str, *, mode: str = "strip", scope: str = "") -> Sanitiz
     for kind, pattern in _CHARACTER_CLASSES:
         spans.extend((match.start(), match.end(), kind, kind) for match in pattern.finditer(source))
     spans.extend((match.start(), match.end(), "soft-hyphen", "soft-hyphen") for match in _SOFT_HYPHEN.finditer(source))
-    # Injection matching runs on the text without invisible characters; map offsets back.
-    keep = [True] * len(source)
-    for start, end, _, _ in spans:
-        for position in range(start, end):
-            keep[position] = False
-    visible_positions = [position for position, flag in enumerate(keep) if flag]
-    visible = "".join(source[position] for position in visible_positions)
+    # Injection matching runs on the text without invisible characters; map offsets back. Most
+    # texts have none, and then the text and its offsets are used as they are.
+    if spans:
+        keep = [True] * len(source)
+        for start, end, _, _ in spans:
+            for position in range(start, end):
+                keep[position] = False
+        visible_positions = [position for position, flag in enumerate(keep) if flag]
+        visible = "".join(source[position] for position in visible_positions)
+    else:
+        visible_positions, visible = None, source
     for start, end, rule in find_injections(visible):
         while start < end and visible[start].isspace():
             start += 1
@@ -179,8 +183,11 @@ def sanitize_text(text: str, *, mode: str = "strip", scope: str = "") -> Sanitiz
             bounds = _sentence_bounds(visible, start, end)
         if bounds[1] <= bounds[0]:
             continue
-        original_start = visible_positions[bounds[0]]
-        original_end = visible_positions[bounds[1] - 1] + 1
+        if visible_positions is None:
+            original_start, original_end = bounds
+        else:
+            original_start = visible_positions[bounds[0]]
+            original_end = visible_positions[bounds[1] - 1] + 1
         spans.append((original_start, original_end, "prompt-injection", rule))
     removals: list[Removal] = []
     for start, end, kind, rule in _merge(spans):
