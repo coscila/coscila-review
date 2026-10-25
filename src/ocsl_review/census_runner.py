@@ -29,7 +29,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import citation_census as C
 from . import scores_db
 from .census_extraction import extract_review, resolve_identity
-from .errors import ReviewError, ValidationError
+from .errors import ConfidentialityError, ReviewError, ValidationError
 
 IDENTITY_LADDER = "identity-ladder@1"
 RESOLVED = ("resolved", "resolved_unverified")
@@ -479,6 +479,16 @@ class CensusRun:
                 collect()
         return totals, (drift[0] if drift else None)
 
+    def _egress_gate(self, condition: str, params: Sequence[Any] = ()) -> None:
+        """Entitled review text reaches only a judge the operator declared on premises; checked before any call."""
+        if getattr(self.transport, "on_premises", False):
+            return
+        with self.lock:
+            entitled = self.connection.execute(
+                f"SELECT COUNT(*) FROM reviews WHERE provenance_class='entitled' AND ({condition})", params).fetchone()[0]
+        if entitled:
+            raise ConfidentialityError(f"{entitled} entitled reviews may only be judged by an on-premises judge")
+
     def _resume_after_drift(self) -> None:
         if scores_db.meta(self.connection).get("runState", "").startswith("paused:model_drift"):
             with self.lock, self.connection:
@@ -494,6 +504,7 @@ class CensusRun:
         """Abstract tier for every pending review, in enumeration order; resumable per review."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        self._egress_gate("abstract_state='pending'")
         self._resume_after_drift()
         with self.lock:
             reviews = self.connection.execute(
@@ -595,6 +606,7 @@ class CensusRun:
         """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        self._egress_gate("full_text_state='pending'")
         self._resume_after_drift()
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
@@ -716,6 +728,7 @@ class CensusRun:
         """Re-run the sampled batches unchanged except for the abstract cut; history only, variant no-truncation."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        self._egress_gate("abstract_state='completed'")
         self._resume_after_drift()
         selected = self.no_truncation_sample(entries)
         with self.lock:
