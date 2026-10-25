@@ -7,6 +7,7 @@ no-truncation sensitivity, gates, freezing, exports, estimands and facts.
 """
 from __future__ import annotations
 
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -92,14 +93,14 @@ def _run(args, transport=None):
 
 
 def europe_pmc_fetcher(spacing: float = 0.4):
-    """Fetch fullTextXML by PMCID, one request at a time with a fixed spacing."""
-    state = {"last": 0.0}
+    """Fetch fullTextXML by PMCID; each fetching thread pauses ``spacing`` seconds between its requests."""
+    state = threading.local()
 
     def fetch(pmcid: str) -> bytes | None:
-        wait = state["last"] + spacing - time.monotonic()
+        wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
         if wait > 0:
             time.sleep(wait)
-        state["last"] = time.monotonic()
+        state.last = time.monotonic()
         try:
             with urllib.request.urlopen(EUROPE_PMC_FULL_TEXT % pmcid, timeout=90) as response:
                 body = response.read()
