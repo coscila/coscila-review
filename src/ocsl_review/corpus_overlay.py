@@ -201,8 +201,12 @@ class Overlay:
                 old = " AND ".join(f"{quote(c)}=OLD.{quote(c)}" for c in table.key)
                 parent_old = " AND ".join(f"p.{quote(c)}=OLD.{quote(c)}" for c in table.key)
                 delta_old = " AND ".join(f"d.{quote(c)}=OLD.{quote(c)}" for c in table.key)
-                yield (f"CREATE TEMP TRIGGER {quote('ocsl_update_' + name)} INSTEAD OF UPDATE ON {t} BEGIN {checks} "
-                       f"INSERT INTO {d}({columns}) SELECT {parent_columns} FROM {PARENT}.{t} AS p "
+                same_key = " AND ".join(f"NEW.{quote(c)} IS OLD.{quote(c)}" for c in table.key)
+                # A changed key would leave the parent's row visible again under the old key.
+                key_guard = (f"SELECT RAISE(ABORT, '{name}: keys of shared rows cannot change in a branch') "
+                             f"WHERE NOT ({same_key}); ")
+                yield (f"CREATE TEMP TRIGGER {quote('ocsl_update_' + name)} INSTEAD OF UPDATE ON {t} BEGIN {key_guard}"
+                       f"{checks} INSERT INTO {d}({columns}) SELECT {parent_columns} FROM {PARENT}.{t} AS p "
                        f"WHERE {parent_old} AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old}); "
                        f"UPDATE {d} SET {assignments} WHERE {old}; END;")
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_delete_' + name)} INSTEAD OF DELETE ON {t} BEGIN "
