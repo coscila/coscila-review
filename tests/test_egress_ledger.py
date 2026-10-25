@@ -135,6 +135,26 @@ class EgressLedgerTests(unittest.TestCase):
         self.assertEqual(read_egress_events(self.workspace)[-1], {"operation": "after-crash"})
         self.assertEqual(verify_egress_ledger(self.workspace)["chainedEvents"], 4)
 
+    def test_a_seal_interrupted_after_its_read_only_step_or_before_it_recovers(self) -> None:
+        for crash in ("after-chmod", "after-unlink"):
+            with self.subTest(crash=crash):
+                confidentiality._HEADS.clear()
+                for event in self.events(2):
+                    append_egress_event(self.workspace, event)
+                sealed = sorted(self.audit.glob("egress-events.0*.jsonl"))
+                name = self.audit / f"egress-events.{len(sealed) + 1:06d}.jsonl"
+                active = self.audit / "egress-events.jsonl"
+                os.link(active, name)
+                if crash == "after-chmod":
+                    os.chmod(active, 0o400)     # the earlier seal order: read-only, active name still linked
+                else:
+                    active.unlink()             # the current order: unlinked, not yet read-only
+                append_egress_event(self.workspace, {"operation": crash})
+                self.assertEqual(0o400, name.stat().st_mode & 0o777)
+                self.assertEqual(1, name.stat().st_nlink)
+                self.assertEqual(read_egress_events(self.workspace)[-1], {"operation": crash})
+                self.assertTrue(verify_egress_ledger(self.workspace)["chainedEvents"])
+
     def test_concurrent_appends_keep_one_contiguous_chain(self) -> None:
         batches = [self.events(100, start=n * 100) for n in range(8)]
 
