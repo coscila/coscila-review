@@ -23,6 +23,9 @@ from .util import is_within
 # the broker's limiter queues items globally, so the next job starts while one drains.
 MAX_JOBS_IN_FLIGHT = 3
 RESULT_PAGE_RECORDS = 100
+# Result pages staged behind one shared durability barrier; each page still commits in
+# its own transaction, in order, together with its cursor.
+BARRIER_PAGES = 10
 MAX_REQUEST_GROUP_BYTES = 6 * 1024 * 1024
 TERMINAL_RECORD_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled", "interrupted", "paused"})
@@ -371,6 +374,15 @@ class CorpusExecutor:
         Receipts are content addressed, so replaying a page imports nothing twice and
         an accepted task never returns to another state.
         """
+        written = []
+        staged = self._stage_page(batch, records, written)
+        if staged is None and cursor is None:
+            return
+        self.repo.sync_staged(written)
+        self._commit_page(batch, staged, cursor)
+
+    def _stage_page(self, batch, records, written):
+        """Validate a page and write its receipt files; durability comes from the caller's barrier."""
         context = self._batch(batch)
         terminal = []
         for record in records:
@@ -379,16 +391,21 @@ class CorpusExecutor:
                 raise ValidationError("worker result escaped its pinned batch")
             if record.get("state") in TERMINAL_RECORD_STATES:
                 terminal.append(record)
-        if not terminal and cursor is None:
-            return
+        if not terminal:
+            return None
         loaded = {task["task_id"]: task for task in self._tasks(
             list(dict.fromkeys(t for r in terminal for t in context["groups"][r["id"]]["taskIds"])))}
-        receipts = self.repo.stage_artifacts((canonical(json_safe(record)).encode(), "worker-response", "application/json")
-                                             for record in terminal)
+        receipts = self.repo.stage_artifacts(((canonical(json_safe(record)).encode(), "worker-response", "application/json")
+                                              for record in terminal), pending=written)
         judged = []
         for record, receipt in zip(terminal, receipts):
             tasks = [loaded[t] for t in context["groups"][record["id"]]["taskIds"]]
             judged.append((record, receipt[0], tasks, *self._judge(context, record, tasks)))
+        return receipts, judged
+
+    def _commit_page(self, batch, staged, cursor):
+        context = self._batch(batch)
+        receipts, judged = staged if staged is not None else ([], [])
         with self.repo.connect(write=True) as connection:
             self.repo.register_artifacts(connection, receipts)
             ids = ["receipt-" + identity(batch["batch_id"], receipt_sha) for _, receipt_sha, *_ in judged]
@@ -447,16 +464,24 @@ class CorpusExecutor:
                             self._release(batch, "interrupted")
                     if not batch["job_id"]:
                         continue
-                while True:
-                    page, cursor = self._results(batch)
-                    if cursor is None:
-                        raise ValidationError("invalid broker result cursor")
-                    self.import_page(batch, page.get("results", []), cursor=cursor)
-                    if page.get("hasMore") and cursor == batch["cursor"]:
+                more = True
+                while more:
+                    # Stage up to BARRIER_PAGES pages, make their receipts durable once,
+                    # then commit each page in order in its own transaction.
+                    staged, written, stuck = [], [], False
+                    while more and len(staged) < BARRIER_PAGES and not stuck:
+                        page, cursor = self._results(batch)
+                        if cursor is None:
+                            raise ValidationError("invalid broker result cursor")
+                        staged.append((self._stage_page(batch, page.get("results", []), written), cursor))
+                        more = bool(page.get("hasMore"))
+                        stuck = more and cursor == batch["cursor"]
+                        batch["cursor"] = cursor
+                    self.repo.sync_staged(written)
+                    for page_staged, cursor in staged:
+                        self._commit_page(batch, page_staged, cursor)
+                    if stuck:
                         raise ValidationError("broker result cursor failed to advance")
-                    batch["cursor"] = cursor
-                    if not page.get("hasMore"):
-                        break
                 summary = self.broker.request("GET", f"/jobs/{batch['job_id']}?view=summary")
                 state = summary.get("state")
                 if state in TERMINAL_JOB_STATES:
