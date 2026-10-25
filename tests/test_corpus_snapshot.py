@@ -280,6 +280,109 @@ class RootTests(unittest.TestCase):
                 library.initialize(workspace, str(self.datasets / "new"), "Q", "x")
 
 
+class BranchCounterTests(unittest.TestCase):
+    """A branch's triggers count its own rows; status must still report the union."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        repo = CorpusRepository.create(self.root, "work/literature", "Fixture question", "first", {"v": 1})
+        self.works = populate(repo)
+        manuscript = repo.json_artifact({"confidential": False}, "review-manuscript")
+        self.reviews = [repo.review({"doi": f"10.1234/review-{n}", "title": f"Review {n}"}) for n in range(3)]
+        repo.review_state(self.reviews[0], "binding", "completed")
+        with repo.connect(write=True) as connection:
+            connection.executemany("INSERT INTO bibliography_entries VALUES (?,?,?,?,?,?,?,?)", [
+                (f"e{n}", self.reviews[n % 3], str(n), f"Printed {n}", "{}", self.works[n % 3], "verified", manuscript)
+                for n in range(4)])
+            connection.executemany("INSERT INTO claim_loci VALUES (?,?,?,?,?,?,?)", [
+                (f"locus-{n}", f"e{n % 4}", manuscript, f"p{n}", f"Claim {n}.", "[]", "fixture") for n in range(6)])
+            connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "receipt-1", "first", "item", manuscript, manuscript, "fixture", "model", "{}", "{}", "completed",
+                library.now(), library.now()))
+            connection.executemany("INSERT INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", [
+                (f"a{n}", "first", f"locus-{n}", "receipt-1", "fixture", "abstract", "{}", "accepted", library.now())
+                for n in range(3)])
+        repo.add_tasks("first", [(f"locus-{n}", "abstract", {"claim": n}, None) for n in range(4)])
+        repo.library.snapshot("results/snapshot")
+        Library(repo.workspace, "results/snapshot").branch("work/branch", "Branch question", "second", {"v": 2})
+        self.branch = CorpusRepository(self.root, "work/branch")
+        self.manuscript = manuscript
+
+    def scanned(self, analysis_id):
+        result = self.branch._scanned_status(self.branch.analysis(analysis_id))
+        return self.normalized(result)
+
+    @staticmethod
+    def normalized(result):
+        return ({k: v for k, v in result["counts"].items()},
+                sorted(tuple(sorted(row.items())) for row in result["reviewStates"]),
+                sorted(tuple(sorted(row.items())) for row in result["taskStates"]),
+                sorted(tuple(sorted(row.items())) for row in result["assessments"]))
+
+    def assertStatusMatchesScan(self):
+        for analysis_id in ("first", "second"):
+            with self.subTest(analysis=analysis_id):
+                self.assertEqual(self.normalized(self.branch.status(analysis_id)), self.scanned(analysis_id))
+
+    def test_branch_status_counters_equal_a_scan_of_the_union(self):
+        self.assertStatusMatchesScan()
+        branch = self.branch
+        branch.work({"doi": "10.1234/w0", "title": "Corrected title in the branch"})  # overrides a parent work
+        branch.review_state(self.reviews[1], "binding", "completed")  # overrides a parent corpus review
+        branch.review_state(self.reviews[0], "acquisition", "running")
+        new = branch.review({"doi": "10.1234/review-new", "title": "Branch review"})
+        branch.review_state(new, "binding", "failed", "fixture")
+        populate(branch, prefix="b", count=2)
+        with branch.connect(write=True) as connection:
+            connection.execute("INSERT INTO claim_loci VALUES ('locus-b','e0',?,'pb','Branch claim.','[]','fixture')",
+                               (self.manuscript,))
+            connection.execute("UPDATE claim_loci SET claim_text='Revised claim.' WHERE locus_id='locus-5'")
+            connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "receipt-2", "first", "item", self.manuscript, self.manuscript, "fixture", "model", "{}", "{}",
+                "completed", library.now(), library.now()))
+            connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "receipt-3", "second", "item", self.manuscript, self.manuscript, "fixture", "model", "{}", "{}",
+                "completed", library.now(), library.now()))
+            # Loci 1 and 2 are also accepted in the parent: the union counts them once; locus 4 is new.
+            connection.executemany("INSERT INTO assessments VALUES (?,?,?,?,?,?,?,?,?)", [
+                (f"b{n}", "first", f"locus-{n}", "receipt-2", "fixture", "abstract", "{}", "accepted", library.now())
+                for n in (1, 2, 4)] + [
+                ("c1", "second", "locus-1", "receipt-3", "fixture", "abstract", "{}", "rejected", library.now())])
+        branch.add_tasks("second", [(f"locus-{n}", "abstract", {"claim": n}, "fixture reason" if n else None)
+                                    for n in range(3)])
+        self.assertStatusMatchesScan()
+        status = branch.status("first")
+        # Six parent works (three cited, three reviews), the new review's work and two new cited works.
+        self.assertEqual(status["counts"]["works"], 6 + 1 + 2)
+        self.assertEqual(status["taskStates"], [], "the parent's queue is not part of the branch")
+        self.assertEqual(status["assessments"], [{"evidence_level": "abstract", "validation_state": "accepted",
+                                                  "count": 4}])
+        branch.library.verify()
+        with contextlib.closing(sqlite3.connect(branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
+            own = dict(((c, d, s), v) for c, a, d, s, v in raw.execute("SELECT * FROM progress_counters"))
+        self.assertEqual(own[("rows", "works", "")], 4, "the branch's triggers count only its own rows")
+
+    def test_branch_snapshot_recomputes_counters_for_the_flattened_rows(self):
+        self.branch.work({"doi": "10.1234/w0", "title": "Corrected title in the branch"})
+        populate(self.branch, prefix="b", count=1)
+        self.branch.review_state(self.reviews[1], "binding", "completed")
+        before = self.normalized(self.branch.status("first"))
+        self.branch.library.snapshot("results/flat")
+        flat = CorpusRepository(self.root, "results/flat")
+        self.assertEqual(self.normalized(flat.status("first"))[:2], before[:2])
+        flat.library.verify(level="deep")  # stored counters equal the recount of the flattened rows
+
+    def test_a_branch_cannot_migrate_away_from_its_parent_schema_but_may_rebuild_counters(self):
+        result = self.branch.migrate(rebuild_counters=True)
+        self.assertEqual((result["schemaVersion"], result["migrations"]), (3, []))
+        self.branch.library.verify()
+        self.branch.version = 2  # as a branch of an older parent would be
+        with self.assertRaisesRegex(ValidationError, "keeps its parent snapshot's schema"):
+            self.branch.migrate()
+
+
 class LegacySnapshotTests(unittest.TestCase):
     """Snapshots written before packs (manifest version 1, loose sources) stay usable."""
 
