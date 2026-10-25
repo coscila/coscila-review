@@ -151,7 +151,7 @@ class CorpusDispatchTests(unittest.TestCase):
                 "verified", self.evidence["sourceSha256"]))
         self.loci = 0
 
-    def add_tasks(self, count, analysis="main"):
+    def add_tasks(self, count, analysis="main", proof_provider="europe-pmc"):
         ids = []
         for _ in range(count):
             self.loci += 1
@@ -167,8 +167,9 @@ class CorpusDispatchTests(unittest.TestCase):
                     "citedWork": {"title": "Synthetic trial"},
                     "identifiers": {"doi": "10.1234/source"}, "identityVerified": True,
                     "reviewProof": {"manuscriptSha256": self.manuscript_sha, "public": True,
-                                    "provider": "europe-pmc",
-                                    "sourceUrl": "https://europepmc.org/article/MED/456",
+                                    "provider": proof_provider,
+                                    "sourceUrl": "https://doi.org/10.1234/review" if proof_provider == "retained-structured-source"
+                                    else "https://europepmc.org/article/MED/456",
                                     "publication": {"doi": "10.1234/review"}}}
             ids.append(self.repo.add_task(analysis, locus, "abstract", spec))
         return ids
@@ -551,6 +552,63 @@ class CorpusDispatchTests(unittest.TestCase):
             "messages": build_messages([tasks[0]["spec"]], "abstract")}}]
         with self.assertRaisesRegex(ValidationError, "registered immutable source"):
             authorize(self.repo, None, self.broker.catalog(), self.broker.settings["workers"][0], tasks, inputs)
+
+    def on_prem_worker(self):
+        worker = copy.deepcopy(self.broker.settings["workers"][0])
+        worker.update(id="w2", evidencePolicy="entitled-institutional")
+        self.broker.settings["workers"].append(worker)
+        return worker
+
+    def test_entitled_captures_wait_for_an_on_prem_judge_and_never_reach_a_public_worker(self):
+        public = self.add_tasks(2)
+        entitled = self.add_tasks(2, proof_provider="retained-structured-source")
+        result = self.executor.submit("w1", batch_size=2)
+        job = self.broker.jobs[result["submitted"][0]["jobId"]]
+        sent = [t["id"] for item in job["request"]["items"]
+                for t in json.loads(item["input"]["messages"][1]["content"])["items"]]
+        self.assertEqual(sorted(sent), sorted(public))
+        self.assertEqual(result["heldForRouting"], 2)
+        self.assertEqual({self.states()[t] for t in entitled}, {("pending", 0)})
+        self.assertEqual(self.executor.submit("w1", batch_size=2)["submitted"], [])
+        self.on_prem_worker()
+        on_prem = self.add_analysis("on-prem")
+        mixed = self.add_tasks(1, "on-prem") + self.add_tasks(1, "on-prem", proof_provider="retained-structured-source")
+        job = self.broker.jobs[on_prem.submit("w2", batch_size=2)["submitted"][0]["jobId"]]
+        sent = [t["id"] for item in job["request"]["items"]
+                for t in json.loads(item["input"]["messages"][1]["content"])["items"]]
+        self.assertEqual(sorted(sent), sorted(mixed))
+
+    def test_authorization_routes_entitled_evidence_only_to_on_prem_judges_and_records_its_class(self):
+        self.add_tasks(1, proof_provider="retained-structured-source")
+        tasks = self.repo.tasks("main")
+        inputs = [{"id": "fixture-item", "input": {"messages": build_messages([t["spec"] for t in tasks], "abstract")}}]
+        public_worker, on_prem = self.broker.settings["workers"][0], self.on_prem_worker()
+        with self.public_authority() as audit:
+            with self.assertRaisesRegex(ConfidentialityError, "on-prem judges"):
+                authorize(self.repo, None, self.broker.catalog(), public_worker, tasks, inputs)
+            audit.assert_not_called()
+            authorize(self.repo, None, self.broker.catalog(), on_prem, tasks, inputs)
+            event = audit.call_args.args[1]
+            self.assertEqual(event["decision"], "allowed-configured-entitled-institutional")
+            self.assertEqual(event["provenanceClasses"], ["entitled"])
+        # An explicit operator plan does not widen where licensed text may go.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("ocsl_review.corpus_dispatch.load_scholarly_context", return_value=(EgressPlan(), self.root)), \
+                patch("ocsl_review.corpus_dispatch.authorize_egress", return_value={"decision": "allowed-nonconfidential"}), \
+                patch("ocsl_review.corpus_dispatch.append_egress_event") as audit:
+            with self.assertRaisesRegex(ConfidentialityError, "on-prem judges"):
+                authorize(self.repo, None, self.broker.catalog(), public_worker, tasks, inputs)
+            audit.assert_not_called()
+            authorize(self.repo, None, self.broker.catalog(), on_prem, tasks, inputs)
+            self.assertEqual(audit.call_args.args[1]["provenanceClasses"], ["entitled"])
+
+    def test_public_tasks_record_their_class_for_either_policy(self):
+        tasks, inputs = self.authorization_inputs()
+        for worker in (self.broker.settings["workers"][0], self.on_prem_worker()):
+            with self.subTest(policy=worker["evidencePolicy"]), self.public_authority() as audit:
+                authorize(self.repo, None, self.broker.catalog(), worker, tasks, inputs)
+                self.assertEqual(audit.call_args.args[1]["decision"], "allowed-configured-public-literature")
+                self.assertEqual(audit.call_args.args[1]["provenanceClasses"], ["public"])
 
     def test_configured_public_authority_requires_current_owner_and_preserves_explicit_denial(self):
         tasks, inputs = self.authorization_inputs()
