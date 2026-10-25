@@ -166,12 +166,16 @@ def _payload_digest(value: Any) -> str:
                        (value.decode("utf-8", "replace") if isinstance(value, bytes) else value))
 
 
-def normalize_endpoint(url: str) -> tuple[str, str, int, str]:
-    """(scheme, host, port, path) of an http(s) endpoint; the comparison form of the on-prem allow-list."""
+def normalize_endpoint(url: str, *, strict: bool = True) -> tuple[str, str, int, str]:
+    """(scheme, host, port, path) of an http(s) endpoint; the comparison form of the on-prem allow-list.
+
+    ``strict`` (allow-list entries) refuses credentials, a query or a fragment; a judge's URL may carry a
+    query, and neither it nor any credential is part of the endpoint that is compared and recorded.
+    """
     parsed = urllib.parse.urlsplit(str(url or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValidationError(f"an endpoint must be an http(s) URL with a host: {url!r}")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValidationError("an endpoint must be an http(s) URL with a host")
+    if strict and (parsed.username or parsed.password or parsed.query or parsed.fragment):
         raise ValidationError("an endpoint carries no credentials, query or fragment")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return parsed.scheme, parsed.hostname.lower(), port, parsed.path or "/"
@@ -430,7 +434,7 @@ class HttpJudge:
             raise ValidationError("judge URL must be http(s) with a host")
         self.url, self.model, self.location = url, model, location
         self.host = parsed.hostname
-        self.endpoint = endpoint_text(normalize_endpoint(url))
+        self.endpoint = endpoint_text(normalize_endpoint(url, strict=False))
         self.name = name or f"http-judge:{parsed.hostname}"
         self.timeout = timeout
         self.headers = dict(headers or {})

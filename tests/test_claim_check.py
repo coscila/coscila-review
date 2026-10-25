@@ -215,6 +215,9 @@ class PolicyAndLedgerTests(unittest.TestCase):
             for judge in (relay, lan, external):
                 with self.subTest(judge=judge.url), self.assertRaises(ConfidentialityError):
                     policy.authorize_model(ledger, judge, payload_sha256="0" * 64, items=1)
+            keyed = HttpJudge("http://user:secret@127.0.0.1:18160/v1/chat/completions?api-version=1", "local-model")
+            self.assertEqual("http://127.0.0.1:18160/v1/chat/completions", keyed.endpoint)
+            self.assertTrue(policy.judge_allowed(keyed))
             self.assertTrue(policy.served_model_allowed(listed, "local-model"))
             self.assertFalse(policy.served_model_allowed(listed, "external-model"))
             self.assertTrue(policy.served_model_allowed(below, "anything"))
