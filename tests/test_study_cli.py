@@ -110,6 +110,14 @@ class CommandLineTests(RunnerTestCase):
         self.assertTrue(outputs[2]["checks"]["invalidOutputsAtMostOnePercent"])
         self.assertTrue(outputs[5]["ok"])
 
+    def test_cross_validate_command(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(0, main(["study", "cross-validate", "--jats", str(FIXTURES / "review.xml"),
+                                      "--html", str(FIXTURES / "review.html")]))
+        result = json.loads(buffer.getvalue())
+        self.assertEqual((1.0, True, True), (result["share"], result["gate"]["ok"], result["uncovered"]["html"]["ok"]))
+
     def test_document_paths_cannot_escape(self):
         with self.assertRaises(ValidationError):
             read_document(self.root, {"document": {"path": "../x.xml"}})
