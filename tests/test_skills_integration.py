@@ -115,8 +115,14 @@ class SkillCatalogTests(ReviewPathsTestCase):
         self.assertTrue(skills.manifest_path(self.paths).is_file())
 
     def test_skill_roots_cannot_overlap_protected_source_or_state(self) -> None:
-        bio = ROOT.parent / "oc-science-lab-bio"
-        self.assertTrue(bio.is_dir())
+        # The sibling bio checkout is named oc-science-lab-bio on the lab host and coscila-bio in development clones; CI
+        # checks out this repository alone.
+        bio = next(
+            (ROOT.parent / name for name in ("oc-science-lab-bio", "coscila-bio") if (ROOT.parent / name).is_dir()),
+            None,
+        )
+        if bio is None:
+            self.skipTest("sibling bio checkout not present")
         unsafe_roots = (
             ROOT / "untracked-skill-root",
             bio / "untracked-skill-root",
