@@ -16,12 +16,14 @@ from ocsl_review.errors import ValidationError
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Study-identifying tokens (identifiers, file names, outcome figures and a date seed) are kept here only as
-# sha256 digests, grouped by length; lab-facing files must contain none of them at a word start.
+# Study-identifying tokens (identifiers, file names, outcome figures, corpus totals, title fragments and a
+# date seed) are kept here only as sha256 digests, grouped by length; lab-facing files must contain none of
+# them at a word start.
 FORBIDDEN = {
     4: {"0c90dd551bf12b5fecc7a9c5caa5a728d45b1c2a5f1760aca9331c12ce0df252",
         "c31e0fcedb154b3269a7fbf9b8e71a41d16af95fd4b16cb805df3dcdddf0e700"},
-    5: {"fc17580b56601023f5104f60e79b6e3390def8e30e35cc4fc0ab4ed1a5de3777",
+    5: {"a46773d48e58ed47190eba1132d7d735ab2d06fd94859332b8ead7bc2e5163e9",
+        "fc17580b56601023f5104f60e79b6e3390def8e30e35cc4fc0ab4ed1a5de3777",
         "1a5cf5c59619f15229f4f8c805d0667fd7c2e4001194717fb7ee62582f829045",
         "b8ad25220cb9a5bcb26f18dac02f87a1e947b58e5cba443d566601a4e9cd601e",
         "844cb8bb059c33fa526cb7124d8c52c6ff309f5113241e4dd16e04f20c9b005d",
@@ -33,12 +35,17 @@ FORBIDDEN = {
         "2c1ea11a3e37bce82366e296bbb04a05204ae360b5046b7ebe103682bfbace78",
         "47214e5b4a0d19d7eda978b74955ba4e914e0bb4020ecca9dc036241424917d5",
         "d7198881bf92a4872f10e9fa0ef00fb5c8860f56060f85642fcbe1d4ac05a6fd"},
+    7: {"c0c83edd9625e9bb2d3cd03550dc250197624f743a1a5bd3dad969167bdc8347"},
     8: {"e89c2935a82eb5858fdb7b1ec108c72b5fc288730f5dfd123a53a591a625d4b9",
         "42474026dbf58ea83c4f5a17a2ce9f74e5690a9ab3b9195e8682d39ad3a17dd2",
         "7d24b99d06d2eaaacb3962cbd29ebce5c4ccd4c3be5a1ebae44c370ff1d60d5b"},
     12: {"2463f01a9b90a2ad08a97f6c854d48e18ced053a7f61906c01e12b4ab438990b"},
+    42: {"d8e6d64915d843b393a00b1c75711cf9b95a45cb5ec3ca55f2194600e4daea33"},
+    53: {"4a644f4c0b74832906e22a4322b92a083cc26e14fa38b131b03fc46b4c16684e"},
 }
-LAB_FACING = ["instruments", "prompts", "schemas/instrument.schema.json", "docs/census-instrument.md",
+# Everything the lab sees: skills (with their assets and references), instruments, prompts, docs and the
+# modules that build prompts or runtime output.
+LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/instrument.schema.json",
               "src/ocsl_review/instruments.py", "src/ocsl_review/citation_census.py",
               "src/ocsl_review/census_extraction.py", "src/ocsl_review/census_runner.py",
               "src/ocsl_review/scores_db.py", "src/ocsl_review/estimands.py", "src/ocsl_review/corpus_facts.py",
@@ -187,7 +194,7 @@ class BlindnessTests(unittest.TestCase):
             files.extend(sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path])
         self.assertTrue(files)
         for path in files:
-            if not path.exists():
+            if not path.exists() or "__pycache__" in path.parts:
                 continue
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], forbidden_hits(path.read_text(encoding="utf-8")))

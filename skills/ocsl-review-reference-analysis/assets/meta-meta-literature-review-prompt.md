@@ -8,7 +8,7 @@ the main model and this study prompt are selected separately in the Lab.
 ## Controller prompt
 
 Read the installed **ocsl-review-reference-analysis** skill, including its
-historical workflow lessons and database/fork instructions. Conduct the complete
+workflow lessons and database/fork instructions. Conduct the complete
 oncology citation-support meta-meta review and produce a reusable literature
 database plus the scientific paper. Use the installed review and writing
 companions and recorded advanced orchestration. Start by identifying whether
@@ -22,14 +22,10 @@ the inherited database as evidence, configure task-appropriate worker assignment
 and record new schemas and analysis identity. Do not rerun the original census
 or require its paper format merely because the parent used this template.
 
-The reference deliverable is the September 11–12, 2026 Claude audit's paper,
-*Citation support in oncology review articles at scale: a census of two journals
-with one language-model judge*. Its historical database contained 5,564 reviews
-and 670,938 printed reference entries. These describe the reference study's scale,
-not an assumed count or completion target for newly discovered source records.
-Use the skill's account of the final working pipeline and its post-mortem as the
-methodological baseline. Historical judgments are comparators, never new results
-or human ground truth.
+Use the skill's workflow lessons and limits as the methodological baseline.
+Counts are determined from verified source records, never assumed or set as
+completion targets. Supplied earlier judgments are comparators, never new
+results or human ground truth.
 
 ### Scientific scope
 
@@ -159,7 +155,7 @@ accounting and must establish its own authorized execution.
 ### Scientific deliverables
 
 Personally write the complete manuscript and generate its figures from verified
-facts. Preserve the reference paper's five figure-led chapters: **pipeline/cost
+facts. Organize it in five figure-led chapters: **pipeline/cost
 and scaling; journal/year/stratum/topic/affiliation-country distributions;
 extremes and anchored examples; instrument validation and paired evidence-tier
 changes; reusable database and coverage**. Describe the actual Qwen-only

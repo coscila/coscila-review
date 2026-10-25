@@ -41,8 +41,8 @@ Primary environment: `review-literature`
    schemas and protocol in the new analysis, retaining the code ownership and
    evidence-provenance boundaries.
 
-Read [the historical solution and its limits](references/claude-census-lessons.md)
-when planning the first run or comparing against the earlier oncology paper.
+Read [the census workflow lessons and limits](references/census-workflow-lessons.md)
+when planning the first run.
 Read [the corpus protocol](references/corpus-protocol.md) before extraction or
 judging, and [the database and fork contract](references/database-and-forks.md)
 before initialization, export or reuse.
@@ -68,7 +68,7 @@ before initialization, export or reuse.
   statistics, figures and manuscript prose. Qwen workers return bounded,
   structured evidence assessments through the configured bulk worker path;
   they do not write or modify scripts. Validation model roles come from the
-  approved study specification, not a historical paper's benchmark design.
+  approved study specification.
 - Pin prompts, schemas, provider/model receipts and evidence hashes; persist
   accepted and rejected attempts. Resume incomplete work without relabelling
   historical judgments as fresh or repeating already accepted assessments.

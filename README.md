@@ -55,8 +55,8 @@ acquires shared sources, schedules per-locus v2 assessments, resumes durable
 queues and creates verified snapshots and analysis branches ([storage](docs/storage.md):
 packs, Merkle-rooted snapshots, delta branches and read-only stores). It keeps legacy
 results separate and calibrates small batches before enabling them. The skill
-includes the earlier oncology census's measured workflow lessons and limitations;
-deployment authorization and live throughput still require their own checks.
+includes census workflow lessons and limitations; deployment authorization and
+live throughput still require their own checks.
 
 ## What the companion decides
 
