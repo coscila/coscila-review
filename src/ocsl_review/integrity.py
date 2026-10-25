@@ -366,11 +366,12 @@ class RetractionWatchDataset:
 
 
 def combine_status(*, scholarly: Mapping[str, Any] | None = None, notices: Iterable[Mapping[str, Any]] = (),
-                   datasets: Sequence[DatasetVersion] = (), dataset_checked: bool = False) -> dict[str, Any]:
+                   datasets: Sequence[DatasetVersion] = (), dataset_checked: bool = False,
+                   checked_sources: Sequence[str] = ()) -> dict[str, Any]:
     """Dated status from every source; with no successful source the state stays unknown."""
 
     collected = [dict(notice) for notice in notices]
-    sources = [version.identifier for version in datasets] if dataset_checked else []
+    sources = ([version.identifier for version in datasets] if dataset_checked else []) + list(checked_sources)
     limitations: list[str] = []
     scholarly_state = None
     if scholarly is not None:
@@ -542,20 +543,22 @@ class IntegrityChecker:
                 scholarly_result = None
                 result["statusError"] = f"{type(error).__name__}: {error}"
             result["scholarly"] = scholarly_result
-        notices = crossref_notices(crossref_record(scholarly_result))
+        record = crossref_record(scholarly_result)
+        notices = crossref_notices(record)
         dataset_checked = bool(self.datasets) and bool(doi or pmid)
         for dataset in self.datasets:
             notices.extend(dataset.notices(doi=doi, pmid=pmid))
         if scholarly_result is not None or dataset_checked:
+            # A retrieved Crossref record is itself a checked source: its update relations were read.
             status = combine_status(scholarly=scholarly_result, notices=notices,
-                                    datasets=[dataset.version for dataset in self.datasets], dataset_checked=dataset_checked)
+                                    datasets=[dataset.version for dataset in self.datasets], dataset_checked=dataset_checked,
+                                    checked_sources=["crossref-relations"] if record is not None else [])
         else:
             status = {"state": "unknown", "notices": [], "sources": [], "scholarlyState": None,
                       "limitations": ["no status source was checked"], "checkedAt": datetime.now(UTC).isoformat()}
         result["status"] = status
         version = ",".join(dataset.version.identifier for dataset in self.datasets) or None
         result["findings"].extend(status_findings(entry["id"], status, dataset_version=version))
-        record = crossref_record(scholarly_result)
         if record is not None:
             result["findings"].extend(metadata_findings(entry["id"], entry.get("raw", ""), record))
         return result
