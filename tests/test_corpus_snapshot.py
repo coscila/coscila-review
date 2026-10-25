@@ -280,6 +280,49 @@ class RootTests(unittest.TestCase):
                 library.initialize(workspace, str(self.datasets / "new"), "Q", "x")
 
 
+class LegacySnapshotTests(unittest.TestCase):
+    """Snapshots written before packs (manifest version 1, loose sources) stay usable."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.repo = CorpusRepository.create(self.root, "work/literature", "Q", "first", {})
+        self.works = populate(self.repo, count=2)
+        snapshot = self.root / "old"
+        (snapshot / "sources").mkdir(parents=True)
+        self.repo.library.backup(snapshot / "corpus.sqlite3")
+        with contextlib.closing(sqlite3.connect(snapshot / "corpus.sqlite3")) as connection:
+            connection.row_factory = sqlite3.Row
+            sources = [dict(r) for r in connection.execute(
+                "SELECT sha256, relative_path, byte_count FROM source_artifacts ORDER BY sha256")]
+            counts = {t: connection.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                      for t in library.TABLES + library.V2_TABLES}
+            analyses = [dict(r) for r in connection.execute("SELECT * FROM analyses ORDER BY analysis_id")]
+        for item in sources:
+            (snapshot / item["relative_path"]).write_bytes(self.repo.read_artifact(item["sha256"]))
+        manifest = {"format": "ocsl-literature-snapshot", "version": 1, "created_at": library.now(),
+                    "active_analysis_id": "first", "schema_version": 2, "counts": counts, "analyses": analyses,
+                    "sources": sources, "database": {"path": "corpus.sqlite3",
+                                                     "sha256": library.digest_file(snapshot / "corpus.sqlite3"),
+                                                     "byte_count": (snapshot / "corpus.sqlite3").stat().st_size}}
+        (snapshot / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        self.old = Library(self.repo.workspace, "old")
+
+    def test_version_one_snapshots_verify_branch_and_convert(self):
+        self.assertEqual(self.old.verify()["format_version"], 1)
+        self.old.branch("work/followup", "Follow-up", "second", {})
+        branch = CorpusRepository(self.root, "work/followup")
+        self.assertEqual(branch.evidence(self.works[0], "abstract")["evidenceUnits"][0]["text"][:7], "Block 3")
+        branch.work({"doi": "10.1234/new", "title": "New in the branch"})
+        self.assertEqual(branch.library.verify()["counts"]["works"], 3)
+        branch.library.snapshot("results/flat")
+        self.assertEqual(Library(self.repo.workspace, "results/flat").verify(level="deep")["counts"]["works"], 3)
+        self.old.snapshot("results/converted")  # Re-snapshotting packs the loose sources: format version 2.
+        converted = Library(self.repo.workspace, "results/converted").verify(level="deep")
+        self.assertEqual((converted["format_version"], converted["counts"]["works"]), (2, 2))
+
+
 class MigrationTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
