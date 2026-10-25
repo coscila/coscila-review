@@ -287,7 +287,7 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
         self.assertEqual(repo.task_counts("main"), {"pending": 7})
         blocked = repo.add_task("main", "locus-0", "abstract", {"claim": "missing evidence"}, "evidence unavailable")
         repo.add_tasks("main", [("locus-0", "abstract", {"claim": "acquired evidence"}, None)], supersede_blocked=True)
-        self.assertEqual(stored and next(t for t in repo.tasks("main", state="cancelled"))["task_id"], blocked)
+        self.assertEqual([t["task_id"] for t in repo.tasks("main", state="cancelled")], [blocked])
         repo.library.verify()
 
     def test_held_connection_spans_bulk_work_and_is_released(self):
