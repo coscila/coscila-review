@@ -94,21 +94,28 @@ class SyntheticBroker:
 
 
 def generate(repo: CorpusRepository, loci: int, *, loci_per_review: int = 50, entries_per_work: int = 2) -> dict:
-    """Write a synthetic corpus with bulk SQL: reviews, cited works with abstracts, entries and loci."""
+    """Write a synthetic corpus with bulk SQL: reviews, cited works with abstracts, entries and loci.
+
+    Artifacts go where the library keeps them: into its packs (one batch), or loose
+    files behind one barrier for a library without packs.
+    """
     started = time.perf_counter()
     analysis = repo.analysis()
-    sources = repo.root / "sources"
+    sources, packs = repo.root / "sources", repo.library.packs
     created = now()
-    artifacts, files = [], []
+    artifacts, files, blobs = [], [], {}
 
     def artifact(value) -> str:
         body = canonical(value).encode()
         digest = hashlib.sha256(body).hexdigest()
-        path = sources / digest
-        if not path.exists():
-            path.write_bytes(body)
-            path.chmod(0o444)
-            files.append(path)
+        if packs is not None:
+            blobs.setdefault(digest, body)
+        else:
+            path = sources / digest
+            if not path.exists():
+                path.write_bytes(body)
+                path.chmod(0o444)
+                files.append(path)
         artifacts.append((digest, "sources/" + digest, len(body), "application/json", "synthetic", created))
         return digest
 
@@ -155,6 +162,10 @@ def generate(repo: CorpusRepository, loci: int, *, loci_per_review: int = 50, en
         claim_loci.append(("locus-" + identity(entry_id, manuscript, locator), entry_id, manuscript, locator,
                            _sentence(index, 14), canonical([_sentence(index + 1, 10), _sentence(index + 2, 12)]),
                            "synthetic-v1"))
+    if packs is not None:
+        with packs.batch():
+            for digest, body in blobs.items():
+                packs.put(body, digest)
     sync_batch(sources, files)
     with repo.connect(write=True) as connection:
         connection.executemany("INSERT OR IGNORE INTO source_artifacts VALUES (?,?,?,?,?,?)", artifacts)
@@ -165,8 +176,8 @@ def generate(repo: CorpusRepository, loci: int, *, loci_per_review: int = 50, en
         connection.executemany("INSERT INTO source_sections VALUES (?,?,?,?,?,?,?,?,?)", sections)
         connection.executemany("INSERT INTO bibliography_entries VALUES (?,?,?,?,?,?,?,?)", entries)
         connection.executemany("INSERT INTO claim_loci VALUES (?,?,?,?,?,?,?)", claim_loci)
-    return {"reviews": reviews, "citedWorks": works, "loci": loci, "artifacts": len(files),
-            "seconds": round(time.perf_counter() - started, 3)}
+    return {"reviews": reviews, "citedWorks": works, "loci": loci, "artifacts": len(files) + len(blobs),
+            "storage": "packs" if packs is not None else "loose", "seconds": round(time.perf_counter() - started, 3)}
 
 
 def measure_import(repo: CorpusRepository, broker: SyntheticBroker, *, limit: int | None, job_items: int) -> dict:
