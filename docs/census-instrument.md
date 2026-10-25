@@ -170,7 +170,11 @@ and full-text verdicts, classes, call ids and positions), `loci`, `works`,
 served model, fingerprint, settings digest, system, user, message-list and body
 digests, tokens, finish reason, attempts), `history` (append-only),
 `review_scores` and `work_scores` (beta-binomial excess and Benjamini-Hochberg
-q-values) and `data_dictionary`. `study freeze` writes the closed, read-only
+q-values), `sanitizer_findings` and `data_dictionary`. Citing sentences that are
+sent, every abstract (once per database) and every full-text window pass the
+sanitizer in detect mode: hidden characters and prompt-injection sentences are
+recorded by offset, rule and digest, and the text the judge receives stays the
+instrument's, byte for byte. `study freeze` writes the closed, read-only
 copy (rollback journal, evidence text removed unless `--keep-text`).
 `study export` writes TSV for every table and Parquet when `pyarrow` is
 installed; otherwise the manifest says that Parquet is unavailable.
