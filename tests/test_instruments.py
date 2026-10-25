@@ -42,7 +42,7 @@ LAB_FACING = ["instruments", "prompts", "schemas/instrument.schema.json", "docs/
               "src/ocsl_review/instruments.py", "src/ocsl_review/citation_census.py",
               "src/ocsl_review/census_extraction.py", "src/ocsl_review/census_runner.py",
               "src/ocsl_review/scores_db.py", "src/ocsl_review/estimands.py", "src/ocsl_review/corpus_facts.py",
-              "src/ocsl_review/study_cli.py"]
+              "src/ocsl_review/study_cli.py", "src/ocsl_review/census_abstracts.py"]
 
 
 def forbidden_hits(text: str, table=None) -> list[int]:
