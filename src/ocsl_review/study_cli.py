@@ -46,7 +46,8 @@ def add_commands(families, register):
         if name == "abstracts":
             command.add_argument("--input", required=True, help="JSONL review records")
             command.add_argument("--output", required=True, help="JSONL review records with Europe PMC abstracts")
-            command.add_argument("--overwrite", action="store_true", help="replace abstracts already present")
+            command.add_argument("--overwrite", action="store_true",
+                                 help="look up every work again, also those already looked up")
         if name in ("judge", "full-text", "no-truncation", "replicate"):
             command.add_argument("--base-url", required=True, help="chat-completions base URL of the judge")
             command.add_argument("--api-key-env", help="environment variable holding the judge key")
@@ -172,32 +173,92 @@ def gates(status: dict[str, Any]) -> dict[str, Any]:
     return {"ok": all(checks.values()), "checks": checks, "notes": notes, "status": status}
 
 
+def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = False) -> dict[str, Any]:
+    """Stream records through the Europe PMC ladder into ``<output>.partial``; resume it; rename when complete."""
+    import json
+    import os
+    from .census_abstracts import fill_record
+    from .census_runner import abstract_lookup_failed, iter_records
+    if output.resolve() == source.resolve():
+        raise ValidationError("write enriched records to a new file")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = Path(str(output) + ".partial")
+    done: list[tuple[Any, Any]] = []
+    if partial.exists():
+        kept = 0
+        with partial.open("rb") as handle:
+            for raw in handle:
+                try:
+                    value = json.loads(raw)
+                except ValueError:
+                    break               # a line cut off by a crash: rewrite from here
+                if not raw.endswith(b"\n"):
+                    break
+                done.append((value.get("journal"), value.get("doi")))
+                kept += len(raw)
+        with partial.open("rb+") as handle:   # drop a cut-off tail before appending
+            handle.truncate(kept)
+    sources: dict[str, int] = {}
+    counts = {"records": 0, "resumed": len(done), "lookupFailed": 0}
+    with partial.open("a", encoding="utf-8") as handle:
+        for index, record in enumerate(iter_records(source)):
+            if index < len(done):
+                if (record.get("journal"), record.get("doi")) != done[index]:
+                    raise ValidationError(f"{partial} does not continue this input (record {index + 1} differs)")
+                filled = record
+            else:
+                filled = fill_record(record, get, overwrite=overwrite)
+                handle.write(json.dumps(filled, ensure_ascii=False) + "\n")
+                handle.flush()
+                counts["lookupFailed"] += bool(abstract_lookup_failed(filled))
+                for work in filled.get("works", {}).values():
+                    name = work.get("abstractSource") or "none"
+                    sources[name] = sources.get(name, 0) + 1
+            counts["records"] += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, output)
+    return {**counts, "output": str(output), "abstractSources": sources,
+            "next": "run study abstracts again on the output for works whose lookup failed" if counts["lookupFailed"] else None}
+
+
+def prepare(run: Any, source: Path) -> dict[str, Any]:
+    """Prepare reviews one record at a time; a review that cannot be read or extracted is recorded, not fatal."""
+    from .census_runner import abstract_lookup_failed, iter_records, read_document
+    counts: dict[str, int] = {}
+    problems = []
+    for record in iter_records(source):
+        failed = abstract_lookup_failed(record)
+        if failed:
+            result = {"doi": record.get("doi"), "state": "skipped-abstract-lookup-failed", "works": failed[:20]}
+        else:
+            try:
+                document = read_document(source.parent, record)
+            except (OSError, ValidationError) as error:
+                result = run.record_unavailable(record, f"{type(error).__name__}: {error}")
+            else:
+                try:
+                    result = run.prepare_review(record, document)
+                except ValidationError as error:
+                    # An inconsistent record (unknown work, changed document): kept in coverage with its reason.
+                    result = {**run.record_unavailable(record, f"input refused: {error}"), "state": "input-refused"}
+        counts[result["state"]] = counts.get(result["state"], 0) + 1
+        if result["state"] not in ("prepared", "already-prepared"):
+            problems.append(result)
+    return {"prepared": counts.get("prepared", 0), "states": counts, "problems": problems}
+
+
 def command(args) -> Any:
-    from .census_runner import load_records, read_document
     action = args.study_command
     if action == "abstracts":
-        import json
-        from .census_abstracts import fill_record, http_get
-        source, output = Path(args.input), Path(args.output)
-        if output.resolve() == source.resolve():
-            raise ValidationError("write enriched records to a new file")
-        get = http_get()
-        records = [fill_record(record, get, overwrite=args.overwrite) for record in load_records(source)]
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
-        sources: dict[str, int] = {}
-        for record in records:
-            for work in record["works"].values():
-                sources[work.get("abstractSource") or "supplied"] = sources.get(work.get("abstractSource") or "supplied", 0) + 1
-        return {"records": len(records), "output": str(output), "abstractSources": sources}
+        from .census_abstracts import http_get
+        return fill_abstracts(Path(args.input), Path(args.output), http_get(), overwrite=args.overwrite)
     if action == "prepare":
         run = _run(args)
         try:
-            source = Path(args.input)
-            results = [run.prepare_review(record, read_document(source.parent, record)) for record in load_records(source)]
+            return prepare(run, Path(args.input))
         finally:
             run.close()
-        return {"prepared": sum(r["state"] == "prepared" for r in results), "results": results}
     if action in ("judge", "full-text", "no-truncation", "replicate"):
         run = _run(args, _transport(args))
         passes = {"transport_retries": args.transport_retries, "cooldown": args.transport_cooldown}

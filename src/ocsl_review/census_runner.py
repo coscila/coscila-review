@@ -27,7 +27,8 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from xml.etree import ElementTree as ET
 
 from . import citation_census as C
 from . import scores_db
@@ -298,7 +299,10 @@ class CensusRun:
             return {"doi": doi, "state": "unavailable"}
         if kind not in ("jats", "html"):
             raise ValidationError(f"{doi}: document kind must be jats or html")
-        review = extract_review(document, html=kind == "html")
+        try:
+            review = extract_review(document, html=kind == "html")
+        except (ValidationError, ET.ParseError, UnicodeError) as error:
+            return self._record_unreadable(record, base, order, document_sha, kind, f"{type(error).__name__}: {error}")
         works = {key: dict(value) for key, value in (record.get("works") or {}).items()}
         supplied = record.get("identities") or {}
         title = record.get("title") or review["title"] or ""
@@ -396,6 +400,38 @@ class CensusRun:
             scores_db.aggregate_reviews(self.connection, journal, doi)
         return {"doi": doi, "state": "prepared", "entries": len(rows), "uncovered": uncovered,
                 "judgeable": sum(1 for r in rows if "abs_class" not in r), "sanitizerFindings": len(findings)}
+
+    def _record_unreadable(self, record: Mapping[str, Any], base: tuple, order: int, document_sha: str | None,
+                           kind: str | None, reason: str) -> dict[str, Any]:
+        """A review whose document cannot be extracted stays in coverage with its reason; nothing is judged."""
+        journal, doi = base[0], base[1]
+        diagnostics = {"extractionFailed": reason[:500]}
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, route, provenance_class,"
+                " document_sha256, extraction_json, review_order, abstract_state, full_text_state)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'completed','completed')",
+                (journal, doi, record.get("paperKey"), record.get("title"), record.get("year"), record.get("firstOnline"),
+                 record.get("stratum"), kind, base[8], document_sha, canonical(diagnostics), order))
+        return {"doi": doi, "state": "extraction-failed", "reason": diagnostics["extractionFailed"]}
+
+    def record_unavailable(self, record: Mapping[str, Any], reason: str) -> dict[str, Any]:
+        """A review whose document could not be read (missing file, digest mismatch) stays in coverage."""
+        journal, doi = record.get("journal"), (record.get("doi") or "").lower()
+        if not journal or not doi:
+            raise ValidationError("a review record needs journal and doi")
+        with self.lock:
+            if self.connection.execute("SELECT 1 FROM reviews WHERE journal=? AND doi=?", (journal, doi)).fetchone():
+                return {"doi": doi, "state": "already-prepared"}
+            order = self.connection.execute("SELECT COALESCE(MAX(review_order), -1) + 1 FROM reviews").fetchone()[0]
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, provenance_class,"
+                " extraction_json, review_order, abstract_state, full_text_state)"
+                " VALUES(?,?,?,?,?,?,?,'unavailable',?,?,'completed','completed')",
+                (journal, doi, record.get("paperKey"), record.get("title"), record.get("year"), record.get("firstOnline"),
+                 record.get("stratum"), canonical({"documentUnreadable": reason[:500]}), order))
+        return {"doi": doi, "state": "unavailable", "reason": reason[:500]}
 
     # ------------------------------------------------------------------ abstract tier
     def _items(self, journal: str, doi: str) -> list[dict[str, Any]]:
@@ -1123,18 +1159,34 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
             "fingerprintOffered": bool(responded[1]),
             "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
             "duplicateJudgments": duplicates,
-            "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0]}
+            "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
+            "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
+                                                 "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
+
+
+def iter_records(path: Path) -> Iterator[dict[str, Any]]:
+    """Review records one line at a time (a census manifest can hold gigabytes of abstracts)."""
+    with Path(path).open(encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except ValueError as error:
+                raise ValidationError(f"census input line {number} is not JSON") from error
+            if not isinstance(value, dict):
+                raise ValidationError("census input lines must be JSON objects")
+            yield value
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
-    records = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise ValidationError("census input lines must be JSON objects")
-            records.append(value)
-    return records
+    return list(iter_records(path))
+
+
+def abstract_lookup_failed(record: Mapping[str, Any]) -> list[str]:
+    """Works whose Europe PMC lookup failed in transport; ``study abstracts`` must run again before preparing."""
+    return sorted(key for key, work in (record.get("works") or {}).items()
+                  if "europe-pmc-failed" in (work.get("europePmcOutcome"), work.get("abstractSource")))
 
 
 def read_document(base: Path, record: Mapping[str, Any]) -> bytes | None:
