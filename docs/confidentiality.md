@@ -176,6 +176,12 @@ segment. A ledger written by earlier versions as one JSON array
 starts from its SHA-256. `verify_egress_ledger` checks every segment and link,
 and `read_egress_events` returns all events in order after that check.
 
+`ocsl-review screen` keeps its own chained `egress.jsonl` in the run directory
+(see [claim screen](claim-check.md)) and appends every one of its decisions to
+the workspace ledger as well (`source: claim-check@1`, linked by
+`runLedgerSha256`): judge calls, registry checks and refusals. Provider
+fetches are recorded once there, by the scholarly client.
+
 Each event reaches the operating system before the request it authorizes is
 sent, so it survives a crash of the process. The ledger calls `fdatasync` at
 most once per second per process and at the latest one second after an

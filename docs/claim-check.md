@@ -127,7 +127,10 @@ PMCID) reach external providers, refuses free-text lookups before any request, a
 and cited text only to an on-prem judge: `--judge-location on-prem` on a host the policy allows
 (loopback, private addresses, or the policy's `onPremHosts`). Every decision, allowed or refused,
 is appended to the run's `egress.jsonl`: destination, destination class, operation, argument names,
-payload sha256 and policy digest, chained by hash. `ocsl-review replay` verifies the chain.
+payload sha256 and policy digest, chained by hash. `ocsl-review replay` verifies the chain. A screen
+run in a workspace also appends each decision to the workspace's egress ledger
+([confidentiality](confidentiality.md)), linked by the run record's hash; allowed provider fetches
+appear there once, recorded by the scholarly client.
 
 ```json
 {"policy": "claim-check-egress", "version": 1, "mode": "confidential-manuscript",
