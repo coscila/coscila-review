@@ -205,7 +205,9 @@ Planning reads citation loci in keyset pages of 5,000 rows, loads each cited
 work's evidence once per pass and stores task inputs in transactions of at most
 5,000 rows behind one durability barrier per batch. Result import parses each
 batch request once and writes every result page of up to 100 records, with its
-broker cursor, in one transaction; a replayed page imports nothing twice.
+broker cursor, in one transaction; a replayed page imports nothing twice. Up to
+ten staged pages share one durability barrier for their receipt files before
+their transactions commit in order.
 
 Libraries at schema version 3 keep progress counters in the same transactions
 as the rows they count, so `corpus status`, the progress heartbeat and the
