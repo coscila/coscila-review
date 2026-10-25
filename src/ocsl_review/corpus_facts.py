@@ -168,6 +168,11 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
         for name in ("slope", "lo", "hi"):
             _store(estimates, f"census.{s}.trend_{name}", trend.get(name), "OLS slope of the yearly share", journal,
                    {**detail, "years": trend.get("years")})
+        replicate = result["replicate"]
+        if replicate["entries"]:
+            detail_r = {"estimand": "agreement of a stratified unchanged re-run with the primary verdicts"}
+            for name in ("entries", "categoryAgreement", "classAgreement", "trueFalsePairs", "trueFalseKappa"):
+                _store(estimates, f"census.{s}.replicate.{slug(name)}", replicate[name], "replicate agreement", journal, detail_r)
         for step in result["ladder"]["steps"]:
             key = f"census.{s}.ladder.{slug(step['step'])}"
             _store(estimates, key + ".share", step.get("share"), step["definition"], journal, detail)

@@ -391,6 +391,27 @@ class SensitivityTests(RunnerTestCase):
         self.assertEqual(0, run.run_no_truncation(entries=10)["batches"])
 
 
+class ReplicateTests(RunnerTestCase):
+    def test_stratified_replicate(self):
+        run = self.run_census()
+        self.prepare(run, record(), record(doi="10.5555/second", year=2020))
+        run.run_abstract()
+        sample = run.replicate_sample(5)
+        self.assertEqual({"10.5555/synthetic.review.1", "10.5555/second"}, {doi for _, doi, _ in sample})
+        self.assertEqual(sample, run.replicate_sample(5))
+        result = run.run_replicate(entries=5)
+        self.assertEqual(("completed", 2, 30), (result["state"], result["batches"], result["accepted"]))
+        with closing(sqlite3.connect(self.database)) as c:
+            agreement = estimands.variant_agreement(c, JOURNAL)
+        self.assertEqual((30, 1.0, 1.0, 1.0), (agreement["entries"], agreement["categoryAgreement"],
+                                               agreement["classAgreement"], agreement["trueFalseKappa"]))
+        self.assertEqual(0, run.run_replicate(entries=5)["batches"])
+        primary = self.rows("SELECT COUNT(*) AS n FROM history WHERE variant='primary' AND outcome='accepted'")[0]["n"]
+        self.assertEqual(30, primary)
+        with self.assertRaises(ValidationError):
+            run.replicate_sample(0)
+
+
 class FreezeExportTests(RunnerTestCase):
     def test_freeze_and_export_a_run(self):
         run = self.run_census()

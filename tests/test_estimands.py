@@ -266,6 +266,13 @@ class DatabaseEstimandTests(unittest.TestCase):
         self.assertEqual(2, result["entries"])
         self.assertEqual((0.5, 1.0, 0.5), (result["all"]["primaryShare"], result["all"]["variantShare"], result["all"]["agreement"]))
 
+    def test_variant_agreement(self):
+        result = E.variant_agreement(self.c, "J1", "no-truncation")
+        self.assertEqual((2, 0.5, 2), (result["entries"], result["categoryAgreement"], result["trueFalsePairs"]))
+        # Pairs (T->F) and (F->F): observed 1/2, P(F) 1/2 and 1, expected 1/2, kappa 0.
+        self.assertAlmostEqual(0.0, result["trueFalseKappa"])
+        self.assertEqual(0, E.variant_agreement(self.c, "J1", "replicate")["entries"])
+
     def test_coverage_and_decomposition(self):
         coverage = {row["cell"]: row for row in E.coverage(self.c, "J1", "year")}
         self.assertEqual((1, 1, 7, 6, 5, 1), tuple(coverage[2020][k] for k in

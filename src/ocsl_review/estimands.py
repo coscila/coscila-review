@@ -410,6 +410,36 @@ def no_truncation_comparison(connection: sqlite3.Connection, journal: str) -> di
     return result
 
 
+def variant_agreement(connection: sqlite3.Connection, journal: str, variant: str = "replicate") -> dict[str, Any]:
+    """Agreement between primary verdicts and a re-run variant on the same entries (category, class, T/F kappa)."""
+    rows = _rows(connection, """
+      SELECT c.abs_category AS primary_category, c.abs_escalated AS primary_escalate, h.category AS variant_category,
+             h.escalate AS variant_escalate
+      FROM history h JOIN citations c ON c.journal=h.journal AND c.doi=h.doi AND c.label=h.label
+      WHERE h.journal=? AND h.variant=? AND h.outcome='accepted' AND c.model_judged=1 AND c.cited_inbody=1
+        AND c.identity IN ('resolved','resolved_unverified')""", (journal, variant))
+
+    def klass(category, escalate):
+        return ("sure_supported" if category == "true" and not escalate else
+                "sure_not_supported" if category == "false" and not escalate else "unsure")
+    pairs = [(r["primary_category"], r["variant_category"], klass(r["primary_category"], r["primary_escalate"]),
+              klass(r["variant_category"], r["variant_escalate"])) for r in rows]
+    tf = [(a, b) for a, b, _, _ in pairs if a in ("true", "false") and b in ("true", "false")]
+    kappa = None
+    if tf:
+        observed = sum(1 for a, b in tf if a == b) / len(tf)
+        pa = sum(1 for a, _ in tf if a == "false") / len(tf)
+        pb = sum(1 for _, b in tf if b == "false") / len(tf)
+        expected = pa * pb + (1 - pa) * (1 - pb)
+        kappa = (observed - expected) / (1 - expected) if expected < 1 else None
+    return {"journal": journal, "variant": variant, "entries": len(pairs),
+            "categoryAgreement": sum(1 for a, b, _, _ in pairs if a == b) / len(pairs) if pairs else None,
+            "classAgreement": sum(1 for _, _, c, d in pairs if c == d) / len(pairs) if pairs else None,
+            "trueFalsePairs": len(tf), "trueFalseKappa": kappa,
+            "primaryShare": sum(1 for a, _ in tf if a == "false") / len(tf) if tf else None,
+            "variantShare": sum(1 for _, b in tf if b == "false") / len(tf) if tf else None}
+
+
 def coverage(connection: sqlite3.Connection, journal: str, by: str = "year") -> list[dict[str, Any]]:
     """Coverage table: reviews, extraction, identity, judged and full-text counts per cell."""
     if by not in PANELS:
@@ -471,6 +501,7 @@ def report(connection: sqlite3.Connection, journals: Sequence[str], *, b: int = 
             "panels": {by: panel(connection, journal, by, b=b, seed=seed) for by in panels},
             "trend": trend(connection, journal, b=b, seed=seed, years=trend_years),
             "ladder": sensitivity_ladder(connection, journal),
+            "replicate": variant_agreement(connection, journal, "replicate"),
             "coverage": {by: coverage(connection, journal, by) for by in ("year", "stratum", "route", "provenance")},
         }
     if ratio_pair:

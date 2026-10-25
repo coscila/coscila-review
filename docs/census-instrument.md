@@ -131,6 +131,7 @@ ocsl-review study judge --database work/census.sqlite3 --seed "$SEED" --base-url
   --api-key-env JUDGE_KEY_VARIABLE --concurrency 60
 ocsl-review study full-text --database work/census.sqlite3 --seed "$SEED" --base-url "$JUDGE_URL" --europe-pmc
 ocsl-review study no-truncation --database work/census.sqlite3 --seed "$SEED" --base-url "$JUDGE_URL"
+ocsl-review study replicate --database work/census.sqlite3 --seed "$SEED" --base-url "$JUDGE_URL" --entries "$N"
 ocsl-review study gates --database work/census.sqlite3
 ocsl-review study freeze --database work/census.sqlite3 --output results/scores.sqlite3
 ocsl-review study export --scores results/scores.sqlite3 --output results/scores-export
@@ -139,7 +140,11 @@ ocsl-review study facts --scores results/scores.sqlite3 --output results/facts \
 ocsl-review study verify-facts --facts results/facts/facts.json
 ```
 
-Runs are resumable per review; receipts are written per call. `gates` checks
+Runs are resumable per review; receipts are written per call. `replicate`
+re-runs whole primary batches, unchanged, in a sample stratified by journal and
+first-online year and allocated in proportion to judged entries; its verdicts go
+to the history as variant `replicate`, and the estimands report category and
+class agreement and the T/F kappa against the primary verdicts. `gates` checks
 invalid outputs (at most 1 %), transport failures (at most 0.5 % of calls),
 uncovered anchors (0), duplicate judgments (0) and fingerprints on every
 receipt. The transport sends the request body bytes exactly as built and
