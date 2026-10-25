@@ -294,9 +294,19 @@ class CorpusDispatchTests(unittest.TestCase):
         with self.repo.connect(write=True) as connection:
             connection.execute("CREATE TRIGGER injected BEFORE UPDATE OF cursor ON corpus_batches "
                                "BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END")
-        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2):
+        barriers, original_sync = [], CorpusRepository.sync_staged
+
+        def counting_sync(repo, paths):
+            barriers.append(len(paths))
+            return original_sync(repo, paths)
+
+        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2), \
+                patch("ocsl_review.corpus_dispatch.BARRIER_PAGES", 2), \
+                patch.object(CorpusRepository, "sync_staged", counting_sync):
             with self.assertRaisesRegex(Exception, "injected cursor failure"):
                 self.executor.resume()
+        # Two staged pages shared one barrier before the first page's commit failed.
+        self.assertEqual(barriers, [4])
         self.assertEqual(self.rows("model_receipts"), [])
         self.assertEqual({self.states()[t] for t in tasks}, {("running", 1)})
         with self.repo.connect(write=True) as connection:
@@ -310,6 +320,7 @@ class CorpusDispatchTests(unittest.TestCase):
 
         fresh = CorpusExecutor(self.repo, broker=self.broker, authorization=lambda *args: None)
         with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2), \
+                patch("ocsl_review.corpus_dispatch.BARRIER_PAGES", 2), \
                 patch.object(CorpusRepository, "connect", connect), \
                 patch.object(CorpusRepository, "read_artifact", counting_read):
             fresh.resume()
