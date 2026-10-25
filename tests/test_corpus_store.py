@@ -282,6 +282,37 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
         self.assertEqual(stored and next(t for t in repo.tasks("main", state="cancelled"))["task_id"], blocked)
         repo.library.verify()
 
+    def test_held_connection_spans_bulk_work_and_is_released(self):
+        repo = CorpusRepository.create(self.root, "work/corpus", "Question", "main", {"version": 2})
+        wal = repo.db.with_name(repo.db.name + "-wal")
+        with repo.held_open():
+            held = repo._held
+            with repo.held_open():
+                self.assertIs(repo._held, held)
+            repo.add_tasks("main", [])
+            repo.json_artifact({"value": 1}, "test")
+            # The short writer was not the last connection, so the WAL was not checkpointed away.
+            self.assertTrue(wal.exists())
+        self.assertIsNone(repo._held)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            held.execute("SELECT 1")
+        self.assertEqual(repo.status()["counts"]["source_artifacts"], len(list((repo.root / "sources").iterdir())))
+
+    def test_reads_resolve_local_sources_quickly_and_refuse_swapped_symlinks(self):
+        repo = CorpusRepository.create(self.root, "work/corpus", "Question", "main", {"version": 2})
+        digest = repo.artifact(b"original evidence", "test")
+        self.assertEqual(repo.read_artifacts([digest]), {digest: b"original evidence"})
+        path = repo.root / "sources" / digest
+        outside = self.root / "outside"
+        outside.write_bytes(b"original evidence")
+        path.chmod(0o600)
+        path.unlink()
+        path.symlink_to(outside)
+        with self.assertRaises((ValueError, ValidationError)):
+            repo.read_artifacts([digest])
+        with self.assertRaises((ValueError, ValidationError)):
+            repo.verify_artifacts([digest])
+
     def test_batch_barrier_uses_syncfs_once_or_fsyncs_every_new_file(self):
         repo = CorpusRepository.create(self.root, "work/corpus", "Question", "main", {"version": 2})
         calls = []
