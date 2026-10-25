@@ -99,6 +99,11 @@ writes redacted events when `OCSL_REVIEW_WORKSPACE` selects a validated chat or
 when its exact process working directory is a validated descendant of
 `LAB_WORKSPACE_ROOT`.
 
+Corpus commands make batches of new artifact files durable with one Linux
+`syncfs` call per batch before database rows refer to them. Set
+`OCSL_REVIEW_ARTIFACT_SYNC=fsync` where `syncfs` is unavailable or undesirable;
+each new file and its directory are then synced individually, which is slower.
+
 ## Pre-install preparation
 
 ### 1. Validate tracked inputs
