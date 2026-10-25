@@ -20,6 +20,7 @@ egress decision is written to a hash-chained ledger that stores names and digest
 from __future__ import annotations
 
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -392,7 +393,7 @@ class HttpJudge:
         try:
             with self.opener(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read(32 * 1024 * 1024).decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.HTTPException) as exc:
             raise ValidationError(f"judge request failed: {type(exc).__name__}") from exc
         try:
             choice = payload["choices"][0]
