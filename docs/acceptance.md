@@ -48,6 +48,15 @@ and no manuscript text in any outbound request or egress-ledger event in
 confidential mode. Live judge throughput and provider behaviour still require
 deployment-specific checks.
 
+The `citation-census@1` code-fidelity tests (byte-identical prompts, parser
+results, windows and geometry on synthetic fixtures; system-prompt digests) run
+in the same suite and never read verdicts. Two acceptance measurements are
+opt-in because they build large synthetic stores: the corpus executor benchmark
+(`tests/benchmark_corpus_executor.py --loci 200000 --check`, see
+[corpus review](corpus-review.md)) and the storage benchmark
+(`scripts/storage_benchmark.py --out NEW_DIR`, see [storage](storage.md)). Both
+report only what they measure on the store they just generated.
+
 ### 3. Environment acceptance
 
 For every one of the six catalogued environments on the target platform:
