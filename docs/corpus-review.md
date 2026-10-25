@@ -213,13 +213,16 @@ coverage require their own resolution rather than repeating the same inference.
 
 ## Storage, progress and schema upgrades
 
-Planning reads citation loci in keyset pages of 5,000 rows, loads each cited
-work's evidence once per pass and stores task inputs in transactions of at most
-5,000 rows behind one durability barrier per batch. Result import parses each
-batch request once and writes every result page of up to 100 records, with its
-broker cursor, in one transaction; a replayed page imports nothing twice. Up to
-ten staged pages share one durability barrier for their receipt files before
-their transactions commit in order.
+Planning reads citation loci in keyset pages of 5,000 rows (a branch pages its
+own loci, then its parent's), loads each cited work's evidence once per pass and
+stores task inputs in transactions of at most 5,000 rows behind one durability
+barrier per batch: one pack fsync before the index rows commit, or one
+filesystem barrier for the loose files of a library without packs
+([storage](storage.md)). Result import parses each batch request once and
+writes every result page of up to 100 records, with its broker cursor, in one
+transaction; a replayed page imports nothing twice. Up to ten staged pages
+share one durability barrier for their receipts before their transactions
+commit in order.
 
 Libraries at schema version 3 keep progress counters in the same transactions
 as the rows they count, so `corpus status`, the progress heartbeat and the
@@ -232,7 +235,11 @@ ocsl-review corpus migrate --workspace . --library work/literature
 
 Each step first writes and checks a backup (`corpus-v<N>-backup.sqlite3`, never
 overwriting an earlier one) and refuses immutable snapshots; branch a snapshot
-first. Until then, status of an older library scans its tables and says so.
+first. Until then, status of an older library scans its tables and says so. A
+delta branch keeps its parent snapshot's schema version: migrate the parent
+library, snapshot it and branch again. A branch's counters cover its own rows;
+its status adds the parent snapshot's counters and takes out the parent rows
+the branch has overridden, and a snapshot of a branch recounts them.
 `corpus verify` compares the counters with the stored rows; `corpus migrate
 --rebuild-counters` recomputes them.
 
