@@ -14,6 +14,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import random
 import subprocess
@@ -748,6 +749,61 @@ class CensusRun:
                     batches = C.paper_batches(self._items(journal, doi))
                 yield journal, doi, title or "", [(index, batches[index]) for index in sorted(indices)]
         totals, drift = self._schedule(work(), cut=None, variant="no-truncation")
+        totals["batches"] = sum(len(v) for v in by_review.values())
+        totals["selectedBatches"] = len(selected)
+        return self._paused(totals, drift)
+
+    def replicate_sample(self, entries: int) -> list[tuple[str, str, int]]:
+        """Whole primary batches stratified by journal and year, allocated in proportion to judged entries."""
+        if not isinstance(entries, int) or entries < 1:
+            raise ValidationError("the replicate needs a positive number of entries")
+        with self.lock:
+            batches = self.connection.execute(
+                "SELECT c.journal, c.doi, c.abs_batch AS batch, r.year, COUNT(*) AS n FROM citations c JOIN reviews r "
+                "ON r.journal=c.journal AND r.doi=c.doi WHERE c.abs_batch IS NOT NULL AND c.cited_inbody=1 "
+                "AND c.identity IN ('resolved','resolved_unverified') GROUP BY c.journal, c.doi, c.abs_batch "
+                "ORDER BY c.journal, c.doi, c.abs_batch").fetchall()
+        strata: dict[tuple[str, Any], list[tuple[str, str, int, int]]] = {}
+        for b in batches:
+            strata.setdefault((b["journal"], b["year"]), []).append((b["journal"], b["doi"], b["batch"], b["n"]))
+        total = sum(b["n"] for b in batches)
+        selected = []
+        for key in sorted(strata, key=lambda k: (k[0], str(k[1]))):
+            members = list(strata[key])
+            target = math.ceil(entries * sum(m[3] for m in members) / total) if total else 0
+            random.Random(f"{self.seed}:replicate:{key[0]}:{key[1]}").shuffle(members)
+            covered = 0
+            for journal, doi, batch, n in members:
+                if covered >= target:
+                    break
+                selected.append((journal, doi, batch))
+                covered += n
+        return selected
+
+    def run_replicate(self, *, entries: int) -> dict[str, Any]:
+        """Re-run a stratified sample of primary batches unchanged; history only, variant replicate."""
+        if self.transport is None:
+            raise ValidationError("a transport is required to run the census")
+        self._egress_gate("abstract_state='completed'")
+        self._resume_after_drift()
+        selected = self.replicate_sample(entries)
+        with self.lock:
+            done = {(r[0], r[1], r[2]) for r in self.connection.execute(
+                "SELECT DISTINCT h.journal, h.doi, c.abs_batch FROM history h JOIN citations c ON c.journal=h.journal "
+                "AND c.doi=h.doi AND c.label=h.label WHERE h.variant='replicate'")}
+        by_review: dict[tuple[str, str], list[int]] = {}
+        for journal, doi, batch in selected:
+            if (journal, doi, batch) not in done:
+                by_review.setdefault((journal, doi), []).append(batch)
+
+        def work():
+            for (journal, doi), indices in by_review.items():
+                with self.lock:
+                    title = self.connection.execute("SELECT title FROM reviews WHERE journal=? AND doi=?",
+                                                    (journal, doi)).fetchone()[0]
+                    batches = C.paper_batches(self._items(journal, doi))
+                yield journal, doi, title or "", [(index, batches[index]) for index in sorted(indices)]
+        totals, drift = self._schedule(work(), cut=True, variant="replicate")
         totals["batches"] = sum(len(v) for v in by_review.values())
         totals["selectedBatches"] = len(selected)
         return self._paused(totals, drift)

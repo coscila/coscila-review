@@ -33,16 +33,16 @@ def add_commands(families, register):
 
     study = families.add_parser("study", help="run a census study with a registered instrument")
     actions = study.add_subparsers(dest="study_command", required=True)
-    for name in ("prepare", "judge", "full-text", "no-truncation", "status", "gates", "freeze", "export",
+    for name in ("prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze", "export",
                  "estimands", "facts", "verify-facts", "cross-validate"):
         command = actions.add_parser(name)
-        if name in ("prepare", "judge", "full-text", "no-truncation", "status", "gates", "freeze"):
+        if name in ("prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze"):
             command.add_argument("--database", required=True, help="working census database")
-        if name in ("prepare", "judge", "full-text", "no-truncation"):
+        if name in ("prepare", "judge", "full-text", "no-truncation", "replicate"):
             command.add_argument("--seed", type=int, required=True, help="protocol seed")
         if name == "prepare":
             command.add_argument("--input", required=True, help="JSONL review records; document paths are relative to it")
-        if name in ("judge", "full-text", "no-truncation"):
+        if name in ("judge", "full-text", "no-truncation", "replicate"):
             command.add_argument("--base-url", required=True, help="chat-completions base URL of the judge")
             command.add_argument("--api-key-env", help="environment variable holding the judge key")
             command.add_argument("--model", help="model name to request (defaults to the required served model)")
@@ -55,6 +55,8 @@ def add_commands(families, register):
             command.add_argument("--fetch-workers", type=int, default=4)
         if name == "no-truncation":
             command.add_argument("--entries", type=int)
+        if name == "replicate":
+            command.add_argument("--entries", type=int, required=True, help="entries to re-judge, stratified by journal and year")
         if name == "freeze":
             command.add_argument("--output", required=True)
             command.add_argument("--keep-text", action="store_true")
@@ -132,7 +134,7 @@ def command(args) -> Any:
         finally:
             run.close()
         return {"prepared": sum(r["state"] == "prepared" for r in results), "results": results}
-    if action in ("judge", "full-text", "no-truncation"):
+    if action in ("judge", "full-text", "no-truncation", "replicate"):
         run = _run(args, _transport(args))
         try:
             if action == "judge":
@@ -140,6 +142,8 @@ def command(args) -> Any:
             if action == "full-text":
                 return run.run_full_text(fetch_xml=europe_pmc_fetcher() if args.europe_pmc else None,
                                          fetch_workers=args.fetch_workers)
+            if action == "replicate":
+                return run.run_replicate(entries=args.entries)
             return run.run_no_truncation(entries=args.entries)
         finally:
             run.close()
