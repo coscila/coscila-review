@@ -19,6 +19,7 @@ class CorpusBenchmarkSmokeTests(unittest.TestCase):
         self.assertEqual((report["corpus"]["loci"], report["prepare"]["tasks"], report["prepare"]["blocked"]), (240, 240, 0))
         self.assertEqual(report["import"]["results"], 240)
         self.assertEqual(report["counts"]["claim_loci"], 240)
+        self.assertEqual(report["corpus"]["storage"], "packs", "a new library keeps its artifacts in packs")
         self.assertEqual((report["egress"]["events"], report["egress"]["verifiedEvents"]), (300, 300))
         for stage in ("prepare", "import"):
             self.assertGreater(report[stage]["seconds"], 0)
