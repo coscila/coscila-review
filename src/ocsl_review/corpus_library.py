@@ -775,9 +775,11 @@ class Library:
 
     # -------------------------------------------------------------- snapshots
     def backup(self, destination):
-        # SQLite backup includes committed WAL pages; a raw .sqlite file copy does not.
+        # SQLite backup includes committed WAL pages; a raw .sqlite file copy does not. One step copies every
+        # page inside a single read transaction: a stepwise backup restarts whenever another connection
+        # commits, so it would never finish while a controller keeps importing results.
         with self.connect() as source, database(destination) as target:
-            source.backup(target, pages=16384)
+            source.backup(target, pages=-1)
             target.execute("PRAGMA journal_mode=DELETE")
 
     def _flatten(self, destination):
