@@ -394,6 +394,28 @@ class CorpusDispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "study bundle is not recorded"):
             self.executor_for("unrecorded").submit("w1")
 
+    def test_a_delta_branch_dispatches_imports_and_counts_like_a_library(self):
+        self.repo.library.snapshot("results/snapshot")
+        CorpusRepository(self.root, "results/snapshot").library.branch(
+            "work/branch", "Branch question", "branch", {"version": 2, "kind": "calibration"})
+        parent_repo, self.repo = self.repo, CorpusRepository(self.root, "work/branch")
+        self.assertIsNotNone(self.repo.library.overlay)
+        tasks = self.add_tasks(3, "branch")
+        executor = self.executor_for("branch")
+        jobs = executor.submit("w1", job_items=2)["submitted"]
+        for job in jobs:
+            self.broker.complete(job["jobId"])
+        result = executor.resume()
+        self.assertEqual({self.states()[task] for task in tasks}, {("completed", 1)})
+        self.assertEqual(result["taskStates"], [{"tier": "abstract", "state": "completed", "count": 3}])
+        self.assertEqual(result["assessments"], [{"evidence_level": "abstract", "validation_state": "accepted",
+                                                  "count": 3}])
+        self.assertEqual(result["counts"]["claim_loci"], 3)
+        self.assertEqual(result["counts"]["works"], parent_repo.status()["counts"]["works"])
+        self.repo.library.verify()
+        with parent_repo.connect() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM model_receipts").fetchone()[0], 0)
+
     def test_paused_job_is_not_resubmitted_until_new_approved_owner(self):
         task = self.add_tasks(1)[0]
         job = self.executor.submit("w1")["submitted"][0]["jobId"]
