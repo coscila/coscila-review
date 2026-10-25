@@ -14,10 +14,15 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+import io
+from contextlib import redirect_stdout
+
 from ocsl_review import citation_census as C
 from ocsl_review import estimands, scores_db
-from ocsl_review.census_runner import CensusRun, HttpChatTransport
+from ocsl_review.census_runner import CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute
+from ocsl_review.cli import main
 from ocsl_review.errors import ConfidentialityError, ValidationError
+from ocsl_review.study_cli import gates
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "citation_census"
 JOURNAL = "Synthetic Journal of Examples"
@@ -430,6 +435,252 @@ class ReplicateTests(RunnerTestCase):
         self.assertEqual(30, primary)
         with self.assertRaises(ValidationError):
             run.replicate_sample(0)
+
+
+class OutageTests(RunnerTestCase):
+    """A judge outage leaves entries open (never invalid) and the next pass or invocation finishes them."""
+
+    def test_unanswered_batches_stay_open_and_resume_after_the_outage(self):
+        transport = HttpChatTransport(self.base)
+        run = CensusRun(self.database, seed=1234, transport=transport, concurrency=1, sleep=lambda s: None, breaker=2)
+        self.addCleanup(run.close)
+        for index in range(6):
+            run.prepare_review(record(doi="10.5555/outage.%d" % index), (FIXTURES / "review.xml").read_bytes())
+        self.judge.fail_next = 10 ** 6
+        during = run.run_abstract(transport_retries=1, cooldown=0)
+        self.assertEqual(("paused", 0, 0, 2), (during["state"], during["accepted"], during["invalid"], during["passes"]))
+        self.assertIn("transport", during["reason"])
+        self.assertEqual("paused:transport", run.status()["runState"])
+        rows = self.rows("SELECT COUNT(*) AS n FROM citations WHERE abs_basis LIKE 'invalid%'")
+        self.assertEqual(0, rows[0]["n"], "an outage never produces invalid outputs")
+        self.assertEqual({"pending"}, {r["abstract_state"] for r in self.rows("SELECT abstract_state FROM reviews")})
+        # The breaker stops each pass after two silent batches instead of trying all six reviews; with two batches in
+        # flight a third was already sent: two passes x three batches x (first + repair call) x three attempts.
+        self.assertEqual(2 * 3 * 2 * 3, len(self.judge.requests))
+        self.judge.fail_next = 0
+        after = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 90, 0), (after["state"], after["accepted"], after["invalid"]))
+        status = run.status()
+        self.assertEqual((0, 0, 0.0, "active"), (status["duplicateJudgments"], status["openEntries"], status["invalidShare"],
+                                                 status["runState"]))
+
+    def test_a_second_pass_finishes_what_a_short_outage_left_open(self):
+        run = self.run_census()
+        self.prepare(run)
+        self.judge.fail_next = 6            # first and repair call of the only batch, three attempts each
+        result = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 15, 0, 2), (result["state"], result["accepted"], result["invalid"], result["passes"]))
+        self.assertEqual(2, result["transportFailures"])
+
+    def test_an_unanswered_repair_call_resumes_as_a_repair_call(self):
+        self.judge.drop_first = {"2", "9"}
+        run = self.run_census()
+        self.prepare(run)
+        original = self.judge.answer
+        calls = []
+
+        def answer(payload):
+            calls.append(payload)
+            return original(payload)
+        self.judge.answer = answer
+        # First call answered without 2 and 9; the repair call then meets an outage.
+        sends = run.transport.send
+        state = {"n": 0}
+
+        def send(body, timeout):
+            state["n"] += 1
+            if state["n"] > 1:
+                raise TransportError("connection refused")
+            return sends(body, timeout)
+        run.transport.send = send
+        paused = run.run_abstract(transport_retries=0, cooldown=0)
+        self.assertEqual(("paused", 13, 0), (paused["state"], paused["accepted"], paused["invalid"]))
+        open_labels = [r["label"] for r in self.rows("SELECT label FROM citations WHERE cited_inbody=1 AND "
+                                                     "identity IN ('resolved','resolved_unverified') AND abs_basis IS NULL")]
+        self.assertEqual(["2", "9"], sorted(open_labels))
+        run.transport.send = sends
+        resumed = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 2), (resumed["state"], resumed["accepted"]))
+        user = self.judge.requests[-1]["payload"]["messages"][1]["content"]
+        self.assertEqual(C.repair_note(), user.split("\n")[1], "the resumed call is the repair call it replaces")
+        self.assertEqual(["2", "9"], re.findall(r"^### id=(\S+)", user, re.M))
+        positions = {r["label"]: r["abs_position"] for r in self.rows("SELECT label, abs_position FROM citations")}
+        self.assertEqual((2, 9), (positions["2"], positions["9"]))
+        self.assertEqual(0, run.status()["duplicateJudgments"])
+
+    def test_disconnects_and_malformed_bodies_are_transport_failures(self):
+        import http.client
+        attempts = []
+
+        def opener(request, timeout):
+            attempts.append(1)
+            raise http.client.IncompleteRead(b'{"choices": [', 4096)
+        transport = HttpChatTransport("http://127.0.0.1:9/v1", opener=opener)
+        run = CensusRun(self.database, seed=1234, transport=transport, concurrency=2, sleep=lambda s: None)
+        self.addCleanup(run.close)
+        self.prepare(run)
+        result = run.run_abstract(transport_retries=0, cooldown=0)
+        self.assertEqual("paused", result["state"])
+        self.assertEqual(6, len(attempts))
+        errors = [r["error"] for r in self.rows("SELECT error FROM calls ORDER BY kind")]
+        self.assertTrue(all(e.startswith("IncompleteRead") for e in errors), errors)
+
+        class Body:
+            def __init__(self, data):
+                self.data = data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return self.data
+        for body in (b"[1, 2]", b'{"choices": "none"}', b'{"choices": [{"message": "x"}]}'):
+            with self.subTest(body=body):
+                probe = HttpChatTransport("http://127.0.0.1:9/v1", opener=lambda request, timeout: Body(body))
+                payload = C.request_payload(C.build_abstract_messages([], "t", JOURNAL), model=MODEL, items=1)
+                result = execute(probe, payload, tier="abstract", required_model=MODEL, sleep=lambda s: None)
+                self.assertIsNone(result.text)
+                self.assertFalse(result.responded)
+
+
+class SingleWriterTests(RunnerTestCase):
+    def test_a_second_writer_is_refused_and_released_on_close(self):
+        run = self.run_census()
+        with self.assertRaisesRegex(ValidationError, "another census process"):
+            CensusRun(self.database, seed=1234)
+        run.close()
+        again = CensusRun(self.database, seed=1234)
+        again.close()
+
+    def test_duplicate_primary_verdicts_are_impossible(self):
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        with self.assertRaises(sqlite3.IntegrityError):
+            with run.connection:
+                run.connection.execute(
+                    "INSERT INTO history(journal, doi, label, tier, variant, outcome, created_at) "
+                    "VALUES(?, ?, '1', 'abstract', 'primary', 'accepted', 't')", (JOURNAL, "10.5555/synthetic.review.1"))
+
+
+class RetryableFetchTests(RunnerTestCase):
+    def test_transient_fetch_failures_stay_open_and_retry(self):
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        state = {"fail": True}
+
+        def flaky(pmcid):
+            if state["fail"]:
+                raise RetryableFetch(pmcid + ": HTTP 429")
+            return (FIXTURES / "full_texts" / "ft2.xml").read_bytes()
+        first = run.run_full_text(fetch_xml=flaky, transport_retries=0, cooldown=0)
+        self.assertEqual(("paused", 3), (first["state"], first["fetchRetries"]))
+        self.assertEqual(0, self.rows("SELECT COUNT(*) AS n FROM citations WHERE ft_retrieval='fetch-failed'")[0]["n"])
+        self.assertEqual("pending", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+        state["fail"] = False
+        second = run.run_full_text(fetch_xml=flaky, cooldown=0)
+        self.assertEqual(("completed", 3), (second["state"], second["retrieved"]))
+        self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+
+    def test_retry_failed_reopens_recorded_fetch_failures(self):
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        run.run_full_text(fetch_xml=lambda pmcid: None)
+        self.assertEqual(3, self.rows("SELECT COUNT(*) AS n FROM citations WHERE ft_retrieval='fetch-failed'")[0]["n"])
+        self.assertEqual(0, run.run_full_text(fetch_xml=full_text_fetcher([]))["retrieved"])
+        again = run.run_full_text(fetch_xml=full_text_fetcher([]), retry_failed=True)
+        self.assertEqual(("completed", 3), (again["state"], again["retrieved"]))
+
+    def test_europe_pmc_fetcher_classifies_failures(self):
+        import http.client
+        import io
+        import urllib.error
+        from ocsl_review.study_cli import europe_pmc_fetcher
+
+        class Response:
+            def __init__(self, status=200, body=b"<article/>", fail=None):
+                self.status, self.body, self.fail = status, body, fail
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                if self.fail:
+                    raise self.fail
+                return self.body
+
+        def opener_for(*outcomes):
+            queue = list(outcomes)
+
+            def opener(url, timeout=None):
+                item = queue.pop(0) if len(queue) > 1 else queue[0]
+                if isinstance(item, Exception):
+                    raise item
+                return item
+            return opener
+        sleeps = []
+        throttled = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b""))
+        missing = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b""))
+        fetch = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled), sleep=sleeps.append)
+        with self.assertRaises(RetryableFetch):
+            fetch("PMC1")
+        self.assertEqual([2.0, 5.0], sleeps)
+        self.assertIsNone(europe_pmc_fetcher(spacing=0, opener=opener_for(missing), sleep=sleeps.append)("PMC1"))
+        cut = Response(fail=http.client.IncompleteRead(b"<article>", 100))
+        with self.assertRaises(RetryableFetch):
+            europe_pmc_fetcher(spacing=0, opener=opener_for(cut), sleep=sleeps.append)("PMC1")
+        recovered = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled, Response()), sleep=sleeps.append)
+        self.assertEqual(b"<article/>", recovered("PMC1"))
+
+
+class ReadOnlyStatusTests(RunnerTestCase):
+    def test_status_and_gates_read_without_writing(self):
+        run = self.run_census()
+        self.prepare(run)
+        self.judge.fail_next = 3            # the first call fails; the repair call recovers every label
+        run.run_abstract()
+        run.run_full_text(fetch_xml=full_text_fetcher([]))
+        run.close()
+        before = self.database.read_bytes()
+        outputs = []
+        for name in ("status", "gates"):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                self.assertEqual(0, main(["study", name, "--database", str(self.database)]))
+            outputs.append(json.loads(buffer.getvalue()))
+        self.assertEqual(before, self.database.read_bytes())
+        status, gates = outputs
+        # The failed first call has no response to carry a fingerprint; the repair and full-text calls do.
+        self.assertEqual((2, 2), (status["receiptsWithResponse"], status["receiptsWithFingerprint"]))
+        self.assertTrue(gates["checks"]["everyReceiptHasFingerprint"], gates)
+        self.assertEqual(1, status["transportFailures"])
+        frozen = self.root / "frozen.sqlite3"
+        scores_db.freeze(self.database, frozen)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(0, main(["study", "gates", "--database", str(frozen)]))
+        self.assertTrue(json.loads(buffer.getvalue())["checks"]["noDuplicateJudgments"])
+
+    def test_fingerprint_gate_names_a_server_without_fingerprints(self):
+        original = start_server
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        run.connection.execute("DROP TRIGGER calls_no_update")
+        run.connection.execute("UPDATE calls SET fingerprint=NULL")
+        run.connection.commit()
+        result = gates(run.status())
+        self.assertFalse(result["checks"]["everyReceiptHasFingerprint"])
+        self.assertTrue(any("system_fingerprint" in note for note in result["notes"]))
+        self.assertIs(original, start_server)
 
 
 class FreezeExportTests(RunnerTestCase):

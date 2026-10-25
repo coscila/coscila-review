@@ -8,6 +8,7 @@ identifiers only.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
@@ -35,7 +36,7 @@ def http_get(spacing: float = 0.4, attempts: int = 4) -> Callable[[dict[str, Any
                 with urllib.request.urlopen(SEARCH + "?" + urllib.parse.urlencode(params), timeout=90) as response:
                     if response.status == 200:
                         return json.loads(response.read())
-            except (urllib.error.URLError, OSError, ValueError):
+            except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
                 pass
             time.sleep(3 * (attempt + 1))
         return None

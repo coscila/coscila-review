@@ -12,7 +12,9 @@ sensitivity. The working database is ``scores_db``.
 from __future__ import annotations
 
 import concurrent.futures
+import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -62,6 +64,10 @@ class ModelDrift(ReviewError):
     """The server reported a model other than the instrument's required model; the run pauses."""
 
 
+class RetryableFetch(ReviewError):
+    """A full-text fetch failed transiently (throttling, server error, timeout); the entry stays open."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -106,11 +112,15 @@ class HttpChatTransport:
         request = urllib.request.Request(self.base_url + "/chat/completions", data=body, headers=headers, method="POST")
         try:
             with self.opener(request, timeout=timeout) as response:
-                return json.loads(response.read())
+                payload = json.loads(response.read())
         except urllib.error.HTTPError as error:
             raise TransportError(f"HTTP {error.code}") from error
-        except (urllib.error.URLError, OSError, ValueError) as error:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as error:
+            # HTTPException covers a body cut off mid-response (IncompleteRead) and malformed status lines.
             raise TransportError(f"{type(error).__name__}: {str(error)[:120]}") from error
+        if not isinstance(payload, dict):
+            raise TransportError("response body is not a JSON object")
+        return payload
 
 
 @dataclass
@@ -118,11 +128,50 @@ class CallResult:
     receipt: dict[str, Any]
     text: str | None
     served_model: str | None
+    responded: bool = True      # False when no attempt received a response (connection, HTTP error, timeout)
+
+
+class EmptyCompletion(TransportError):
+    """A chat completion arrived with no content: a response, but nothing the parser can read."""
+
+
+def _completion(response: Any) -> tuple[dict[str, Any], str]:
+    """The first choice and its text, or a TransportError for any response that is not a chat completion."""
+    if not isinstance(response, dict):
+        raise TransportError("response is not a JSON object")
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise TransportError("response carries no choices")
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise TransportError("response choice carries no message")
+    content = message.get("content")
+    if content is None or content == "":
+        raise EmptyCompletion("empty content; finish=%s" % choice.get("finish_reason"))
+    if not isinstance(content, str):
+        raise TransportError("message content is not text")
+    return choice, content
+
+
+def _response_fields(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices") if isinstance(response.get("choices"), list) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    return {"served_model": response.get("model"), "fingerprint": response.get("system_fingerprint"),
+            "finish_reason": choice.get("finish_reason"), "truncated": int(choice.get("finish_reason") == "length"),
+            "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"), "cached_tokens": details.get("cached_tokens")}
 
 
 def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_model: str,
             sleep: Callable[[float], None] = time.sleep) -> CallResult:
-    """One logical call with the instrument's transport attempts; returns the receipt fields."""
+    """One logical call with the instrument's transport attempts; returns the receipt fields.
+
+    ``responded`` tells a call that never got a response (retryable later) from one whose last attempt was
+    answered with an empty completion (a response without any parseable line).
+    """
     spec = C.settings(tier)
     attempts = int(spec["transport"]["attempts"])
     backoff = list(spec["transport"]["backoffSeconds"])
@@ -131,45 +180,53 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
     settings = {k: v for k, v in payload.items() if k != "messages"}
     receipt = {**C.digests(payload["messages"], body), "settings_sha256": sha256_text(canonical(settings)),
                "max_tokens": payload["max_tokens"], "request_model": payload["model"], "attempts": 0, "error": None}
-    error = None
+    error, empty = None, None
     for attempt in range(attempts):
         receipt["attempts"] = attempt + 1
         started = time.monotonic()
+        response = None
         try:
             response = transport.send(body, timeout)
-            choice = (response.get("choices") or [{}])[0]
-            content = (choice.get("message") or {}).get("content")
-            if not content:
-                raise TransportError("empty content; finish=%s" % choice.get("finish_reason"))
+            choice, content = _completion(response)
         except TransportError as failure:
             error = str(failure)
+            empty = response if isinstance(failure, EmptyCompletion) else None
             receipt["seconds"] = round(time.monotonic() - started, 3)
             if attempt + 1 < attempts:
                 sleep(backoff[min(attempt, len(backoff) - 1)])
             continue
-        usage = response.get("usage") or {}
-        details = usage.get("prompt_tokens_details") or {}
         served = response.get("model")
-        receipt.update({"seconds": round(time.monotonic() - started, 3), "served_model": served,
-                        "fingerprint": response.get("system_fingerprint"), "finish_reason": choice.get("finish_reason"),
-                        "truncated": int(choice.get("finish_reason") == "length"),
-                        "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
-                        "total_tokens": usage.get("total_tokens"), "cached_tokens": details.get("cached_tokens"),
-                        "error": None})
+        receipt.update({"seconds": round(time.monotonic() - started, 3), **_response_fields(response), "error": None})
         if served != required_model:
             receipt["error"] = "model_drift"
             return CallResult(receipt, None, served)
         return CallResult(receipt, content, served)
+    if empty is not None:
+        receipt.update(_response_fields(empty))
+        receipt["error"] = "model_drift" if receipt["served_model"] != required_model else error
+        return CallResult(receipt, None, receipt["served_model"])
     receipt["error"] = error or "transport failure"
-    return CallResult(receipt, None, None)
+    return CallResult(receipt, None, None, responded=False)
+
+
+def writer_lock(database: Path) -> int:
+    """Exclusive, non-blocking lock on ``<database>.lock``: one census process writes a database at a time."""
+    descriptor = os.open(str(database) + ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise ValidationError("another census process is writing this database; run one study command at a time "
+                              "(status and gates read it without the lock)") from error
+    return descriptor
 
 
 class CensusRun:
-    """A census run over one working scores database."""
+    """A census run over one working scores database (one writing process at a time)."""
 
     def __init__(self, database: Path, *, seed: int, transport: Any = None, request_model: str | None = None,
                  concurrency: int = 60, run_id: str | None = None, sleep: Callable[[float], None] = time.sleep,
-                 revision: str | None = None):
+                 revision: str | None = None, breaker: int | None = None):
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValidationError("the census protocol seed must be an integer")
         if not 1 <= concurrency <= 1024:
@@ -178,9 +235,16 @@ class CensusRun:
         self.required_model = self.instrument.manifest["requiredModel"]["served"]
         self.request_model = request_model or self.required_model
         self.transport, self.concurrency, self.sleep = transport, concurrency, sleep
+        # Consecutive batches or calls without any response before a pass stops dispatching (an outage).
+        self.breaker = breaker or max(4, concurrency)
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
-        self.connection = scores_db.connect(Path(database), create=True)
+        self._writer = writer_lock(Path(database))
+        try:
+            self.connection = scores_db.connect(Path(database), create=True)
+        except Exception:
+            self._release()
+            raise
         self.run_id = run_id or "census-" + hashlib.sha256(
             canonical([self.instrument.digest, seed]).encode()).hexdigest()[:16]
         try:
@@ -190,12 +254,21 @@ class CensusRun:
                                                      "requiredModel": self.required_model, "seed": str(seed),
                                                      "runId": self.run_id, "identityLadder": IDENTITY_LADDER})
         except Exception:
-            self.connection.close()
+            self.close()
             raise
         self.seed = seed
 
+    def _release(self) -> None:
+        if self._writer is not None:
+            fcntl.flock(self._writer, fcntl.LOCK_UN)
+            os.close(self._writer)
+            self._writer = None
+
     def close(self) -> None:
-        self.connection.close()
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            connection.close()
+        self._release()
 
     # ------------------------------------------------------------------ preparation
     def prepare_review(self, record: Mapping[str, Any], document: bytes | None) -> dict[str, Any]:
@@ -365,12 +438,22 @@ class CensusRun:
         return call_id
 
     def _judge_batch(self, journal: str, doi: str, title: str, batch_index: int, batch: list[dict[str, Any]], *,
-                     cut: Any = True, variant: str = "primary") -> dict[str, Any]:
-        """First call, then one repair pass for labels without a parseable line (including failed calls)."""
+                     cut: Any = True, variant: str = "primary", todo: Sequence[str] | None = None,
+                     start: str = "first") -> dict[str, Any]:
+        """First call, then one repair pass for labels without a parseable line (including failed calls).
+
+        ``batch`` is the whole paper batch (its order gives the positions). ``todo`` names the labels still
+        open; ``start="repair"`` resumes a batch whose first call was answered but whose repair call never
+        was. When the call that would decide the open labels got no response after its transport attempts,
+        the outcome is ``incomplete``: those labels stay open for the next pass instead of becoming invalid.
+        """
+        open_labels = set(it["label"] for it in batch) if todo is None else set(todo)
         got: dict[str, tuple[dict[str, Any], str, int]] = {}
-        failures, drift = 0, None
+        failures, drift, responded, answered = 0, None, False, True
         for kind in ("first", "repair"):
-            sub = batch if kind == "first" else [it for it in batch if it["label"] not in got]
+            if kind == "first" and start == "repair":
+                continue
+            sub = batch if kind == "first" else [it for it in batch if it["label"] in open_labels and it["label"] not in got]
             if not sub:
                 break
             messages = (C.build_abstract_messages(sub, title, journal, cut=cut) if kind == "first"
@@ -380,28 +463,41 @@ class CensusRun:
             labels = [it["label"] for it in sub]
             if result.text is None:
                 failures += result.receipt.get("error") != "model_drift"
-                call_id = self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant,
-                                        batch=batch_index, kind=kind, labels=labels, parsed=0, missing=len(sub), problems=0)
+                self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant, batch=batch_index,
+                              kind=kind, labels=labels, parsed=0, missing=len(sub), problems=0)
                 if result.receipt.get("error") == "model_drift":
                     drift = result.served_model
                     break
+                # An empty completion is an answer without labels; only a call nobody answered stays open.
+                answered = result.responded
+                responded = responded or result.responded
                 continue
+            responded, answered = True, True
             records, problems, missing = C.parse_labels(result.text, labels, stage="abstract")
             call_id = self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant, batch=batch_index,
                                     kind=kind, labels=labels, parsed=len(records), missing=len(missing),
                                     problems=len(problems))
             positions = {label: i + 1 for i, label in enumerate(labels)}
             for label, record in records.items():
-                got[label] = (record, call_id, positions[label])
-        return {"batch": batch_index, "items": batch, "got": got, "failures": failures, "drift": drift}
+                if label in open_labels:
+                    got[label] = (record, call_id, positions[label])
+        incomplete = drift is None and not answered and any(label not in got for label in open_labels)
+        return {"batch": batch_index, "items": batch, "got": got, "todo": open_labels, "failures": failures,
+                "drift": drift, "incomplete": incomplete, "responded": responded}
 
     def _write_abstract(self, journal: str, doi: str, outcomes: list[dict[str, Any]], *, cut: Any, variant: str) -> dict[str, int]:
+        """Write decided labels; an incomplete batch leaves its unanswered labels open (never invalid)."""
         now = utc_now()
-        counts = {"accepted": 0, "invalid": 0}
+        counts = {"accepted": 0, "invalid": 0, "open": 0}
         with self.lock, self.connection:
             for outcome in outcomes:
+                if variant != "primary" and outcome["incomplete"]:
+                    counts["open"] += len(outcome["todo"])
+                    continue                    # a sensitivity batch is re-run whole on the next pass
                 for position, item in enumerate(outcome["items"], 1):
                     label = item["label"]
+                    if label not in outcome["todo"]:
+                        continue
                     found = outcome["got"].get(label)
                     if variant != "primary":
                         record = found[0] if found else None
@@ -439,6 +535,8 @@ class CensusRun:
                              record["support_verdict"], record["escalate"], record["quote"], record["reason"],
                              canonical(record), now))
                         counts["accepted"] += 1
+                    elif outcome["incomplete"]:
+                        counts["open"] += 1     # no response decided this label; the next pass asks again
                     else:
                         self.connection.execute(
                             "UPDATE citations SET model_judged=0, abs_class='unsure', abs_basis='invalid:no-parseable-output',"
@@ -449,7 +547,12 @@ class CensusRun:
                             " VALUES(?,?,?,?,?,?,?,?,?)", (journal, doi, label, "abstract", variant, None, position, "invalid", now))
                         counts["invalid"] += 1
             if variant == "primary":
-                self.connection.execute("UPDATE reviews SET abstract_state='completed' WHERE journal=? AND doi=?", (journal, doi))
+                remaining = self.connection.execute(
+                    "SELECT COUNT(*) FROM citations WHERE journal=? AND doi=? AND cited_inbody=1 AND identity IN "
+                    "('resolved','resolved_unverified') AND abs_basis IS NULL", (journal, doi)).fetchone()[0]
+                if not remaining:
+                    self.connection.execute("UPDATE reviews SET abstract_state='completed' WHERE journal=? AND doi=?",
+                                            (journal, doi))
                 scores_db.aggregate_reviews(self.connection, journal, doi)
         return counts
 
@@ -457,15 +560,28 @@ class CensusRun:
         with self.lock, self.connection:
             self.connection.execute("INSERT OR REPLACE INTO meta VALUES('runState', ?)", ("paused:" + reason,))
 
-    def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]]]]]], *, cut: Any,
-                  variant: str) -> tuple[dict[str, int], str | None]:
-        """Run review batches with at most two batches per stream in flight; write each review when complete."""
-        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0}
+    def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]], Any, str]]]], *,
+                  cut: Any, variant: str) -> tuple[dict[str, int], str | None, bool]:
+        """Run review batches with at most two batches per stream in flight; write each review when complete.
+
+        Returns the totals, the served model of a drift (or None) and whether the breaker stopped the pass
+        after ``self.breaker`` consecutive batches that got no response at all.
+        """
+        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "open": 0, "transportFailures": 0}
         pending: dict[tuple[str, str], dict[str, Any]] = {}
         drift: list[str] = []
+        tripped: list[bool] = []
+        silent = [0]
         limit = 2 * self.concurrency
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             inflight: dict[concurrent.futures.Future, tuple[str, str]] = {}
+
+            def write(key, outcomes):
+                counts = self._write_abstract(key[0], key[1], sorted(outcomes, key=lambda o: o["batch"]),
+                                              cut=cut, variant=variant)
+                for name in ("accepted", "invalid", "open"):
+                    totals[name] += counts[name]
+                totals["reviews"] += 1
 
             def collect() -> None:
                 done, _ = concurrent.futures.wait(list(inflight), return_when=concurrent.futures.FIRST_COMPLETED)
@@ -475,39 +591,42 @@ class CensusRun:
                     totals["transportFailures"] += outcome["failures"]
                     if outcome["drift"] is not None:
                         drift.append(outcome["drift"])
-                    if drift:
-                        continue
+                    silent[0] = 0 if outcome["responded"] else silent[0] + int(outcome["incomplete"])
+                    if silent[0] >= self.breaker and not tripped:
+                        tripped.append(True)
                     slot = pending[key]
-                    slot["outcomes"].append(outcome)
                     slot["left"] -= 1
-                    if slot["left"] == 0:
-                        counts = self._write_abstract(key[0], key[1], sorted(slot["outcomes"], key=lambda o: o["batch"]),
-                                                      cut=cut, variant=variant)
-                        totals["accepted"] += counts["accepted"]
-                        totals["invalid"] += counts["invalid"]
-                        totals["reviews"] += 1
+                    if outcome["drift"] is None:
+                        slot["outcomes"].append(outcome)
+                    if slot["left"] == 0 and not drift:
+                        write(key, slot["outcomes"])
                         del pending[key]
 
             for journal, doi, title, batches in work:
-                if drift:
+                if drift or tripped:
                     break
                 key = (journal, doi)
                 if not batches:
                     if variant == "primary":
-                        self._write_abstract(journal, doi, [], cut=cut, variant=variant)
-                        totals["reviews"] += 1
+                        write(key, [])
                     continue
                 pending[key] = {"left": len(batches), "outcomes": []}
-                for index, batch in batches:
-                    while len(inflight) >= limit and not drift:
+                for index, batch, todo, start in batches:
+                    while len(inflight) >= limit and not (drift or tripped):
                         collect()
-                    if drift:
+                    if drift or tripped:
                         break
-                    future = pool.submit(self._judge_batch, journal, doi, title, index, batch, cut=cut, variant=variant)
+                    future = pool.submit(self._judge_batch, journal, doi, title, index, batch, cut=cut, variant=variant,
+                                         todo=todo, start=start)
                     inflight[future] = key
             while inflight:
                 collect()
-        return totals, (drift[0] if drift else None)
+            # Reviews cut short by a drift or by the breaker keep what their answered batches decided; the
+            # batches that drifted or were never sent stay open and resume with the call they still need.
+            for key, slot in pending.items():
+                if slot["outcomes"]:
+                    write(key, slot["outcomes"])
+        return totals, (drift[0] if drift else None), bool(tripped)
 
     def _egress_gate(self, condition: str, params: Sequence[Any] = ()) -> None:
         """Entitled review text reaches only a judge the operator declared on premises; checked before any call."""
@@ -519,8 +638,9 @@ class CensusRun:
         if entitled:
             raise ConfidentialityError(f"{entitled} entitled reviews may only be judged by an on-premises judge")
 
-    def _resume_after_drift(self) -> None:
-        if scores_db.meta(self.connection).get("runState", "").startswith("paused:model_drift"):
+    def _resume(self) -> None:
+        """A new invocation resumes a run paused by model drift or by a transport outage."""
+        if scores_db.meta(self.connection).get("runState", "").startswith("paused:"):
             with self.lock, self.connection:
                 self.connection.execute("DELETE FROM meta WHERE key='runState'")
 
@@ -530,27 +650,72 @@ class CensusRun:
         self._pause("model_drift")
         return {**totals, "state": "paused", "reason": f"model_drift: served {drift!r}, required {self.required_model!r}"}
 
-    def run_abstract(self, *, limit: int | None = None) -> dict[str, Any]:
-        """Abstract tier for every pending review, in enumeration order; resumable per review."""
+    def _open_batches(self, journal: str, doi: str) -> list[tuple[int, list[dict[str, Any]], list[str], str]]:
+        """Paper batches with labels still open; a batch whose first call was answered resumes with its repair call."""
+        items = self._items(journal, doi)
+        decided = {row[0] for row in self.connection.execute(
+            "SELECT label FROM citations WHERE journal=? AND doi=? AND abs_basis IS NOT NULL", (journal, doi))}
+        answered = {row[0] for row in self.connection.execute(
+            "SELECT DISTINCT batch FROM calls WHERE run_id=? AND journal=? AND doi=? AND tier='abstract' AND "
+            "variant='primary' AND kind='first' AND error IS NULL", (self.run_id, journal, doi))}
+        batches = []
+        for index, batch in enumerate(C.paper_batches(items)):
+            todo = [it["label"] for it in batch if it["label"] not in decided]
+            if todo:
+                start = "repair" if (len(todo) < len(batch) or index in answered) else "first"
+                batches.append((index, batch, todo, start))
+        return batches
+
+    def run_abstract(self, *, limit: int | None = None, transport_retries: int = 3,
+                     cooldown: float = 60.0) -> dict[str, Any]:
+        """Abstract tier for every pending review, in enumeration order; resumable per batch.
+
+        A pass stops early when the breaker trips (consecutive batches without any response). Reviews
+        left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
+        some are still open, the run pauses with ``paused:transport`` and the next invocation resumes it.
+        """
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='pending'")
-        self._resume_after_drift()
+        self._resume()
         with self.lock:
-            reviews = self.connection.execute(
-                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()
+            reviews = [tuple(r) for r in self.connection.execute(
+                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()]
         if limit is not None:
             reviews = reviews[:limit]
 
-        def work():
-            for review in reviews:
+        def work(selection):
+            for journal, doi, title in selection:
                 with self.lock:
-                    items = self._items(review["journal"], review["doi"])
-                yield review["journal"], review["doi"], review["title"] or "", list(enumerate(C.paper_batches(items)))
-        totals, drift = self._schedule(work(), cut=True, variant="primary")
+                    batches = self._open_batches(journal, doi)
+                yield journal, doi, title or "", batches
+        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0}
+        drift, retries = None, 0
+        while True:
+            totals["passes"] += 1
+            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary")
+            for name in ("accepted", "invalid", "transportFailures"):
+                totals[name] += outcome[name]
+            if drift is not None:
+                break
+            with self.lock:
+                open_reviews = {tuple(r) for r in self.connection.execute(
+                    "SELECT journal, doi FROM reviews WHERE abstract_state='pending'")}
+            totals["reviews"] += sum(1 for journal, doi, _ in reviews if (journal, doi) not in open_reviews)
+            reviews = [review for review in reviews if review[:2] in open_reviews]
+            if not reviews or retries >= transport_retries:
+                break
+            retries += 1
+            self.sleep(cooldown * 2 ** (retries - 1))
         with self.lock:
             totals["calls"] = self.connection.execute("SELECT COUNT(*) FROM calls WHERE run_id=? AND tier='abstract'",
                                                       (self.run_id,)).fetchone()[0]
+        if drift is None and reviews:
+            totals["openReviews"] = len(reviews)
+            self._pause("transport")
+            return {**totals, "state": "paused",
+                    "reason": f"transport: {len(reviews)} reviews still open after {totals['passes']} passes; "
+                              "run the command again to resume"}
         return self._paused(totals, drift)
 
     # ------------------------------------------------------------------ full-text tier
@@ -567,7 +732,11 @@ class CensusRun:
         provenance = "public"
         if work.get("pmcid") and fetch_xml is not None:
             pmcid = work["pmcid"] if str(work["pmcid"]).upper().startswith("PMC") else "PMC%s" % work["pmcid"]
-            fetched = fetch_xml(pmcid)
+            try:
+                fetched = fetch_xml(pmcid)
+            except RetryableFetch:
+                # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
+                return None, "retry", None, provenance
             if fetched:
                 try:
                     text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
@@ -589,13 +758,16 @@ class CensusRun:
         return text, source, source, provenance
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
-                       allow_entitled: bool) -> tuple[str, str, str, list[dict[str, Any]]]:
-        """Retrieve every entry of one review's group, record failed retrievals, build the windows."""
+                       allow_entitled: bool) -> tuple[str, str, str, list[dict[str, Any]], int]:
+        """Retrieve every entry of one review's group, record definitive failures, build the windows."""
         journal, title = group[0]["journal"], group[0]["title"] or ""
-        retrieved = []
+        retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
             text, outcome, source, provenance = self._retrieve(work, fetch_xml, entitled)
+            if outcome == "retry":
+                retry += 1
+                continue
             if text is not None and provenance == "entitled" and not allow_entitled:
                 text, outcome = None, "entitled-blocked"
             if text is None:
@@ -617,7 +789,7 @@ class CensusRun:
                               "cited_work": {"title": work["title"], "venue": work["venue"], "year": year},
                               "fulltext_window": window,
                               "_entry": {"row": row, "outcome": outcome, "source": source, "provenance": provenance}})
-        return doi, journal, title, retrieved
+        return doi, journal, title, retrieved, retry
 
     def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]]):
         messages = C.build_full_text_messages(items, title, journal)
@@ -625,10 +797,15 @@ class CensusRun:
         result = execute(self.transport, payload, tier="full-text", required_model=self.required_model, sleep=self.sleep)
         labels = [it["label"] for it in items]
         if result.text is None:
-            self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
-                          kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0)
-            return {"drift": result.served_model if result.receipt.get("error") == "model_drift" else None,
-                    "failed": result.receipt.get("error") != "model_drift", "judged": 0, "missing": 0}
+            call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
+                                    kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0)
+            if result.receipt.get("error") == "model_drift":
+                return {"drift": result.served_model, "failed": False, "judged": 0, "missing": 0}
+            if result.responded:
+                # An empty completion answers the call: its entries are recorded as missing (no repair pass).
+                self._record_full_text(journal, doi, items, {}, call_id)
+                return {"drift": None, "failed": False, "judged": 0, "missing": len(items)}
+            return {"drift": None, "failed": True, "judged": 0, "missing": 0}
         records, problems, missing = C.parse_labels(result.text, labels, stage="fulltext")
         call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
                                 kind="full-text", labels=labels, parsed=len(records), missing=len(missing),
@@ -636,30 +813,29 @@ class CensusRun:
         self._record_full_text(journal, doi, items, records, call_id)
         return {"drift": None, "failed": False, "judged": len(records), "missing": len(missing)}
 
-    def run_full_text(self, *, fetch_xml: Callable[[str], bytes | None] | None = None,
-                      entitled: Callable[[dict[str, Any]], tuple[bytes, str] | None] | None = None,
-                      fetch_workers: int = 8) -> dict[str, Any]:
-        """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair."""
-        if self.transport is None:
-            raise ValidationError("a transport is required to run the census")
-        self._egress_gate("full_text_state='pending'")
-        self._resume_after_drift()
+    _ESCALATED = ("c.model_judged=1 AND c.abs_escalated=1 AND c.cited_inbody=1 "
+                  "AND c.identity IN ('resolved','resolved_unverified')")
+
+    def _full_text_pass(self, fetch_xml, entitled, fetch_workers: int, totals: dict[str, int],
+                        touched: set[tuple[str, str]]) -> tuple[str | None, bool]:
+        """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped)."""
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
                 "SELECT c.journal, c.doi, c.label, c.cited_work_key, r.title FROM citations c JOIN reviews r "
-                "ON r.journal=c.journal AND r.doi=c.doi WHERE c.model_judged=1 AND c.abs_escalated=1 AND c.cited_inbody=1 "
-                "AND c.identity IN ('resolved','resolved_unverified') AND c.ft_retrieval IS NULL "
+                f"ON r.journal=c.journal AND r.doi=c.doi WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL "
                 "ORDER BY r.review_order, c.ordinal")]
+            touched.update((row["journal"], row["doi"]) for row in rows)
             needed = sorted({row["cited_work_key"] for row in rows})
             works = {}
             for start in range(0, len(needed), 500):
                 chunk = needed[start:start + 500]
                 works.update({r["work_key"]: dict(r) for r in self.connection.execute(
                     f"SELECT * FROM works WHERE work_key IN ({','.join('?' * len(chunk))})", chunk)})
+        totals["escalated"] = max(totals.get("escalated", 0), len(rows))
         groups = C.full_text_groups(rows, self.seed, review=lambda row: row["doi"])
         allow_entitled = bool(getattr(self.transport, "on_premises", False))
-        totals = {"escalated": len(rows), "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0}
         drift: list[str] = []
+        silent, tripped = [0], [False]
         limit = 4 * self.concurrency
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as fetch_pool, \
                 concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as call_pool:
@@ -675,33 +851,81 @@ class CensusRun:
                     outcome = future.result()
                     if outcome["drift"] is not None:
                         drift.append(outcome["drift"])
+                    silent[0] = silent[0] + 1 if outcome["failed"] else 0
+                    if silent[0] >= self.breaker:
+                        tripped[0] = True
                     totals["transportFailures"] += int(outcome["failed"])
                     totals["calls"] += int(not outcome["failed"] and outcome["drift"] is None)
                     totals["judged"] += outcome["judged"]
                     totals["missing"] += outcome["missing"]
 
             for future in concurrent.futures.as_completed(retrievals):
-                doi, journal, title, retrieved = future.result()
+                doi, journal, title, retrieved, retry = future.result()
                 totals["retrieved"] += len(retrieved)
-                if drift:
+                totals["fetchRetries"] += retry
+                if drift or tripped[0]:
                     continue
                 for index, chunk in enumerate(C.full_text_chunks(retrieved)):
                     while len(calls) >= limit:
                         collect(True)
+                    if drift or tripped[0]:
+                        break
                     calls.add(call_pool.submit(self._judge_full_text, journal, doi, title, index, chunk))
                 if calls:
                     collect(False)
             while calls:
                 collect(True)
+        return (drift[0] if drift else None), tripped[0]
+
+    def run_full_text(self, *, fetch_xml: Callable[[str], bytes | None] | None = None,
+                      entitled: Callable[[dict[str, Any]], tuple[bytes, str] | None] | None = None,
+                      fetch_workers: int = 8, retry_failed: bool = False, transport_retries: int = 3,
+                      cooldown: float = 60.0) -> dict[str, Any]:
+        """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair.
+
+        Entries whose fetch failed transiently or whose call got no response stay open and are retried in
+        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``.
+        """
+        if self.transport is None:
+            raise ValidationError("a transport is required to run the census")
+        if retry_failed:
+            with self.lock, self.connection:
+                self.connection.execute(
+                    "UPDATE citations SET ft_retrieval=NULL WHERE ft_retrieval='fetch-failed' AND model_judged=1 AND "
+                    "abs_escalated=1 AND cited_inbody=1 AND identity IN ('resolved','resolved_unverified')")
+                self.connection.execute(
+                    "UPDATE reviews SET full_text_state='pending' WHERE EXISTS (SELECT 1 FROM citations c WHERE "
+                    f"c.journal=reviews.journal AND c.doi=reviews.doi AND {self._ESCALATED} AND c.ft_retrieval IS NULL)")
+        self._egress_gate("full_text_state='pending'")
+        self._resume()
+        totals = {"escalated": 0, "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0,
+                  "fetchRetries": 0, "passes": 0}
+        drift, retries, still_open = None, 0, 0
+        touched: set[tuple[str, str]] = set()
+        while True:
+            totals["passes"] += 1
+            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched)
+            with self.lock:
+                still_open = self.connection.execute(
+                    f"SELECT COUNT(*) FROM citations c WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL").fetchone()[0]
+            if drift is not None or not still_open or retries >= transport_retries:
+                break
+            retries += 1
+            self.sleep(cooldown * 2 ** (retries - 1))
         with self.lock, self.connection:
-            for journal, doi in {(row["journal"], row["doi"]) for row in rows}:
+            for journal, doi in sorted(touched):
                 scores_db.aggregate_reviews(self.connection, journal, doi)
             self.connection.execute(
                 "UPDATE reviews SET full_text_state='completed' WHERE abstract_state='completed' AND NOT EXISTS ("
-                "SELECT 1 FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND c.model_judged=1 "
-                "AND c.abs_escalated=1 AND c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') "
-                "AND c.ft_retrieval IS NULL)")
-        return self._paused(totals, drift[0] if drift else None)
+                "SELECT 1 FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND "
+                f"{self._ESCALATED} AND c.ft_retrieval IS NULL)")
+        if drift is None and still_open:
+            totals["openEntries"] = still_open
+            self._pause("transport")
+            return {**totals, "state": "paused",
+                    "reason": f"transport: {still_open} escalated entries still open after {totals['passes']} passes "
+                              "(throttled or failed fetches, or calls without a response); run the command again"}
+        return self._paused(totals, drift)
 
     def _loci(self, journal: str, doi: str, label: str):
         return self.connection.execute(
@@ -765,32 +989,57 @@ class CensusRun:
             covered += n
         return selected
 
-    def run_no_truncation(self, *, entries: int | None = None) -> dict[str, Any]:
+    def run_no_truncation(self, *, entries: int | None = None, transport_retries: int = 3,
+                          cooldown: float = 60.0) -> dict[str, Any]:
         """Re-run the sampled batches unchanged except for the abstract cut; history only, variant no-truncation."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='completed'")
-        self._resume_after_drift()
+        self._resume()
         selected = self.no_truncation_sample(entries)
-        with self.lock:
-            done = {(r[0], r[1], r[2]) for r in self.connection.execute(
-                "SELECT DISTINCT h.journal, h.doi, c.abs_batch FROM history h JOIN citations c ON c.journal=h.journal "
-                "AND c.doi=h.doi AND c.label=h.label WHERE h.variant='no-truncation'")}
-        by_review: dict[tuple[str, str], list[int]] = {}
-        for journal, doi, batch in selected:
-            if (journal, doi, batch) not in done:
-                by_review.setdefault((journal, doi), []).append(batch)
+        return self._run_variant(selected, variant="no-truncation", cut=None, transport_retries=transport_retries,
+                                 cooldown=cooldown)
 
-        def work():
+    def _run_variant(self, selected: Sequence[tuple[str, str, int]], *, variant: str, cut: Any, transport_retries: int,
+                     cooldown: float) -> dict[str, Any]:
+        """Whole sampled primary batches re-run unchanged (history only), with the same passes as the primary tier."""
+        def open_batches() -> dict[tuple[str, str], list[int]]:
+            with self.lock:
+                done = {(r[0], r[1], r[2]) for r in self.connection.execute(
+                    "SELECT DISTINCT h.journal, h.doi, c.abs_batch FROM history h JOIN citations c ON c.journal=h.journal "
+                    "AND c.doi=h.doi AND c.label=h.label WHERE h.variant=?", (variant,))}
+            by_review: dict[tuple[str, str], list[int]] = {}
+            for journal, doi, batch in selected:
+                if (journal, doi, batch) not in done:
+                    by_review.setdefault((journal, doi), []).append(batch)
+            return by_review
+
+        def work(by_review):
             for (journal, doi), indices in by_review.items():
                 with self.lock:
                     title = self.connection.execute("SELECT title FROM reviews WHERE journal=? AND doi=?",
                                                     (journal, doi)).fetchone()[0]
                     batches = C.paper_batches(self._items(journal, doi))
-                yield journal, doi, title or "", [(index, batches[index]) for index in sorted(indices)]
-        totals, drift = self._schedule(work(), cut=None, variant="no-truncation")
-        totals["batches"] = sum(len(v) for v in by_review.values())
-        totals["selectedBatches"] = len(selected)
+                yield journal, doi, title or "", [(index, batches[index], None, "first") for index in sorted(indices)]
+        by_review = open_batches()
+        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0,
+                  "batches": sum(len(v) for v in by_review.values()), "selectedBatches": len(selected)}
+        drift, retries = None, 0
+        while by_review:
+            totals["passes"] += 1
+            outcome, drift, _ = self._schedule(work(by_review), cut=cut, variant=variant)
+            for name in ("reviews", "accepted", "invalid", "transportFailures"):
+                totals[name] += outcome[name]
+            by_review = open_batches()
+            if drift is not None or not by_review or retries >= transport_retries:
+                break
+            retries += 1
+            self.sleep(cooldown * 2 ** (retries - 1))
+        if drift is None and by_review:
+            totals["openBatches"] = sum(len(v) for v in by_review.values())
+            self._pause("transport")
+            return {**totals, "state": "paused",
+                    "reason": f"transport: {totals['openBatches']} {variant} batches still open; run the command again"}
         return self._paused(totals, drift)
 
     def replicate_sample(self, entries: int) -> list[tuple[str, str, int]]:
@@ -820,57 +1069,61 @@ class CensusRun:
                 covered += n
         return selected
 
-    def run_replicate(self, *, entries: int) -> dict[str, Any]:
+    def run_replicate(self, *, entries: int, transport_retries: int = 3, cooldown: float = 60.0) -> dict[str, Any]:
         """Re-run a stratified sample of primary batches unchanged; history only, variant replicate."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='completed'")
-        self._resume_after_drift()
+        self._resume()
         selected = self.replicate_sample(entries)
-        with self.lock:
-            done = {(r[0], r[1], r[2]) for r in self.connection.execute(
-                "SELECT DISTINCT h.journal, h.doi, c.abs_batch FROM history h JOIN citations c ON c.journal=h.journal "
-                "AND c.doi=h.doi AND c.label=h.label WHERE h.variant='replicate'")}
-        by_review: dict[tuple[str, str], list[int]] = {}
-        for journal, doi, batch in selected:
-            if (journal, doi, batch) not in done:
-                by_review.setdefault((journal, doi), []).append(batch)
-
-        def work():
-            for (journal, doi), indices in by_review.items():
-                with self.lock:
-                    title = self.connection.execute("SELECT title FROM reviews WHERE journal=? AND doi=?",
-                                                    (journal, doi)).fetchone()[0]
-                    batches = C.paper_batches(self._items(journal, doi))
-                yield journal, doi, title or "", [(index, batches[index]) for index in sorted(indices)]
-        totals, drift = self._schedule(work(), cut=True, variant="replicate")
-        totals["batches"] = sum(len(v) for v in by_review.values())
-        totals["selectedBatches"] = len(selected)
-        return self._paused(totals, drift)
+        return self._run_variant(selected, variant="replicate", cut=True, transport_retries=transport_retries,
+                                 cooldown=cooldown)
 
     # ------------------------------------------------------------------ status and gates
     def status(self) -> dict[str, Any]:
-        c = self.connection
-        abstract_calls = c.execute("SELECT COUNT(*), SUM(error IS NOT NULL AND error!='model_drift'), SUM(truncated=1), "
-                                   "SUM(fingerprint IS NOT NULL), SUM(prompt_tokens), SUM(completion_tokens) FROM calls "
-                                   "WHERE tier='abstract' AND variant='primary'").fetchone()
-        judgeable = c.execute("SELECT COUNT(*) FROM citations WHERE cited_inbody=1 AND identity IN ('resolved','resolved_unverified')"
-                              " AND (abs_basis IS NULL OR abs_basis='model' OR abs_basis LIKE 'invalid%')").fetchone()[0]
-        invalid = c.execute("SELECT COUNT(*) FROM citations WHERE abs_basis LIKE 'invalid%'").fetchone()[0]
-        duplicates = c.execute("SELECT COUNT(*) FROM (SELECT journal, doi, label FROM history WHERE tier='abstract' AND "
-                               "variant='primary' AND outcome='accepted' GROUP BY journal, doi, label HAVING COUNT(*) > 1)").fetchone()[0]
-        reviews = {r[0]: r[1] for r in c.execute("SELECT abstract_state, COUNT(*) FROM reviews GROUP BY abstract_state")}
-        calls = abstract_calls[0] or 0
-        return {"runId": self.run_id, "instrumentDigest": self.instrument.digest,
-                "runState": scores_db.meta(c).get("runState", "active"), "reviews": reviews,
-                "judgeableEntries": judgeable, "invalidOutputs": invalid,
-                "invalidShare": invalid / judgeable if judgeable else None,
-                "abstractCalls": calls, "transportFailures": abstract_calls[1] or 0,
-                "transportFailureShare": (abstract_calls[1] or 0) / calls if calls else None,
-                "truncatedCalls": abstract_calls[2] or 0, "receiptsWithFingerprint": abstract_calls[3] or 0,
-                "promptTokens": abstract_calls[4], "completionTokens": abstract_calls[5],
-                "duplicateJudgments": duplicates,
-                "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0]}
+        return {**census_status(self.connection, code_instrument_digest=self.instrument.digest), "runId": self.run_id}
+
+
+ESCALATED_OPEN = ("cited_inbody=1 AND identity IN ('resolved','resolved_unverified') AND model_judged=1 "
+                  "AND abs_escalated=1 AND ft_retrieval IS NULL")
+
+
+def census_status(connection: Any, *, code_instrument_digest: str | None = None) -> dict[str, Any]:
+    """Run status from any connection, including a read-only one: nothing is written or pinned."""
+    c = connection
+    meta = {row[0]: row[1] for row in c.execute("SELECT key, value FROM meta")}
+    abstract_calls = c.execute("SELECT COUNT(*), SUM(error IS NOT NULL AND error!='model_drift'), SUM(truncated=1), "
+                               "SUM(prompt_tokens), SUM(completion_tokens) FROM calls "
+                               "WHERE tier='abstract' AND variant='primary'").fetchone()
+    # Fingerprints can only come with a response: receipts of calls that never got one are counted apart.
+    responded = c.execute("SELECT COUNT(*), SUM(fingerprint IS NOT NULL) FROM calls WHERE served_model IS NOT NULL").fetchone()
+    judgeable = c.execute("SELECT COUNT(*) FROM citations WHERE cited_inbody=1 AND identity IN ('resolved','resolved_unverified')"
+                          " AND (abs_basis IS NULL OR abs_basis='model' OR abs_basis LIKE 'invalid%')").fetchone()[0]
+    invalid = c.execute("SELECT COUNT(*) FROM citations WHERE abs_basis LIKE 'invalid%'").fetchone()[0]
+    open_entries = c.execute("SELECT COUNT(*) FROM citations WHERE cited_inbody=1 AND identity IN "
+                             "('resolved','resolved_unverified') AND abs_basis IS NULL").fetchone()[0]
+    open_full_text = c.execute(f"SELECT COUNT(*) FROM citations WHERE {ESCALATED_OPEN}").fetchone()[0]
+    duplicates = c.execute("SELECT COUNT(*) FROM (SELECT journal, doi, label FROM history WHERE tier='abstract' AND "
+                           "variant='primary' AND outcome='accepted' GROUP BY journal, doi, label HAVING COUNT(*) > 1)").fetchone()[0]
+    reviews = {r[0]: r[1] for r in c.execute("SELECT abstract_state, COUNT(*) FROM reviews GROUP BY abstract_state")}
+    full_text = {r[0]: r[1] for r in c.execute("SELECT full_text_state, COUNT(*) FROM reviews GROUP BY full_text_state")}
+    calls = abstract_calls[0] or 0
+    pinned = meta.get("instrumentDigest")
+    return {"runId": meta.get("runId"), "instrumentDigest": pinned, "codeInstrumentDigest": code_instrument_digest,
+            "instrumentDigestMatches": None if code_instrument_digest is None or pinned is None
+            else pinned == code_instrument_digest,
+            "runState": meta.get("runState", "active"), "reviews": reviews, "fullTextReviews": full_text,
+            "openEntries": open_entries, "openFullTextEntries": open_full_text,
+            "judgeableEntries": judgeable, "invalidOutputs": invalid,
+            "invalidShare": invalid / judgeable if judgeable else None,
+            "abstractCalls": calls, "transportFailures": abstract_calls[1] or 0,
+            "transportFailureShare": (abstract_calls[1] or 0) / calls if calls else None,
+            "truncatedCalls": abstract_calls[2] or 0,
+            "receiptsWithResponse": responded[0] or 0, "receiptsWithFingerprint": responded[1] or 0,
+            "fingerprintOffered": bool(responded[1]),
+            "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
+            "duplicateJudgments": duplicates,
+            "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0]}
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:

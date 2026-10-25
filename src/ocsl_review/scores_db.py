@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS data_dictionary(
 CREATE INDEX IF NOT EXISTS ix_citations_class ON citations(journal, abs_class);
 CREATE INDEX IF NOT EXISTS ix_calls_review ON calls(journal, doi, tier);
 CREATE INDEX IF NOT EXISTS ix_history_entry ON history(journal, doi, label);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_history_primary_verdict ON history(journal, doi, label, tier)
+  WHERE variant='primary' AND outcome='accepted';
 CREATE TRIGGER IF NOT EXISTS history_no_update BEFORE UPDATE ON history
   BEGIN SELECT RAISE(ABORT, 'verdict history is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS history_no_delete BEFORE DELETE ON history
@@ -339,6 +341,24 @@ def freeze(source: Path, output: Path, *, keep_text: bool = False) -> dict[str, 
     os.chmod(output, 0o444)
     return {"path": str(output), "sha256": file_sha256(output), "bytes": output.stat().st_size, "evidenceTextKept": keep_text,
             "scored": scores}
+
+
+def open_readonly(path: Path) -> sqlite3.Connection:
+    """A read-only connection to a working or frozen scores database: no DDL, no metadata pins, no writes."""
+    path = Path(path)
+    if not path.is_file():
+        raise ValidationError(f"scores database is missing: {path}")
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+    connection.row_factory = sqlite3.Row
+    try:
+        version = connection.execute("SELECT value FROM meta WHERE key='schemaVersion'").fetchone()
+    except sqlite3.DatabaseError as error:
+        connection.close()
+        raise ValidationError("not a census scores database") from error
+    if not version or int(version[0]) != SCHEMA_VERSION:
+        connection.close()
+        raise ValidationError("unsupported scores database schema version")
+    return connection
 
 
 def open_frozen(path: Path) -> sqlite3.Connection:
