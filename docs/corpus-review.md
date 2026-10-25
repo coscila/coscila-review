@@ -69,6 +69,12 @@ checks. Legacy abstract fields without sufficient provenance remain incomplete a
 require acquisition; an old publication-status observation does not establish a
 paper's current status.
 
+A sealed store mounted read-only, such as the label-free projection
+`literature-evidence@2`, is attached instead of copied: `ocsl-review store attach
+--store /mounted/store --workspace . --library work/literature` pins it by its
+Merkle root, and acquisition then reuses its evidence study-first, re-checking
+provider records before use (see [storage](storage.md)).
+
 For a verified reusable seed supplied by the operator, import the external
 snapshot, then branch it into a new analysis. The operator supplies the actual
 seed location; `/external/seed` below is an example, not a deployed path.
