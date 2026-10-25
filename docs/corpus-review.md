@@ -69,6 +69,22 @@ checks. Legacy abstract fields without sufficient provenance remain incomplete a
 require acquisition; an old publication-status observation does not establish a
 paper's current status.
 
+A review bound from a retained structured capture has the provenance class
+`entitled` (licensed text); a review and cited evidence from public providers
+have the class `public`. Entitled tasks are dispatched only to on-prem judges:
+workers whose broker configuration carries the `entitled-institutional`
+evidence policy. A `public-literature` worker never receives them, the egress
+gate refuses such a batch even under an explicit operator plan, and every
+egress event records the provenance classes it carried. When the only pending
+tasks are held for an on-prem judge, `corpus execute` stops with
+`waiting_input` and the number of held tasks instead of polling.
+
+A sealed store mounted read-only, such as the label-free projection
+`literature-evidence@2`, is attached instead of copied: `ocsl-review store attach
+--store /mounted/store --workspace . --library work/literature` pins it by its
+Merkle root, and acquisition then reuses its evidence study-first, re-checking
+provider records before use (see [storage](storage.md)).
+
 For a verified reusable seed supplied by the operator, import the external
 snapshot, then branch it into a new analysis. The operator supplies the actual
 seed location; `/external/seed` below is an example, not a deployed path.
@@ -86,15 +102,23 @@ and raw captures through a verified adapter. Review its reconciliation before
 judging. A seed contributes source material and labelled history; it never
 pre-accepts new tasks. Initialization and branching register the implementation
 files, schemas, prompts, dependency versions and licenses as immutable artifacts.
-The run's code revision identifies the source tree, and dispatch rejects a
-changed implementation under the same pinned analysis.
+A new analysis is pinned to a study bundle (`study-bundle-sha256:`): its protocol,
+the optional `--study-prompt` file, the registry digest of `citation-support@2`
+(prompt, schema and validator), dataset versions (a branch records its parent
+snapshot's Merkle root) and package tags. Dispatch refuses the analysis when that
+instrument has changed; executor, storage and transport fixes do not affect the
+pin, and every receipt records the code that served it (`codeTag`). Analyses
+pinned to a whole source tree (`source-tree-sha256:`) keep rejecting any changed
+implementation.
 
 ## Calibrate the instrument, then execute
 
 Verify actual worker IDs with `node tools/ocsl-workers.mjs configs`. The template
 uses `none` for primary abstract assessment, `low` for targeted full-text
-assessment, and `none` for selected blind replication. All share the same
-aggregate capacity budget of 60. The launch default is **one locus per call**.
+assessment, and `none` for selected blind replication. Each job asks for its
+worker's capacity-group limit as reported by the broker configuration, and the
+broker's limiter queues items across all jobs, so the roles still share the
+group's capacity (60 by default). The launch default is **one locus per call**.
 
 ```bash
 ocsl-review corpus calibrate --workspace . --library work/literature \
@@ -126,9 +150,11 @@ tests do not establish that the live gate has passed.
 
 After a qualifying recorded calibration, execute with `--batch-size 4`. Each item
 retains its locus, task and evidence identity; a four-item call is transport
-grouping, not a merged scientific unit. `--max-jobs N` bounds a continuation
-segment; it does not declare the remaining corpus complete. Avoid multiplying
-the concurrency budget by the number of reviewers or worker roles.
+grouping, not a merged scientific unit. Up to three jobs of one analysis stay in
+flight, so the next job starts while another drains; `--max-jobs N` lowers that
+bound and does not declare the remaining corpus complete. Jobs of other analyses
+are neither blocked by nor charged for them. Avoid multiplying the concurrency
+budget by the number of reviewers or worker roles.
 
 For managed end-to-end execution after preparation/calibration:
 
@@ -184,6 +210,53 @@ or all-unit ID echo. Local validation checks each item independently. Accepted
 peers survive invalid or missing peers; preserve rejected attempts. Format
 repair is bounded. Missing evidence, changed source identity and inadequate
 coverage require their own resolution rather than repeating the same inference.
+
+## Storage, progress and schema upgrades
+
+Planning reads citation loci in keyset pages of 5,000 rows (a branch pages its
+own loci, then its parent's), loads each cited work's evidence once per pass and
+stores task inputs in transactions of at most 5,000 rows behind one durability
+barrier per batch: one pack fsync before the index rows commit, or one
+filesystem barrier for the loose files of a library without packs
+([storage](storage.md)). Result import parses each batch request once and
+writes every result page of up to 100 records, with its broker cursor, in one
+transaction; a replayed page imports nothing twice. Up to ten staged pages
+share one durability barrier for their receipts before their transactions
+commit in order.
+
+Libraries at schema version 3 keep progress counters in the same transactions
+as the rows they count, so `corpus status`, the progress heartbeat and the
+execute loop read counters instead of scanning tables. Opening an older library
+never changes its schema. Upgrade it explicitly:
+
+```bash
+ocsl-review corpus migrate --workspace . --library work/literature
+```
+
+Each step first writes and checks a backup (`corpus-v<N>-backup.sqlite3`, never
+overwriting an earlier one) and refuses immutable snapshots; branch a snapshot
+first. Until then, status of an older library scans its tables and says so. A
+delta branch keeps its parent snapshot's schema version: migrate the parent
+library, snapshot it and branch again. A branch's counters cover its own rows;
+its status adds the parent snapshot's counters and takes out the parent rows
+the branch has overridden, and a snapshot of a branch recounts them. A branch
+counts each parent row it copies (copy-on-write) when it copies it, so its
+status reads those counts instead of scanning its tables; a branch made by an
+earlier version is scanned until `corpus migrate --rebuild-counters` adds them.
+`corpus verify` compares the counters with the stored rows; `corpus migrate
+--rebuild-counters` recomputes them. Dispatch authorization checks a whole
+job's tasks through one connection with batched reads.
+
+An opt-in synthetic benchmark generates a corpus in a new temporary workspace
+and reports preparation, import, the per-task checks of dispatch
+authorization, status and egress-ledger rates against the execution targets
+(2,000 tasks/s, 1,000 results/s, 50 ms, 100,000 events in 10 s); `--branch`
+repeats preparation, authorization, import and status in a delta branch of a
+snapshot. It uses an in-process broker and touches no deployment path:
+
+```bash
+PYTHONPATH=src python3 tests/benchmark_corpus_executor.py --loci 200000 --branch
+```
 
 ## Resume, export and branch
 

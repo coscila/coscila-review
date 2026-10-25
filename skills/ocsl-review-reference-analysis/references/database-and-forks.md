@@ -2,8 +2,9 @@
 # A database a future thread can reuse
 
 The portable deliverable is a bundle: `corpus.sqlite3`, registered evidence in
-`sources/`, and a snapshot `manifest.json`. A PDF or table of final scores alone
-does not retain the evidence needed to ask a different scientific question.
+content-addressed packs (`packs/`), and a snapshot `manifest.json` with a Merkle
+root. A PDF or table of final scores alone does not retain the evidence needed
+to ask a different scientific question.
 
 ## Separate evidence from interpretation
 
@@ -24,8 +25,11 @@ version relationships in work metadata. Keep provider candidates and reasons
 for accepting/rejecting them in bibliography entries and their identity-evidence
 artifacts; the verified identifier table alone is not an adequate identity audit.
 
-Write acquired files under `sources/<SHA256>` and register their exact hash and
-size after writing. Retain structured source documents and provider payloads,
+Register acquired bytes through the maintained commands: they are written to
+append-only content-addressed packs and registered by exact hash and size only
+after they are durable (the registry names them `sources/<SHA256>`). Loose
+`sources/<SHA256>` files of older libraries stay readable, and `corpus pack`
+copies them into packs. Retain structured source documents and provider payloads,
 not just text excerpts. Evidence is reusable across analyses, but judgments
 remain tied to the question, locus, evidence and instrument that generated
 them. Use explicit analysis filters in every analytical query. Never obtain a
@@ -43,6 +47,11 @@ imported with `corpus import-snapshot /operator/supplied/seed --workspace .
 --library work/seed`, then branched into the new analysis. Obtain the actual
 seed path from the operator; no historical absolute path is a runtime default.
 These imports retain source bytes and provenance without completing new tasks.
+A sealed store mounted read-only can instead be attached as a byte cache with
+`ocsl-review store attach --store /mounted/store --workspace . --library
+work/literature`. Lookups ask the study first; what the store holds is copied
+into the study with an adoption receipt, and provider records are re-checked
+before that evidence is used.
 
 ## Maintained corpus commands
 
@@ -74,9 +83,12 @@ Create a consistent snapshot, including live SQLite WAL data, and verify it:
   --workspace "$PWD" --library results/literature-snapshot
 ```
 
-The manifest records the schema version, database hash, registered artifact
-hashes and sizes, table counts and analysis namespaces. Verification must detect
-missing or altered evidence. Keep the snapshot immutable by workflow convention;
+The manifest records the schema version, table counts, analysis namespaces, the
+digests of the closed database, the pack index and every pack, and a Merkle root
+over them; the pack index lists every artifact's hash and size. Packs are shared
+with the library by hard link, so a snapshot copies the database but not the
+evidence bytes. `corpus verify --level light|standard|deep` checks a snapshot at
+increasing depth and must detect missing or altered evidence. Keep the snapshot immutable by workflow convention;
 verification detects edits but does not turn an ordinary directory into a
 read-only storage service. Register sources completely before taking a snapshot;
 do not race it against file replacement. Use a new destination for later
@@ -106,11 +118,12 @@ destination chat's authorized workspace, then branch it:
   --question "How have the study designs of the cited evidence changed over time?"
 ```
 
-Prepare the new question's protocol file first. Branching copies the database,
-adds a fresh analysis and records the parent manifest digest. Its `bundle.json`
-uses a workspace-relative pointer to the verified parent snapshot's immutable
-sources, avoiding a second copy of the corpus. New source files belong to the
-branch. Historical records stay labelled history; the new question's tasks do
+Prepare the new question's protocol file first. Branching creates a delta
+database with the fresh analysis and records the parent manifest digest and
+Merkle root in `bundle.json`; the parent database is attached read-only and never
+copied. Queries see parent and branch rows together. New rows and new artifacts
+belong to the branch, and parent rows never change: an update copies the row into
+the branch first, and references are checked across both. Historical records stay labelled history; the new question's tasks do
 not become complete. The parent is unchanged. New extractions, provider updates
 and judgments receive new versioned records, while verified evidence can be
 read again without downloading it. A different question requires its own task
@@ -144,8 +157,9 @@ WHERE analysis_id = 'evidence-trends-v1'
 ```
 
 Keep the parent snapshot while using a branch. To move the follow-up alone to
-another workspace or export it, snapshot the branch first; this materializes all
-its registered sources into a self-contained bundle. Moving only the branch
+another workspace or export it, snapshot the branch first; this writes one closed
+database with the parent and branch rows and links all their packs into a
+self-contained bundle. Moving only the branch
 directory leaves its parent-source dependency unresolved and verification fails.
 
 Lab chat forks materialize the source workspace's files in an independent

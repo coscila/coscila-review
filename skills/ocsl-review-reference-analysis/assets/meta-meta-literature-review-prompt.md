@@ -8,7 +8,7 @@ the main model and this study prompt are selected separately in the Lab.
 ## Controller prompt
 
 Read the installed **ocsl-review-reference-analysis** skill, including its
-historical workflow lessons and database/fork instructions. Conduct the complete
+workflow lessons and database/fork instructions. Conduct the complete
 oncology citation-support meta-meta review and produce a reusable literature
 database plus the scientific paper. Use the installed review and writing
 companions and recorded advanced orchestration. Start by identifying whether
@@ -19,17 +19,12 @@ This prompt's scientific scope and manuscript specification apply to the oncolog
 citation-support study. If the user requests a different question in a fork,
 replace those two sections with that question's protocol and deliverables. Use
 the inherited database as evidence, configure task-appropriate worker assignments
-and record new schemas and analysis identity. Do not rerun the original census
+and record new schemas and analysis identity. Do not rerun the parent study
 or require its paper format merely because the parent used this template.
 
-The reference deliverable is the September 11–12, 2026 Claude audit's paper,
-*Citation support in oncology review articles at scale: a census of two journals
-with one language-model judge*. Its historical database contained 5,564 reviews
-and 670,938 printed reference entries. These describe the reference study's scale,
-not an assumed count or completion target for newly discovered source records.
-Use the skill's account of the final working pipeline and its post-mortem as the
-methodological baseline. Historical judgments are comparators, never new results
-or human ground truth.
+Use the skill's workflow lessons and limits as the methodological baseline.
+Counts are determined from verified source records, never assumed or set as
+completion targets. Judgments are never human ground truth.
 
 ### Scientific scope
 
@@ -75,13 +70,12 @@ Keep extremes separate from population calibration. Do not claim Claude,
 OpenAI or human benchmark judgments unless the study is explicitly amended and
 those observations actually exist. Claude remains the controller and author.
 
-Load the existing approval/run state before planning again. Continue unchanged
-authorized work under the existing lifecycle. Check the actual installed
+Check the actual installed
 acquisition, evidence, worker and public-material authorization contracts before
 production. Prove a bounded complete path through accepted judgments and exported
 facts, then measure workload, tokens and throughput. The pilot is an execution
 check inside the full census, not the deliverable. Use the maintained
-`ocsl-review corpus` commands: `init`, `import-manifest`, `import-legacy`, `import-snapshot`,
+`ocsl-review corpus` commands: `init`, `import-manifest`,
 `enumerate`, `acquire`, `prepare`, `calibrate`, `execute`, `run`, `resume`,
 `validate`, `status`, `export`, `snapshot`, `verify` and `branch`. Read their installed help
 and `docs/corpus-review.md`; use `execute` for the maintained full-workflow loop,
@@ -121,15 +115,13 @@ Stop the affected stage for systematic extraction or identity errors. Follow the
 broker's tracked-work lifecycle, joining or cancelling jobs as required; a
 detached heartbeat is not a managed workflow. Show measured progress separately
 for reviews, entries, loci, verified sources, evidence tiers and accepted
-judgments. Do not extrapolate the old 40-item-batch throughput to a new per-locus
-or complete-paper instrument without measurement.
+judgments. Do not extrapolate throughput from one instrument geometry to another
+without measurement.
 
 Validate each returned item independently, including exact quotations from the
 named supplied units. Preserve accepted peers when another item fails; retry
 only bounded format failures, never a missing-evidence condition by resending
 the same source. Do not require confidence scores or a complete unit-ID echo.
-Keep old v1 and historical scores under their original protocols; they are
-comparators and reusable provenance, not completed v2 judgments.
 
 ### Reusable database and future forks
 
@@ -138,7 +130,7 @@ inventory, identity/provenance records, immutable source artifacts and text,
 sections/citation locations, all observations with prompt/model/source versions,
 processing states and reproducible analysis outputs. Preserve raw inputs and
 alternative observations. New questions use new analysis namespaces and declared
-eligibility; they do not overwrite the original census.
+eligibility; they do not overwrite the parent study.
 
 For a fresh study, acquire inputs and generate results for that study. For an
 explicit continuation, reuse verified same-run work. For a downstream fork, verify
@@ -159,7 +151,7 @@ accounting and must establish its own authorized execution.
 ### Scientific deliverables
 
 Personally write the complete manuscript and generate its figures from verified
-facts. Preserve the reference paper's five figure-led chapters: **pipeline/cost
+facts. Organize it in five figure-led chapters: **pipeline/cost
 and scaling; journal/year/stratum/topic/affiliation-country distributions;
 extremes and anchored examples; instrument validation and paired evidence-tier
 changes; reusable database and coverage**. Describe the actual Qwen-only

@@ -23,6 +23,20 @@ def retained_review_sources(repo, selected):
             for source in json.loads(row["value_json"]).get("sources", []):
                 if source.get("state") == "retained" and source.get("mediaType") in {"application/xml", "text/html"}:
                     sources.setdefault(row["work_id"], {})[source["sha256"]] = source
+    # A label-free store keeps only a neutral retained-source index (store_client); study rows come first.
+    from .store_client import retained_captures
+    for row in selected:
+        if row["work_id"] in sources:
+            continue
+        try:
+            doi = normalize_doi(json.loads(row["metadata_json"]).get("doi") or "")
+        except (ReviewError, ValueError):
+            continue
+        for capture in retained_captures(repo, doi):
+            if capture["media_type"] in {"application/xml", "text/html"}:
+                sources.setdefault(row["work_id"], {})[capture["capture_sha256"]] = {
+                    "sha256": capture["capture_sha256"], "mediaType": capture["media_type"], "state": "retained",
+                    "route": capture["route"], "capturedAt": capture["captured_at"]}
     return sources
 
 

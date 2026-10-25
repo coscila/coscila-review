@@ -1,0 +1,51 @@
+{
+ "license": "Apache-2.0 synthetic fixture",
+ "outputs": [
+  {
+   "labels": [
+    "1",
+    "2",
+    "3"
+   ],
+   "text": "{\"l\":\"1\",\"c\":\"T\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"Abstract states it.\"}\n{\"l\":\"2\",\"c\":\"F\",\"v\":\"contra\",\"q\":\"an invented association\",\"e\":0,\"r\":\"Opposite direction.\"}\n{\"l\":\"3\",\"c\":\"N\",\"v\":\"abstain\",\"q\":\"\",\"e\":1,\"r\":\"No abstract.\"}"
+  },
+  {
+   "labels": [
+    "4",
+    "5",
+    "6",
+    "7",
+    "8"
+   ],
+   "text": "Here are the results:\n```json\nitem 4: {\"l\":\"item 4\",\"c\":\"t\",\"v\":\"scope\",\"q\":\"x\",\"e\":\"1\",\"r\":\"Scope differs.\"}\n{\"l\":\"id=5\",\"c\":\"F\",\"v\":\"notaddr\",\"q\":\"\",\"e\":true,\"r\":\"Not addressed.\"}\n{\"l\":\"#6\",\"c\":\"U\",\"v\":\"weird\",\"q\":\"\",\"e\":\"true\",\"r\":\"Unknown work.\"}\n{\"l\":\"7\",\"c\":\"X\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"bad category\"}\n{\"l\":\"99\",\"c\":\"T\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"unexpected\"}\n\"just a quoted string\" and \"another\"\n{\"l\":\"8\",\"c\":\"F\",\"v\":\"partial\",\"q\":\"verbatim\n```"
+  },
+  {
+   "labels": [
+    "10",
+    "11",
+    "12"
+   ],
+   "text": "{\"l\":\"10\",\"c\":\"F\",\"v\":\"contra\",\"q\":\"qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\",\"e\":0,\"r\":\"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\"} trailing words\n{\"l\": \"11\", \"c\": \"T\", \"v\": \"direct\", \"q\": \"\", \"e\": 0, \"r\": \"nested {braces} in text\"}\n{\"l\":\"12\",\"c\":\"T\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"first\"} {\"l\":\"12\",\"c\":\"F\",\"v\":\"contra\",\"q\":\"\",\"e\":0,\"r\":\"second\"}\n}"
+  },
+  {
+   "labels": [
+    "13",
+    "14"
+   ],
+   "text": "  {\"l\":13,\"c\":\"T\",\"v\":\"Direct\",\"q\":null,\"e\":0,\"r\":null}\n{\"l\":\"`14`\",\"c\":\"F \",\"v\":\"contra\",\"q\":\"  padded quote  \",\"e\":\"0\",\"r\":\"  padded reason  \"}\n"
+  },
+  {
+   "labels": [
+    "15"
+   ],
+   "text": ""
+  },
+  {
+   "labels": [
+    "16",
+    "17"
+   ],
+   "text": "{\"l\":\"16\",\"c\":\"T\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"a\"}\n{\"l\":\"16\",\"c\":\"F\",\"v\":\"contra\",\"q\":\"dup\",\"e\":0,\"r\":\"b\"}\n"
+  }
+ ]
+}

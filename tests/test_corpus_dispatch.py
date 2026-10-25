@@ -12,9 +12,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 from urllib.parse import parse_qs, urlsplit
 
+from ocsl_review import corpus_export, instruments
 from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.corpus_assessment import build_messages
 from ocsl_review.corpus_dispatch import CorpusExecutor, authorize
@@ -151,7 +152,7 @@ class CorpusDispatchTests(unittest.TestCase):
                 "verified", self.evidence["sourceSha256"]))
         self.loci = 0
 
-    def add_tasks(self, count, analysis="main"):
+    def add_tasks(self, count, analysis="main", proof_provider="europe-pmc"):
         ids = []
         for _ in range(count):
             self.loci += 1
@@ -167,8 +168,9 @@ class CorpusDispatchTests(unittest.TestCase):
                     "citedWork": {"title": "Synthetic trial"},
                     "identifiers": {"doi": "10.1234/source"}, "identityVerified": True,
                     "reviewProof": {"manuscriptSha256": self.manuscript_sha, "public": True,
-                                    "provider": "europe-pmc",
-                                    "sourceUrl": "https://europepmc.org/article/MED/456",
+                                    "provider": proof_provider,
+                                    "sourceUrl": "https://doi.org/10.1234/review" if proof_provider == "retained-structured-source"
+                                    else "https://europepmc.org/article/MED/456",
                                     "publication": {"doi": "10.1234/review"}}}
             ids.append(self.repo.add_task(analysis, locus, "abstract", spec))
         return ids
@@ -225,20 +227,194 @@ class CorpusDispatchTests(unittest.TestCase):
         self.assertEqual(len(self.rows("model_receipts")), 2)
         self.assertEqual(len([r for r in self.rows("assessments") if r["validation_state"] == "accepted"]), 1)
 
-    def test_aggregate_capacity_across_analyses_releases_after_harvest(self):
-        self.add_tasks(1)
+    def test_up_to_three_jobs_in_flight_sized_to_group_limit_and_scoped_to_analysis(self):
+        self.broker.settings["workers"][0]["bulkConcurrencyLimit"] = 30
+        tasks = self.add_tasks(7)
         other = self.add_analysis("second")
         self.add_tasks(1, "second")
-        first = self.executor.submit("w1", concurrency=40)["submitted"][0]["jobId"]
-        second = other.submit("w1", concurrency=60)["submitted"][0]["jobId"]
-        self.assertEqual(self.broker.jobs[first]["request"]["concurrency"], 40)
-        self.assertEqual(self.broker.jobs[second]["request"]["concurrency"], 20)
-        self.add_tasks(1)
-        self.assertEqual(self.executor.submit("w1", concurrency=60)["submitted"], [])
-        self.broker.complete(first)
+        jobs = [job["jobId"] for job in self.executor.submit("w1", concurrency=60, job_items=2)["submitted"]]
+        self.assertEqual(len(jobs), 3)
+        self.assertEqual([len(self.broker.jobs[j]["request"]["items"]) for j in jobs], [2, 2, 2])
+        self.assertEqual({self.broker.jobs[j]["request"]["concurrency"] for j in jobs}, {30})
+        # Another analysis is neither blocked by nor charged for these jobs.
+        second = other.submit("w1", concurrency=20)["submitted"]
+        self.assertEqual(self.broker.jobs[second[0]["jobId"]]["request"]["concurrency"], 20)
+        self.assertEqual(self.executor.submit("w1", job_items=2)["submitted"], [])
+        self.assertEqual(self.executor.in_flight(), 3)
+        self.assertEqual(sum(state == ("pending", 0) for state in self.states().values()), 1)
+        self.broker.complete(jobs[0])
         self.executor.resume()
-        next_job = self.executor.submit("w1", concurrency=60)["submitted"][0]["jobId"]
-        self.assertEqual(self.broker.jobs[next_job]["request"]["concurrency"], 40)
+        fourth = self.executor.submit("w1", job_items=2, max_jobs=10)["submitted"]
+        self.assertEqual(len(fourth), 1)
+        self.assertEqual(self.executor.in_flight(), 3)
+        for job in jobs[1:] + [fourth[0]["jobId"]]:
+            self.broker.complete(job)
+        self.executor.resume()
+        self.assertEqual({self.states()[task] for task in tasks}, {("completed", 1)})
+        self.assertEqual(self.executor.in_flight(), 0)
+
+    def test_request_bound_splits_jobs_exactly_where_the_canonical_group_list_overflows(self):
+        from ocsl_review.corpus_store import identity
+        for name, slack, expected in (("exact", 0, [3, 2]), ("short", -1, [2, 2, 1])):
+            with self.subTest(bound=name):
+                executor = self.add_analysis(name)
+                self.add_tasks(5, name)
+                tasks = self.repo.tasks(name, state="pending")
+                groups = [{"id": "item-" + identity([t["task_id"]], [0]),
+                           "input": {"messages": build_messages([t["spec"]], "abstract")},
+                           "taskIds": [t["task_id"]]} for t in tasks]
+                bound = len(canonical(groups[:3]).encode()) + slack
+                with patch("ocsl_review.corpus_dispatch.MAX_REQUEST_GROUP_BYTES", bound):
+                    jobs = executor.submit("w1")["submitted"]
+                self.assertEqual([j["tasks"] for j in jobs], expected)
+        with patch("ocsl_review.corpus_dispatch.MAX_REQUEST_GROUP_BYTES", 10):
+            tiny = self.add_analysis("tiny")
+            self.add_tasks(1, "tiny")
+            with self.assertRaisesRegex(ValidationError, "exceeds the broker request bound"):
+                tiny.submit("w1")
+
+    def write_statements(self):
+        """Statements per write connection, to count page transactions."""
+        transactions, original = [], CorpusRepository.connect
+
+        @contextmanager
+        def connect(repo, *, write=False):
+            with original(repo, write=write) as connection:
+                if write:
+                    statements = []
+                    transactions.append(statements)
+                    connection.set_trace_callback(statements.append)
+                yield connection
+        return transactions, connect
+
+    def test_each_result_page_is_one_transaction_with_its_cursor_and_replays_idempotently(self):
+        tasks = self.add_tasks(5)
+        job = self.executor.submit("w1")["submitted"][0]["jobId"]
+        self.broker.complete(job)
+        batch = self.rows("corpus_batches")[0]
+        with self.repo.connect(write=True) as connection:
+            connection.execute("CREATE TRIGGER injected BEFORE UPDATE OF cursor ON corpus_batches "
+                               "BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END")
+        barriers, original_sync = [], CorpusRepository.sync_staged
+
+        def counting_sync(repo, paths):
+            barriers.append(len(paths))
+            return original_sync(repo, paths)
+
+        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2), \
+                patch("ocsl_review.corpus_dispatch.BARRIER_PAGES", 2), \
+                patch.object(CorpusRepository, "sync_staged", counting_sync):
+            with self.assertRaisesRegex(Exception, "injected cursor failure"):
+                self.executor.resume()
+        # Two staged pages shared one barrier before the first page's commit failed.
+        self.assertEqual(barriers, [4])
+        self.assertEqual(self.rows("model_receipts"), [])
+        self.assertEqual({self.states()[t] for t in tasks}, {("running", 1)})
+        with self.repo.connect(write=True) as connection:
+            connection.execute("DROP TRIGGER injected")
+        transactions, connect = self.write_statements()
+        reads, original_read = [], CorpusRepository.read_artifact
+
+        def counting_read(repo, digest):
+            reads.append(digest)
+            return original_read(repo, digest)
+
+        fresh = CorpusExecutor(self.repo, broker=self.broker, authorization=lambda *args: None)
+        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2), \
+                patch("ocsl_review.corpus_dispatch.BARRIER_PAGES", 2), \
+                patch.object(CorpusRepository, "connect", connect), \
+                patch.object(CorpusRepository, "read_artifact", counting_read):
+            fresh.resume()
+        pages = [t for t in transactions if any("INSERT INTO model_receipts" in s for s in t)]
+        self.assertEqual(len(pages), 3)
+        self.assertTrue(all(any("UPDATE corpus_batches SET cursor" in s for s in t) for t in pages))
+        self.assertEqual(reads.count(batch["input_sha256"]), 1, "the batch request is parsed once")
+        self.assertEqual({self.states()[t] for t in tasks}, {("completed", 1)})
+        records = [r for r in self.broker.jobs[job]["records"] if r["state"] == "completed"]
+        before = {table: len(self.rows(table)) for table in ("model_receipts", "assessments", "assessment_evidence")}
+        self.executor.import_page(self.rows("corpus_batches")[0], records + records[:2])
+        self.assertEqual({table: len(self.rows(table)) for table in before}, before)
+        self.assertEqual(before["model_receipts"], 5)
+        self.repo.library.verify()
+
+    def pinned_analysis(self, name="pinned", protocol=None):
+        protocol = protocol or {"version": 2, "kind": "calibration"}
+        bundle = corpus_export.study_bundle(protocol)
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Pinned question", name, protocol=protocol,
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        corpus_export.record_study_bundle(self.repo, name, bundle)
+        return bundle
+
+    def executor_for(self, analysis):
+        return CorpusExecutor(self.repo, broker=self.broker, authorization=lambda *args: None, analysis_id=analysis)
+
+    def test_study_bundle_pin_survives_executor_changes_but_refuses_a_changed_instrument(self):
+        bundle = self.pinned_analysis()
+        self.assertEqual(bundle["instruments"], {"citation-support@2": instruments.load("citation-support@2").digest})
+        self.add_tasks(3, "pinned")
+        changed_tree = {"format": "ocsl-corpus-implementation-v1", "files": [], "sha256": "f" * 64}
+        with patch.object(corpus_export, "implementation_manifest", return_value=changed_tree):
+            # Execution code changed after the pin: the analysis continues and receipts name the serving code.
+            job = self.executor_for("pinned").submit("w1")["submitted"][0]["jobId"]
+            self.broker.complete(job)
+            self.executor_for("pinned").resume()
+        receipts = [json.loads(row["parameters_json"]) for row in self.rows("model_receipts")]
+        self.assertTrue(receipts)
+        self.assertEqual({receipt["codeTag"] for receipt in receipts}, {"source-tree-sha256:" + "f" * 64})
+        with patch.object(instruments.Instrument, "digest", new_callable=PropertyMock, return_value="0" * 64):
+            with self.assertRaisesRegex(ValidationError, "citation-support@2 changed since the analysis was pinned"):
+                self.executor_for("pinned").submit("w1")
+        with self.repo.connect(write=True) as connection:
+            connection.execute("UPDATE processing_state SET checkpoint_json=json_set(checkpoint_json,'$.protocolSha256',?) "
+                               "WHERE analysis_id='pinned' AND task_key='study-bundle'", ("0" * 64,))
+        with self.assertRaisesRegex(ValidationError, "differs from the analysis pin"):
+            self.executor_for("pinned").submit("w1")
+
+    def test_variants_use_their_parents_bundle_and_source_tree_pins_keep_the_old_check(self):
+        bundle = self.pinned_analysis()
+        variant = "pinned:calibration:none1"
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Variant", variant,
+                         protocol={"version": 2, "kind": "calibration", "parentAnalysisId": "pinned"},
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Old pin", "old",
+                         protocol={"version": 2, "kind": "calibration"},
+                         code_revision=corpus_export.SOURCE_TREE_PREFIX + "0" * 64)
+        self.add_tasks(1, variant)
+        self.add_tasks(1, "old")
+        self.assertEqual(len(self.executor_for(variant).submit("w1")["submitted"]), 1)
+        with self.assertRaisesRegex(ValidationError, "implementation changed"):
+            self.executor_for("old").submit("w1")
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Unrecorded", "unrecorded",
+                         protocol={"version": 2, "kind": "calibration"},
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        self.add_tasks(1, "unrecorded")
+        with self.assertRaisesRegex(ValidationError, "study bundle is not recorded"):
+            self.executor_for("unrecorded").submit("w1")
+
+    def test_a_delta_branch_dispatches_imports_and_counts_like_a_library(self):
+        self.repo.library.snapshot("results/snapshot")
+        CorpusRepository(self.root, "results/snapshot").library.branch(
+            "work/branch", "Branch question", "branch", {"version": 2, "kind": "calibration"})
+        parent_repo, self.repo = self.repo, CorpusRepository(self.root, "work/branch")
+        self.assertIsNotNone(self.repo.library.overlay)
+        tasks = self.add_tasks(3, "branch")
+        executor = self.executor_for("branch")
+        jobs = executor.submit("w1", job_items=2)["submitted"]
+        for job in jobs:
+            self.broker.complete(job["jobId"])
+        result = executor.resume()
+        self.assertEqual({self.states()[task] for task in tasks}, {("completed", 1)})
+        self.assertEqual(result["taskStates"], [{"tier": "abstract", "state": "completed", "count": 3}])
+        self.assertEqual(result["assessments"], [{"evidence_level": "abstract", "validation_state": "accepted",
+                                                  "count": 3}])
+        self.assertEqual(result["counts"]["claim_loci"], 3)
+        self.assertEqual(result["counts"]["works"], parent_repo.status()["counts"]["works"])
+        self.repo.library.verify()
+        with parent_repo.connect() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM model_receipts").fetchone()[0], 0)
 
     def test_paused_job_is_not_resubmitted_until_new_approved_owner(self):
         task = self.add_tasks(1)[0]
@@ -487,6 +663,93 @@ class CorpusDispatchTests(unittest.TestCase):
             "messages": build_messages([tasks[0]["spec"]], "abstract")}}]
         with self.assertRaisesRegex(ValidationError, "registered immutable source"):
             authorize(self.repo, None, self.broker.catalog(), self.broker.settings["workers"][0], tasks, inputs)
+
+    def on_prem_worker(self):
+        worker = copy.deepcopy(self.broker.settings["workers"][0])
+        worker.update(id="w2", evidencePolicy="entitled-institutional")
+        self.broker.settings["workers"].append(worker)
+        return worker
+
+    def test_entitled_captures_wait_for_an_on_prem_judge_and_never_reach_a_public_worker(self):
+        public = self.add_tasks(2)
+        entitled = self.add_tasks(2, proof_provider="retained-structured-source")
+        result = self.executor.submit("w1", batch_size=2)
+        job = self.broker.jobs[result["submitted"][0]["jobId"]]
+        sent = [t["id"] for item in job["request"]["items"]
+                for t in json.loads(item["input"]["messages"][1]["content"])["items"]]
+        self.assertEqual(sorted(sent), sorted(public))
+        self.assertEqual(result["heldForRouting"], 2)
+        self.assertEqual({self.states()[t] for t in entitled}, {("pending", 0)})
+        self.assertEqual(self.executor.submit("w1", batch_size=2)["submitted"], [])
+        self.on_prem_worker()
+        on_prem = self.add_analysis("on-prem")
+        mixed = self.add_tasks(1, "on-prem") + self.add_tasks(1, "on-prem", proof_provider="retained-structured-source")
+        job = self.broker.jobs[on_prem.submit("w2", batch_size=2)["submitted"][0]["jobId"]]
+        sent = [t["id"] for item in job["request"]["items"]
+                for t in json.loads(item["input"]["messages"][1]["content"])["items"]]
+        self.assertEqual(sorted(sent), sorted(mixed))
+
+    def test_authorization_routes_entitled_evidence_only_to_on_prem_judges_and_records_its_class(self):
+        self.add_tasks(1, proof_provider="retained-structured-source")
+        tasks = self.repo.tasks("main")
+        inputs = [{"id": "fixture-item", "input": {"messages": build_messages([t["spec"] for t in tasks], "abstract")}}]
+        public_worker, on_prem = self.broker.settings["workers"][0], self.on_prem_worker()
+        with self.public_authority() as audit:
+            with self.assertRaisesRegex(ConfidentialityError, "on-prem judges"):
+                authorize(self.repo, None, self.broker.catalog(), public_worker, tasks, inputs)
+            audit.assert_not_called()
+            authorize(self.repo, None, self.broker.catalog(), on_prem, tasks, inputs)
+            event = audit.call_args.args[1]
+            self.assertEqual(event["decision"], "allowed-configured-entitled-institutional")
+            self.assertEqual(event["provenanceClasses"], ["entitled"])
+        # An explicit operator plan does not widen where licensed text may go.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("ocsl_review.corpus_dispatch.load_scholarly_context", return_value=(EgressPlan(), self.root)), \
+                patch("ocsl_review.corpus_dispatch.authorize_egress", return_value={"decision": "allowed-nonconfidential"}), \
+                patch("ocsl_review.corpus_dispatch.append_egress_event") as audit:
+            with self.assertRaisesRegex(ConfidentialityError, "on-prem judges"):
+                authorize(self.repo, None, self.broker.catalog(), public_worker, tasks, inputs)
+            audit.assert_not_called()
+            authorize(self.repo, None, self.broker.catalog(), on_prem, tasks, inputs)
+            self.assertEqual(audit.call_args.args[1]["provenanceClasses"], ["entitled"])
+
+    def test_execute_reports_tasks_held_for_an_on_prem_judge_instead_of_polling_forever(self):
+        from types import SimpleNamespace
+        from ocsl_review import corpus_cli
+
+        class CompletingBroker(FakeBroker):
+            def request(self, method, route, payload=None):
+                response = super().request(method, route, payload)
+                if method == "POST":
+                    self.complete(response["jobId"])
+                return response
+
+        broker = CompletingBroker(self.root)
+        public = self.add_tasks(2)
+        entitled = self.add_tasks(1, proof_provider="retained-structured-source")
+        args = SimpleNamespace(poll_seconds=0.1, skip_acquisition=True, acquisition_workers=2, retry_acquisition=False,
+                               worker_config="w1", low_worker_config="w1", batch_size=1, concurrency=60, max_jobs=3,
+                               paths=None)
+        executor = lambda repo, paths: CorpusExecutor(repo, paths, broker=broker, authorization=lambda *a: None)
+        with patch.object(corpus_cli, "acquirer", return_value=object()), \
+                patch("ocsl_review.corpus_dispatch.CorpusExecutor", executor), \
+                patch("ocsl_review.corpus_pipeline.prepare_tasks", return_value={}), \
+                patch("ocsl_review.corpus_export.export_corpus", side_effect=AssertionError("must not export")):
+            result = corpus_cli.execute(args, self.repo)
+        self.assertEqual((result["state"], result["tier"], result["heldForRouting"]), ("waiting_input", "abstract", 1))
+        self.assertEqual({self.states()[t] for t in public}, {("completed", 1)})
+        self.assertEqual(self.states()[entitled[0]], ("pending", 0))
+        progress = json.loads((self.root / "results/.ocsl/progress.json").read_text())
+        self.assertEqual(progress["state"], "waiting_input")
+        self.assertIn("on-prem judge", progress["summary"])
+
+    def test_public_tasks_record_their_class_for_either_policy(self):
+        tasks, inputs = self.authorization_inputs()
+        for worker in (self.broker.settings["workers"][0], self.on_prem_worker()):
+            with self.subTest(policy=worker["evidencePolicy"]), self.public_authority() as audit:
+                authorize(self.repo, None, self.broker.catalog(), worker, tasks, inputs)
+                self.assertEqual(audit.call_args.args[1]["decision"], "allowed-configured-public-literature")
+                self.assertEqual(audit.call_args.args[1]["provenanceClasses"], ["public"])
 
     def test_configured_public_authority_requires_current_owner_and_preserves_explicit_denial(self):
         tasks, inputs = self.authorization_inputs()

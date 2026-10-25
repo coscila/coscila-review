@@ -1,5 +1,6 @@
 """Exercise portable evidence snapshots and independent question branches."""
 
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -64,14 +65,23 @@ class ReferenceLibraryTests(unittest.TestCase):
         parent = library.Library(self.workspace, "results/snapshot")
         self.assertEqual(parent.verify()["counts"]["works"], 1)
         parent_hash = library.digest_file(parent.db)
-        self.assertEqual((parent.root / "sources" / digest).read_bytes(), path.read_bytes())
+        # The snapshot packs the loose source; it keeps no loose copy of its own.
+        self.assertEqual(parent.read_blob(digest), path.read_bytes())
+        self.assertEqual(list((parent.root / "sources").iterdir()), [])
         result = parent.branch("work/new-question", "A completely different question", "followup")
         branch = library.Library(self.workspace, "work/new-question")
         self.assertEqual(result["parent_manifest_sha256"], saved["manifest_sha256"])
         self.assertEqual(list((branch.root / "sources").iterdir()), [])
+        with contextlib.closing(sqlite3.connect(branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
+            self.assertEqual(raw.execute("SELECT count(*) FROM ocsl_delta_works").fetchone()[0], 0)
         self.assertEqual(branch.verify()["counts"]["analyses"], 2)
-        with library.database(branch.db) as conn:
-            conn.execute("UPDATE works SET title='Branch-only correction' WHERE work_id='paper'")
+        conn = branch.open(write=True)
+        try:
+            with conn:
+                conn.execute("UPDATE works SET title='Branch-only correction' WHERE work_id='paper'")
+            self.assertEqual(conn.execute("SELECT title FROM works").fetchone()[0], "Branch-only correction")
+        finally:
+            conn.close()
         self.assertEqual(library.digest_file(parent.db), parent_hash)
         with parent.connect() as conn:
             self.assertEqual(conn.execute("SELECT title FROM works").fetchone()[0], "A real fixture paper")
@@ -241,8 +251,8 @@ class ReferenceLibraryTests(unittest.TestCase):
         parent_hash = library.digest_file(parent.db)
         parent.branch("work/designs", "What kinds of evidence were used?", "study-designs")
         branch = library.Library(self.workspace, "work/designs")
-        with library.database(branch.db) as conn:
-            conn.execute("PRAGMA foreign_keys=ON")
+        # A branch connection reads the parent snapshot through ATTACH; references are checked over both.
+        with contextlib.closing(branch.open(write=True)) as conn, conn:
             artifact = conn.execute("SELECT sha256 FROM source_artifacts").fetchone()[0]
             conn.execute("INSERT INTO work_observations VALUES (?,?,?,?,?,?,?,?,?,?)",
                          ("design", "study-designs", "paper", "evidence_kind",

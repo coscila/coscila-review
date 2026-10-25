@@ -51,9 +51,15 @@ class ReviewReuseTests(unittest.TestCase):
 
     def test_modified_retained_source_fails_before_ingestion(self):
         digest = self.retain()
-        path = self.repo.root / "sources" / digest
+        kind, store, location = self.repo.library.locate(digest)
+        self.assertEqual("pack", kind)
+        path = store.pack_path(location.pack)
         path.chmod(0o600)
-        path.write_bytes(b"changed")
+        with path.open("r+b") as handle:
+            handle.seek(location.offset)
+            first = handle.read(1)
+            handle.seek(location.offset)
+            handle.write(bytes([first[0] ^ 0xFF]))
         sources = retained_review_sources(self.repo, [self.row])
         with self.assertRaisesRegex(ValidationError, "hash mismatch"):
             reuse_review(self.repo, self.row, sources[self.row["work_id"]])

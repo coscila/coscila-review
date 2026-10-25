@@ -1,0 +1,1 @@
+STAGE B. For each item you now hold the FULL TEXT of the cited work (a claim-targeted window of up to 11,000 characters, section headings kept). Judge the review's statement against that text; `q` must be copied verbatim from it. Set e=0. If the window does not contain the relevant passage, answer N rather than F.

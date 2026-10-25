@@ -135,7 +135,8 @@ def _variant_report(repo, variant, sample):
     by_locus = {}
     with repo.connect() as connection:
         states = dict(connection.execute("SELECT state,count(*) FROM corpus_tasks WHERE analysis_id=? GROUP BY state", (analysis,)))
-        observations = [dict(r) for r in connection.execute("SELECT a.*,m.usage_json FROM assessments a JOIN model_receipts m USING(receipt_id) WHERE a.analysis_id=? ORDER BY a.created_at,a.rowid", (analysis,))]
+        assessments, order = repo.library.ordered("assessments", "a")
+        observations = [dict(r) for r in connection.execute(f"SELECT a.*,m.usage_json FROM {assessments} a JOIN model_receipts m USING(receipt_id) WHERE a.analysis_id=? ORDER BY a.created_at,{order}", (analysis,))]
         receipts = [dict(r) for r in connection.execute("SELECT usage_json,outcome,model,provider,started_at,finished_at FROM model_receipts WHERE analysis_id=?", (analysis,))]
         repairs = connection.execute("SELECT sum(max(attempts-1,0)) FROM corpus_tasks WHERE analysis_id=?", (analysis,)).fetchone()[0] or 0
         pin = connection.execute("SELECT checkpoint_json FROM processing_state WHERE analysis_id=? AND task_key='executor:abstract' AND phase='pin'", (analysis,)).fetchone()
@@ -342,7 +343,8 @@ def validate(repo, paths, worker_id="w3", sample_size=1000, execute=False, concu
         execution["resumed"] = resumed.get("jobs", [])
     observed = _variant_report(repo, variant, manifest["sample"])
     with repo.connect() as connection:
-        primary = [dict(r) for r in connection.execute("SELECT locus_id,verdict_json FROM assessments WHERE analysis_id=? AND validation_state='accepted' AND protocol_version=? AND locus_id IN (SELECT json_extract(value,'$.locusId') FROM json_each(?)) ORDER BY created_at,rowid",
+        assessments, order = repo.library.ordered("assessments")
+        primary = [dict(r) for r in connection.execute(f"SELECT locus_id,verdict_json FROM {assessments} WHERE analysis_id=? AND validation_state='accepted' AND protocol_version=? AND locus_id IN (SELECT json_extract(value,'$.locusId') FROM json_each(?)) ORDER BY created_at,{order}",
                                                        (manifest["parentAnalysisId"], PROTOCOL_VERSION, canonical(manifest["sample"]))) ]
     expected_tasks = {s["locusId"]: s["baseTaskId"] for s in manifest["sample"]}
     verdicts = {}

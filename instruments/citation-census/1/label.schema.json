@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coscila/coscila-review/instruments/citation-census/1/label.schema.json",
+  "title": "citation-census@1 output line",
+  "description": "One JSON object per output line, exactly one per item label, in the order given. The validator parses leniently, one repair pass re-asks for missing labels, and an entry without a parseable line after repair is an invalid output.",
+  "type": "object",
+  "required": ["l", "c", "v", "q", "e", "r"],
+  "properties": {
+    "l": {"type": "string", "description": "the value after id=, copied exactly"},
+    "c": {"enum": ["T", "F", "N", "U"], "description": "T supported, F not supported, N not assessable, U cited work not identifiable"},
+    "v": {"enum": ["direct", "scope", "partial", "contra", "notaddr", "abstain"]},
+    "q": {"type": "string", "description": "verbatim excerpt of the cited work for F; empty otherwise"},
+    "e": {"enum": [0, 1], "description": "escalate to the full-text tier"},
+    "r": {"type": "string", "description": "at most 20 words"}
+  }
+}

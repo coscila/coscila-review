@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from ocsl_review.cli import build_parser, main
 from ocsl_review.corpus_store import CorpusRepository
@@ -93,6 +96,24 @@ class CorpusWorkflowTests(unittest.TestCase):
         self.assertEqual(value["state"], "running")
         self.assertIn("+", value["updatedAt"])
 
+    def test_heartbeat_reads_counters_without_scanning_tables(self):
+        self.repo.review({"doi": "10.1234/review", "title": "Fixture"})
+        statements, original = [], CorpusRepository.connect
+
+        @contextlib.contextmanager
+        def traced(repo, *, write=False):
+            with original(repo, write=write) as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        with patch.object(CorpusRepository, "connect", traced):
+            Progress(self.repo)(force=True)
+        self.assertTrue(statements)
+        self.assertFalse([s for s in statements if "count(" in s.lower()])
+        status = json.loads((self.root / "results/.ocsl/corpus-status.json").read_text())
+        self.assertEqual(status["counts"]["reviews"], 1)
+        self.assertEqual(status["reviewStates"], [{"phase": "pending", "state": "pending", "count": 1}])
+
     def test_terminal_progress_survives_queued_heartbeats_and_stops_thread(self):
         with Progress(self.repo) as progress:
             progress(force=True, phase="validation", summary="Validation running")
@@ -119,6 +140,45 @@ class CorpusWorkflowTests(unittest.TestCase):
         code = main(["corpus", "init", "--workspace", str(self.root), "--library", "work/cli", "--question", "Q", "--analysis", "cli", "--protocol", str(protocol)])
         self.assertEqual(code, 0)
         self.assertEqual(CorpusRepository(self.root, "work/cli").analysis()["analysis_id"], "cli")
+
+    def test_cli_init_and_branch_pin_a_study_bundle_instead_of_the_source_tree(self):
+        from ocsl_review import corpus_export, instruments
+        protocol, prompt = self.root / "protocol.json", self.root / "study-prompt.md"
+        protocol.write_text('{"version":2}')
+        prompt.write_text("Study prompt text.\n")
+        args = ["--workspace", str(self.root), "--question", "Q", "--protocol", str(protocol)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["corpus", "init", "--library", "work/pinned", "--analysis", "pinned",
+                                   "--study-prompt", str(prompt), *args]), 0)
+        repo = CorpusRepository(self.root, "work/pinned")
+        analysis = repo.analysis()
+        self.assertTrue(analysis["code_revision"].startswith(corpus_export.STUDY_BUNDLE_PREFIX))
+        bundle = corpus_export.check_study_bundle(repo, analysis)
+        self.assertEqual(bundle["studyPromptSha256"], hashlib.sha256(prompt.read_bytes()).hexdigest())
+        self.assertEqual(bundle["instruments"]["citation-support@2"], instruments.load("citation-support@2").digest)
+        self.assertEqual(bundle["packageTags"]["source-tree-sha256"], corpus_export.implementation_manifest()["sha256"])
+        with repo.connect() as connection:
+            kinds = {row[0] for row in connection.execute("SELECT artifact_kind FROM source_artifacts")}
+        self.assertTrue({"study-bundle", "implementation-manifest"} <= kinds)
+        repo.library.snapshot("results/pinned")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["corpus", "branch", "--library", "results/pinned", "--output", "work/fork",
+                                   "--analysis", "fork", *args]), 0)
+        fork = CorpusRepository(self.root, "work/fork")
+        forked = corpus_export.check_study_bundle(fork, fork.analysis())
+        parent = repo.library.__class__(repo.workspace, "results/pinned").verify(require_snapshot=True, level="light")
+        self.assertEqual(forked["datasetVersions"], {"parentSnapshot": parent["merkle_root"]})
+        self.assertNotEqual(forked["sha256"], bundle["sha256"])
+
+    def test_cli_migrate_is_explicit_and_idempotent(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = main(["corpus", "migrate", "--workspace", str(self.root), "--library", "work/literature"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["migrations"], [])
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            main(["corpus", "migrate", "--workspace", str(self.root), "--library", "work/literature", "--rebuild-counters"])
+        self.assertTrue(json.loads(output.getvalue())["countersRebuilt"])
+        self.repo.library.verify()
 
 
 if __name__ == "__main__":

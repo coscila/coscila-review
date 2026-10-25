@@ -139,6 +139,171 @@ def _reference_identifiers(node: ET.Element) -> tuple[dict[str, str], list[str]]
             [kind for kind, values in candidates.items() if len(values) > 1])
 
 
+class _Citations:
+    """Serialise blocks with one display marker per citation anchor (ranges expanded); shared by every reader."""
+
+    _PAIR = re.compile(r"\x1e\d+\x1f(?:\s*[-–—]\s*\x1e\d+\x1f)+")
+
+    def __init__(self, identities: dict[str, dict[str, Any]], numeric_labels: dict[str, str],
+                 targets: dict[ET.Element, list[str]], warnings: list[dict[str, Any]], location, *, skip, in_figure):
+        self.identities, self.numeric_labels, self.targets = identities, numeric_labels, targets
+        self.warnings, self.location, self.skip, self.in_figure = warnings, location, skip, in_figure
+        self.used: dict[ET.Element, int] = {}
+        self.markers: list[dict[str, Any]] = []
+
+    def mark(self, node: ET.Element) -> str:
+        self.used[node] = self.used.get(node, 0) + 1
+        ids = list(self.targets[node])
+        printed = _text(node)
+        match = _RANGE.fullmatch(printed)
+        if match:
+            low, high = map(int, match.groups())
+            if 0 <= high - low <= 10000:
+                ids = [self.numeric_labels.get(str(i), f"<missing-label:{i}>") for i in range(low, high + 1)]
+            else:
+                self.warnings.append({"code": "invalid-structured-range", "message": printed,
+                                      "affectsCompleteness": True})
+        self.markers.append({"targets": ids, "sourceMarker": printed, "sourceAnchors": [self.location(node)]})
+        return f"\x1e{len(self.markers) - 1}\x1f"
+
+    def serialize(self, node: ET.Element, *, stop_blocks: bool = True) -> str:
+        if node in self.targets:
+            return self.mark(node)
+        if self.skip(node):
+            return ""
+        parts = [node.text or ""]
+        for child in node:
+            if not (stop_blocks and child.tag in BLOCKS):
+                parts.append(self.serialize(child, stop_blocks=stop_blocks))
+            parts.append(child.tail or "")
+        return "".join(parts)
+
+    def block(self, node: ET.Element, *, stop_blocks: bool = True) -> dict[str, Any] | None:
+        raw = re.sub(r"[ \t\r\n]+", " ", self.serialize(node, stop_blocks=stop_blocks)).strip(" \t\r\n")
+        markers, identities, numeric_labels = self.markers, self.identities, self.numeric_labels
+
+        # Consecutive endpoint anchors may share a middle endpoint (1–3–5).
+        # Match the whole chain so non-overlapping replacements lose no range.
+        def expand(match):
+            endpoints = [markers[int(marker.group(1))] for marker in _MARKER.finditer(match.group())]
+            if any(len(marker["targets"]) != 1 for marker in endpoints):
+                return match.group()
+            labels = [_numeric_label(identities.get(marker["targets"][0], {}).get("printedLabel", ""))
+                      for marker in endpoints]
+            if any(label is None for label in labels):
+                return match.group()
+            values = [int(label) for label in labels]
+            if any(b < a for a, b in zip(values, values[1:])) or values[-1] - values[0] > 10000:
+                self.warnings.append({"code": "invalid-structured-range",
+                                      "message": "range endpoints are not ordered or bounded", "affectsCompleteness": True})
+                return match.group()
+            markers.append({"targets": [numeric_labels.get(str(i), f"<missing-label:{i}>")
+                                        for i in range(values[0], values[-1] + 1)],
+                            "sourceMarker": "–".join(marker["sourceMarker"] for marker in endpoints)})
+            markers[-1]["sourceAnchors"] = [anchor for marker in endpoints for anchor in marker["sourceAnchors"]]
+            return f"\x1e{len(markers) - 1}\x1f"
+        raw = self._PAIR.sub(expand, raw)
+        pieces, explicit, cursor, length = [], [], 0, 0
+        for match in _MARKER.finditer(raw):
+            before = raw[cursor:match.start()]
+            pieces.append(before); length += len(before)
+            marker = markers[int(match.group(1))]
+            display = "[" + ",".join(str(identities.get(i, {}).get("ordinal", "?")) for i in marker["targets"]) + "]"
+            explicit.append({"start": length, "end": length + len(display), "raw": display,
+                             "style": "structured", **marker})
+            pieces.append(display); length += len(display); cursor = match.end()
+        pieces.append(raw[cursor:])
+        text = "".join(pieces)
+        if not text.strip():
+            return None
+        return {"kind": "paragraph", "text": text, "rawText": text,
+                "heading": node.tag in {"title", "article-title", "trans-title", "h1", "h2", "h3", "h4"},
+                "sourceLocator": self.location(node),
+                "caption": node.tag in {"caption", "figcaption"} or self.in_figure(node),
+                "explicitCitations": explicit}
+
+
+def _numeric_labels(identities: dict[str, dict[str, Any]]) -> dict[str, str]:
+    numeric_labels: dict[str, str] = {}
+    for key, identity in identities.items():
+        label = _numeric_label(identity["printedLabel"])
+        if label is not None:
+            if label in numeric_labels:
+                raise ValidationError("structured bibliography has ambiguous numeric labels")
+            numeric_labels[label] = key
+    return numeric_labels
+
+
+def extract_table_page(body: bytes, identities: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Citing units of a separately rendered table page, resolved against the article's bibliography.
+
+    Some publisher article pages carry only a table's caption and a link; the table body is a page of its
+    own. Every ``td``/``th`` cell of its tables, its figure captions and its table-footer paragraphs are
+    citing units; a link counts as a citation when its fragment (``...#ref-CR12``) names a bibliography
+    target of the article page. Each anchor is owned by exactly one unit.
+    """
+    try:
+        tree = _HTMLTree()
+        tree.feed(body.decode("utf-8"))
+        tree.close()
+    except (UnicodeError, ValueError) as exc:
+        raise ValidationError("table page HTML is not readable UTF-8") from exc
+    root = tree.root
+    parents = {child: parent for parent in root.iter() for child in parent}
+    element_paths = {root: "/" + root.tag + "[1]"}
+    for parent in root.iter():
+        counts: dict[str, int] = {}
+        for child in parent:
+            counts[child.tag] = counts.get(child.tag, 0) + 1
+            element_paths[child] = f"{element_paths[parent]}/{child.tag}[{counts[child.tag]}]"
+
+    def ancestors(node: ET.Element):
+        while node in parents:
+            node = parents[node]
+            yield node
+
+    def location(node: ET.Element) -> dict[str, str]:
+        return {"elementPath": element_paths[node], "elementId": node.get("id", ""), "tag": node.tag}
+
+    def unit(node: ET.Element) -> bool:
+        if any(a.tag in SKIP for a in ancestors(node)):
+            return False
+        if node.tag in {"td", "th"}:
+            return any(a.tag == "table" for a in ancestors(node))
+        if node.tag == "figcaption":
+            return True
+        return node.tag == "p" and any("c-article-table-footer" in a.get("class", "") for a in ancestors(node))
+
+    candidates = [node for node in root.iter() if unit(node)]
+    chosen = set(candidates)
+    cells = [node for node in candidates if not any(a in chosen for a in ancestors(node))]
+    targets: dict[ET.Element, list[str]] = {}
+    for cell in cells:
+        for node in cell.iter("a"):
+            href = node.get("href", "")
+            if "#" in href and href.rsplit("#", 1)[-1] in identities:
+                targets[node] = [href.rsplit("#", 1)[-1]]
+    warnings: list[dict[str, Any]] = []
+    citations = _Citations(identities, _numeric_labels(identities), targets, warnings, location,
+                           skip=lambda node: node.tag in SKIP, in_figure=lambda node: False)
+    blocks = []
+    for cell in cells:
+        block = citations.block(cell, stop_blocks=False)
+        if block is not None and block["explicitCitations"]:
+            blocks.append(block)
+    missed = [n for n in targets if citations.used.get(n, 0) != 1]
+    if missed:
+        warnings.append({"code": "structured-anchor-ownership", "message": f"{len(missed)} anchors not owned exactly once",
+                         "affectsCompleteness": True})
+    unresolved = {target for marker in citations.markers for target in marker["targets"] if target not in identities}
+    if unresolved:
+        warnings.append({"code": "unresolved-structured-target", "message": f"{len(unresolved)} bibliography targets unresolved",
+                         "affectsCompleteness": True})
+    return {"blocks": blocks, "warnings": warnings,
+            "metadata": {"anchors": len(targets), "ownedAnchors": sum(citations.used.get(n) == 1 for n in targets),
+                         "units": len(cells), "representation": "publisher-html-table-page"}}
+
+
 def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
     """Return ingestion blocks, reference identities, and coverage diagnostics."""
     if html:
@@ -261,79 +426,16 @@ def extract(body: bytes, *, html: bool = False) -> dict[str, Any]:
                 target = node.get("href", "").rsplit("#", 1)[-1]
                 if target in identities or re.search(r"ref|citation|bibr", node.get("class", ""), re.I):
                     targets[node] = [target]
-    used: dict[ET.Element, int] = {}
-    markers: list[dict[str, Any]] = []
-
-    def mark(node: ET.Element) -> str:
-        used[node] = used.get(node, 0) + 1
-        ids = list(targets[node])
-        printed = _text(node)
-        match = _RANGE.fullmatch(printed)
-        if match:
-            low, high = map(int, match.groups())
-            if 0 <= high - low <= 10000:
-                ids = [numeric_labels.get(str(i), f"<missing-label:{i}>") for i in range(low, high + 1)]
-            else:
-                warnings.append({"code": "invalid-structured-range", "message": printed,
-                                 "affectsCompleteness": True})
-        markers.append({"targets": ids, "sourceMarker": printed, "sourceAnchors": [location(node)]})
-        return f"\x1e{len(markers) - 1}\x1f"
-
-    def serialize(node: ET.Element, *, stop_blocks: bool = True) -> str:
-        if node in targets:
-            return mark(node)
-        if node.tag in SKIP or in_references(node):
-            return ""
-        parts = [node.text or ""]
-        for child in node:
-            if not (stop_blocks and child.tag in BLOCKS):
-                parts.append(serialize(child, stop_blocks=stop_blocks))
-            parts.append(child.tail or "")
-        return "".join(parts)
-
+    citations = _Citations(identities, numeric_labels, targets, warnings, location,
+                           skip=lambda node: node.tag in SKIP or in_references(node),
+                           in_figure=lambda node: any(a.tag in {"fig", "figure"} for a in ancestors(node)))
+    used, markers = citations.used, citations.markers
     blocks: list[dict[str, Any]] = []
 
     def emit(node: ET.Element, *, stop_blocks: bool = True) -> None:
-        raw = re.sub(r"[ \t\r\n]+", " ", serialize(node, stop_blocks=stop_blocks)).strip(" \t\r\n")
-        # Consecutive endpoint anchors may share a middle endpoint (1–3–5).
-        # Match the whole chain so non-overlapping replacements lose no range.
-        pair = re.compile(r"\x1e\d+\x1f(?:\s*[-–—]\s*\x1e\d+\x1f)+")
-        def expand(match):
-            endpoints = [markers[int(marker.group(1))] for marker in _MARKER.finditer(match.group())]
-            if any(len(marker["targets"]) != 1 for marker in endpoints):
-                return match.group()
-            labels = [_numeric_label(identities.get(marker["targets"][0], {}).get("printedLabel", ""))
-                      for marker in endpoints]
-            if any(label is None for label in labels):
-                return match.group()
-            values = [int(label) for label in labels]
-            if any(b < a for a, b in zip(values, values[1:])) or values[-1] - values[0] > 10000:
-                warnings.append({"code": "invalid-structured-range", "message": "range endpoints are not ordered or bounded",
-                                 "affectsCompleteness": True})
-                return match.group()
-            markers.append({"targets": [numeric_labels.get(str(i), f"<missing-label:{i}>")
-                                        for i in range(values[0], values[-1] + 1)],
-                            "sourceMarker": "–".join(marker["sourceMarker"] for marker in endpoints)})
-            markers[-1]["sourceAnchors"] = [anchor for marker in endpoints for anchor in marker["sourceAnchors"]]
-            return f"\x1e{len(markers) - 1}\x1f"
-        raw = pair.sub(expand, raw)
-        pieces, explicit, cursor, length = [], [], 0, 0
-        for match in _MARKER.finditer(raw):
-            before = raw[cursor:match.start()]
-            pieces.append(before); length += len(before)
-            marker = markers[int(match.group(1))]
-            display = "[" + ",".join(str(identities.get(i, {}).get("ordinal", "?")) for i in marker["targets"]) + "]"
-            explicit.append({"start": length, "end": length + len(display), "raw": display,
-                             "style": "structured", **marker})
-            pieces.append(display); length += len(display); cursor = match.end()
-        pieces.append(raw[cursor:])
-        text = "".join(pieces)
-        if text.strip():
-            blocks.append({"kind": "paragraph", "text": text, "rawText": text,
-                           "heading": node.tag in {"title", "article-title", "trans-title", "h1", "h2", "h3", "h4"},
-                           "sourceLocator": location(node),
-                           "caption": node.tag in {"caption", "figcaption"} or any(a.tag in {"fig", "figure"} for a in ancestors(node)),
-                           "explicitCitations": explicit})
+        block = citations.block(node, stop_blocks=stop_blocks)
+        if block is not None:
+            blocks.append(block)
 
     def walk(node: ET.Element) -> None:
         if node.tag in SKIP or in_references(node):

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import atexit
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
 import stat
+import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,10 +19,29 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConfidentialityError, ValidationError
-from .util import atomic_json, is_within
+from .util import is_within
 
 MAX_EGRESS_PLAN_BYTES = 64 * 1024
+# Bound of the legacy single-array ledger, which is read for verification but never written.
 MAX_EGRESS_LEDGER_BYTES = 8 * 1024 * 1024
+MAX_EGRESS_SEGMENT_BYTES = 8 * 1024 * 1024
+MAX_EGRESS_RECORD_BYTES = 64 * 1024
+# Appends reach the kernel before the request they authorize. fdatasync runs at most this
+# often per ledger and process, at the latest this long after an unsynced append (timer),
+# at every segment seal and at interpreter exit.
+EGRESS_SYNC_SECONDS = 1.0
+EGRESS_GENESIS = "0" * 64
+_LEGACY_LEDGER = "egress-events.json"
+_ACTIVE_SEGMENT = "egress-events.jsonl"
+_SEALED_SEGMENT = re.compile(r"^egress-events\.(\d{6})\.jsonl$")
+_LEDGER_LOCK = "egress-events.lock"
+_SYNC_GUARD = threading.Lock()
+_LAST_SYNC: dict[str, float] = {}
+_UNSYNCED: set[str] = set()
+_FLUSH_TIMER: threading.Timer | None = None
+# Per process: the active segment's identity and size after this process's last append, with
+# the chain head written then. A size change by another writer forces a tail read.
+_HEADS: dict[str, tuple[int, int, int, int, str]] = {}
 
 IDENTIFIER_FIELDS = {
     "doi",
@@ -424,32 +447,406 @@ def _audit_event(
     }
 
 
-def append_egress_event(workspace: Path, event: Mapping[str, Any]) -> None:
-    """Persist only hashes and field names; never persist confidential payloads."""
+def _assert_no_symlink_prefixes(text: str, *, label: str) -> None:
+    """String form of _assert_no_symlink_components for the per-event ledger path."""
 
-    workspace = _lexical_absolute(workspace, label="egress-ledger workspace")
-    _assert_no_symlink_components(workspace, label="egress-ledger workspace")
-    if not workspace.is_dir():
-        raise ValidationError(f"egress-ledger workspace does not exist: {workspace}")
-    audit_root = workspace / ".ocsl-review"
-    _assert_no_symlink_components(audit_root, label="egress-ledger directory")
-    audit_root.mkdir(mode=0o700, exist_ok=True)
-    _assert_no_symlink_components(audit_root, label="egress-ledger directory")
-    if not audit_root.is_dir() or not is_within(audit_root, workspace):
-        raise ValidationError(f"egress-ledger directory escapes its workspace: {audit_root}")
-    os.chmod(audit_root, 0o700)
-    path = audit_root / "egress-events.json"
-    _assert_no_symlink_components(path, label="egress ledger")
-    events: list[dict[str, Any]] = []
-    if path.exists():
-        if not path.is_file() or path.stat().st_size > MAX_EGRESS_LEDGER_BYTES:
-            raise ValidationError(f"egress ledger is not a bounded regular file: {path}")
+    index = 0
+    while True:
+        index = text.find(os.sep, index + 1)
+        prefix = text if index < 0 else text[:index]
         try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValidationError(f"egress ledger is not valid UTF-8 JSON: {path}") from exc
-        if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
-            raise ValidationError(f"egress ledger must contain one JSON event array: {path}")
-        events = loaded
-    events.append(dict(event))
-    atomic_json(path, events, mode=0o600)
+            if stat.S_ISLNK(os.lstat(prefix).st_mode):
+                raise ValidationError(f"{label} contains a symlink component: {prefix}")
+        except FileNotFoundError:
+            pass
+        if index < 0:
+            return
+
+
+def _ledger_directory(workspace: Path, *, create: bool) -> int | None:
+    """Open the non-symlinked, owner-only ledger directory of one workspace."""
+
+    root = os.fspath(_lexical_absolute(workspace, label="egress-ledger workspace"))
+    _assert_no_symlink_prefixes(root, label="egress-ledger workspace")
+    if not os.path.isdir(root):
+        raise ValidationError(f"egress-ledger workspace does not exist: {root}")
+    audit_root = os.path.join(root, ".ocsl-review")
+    try:
+        existing = os.lstat(audit_root)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and stat.S_ISLNK(existing.st_mode):
+        raise ValidationError(f"egress-ledger directory contains a symlink component: {audit_root}")
+    if existing is None:
+        if not create:
+            return None
+        try:
+            os.mkdir(audit_root, 0o700)
+        except FileExistsError:
+            pass
+    try:
+        descriptor = os.open(audit_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise ValidationError(f"egress-ledger directory contains a symlink component: {audit_root}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValidationError(f"egress-ledger directory escapes its workspace: {audit_root}")
+        if create and stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _ledger_canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _record_digest(event: Mapping[str, Any], index: int, previous: str) -> str:
+    return hashlib.sha256(_ledger_canonical({"event": event, "index": index, "prev": previous}).encode()).hexdigest()
+
+
+def _encode_record(event: Mapping[str, Any], index: int, previous: str) -> tuple[bytes, str]:
+    """The canonical record line and its digest; equal to _ledger_canonical of the record."""
+
+    body = '{"event":' + _ledger_canonical(event) + ',"index":' + str(index) + ',"prev":"' + previous + '"'
+    digest = hashlib.sha256((body + "}").encode("utf-8")).hexdigest()
+    line = (body + ',"sha256":"' + digest + '"}\n').encode("utf-8")
+    if len(line) > MAX_EGRESS_RECORD_BYTES:
+        raise ValidationError("egress event exceeds the ledger record bound")
+    return line, digest
+
+
+def _decode_record(line: bytes, where: str) -> dict[str, Any]:
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"egress ledger record is not valid UTF-8 JSON: {where}") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"event", "index", "prev", "sha256"}
+        or not isinstance(record["event"], dict)
+        or not isinstance(record["index"], int)
+        or isinstance(record["index"], bool)
+        or record["index"] < 0
+        or not isinstance(record["prev"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", record["prev"])
+        or record["sha256"] != _record_digest(record["event"], record["index"], record["prev"])
+        or line != _ledger_canonical(record).encode("utf-8")
+    ):
+        raise ValidationError(f"egress ledger record fails its hash chain: {where}")
+    return record
+
+
+def _last_record(descriptor: int, size: int, where: str) -> dict[str, Any] | None:
+    """The final record of a segment, read from its tail only."""
+
+    if size == 0:
+        return None
+    window = min(size, 4096)
+    while True:
+        data = os.pread(descriptor, window, size - window)
+        if not data.endswith(b"\n"):
+            raise ValidationError(
+                f"egress ledger ends with an incomplete record and is never rewritten automatically: {where}"
+            )
+        start = data.rfind(b"\n", 0, len(data) - 1)
+        if start >= 0 or window == size:
+            return _decode_record(data[start + 1 : -1], where)
+        if window > MAX_EGRESS_RECORD_BYTES:
+            raise ValidationError(f"egress ledger record exceeds its bound: {where}")
+        window = min(size, window * 8)
+
+
+def _sealed_segments(directory: int) -> list[tuple[int, str]]:
+    found = []
+    for name in os.listdir(directory):
+        match = _SEALED_SEGMENT.match(name)
+        if match:
+            found.append((int(match.group(1)), name))
+    return sorted(found)
+
+
+def _read_file(directory: int, name: str, bound: int) -> bytes | None:
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValidationError(f"egress ledger is not a bounded regular file: {name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > bound:
+            raise ValidationError(f"egress ledger is not a bounded regular file: {name}")
+        chunks, remaining = [], metadata.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        body = b"".join(chunks)
+        if len(body) > bound:
+            raise ValidationError(f"egress ledger is not a bounded regular file: {name}")
+        return body
+    finally:
+        os.close(descriptor)
+
+
+def _legacy_events(directory: int) -> tuple[list[dict[str, Any]], str]:
+    """Events of a legacy JSON array ledger and the digest the hash chain starts from."""
+
+    body = _read_file(directory, _LEGACY_LEDGER, MAX_EGRESS_LEDGER_BYTES)
+    if body is None:
+        return [], EGRESS_GENESIS
+    try:
+        loaded = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"egress ledger is not valid UTF-8 JSON: {_LEGACY_LEDGER}") from exc
+    if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
+        raise ValidationError(f"egress ledger must contain one JSON event array: {_LEGACY_LEDGER}")
+    return loaded, hashlib.sha256(body).hexdigest()
+
+
+def _chain_head(directory: int) -> tuple[int, str]:
+    """Index and digest the next record follows when the active segment is empty."""
+
+    sealed = _sealed_segments(directory)
+    if not sealed:
+        return -1, _legacy_events(directory)[1]
+    name = sealed[-1][1]
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        record = _last_record(descriptor, os.fstat(descriptor).st_size, name)
+    finally:
+        os.close(descriptor)
+    if record is None:
+        raise ValidationError(f"sealed egress ledger segment is empty: {name}")
+    return record["index"], record["sha256"]
+
+
+def _finish_seal(directory: int) -> None:
+    """Complete a seal a crash interrupted, before the active segment is opened for writing.
+
+    A seal links the active segment under its sealed name, unlinks the active name and then makes the
+    sealed file read-only. After a crash the active name may still be a second link to the sealed file,
+    or the sealed file may still be writable; both are finished here.
+    """
+    sealed = _sealed_segments(directory)
+    if not sealed:
+        return
+    descriptor = os.open(sealed[-1][1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        latest = os.fstat(descriptor)
+        try:
+            active = os.stat(_ACTIVE_SEGMENT, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            active = None
+        if active is not None and stat.S_ISREG(active.st_mode) and active.st_nlink == 2 \
+                and (active.st_dev, active.st_ino) == (latest.st_dev, latest.st_ino):
+            os.unlink(_ACTIVE_SEGMENT, dir_fd=directory)
+        if stat.S_ISREG(latest.st_mode) and stat.S_IMODE(latest.st_mode) != 0o400:
+            os.fchmod(descriptor, 0o400)
+    finally:
+        os.close(descriptor)
+
+
+def _open_active(directory: int) -> int:
+    _finish_seal(directory)
+    for _ in range(2):
+        descriptor = os.open(
+            _ACTIVE_SEGMENT,
+            os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory,
+        )
+        metadata = os.fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+            if stat.S_IMODE(metadata.st_mode) != 0o600:
+                os.fchmod(descriptor, 0o600)
+            return descriptor
+        os.close(descriptor)
+        sealed = _sealed_segments(directory)
+        if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 2 and sealed:
+            latest = os.stat(sealed[-1][1], dir_fd=directory, follow_symlinks=False)
+            if (latest.st_dev, latest.st_ino) == (metadata.st_dev, metadata.st_ino):
+                # Finish a seal that stopped between linking and unlinking the active name.
+                os.unlink(_ACTIVE_SEGMENT, dir_fd=directory)
+                continue
+        break
+    raise ValidationError("egress ledger segment is not a private regular file")
+
+
+def _seal(directory: int, active: int) -> None:
+    """Close the active segment under the next sequence number; it is never written again."""
+
+    os.fsync(active)
+    sealed = _sealed_segments(directory)
+    name = f"egress-events.{(sealed[-1][0] + 1) if sealed else 1:06d}.jsonl"
+    os.link(_ACTIVE_SEGMENT, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+    # Unlink before making the file read-only: a crash in between must never leave a read-only active name,
+    # which no later append could open; _finish_seal completes either half after a crash.
+    os.unlink(_ACTIVE_SEGMENT, dir_fd=directory)
+    os.fchmod(active, 0o400)
+    os.fsync(directory)
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(descriptor, view) :]
+
+
+def _datasync(descriptor: int) -> None:
+    getattr(os, "fdatasync", os.fsync)(descriptor)
+
+
+def _schedule_flush() -> None:
+    """Arm one daemon timer so a burst's unsynced tail is flushed within the interval."""
+
+    global _FLUSH_TIMER
+    if _FLUSH_TIMER is None:
+        _FLUSH_TIMER = threading.Timer(EGRESS_SYNC_SECONDS, _timed_flush)
+        _FLUSH_TIMER.daemon = True
+        _FLUSH_TIMER.start()
+
+
+def _timed_flush() -> None:
+    global _FLUSH_TIMER
+    with _SYNC_GUARD:
+        _FLUSH_TIMER = None
+    flush_egress_ledgers()
+
+
+def flush_egress_ledgers() -> None:
+    """Flush segments that received events since their last sync in this process."""
+
+    with _SYNC_GUARD:
+        pending = sorted(_UNSYNCED)
+        _UNSYNCED.clear()
+        now = time.monotonic()
+        for path in pending:
+            _LAST_SYNC[path] = now
+    for path in pending:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            _datasync(descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+
+
+atexit.register(flush_egress_ledgers)
+
+
+def append_egress_event(workspace: Path, event: Mapping[str, Any]) -> None:
+    """Persist only hashes and field names; never persist confidential payloads.
+
+    Each event becomes one line of an append-only JSONL segment. A line carries the
+    event, its index and the SHA-256 of the previous line, so editing, reordering or
+    removing an earlier event breaks the chain. A full segment is sealed read-only
+    and the chain continues in a new one; a legacy JSON array is never rewritten and
+    anchors the chain by its digest.
+    """
+
+    event = dict(event)
+    key = os.path.join(_lexical_absolute(workspace, label="egress-ledger workspace"), ".ocsl-review", _ACTIVE_SEGMENT)
+    directory = _ledger_directory(workspace, create=True)
+    try:
+        lock = os.open(_LEDGER_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            active = _open_active(directory)
+            try:
+                metadata = os.fstat(active)
+                cached = _HEADS.get(key)
+                if cached and cached[:3] == (metadata.st_dev, metadata.st_ino, metadata.st_size):
+                    index, previous = cached[3], cached[4]
+                else:
+                    last = _last_record(active, metadata.st_size, _ACTIVE_SEGMENT)
+                    index, previous = (last["index"], last["sha256"]) if last else _chain_head(directory)
+                line, digest = _encode_record(event, index + 1, previous)
+                if metadata.st_size and metadata.st_size + len(line) > MAX_EGRESS_SEGMENT_BYTES:
+                    _seal(directory, active)
+                    os.close(active)
+                    active = _open_active(directory)
+                _write_all(active, line)
+                metadata = os.fstat(active)
+                _HEADS[key] = (metadata.st_dev, metadata.st_ino, metadata.st_size, index + 1, digest)
+                now = time.monotonic()
+                with _SYNC_GUARD:
+                    due = now - _LAST_SYNC.get(key, float("-inf")) >= EGRESS_SYNC_SECONDS
+                    if due:
+                        _LAST_SYNC[key] = now
+                        _UNSYNCED.discard(key)
+                    else:
+                        _UNSYNCED.add(key)
+                        _schedule_flush()
+                if due:
+                    _datasync(active)
+            finally:
+                os.close(active)
+        finally:
+            os.close(lock)
+    finally:
+        os.close(directory)
+
+
+def _load_egress_ledger(workspace: Path) -> dict[str, Any]:
+    directory = _ledger_directory(workspace, create=False)
+    if directory is None:
+        return {"events": [], "legacyEvents": 0, "chainedEvents": 0, "segments": 0, "headSha256": EGRESS_GENESIS}
+    try:
+        try:
+            lock = os.open(_LEDGER_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+        except FileNotFoundError:
+            lock = None
+        try:
+            if lock is not None:
+                fcntl.flock(lock, fcntl.LOCK_SH)
+            legacy, previous = _legacy_events(directory)
+            sealed = _sealed_segments(directory)
+            if [number for number, _ in sealed] != list(range(1, len(sealed) + 1)):
+                raise ValidationError("egress ledger segments are not numbered contiguously")
+            names = [name for _, name in sealed]
+            if _ACTIVE_SEGMENT in os.listdir(directory):
+                names.append(_ACTIVE_SEGMENT)
+            events, index = list(legacy), 0
+            for name in names:
+                body = _read_file(directory, name, MAX_EGRESS_SEGMENT_BYTES + MAX_EGRESS_RECORD_BYTES) or b""
+                if body and not body.endswith(b"\n"):
+                    raise ValidationError(f"egress ledger ends with an incomplete record: {name}")
+                if not body and name != _ACTIVE_SEGMENT:
+                    raise ValidationError(f"sealed egress ledger segment is empty: {name}")
+                for number, line in enumerate(body.split(b"\n")[:-1], start=1):
+                    record = _decode_record(line, f"{name}:{number}")
+                    if record["index"] != index or record["prev"] != previous:
+                        raise ValidationError(f"egress ledger hash chain is broken at {name}:{number}")
+                    events.append(record["event"])
+                    previous, index = record["sha256"], index + 1
+            return {"events": events, "legacyEvents": len(legacy), "chainedEvents": index,
+                    "segments": len(names), "headSha256": previous}
+        finally:
+            if lock is not None:
+                os.close(lock)
+    finally:
+        os.close(directory)
+
+
+def read_egress_events(workspace: Path) -> list[dict[str, Any]]:
+    """All recorded events in order, legacy array first, after verifying the hash chain."""
+
+    return _load_egress_ledger(workspace)["events"]
+
+
+def verify_egress_ledger(workspace: Path) -> dict[str, Any]:
+    """Verify every segment and link; return counts and the head digest."""
+
+    ledger = _load_egress_ledger(workspace)
+    return {key: value for key, value in ledger.items() if key != "events"}
