@@ -53,8 +53,8 @@ deployment's independent egress approval.
   abstract silence cannot establish an adverse verdict.
 - Mark filtered or limited runs as pilots. For comparisons, match loci,
   evidence versions and settings; report disagreements, abstentions, coverage,
-  and dependence between citations in one paper. Historical oncology labels
-  are comparators, not human ground truth.
+  and dependence between citations in one paper. Labels imported from earlier
+  runs are comparators, not human ground truth.
 - Export facts and regenerate every reported count from its recorded SQL and
   SQLite hash. Report provider/model token counts with unknown values intact.
   A successful transport or parser check does not establish scientific accuracy.
