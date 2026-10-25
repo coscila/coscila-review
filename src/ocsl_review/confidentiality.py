@@ -627,7 +627,34 @@ def _chain_head(directory: int) -> tuple[int, str]:
     return record["index"], record["sha256"]
 
 
+def _finish_seal(directory: int) -> None:
+    """Complete a seal a crash interrupted, before the active segment is opened for writing.
+
+    A seal links the active segment under its sealed name, unlinks the active name and then makes the
+    sealed file read-only. After a crash the active name may still be a second link to the sealed file,
+    or the sealed file may still be writable; both are finished here.
+    """
+    sealed = _sealed_segments(directory)
+    if not sealed:
+        return
+    descriptor = os.open(sealed[-1][1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+    try:
+        latest = os.fstat(descriptor)
+        try:
+            active = os.stat(_ACTIVE_SEGMENT, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            active = None
+        if active is not None and stat.S_ISREG(active.st_mode) and active.st_nlink == 2 \
+                and (active.st_dev, active.st_ino) == (latest.st_dev, latest.st_ino):
+            os.unlink(_ACTIVE_SEGMENT, dir_fd=directory)
+        if stat.S_ISREG(latest.st_mode) and stat.S_IMODE(latest.st_mode) != 0o400:
+            os.fchmod(descriptor, 0o400)
+    finally:
+        os.close(descriptor)
+
+
 def _open_active(directory: int) -> int:
+    _finish_seal(directory)
     for _ in range(2):
         descriptor = os.open(
             _ACTIVE_SEGMENT,
@@ -659,8 +686,10 @@ def _seal(directory: int, active: int) -> None:
     sealed = _sealed_segments(directory)
     name = f"egress-events.{(sealed[-1][0] + 1) if sealed else 1:06d}.jsonl"
     os.link(_ACTIVE_SEGMENT, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
-    os.fchmod(active, 0o400)
+    # Unlink before making the file read-only: a crash in between must never leave a read-only active name,
+    # which no later append could open; _finish_seal completes either half after a crash.
     os.unlink(_ACTIVE_SEGMENT, dir_fd=directory)
+    os.fchmod(active, 0o400)
     os.fsync(directory)
 
 
