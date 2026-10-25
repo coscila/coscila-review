@@ -342,7 +342,8 @@ def build_claim_inventory(manuscript: dict[str, Any]) -> dict[str, Any]:
         markers = list(item.get("tokens", [])) or [item["raw"]]
         unresolved = list(markers)
         binding = "unresolved"
-        if item["style"] == "structured":
+        if item["style"] == "structured" or (item["style"] == "author-year" and "authorYear" in item):
+            # Explicit targets and author-year items were bound against the reference list at ingest.
             reference_ids = list(item["referenceIds"])
             unresolved = list(item["unresolvedMarkers"])
             binding = item["bindingStatus"]

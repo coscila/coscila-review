@@ -32,6 +32,26 @@ Primary environment: `review-literature`
 5. Detect plausible fabrications, DOI-to-title mismatches, duplicate entries, citations to the wrong version, and bibliography entries never cited in text.
 6. Emit resolution confidence and the exact fields needing human confirmation.
 
+## Screening one manuscript
+
+`ocsl-review screen` runs these checks for one manuscript with receipts and writes
+`report.json`, `report.md` and a reviewer `dossier.md` under `.ocsl-review/screen/<run>/`:
+
+```bash
+"$OCSL_REVIEW_HOME/bin/ocsl-review" screen draft.docx --workspace "$PWD" \
+  --evidence store.jsonl --retraction-watch retraction-watch.csv --retraction-watch-version <release>
+```
+
+Its integrity classes are listed-not-cited, cited-not-listed, ambiguous-citation,
+identity-unresolved, doi-not-registered (the handle service, the resolver and Crossref all
+answered 404), doi-check-inconclusive (401, 403, 429, server or network failure; never read as
+missing), metadata-disagreement, impossible-year, duplicate-identity (three or more entries point
+to one work), repeated-entry, and dated retracted, expression-of-concern, corrected or reinstated
+status with its source and dataset version. An unknown status stays unknown. `--offline` keeps
+every check local. Every adverse finding reads "check suggested". `--diff <earlier report.json>`
+lists added or changed references, new and resolved findings and status changes after a revision.
+See `$OCSL_REVIEW_HOME/docs/claim-check.md`.
+
 Use the confirmed workflow in `$OCSL_REVIEW_HOME/docs/literature-review.md`.
 `review literature fetch` records provider comparisons and acquisition outcomes
 in the managed ledger and audit graph. Strong printed identity requires two

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from . import author_year as _author_year
 from .errors import ReviewError
 from .citations import DASHES, numeric_citations, parse_numeric_group
 
@@ -61,8 +62,11 @@ _FIGURE_CAPTION = re.compile(
     r"^\s*(?:figure|fig\.)\s*([A-Za-z]?\d+[A-Za-z]?)\s*[:.\-]?\s*(.*)$", re.IGNORECASE
 )
 _NUMBERED_REFERENCE = re.compile(r"^\s*(?:\[(\d+)\]|(\d+)[.)]?)\s+(.+)$")
+_BULLET_REFERENCE = re.compile(r"^\s*[-*+\u2022]\s+(?=\S)")
+_YEARLIKE_NUMERIC = re.compile(
+    r"[\(\[]?\s*(?:1[5-9]|20)\d{2}[a-z]{0,2}(?:\s*[,;]\s*(?:(?:1[5-9]|20)\d{2}[a-z]{0,2}|[a-z]{1,2}))*\s*[\)\]]?"
+)
 _MARKDOWN_CITATION = re.compile(r"\[(?:@[A-Za-z0-9][A-Za-z0-9_.:+/-]*(?:\s*;\s*)?)+\]")
-_AUTHOR_YEAR_CITATION = re.compile(r"\((?=[^()]{1,240}\b(?:19|20)\d{2}[a-z]?\b)[^()]{1,240}\)")
 _DOI = re.compile(r"\b10\.\d{4,9}/[^\s<>\"]+", re.IGNORECASE)
 _PMID = re.compile(r"\bPMID\s*:?\s*(\d{5,9})\b", re.IGNORECASE)
 _ARXIV = re.compile(r"\barXiv\s*:?\s*([a-z.-]+/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?\b", re.IGNORECASE)
@@ -215,6 +219,12 @@ def _text_blocks(text: str, *, markdown: bool) -> list[dict[str, Any]]:
                 continue
             if not stripped:
                 flush()
+                i += 1
+                continue
+            if bibliography_mode and _BULLET_REFERENCE.match(stripped):
+                # A bulleted item always starts the next reference entry.
+                flush()
+                paragraph.append(_BULLET_REFERENCE.sub("", stripped, count=1))
                 i += 1
                 continue
             if bibliography_mode and (_NUMBERED_REFERENCE.match(stripped) or paragraph):
@@ -812,24 +822,28 @@ def _sentence_spans(
 
 def _citation_matches(
     text: str, *, superscript_spans: Iterable[tuple[int, int]] = (),
-) -> list[tuple[int, int, str, str]]:
-    candidates = [
-        (marker.start, marker.end, marker.raw, "numeric")
+) -> list[tuple[int, int, str, str, Any]]:
+    """Citation markers as (start, end, raw, style, author-year marker or None)."""
+
+    candidates: list[tuple[int, int, str, str, Any]] = [
+        (marker.start, marker.end, marker.raw, "numeric", None)
         for marker in numeric_citations(text, superscript_spans=superscript_spans)
     ]
-    for style, pattern in (
-        ("markdown-key", _MARKDOWN_CITATION),
-        ("author-year", _AUTHOR_YEAR_CITATION),
-    ):
-        for match in pattern.finditer(text):
-            raw = match.group(0)
-            if style == "author-year":
-                before_year = re.split(r"(?:19|20)\d{2}", raw, maxsplit=1)[0]
-                if not re.search(r"[A-Za-z]{2,}", before_year):
-                    continue
-            candidates.append((match.start(), match.end(), raw, style))
+    for match in _MARKDOWN_CITATION.finditer(text):
+        candidates.append((match.start(), match.end(), match.group(0), "markdown-key", None))
+    author_year = [
+        (marker.start, marker.end, marker.raw, "author-year", marker)
+        for marker in _author_year.detect(text)
+    ]
+    # "Smith (2019, 2020)" is an author-year marker, not two numeric labels.
+    candidates = [
+        candidate for candidate in candidates
+        if not (candidate[3] == "numeric" and _YEARLIKE_NUMERIC.fullmatch(candidate[2].strip())
+                and any(start <= candidate[0] and candidate[1] <= end for start, end, *_ in author_year))
+    ]
+    candidates.extend(author_year)
     candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
-    accepted: list[tuple[int, int, str, str]] = []
+    accepted: list[tuple[int, int, str, str, Any]] = []
     for candidate in candidates:
         if any(candidate[0] < prior[1] and prior[0] < candidate[1] for prior in accepted):
             continue
@@ -1022,12 +1036,12 @@ def _assemble(
                 if paragraph_kind == "bibliography-entry":
                     paragraph_citations = []
                 elif "explicitCitations" in block:
-                    paragraph_citations = [(c["start"], c["end"], c["raw"], c["style"])
+                    paragraph_citations = [(c["start"], c["end"], c["raw"], c["style"], None)
                                            for c in block["explicitCitations"]]
                 else:
                     paragraph_citations = _citation_matches(text, superscript_spans=block.get("superscriptSpans", []))
                 for sentence_number, (start, end, sentence_text) in enumerate(
-                    _sentence_spans(text, [(a, b) for a, b, _, _ in paragraph_citations]), start=1
+                    _sentence_spans(text, [(a, b) for a, b, *_ in paragraph_citations]), start=1
                 ):
                     sentence_id = f"s-{len(sentences) + 1:07d}"
                     locator = _make_locator(
@@ -1050,10 +1064,10 @@ def _assemble(
                     sentences.append(sentence)
                     paragraph["sentenceIds"].append(sentence_id)
                     sentence_citations = [
-                        (a - start, b - start, raw, style)
-                        for a, b, raw, style in paragraph_citations if start <= a and b <= end
+                        (a - start, b - start, raw, style, marker)
+                        for a, b, raw, style, marker in paragraph_citations if start <= a and b <= end
                     ]
-                    for local_start, local_end, raw, style in sentence_citations:
+                    for local_start, local_end, raw, style, marker in sentence_citations:
                         citation_id = f"cite-{len(citations) + 1:06d}"
                         citation = {
                             "id": citation_id,
@@ -1078,6 +1092,8 @@ def _assemble(
                             citation["sourceTargets"] = original["targets"]
                             citation["sourceMarker"] = original["sourceMarker"]
                             citation["sourceAnchors"] = original["sourceAnchors"]
+                        if marker is not None:
+                            citation["_authorYearMarker"] = marker
                         positions = [
                             word["bbox"] for word in block.get("wordPositions", [])
                             if word["start"] < start + local_end and start + local_start < word["end"]
@@ -1109,7 +1125,7 @@ def _assemble(
             for row_index, row in enumerate(rows):
                 for column, cell in enumerate(row):
                     if "explicitCellCitations" in block:
-                        matches = [(c["start"], c["end"], c["raw"], c["style"])
+                        matches = [(c["start"], c["end"], c["raw"], c["style"], None)
                                    for c in block["explicitCellCitations"].get((row_index, column), [])]
                     else:
                         matches = _citation_matches(cell, superscript_spans=block.get("cellSuperscriptSpans", {}).get((row_index, column), []))
@@ -1117,8 +1133,8 @@ def _assemble(
                     if row_index and column < len(rows[0]) and re.fullmatch(
                         r"(?:refs?|references?|citations?)\.?", rows[0][column].strip(), re.I
                     ) and not matches and re.search(r"\d", cell):
-                        matches = [(0, len(cell), cell, "numeric")]
-                    for start, end, raw, style in matches:
+                        matches = [(0, len(cell), cell, "numeric", None)]
+                    for start, end, raw, style, marker in matches:
                         citation_id = f"cite-{len(citations) + 1:06d}"
                         citations.append({
                             "id": citation_id, "ordinal": len(citations) + 1,
@@ -1135,6 +1151,8 @@ def _assemble(
                             citations[-1]["sourceTargets"] = original["targets"]
                             citations[-1]["sourceMarker"] = original["sourceMarker"]
                             citations[-1]["sourceAnchors"] = original["sourceAnchors"]
+                        if marker is not None:
+                            citations[-1]["_authorYearMarker"] = marker
                         table["citationClusterIds"].append(citation_id)
         elif kind == "figure":
             section = need_section()
@@ -1174,6 +1192,8 @@ def _assemble(
                 "message": "reference numbering has gaps; confirm manuscript numbering and extraction",
                 "labels": gaps, "affectsCompleteness": True,
             })
+    reference_index: _author_year.ReferenceIndex | None = None
+    author_year_warnings: list[dict[str, Any]] = []
     for citation in citations:
         issues: list[str] = []
         if citation["style"] == "structured":
@@ -1203,11 +1223,55 @@ def _assemble(
                     "citationId": citation["id"], "markers": unresolved, "issues": issues,
                     "affectsCompleteness": True,
                 })
+        elif citation["style"] == "author-year" and citation.get("_authorYearMarker") is not None:
+            marker = citation.pop("_authorYearMarker")
+            if reference_index is None:
+                reference_index = _author_year.ReferenceIndex(bibliography)
+            resolutions = [reference_index.resolve(item) for item in marker.items]
+            record = _author_year.marker_record(marker, resolutions)
+            tokens = [_author_year.item_token(item) for item in record["items"]]
+            resolved = list(dict.fromkeys(item.reference_id for item in resolutions
+                                          if item.status == "resolved" and item.reference_id))
+            unresolved = [token for token, item in zip(tokens, resolutions) if item.status != "resolved"]
+            citation["authorYear"] = record
+            citation["tokens"] = tokens
+            citation["referenceIds"] = resolved
+            citation["unresolvedMarkers"] = list(dict.fromkeys(unresolved))
+            if not unresolved:
+                citation["bindingStatus"] = "exact"
+            elif resolved or any(item.status == "ambiguous" for item in resolutions):
+                citation["bindingStatus"] = "ambiguous"
+            else:
+                citation["bindingStatus"] = "unresolved"
+            if not marker.strong and not resolved:
+                # A bare "Name (2020)" that matches no reference is ordinary prose, not a citation.
+                citation["_drop"] = True
+            elif unresolved:
+                author_year_warnings.append(citation)
         else:
+            citation.pop("_authorYearMarker", None)
             citation["referenceIds"] = []
             citation["unresolvedMarkers"] = list(citation["tokens"])
             citation["bindingStatus"] = "unresolved"
         citation["parseIssues"] = issues
+    if any(citation.get("_drop") for citation in citations):
+        kept = [citation for citation in citations if not citation.get("_drop")]
+        renamed = {citation["id"]: f"cite-{ordinal:06d}" for ordinal, citation in enumerate(kept, 1)}
+        for ordinal, citation in enumerate(kept, 1):
+            citation["id"], citation["ordinal"] = renamed[citation["id"]], ordinal
+        for container in [*sentences, *tables]:
+            container["citationClusterIds"] = [renamed[item] for item in container["citationClusterIds"] if item in renamed]
+        for warning in warnings:
+            if warning.get("citationId") in renamed:
+                warning["citationId"] = renamed[warning["citationId"]]
+        citations[:] = kept
+    for citation in author_year_warnings:
+        warnings.append({
+            "code": "unresolved-author-year-citation",
+            "message": "author-year citation does not match exactly one reference-list entry",
+            "citationId": citation["id"], "markers": citation["unresolvedMarkers"],
+            "affectsCompleteness": False,
+        })
 
     complete = not any(bool(item.get("affectsCompleteness")) for item in warnings)
     if not paragraphs:
