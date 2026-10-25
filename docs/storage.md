@@ -90,7 +90,8 @@ not override, so existing queries work unchanged:
 - inserts go to the branch; a row whose key exists in the parent is skipped,
   except for runs, analyses and corpora, where a clash raises;
 - updating a parent row copies it into the branch first, so append-only tables
-  still refuse the change; parent rows cannot be deleted;
+  still refuse the change; keys of shared rows cannot change, and parent rows
+  cannot be deleted;
 - analysis queues (`corpus_tasks`, `corpus_batches`, `processing_state`) and any
   table outside the shared list stay branch-local;
 - SQLite cannot enforce foreign keys across databases, so branch connections
