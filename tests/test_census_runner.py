@@ -17,7 +17,7 @@ from pathlib import Path
 from ocsl_review import citation_census as C
 from ocsl_review import estimands, scores_db
 from ocsl_review.census_runner import CensusRun, HttpChatTransport
-from ocsl_review.errors import ValidationError
+from ocsl_review.errors import ConfidentialityError, ValidationError
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "citation_census"
 JOURNAL = "Synthetic Journal of Examples"
@@ -188,6 +188,17 @@ class PreparationTests(RunnerTestCase):
         self.assertEqual("unavailable", run.prepare_review(record(doi="10.5555/unreadable"), None)["state"])
         review = self.rows("SELECT provenance_class, abstract_state FROM reviews WHERE doi='10.5555/unreadable'")[0]
         self.assertEqual(("unavailable", "completed"), (review["provenance_class"], review["abstract_state"]))
+
+    def test_entitled_reviews_reach_only_on_premises_judges(self):
+        entitled = {**record(), "provenanceClass": "entitled"}
+        run = self.run_census()
+        run.prepare_review(entitled, (FIXTURES / "review.xml").read_bytes())
+        with self.assertRaises(ConfidentialityError):
+            run.run_abstract()
+        self.assertEqual([], self.judge.requests)
+        run.close()
+        local = self.run_census(on_premises=True)
+        self.assertEqual("completed", local.run_abstract()["state"])
 
     def test_run_metadata_is_pinned(self):
         run = self.run_census()
