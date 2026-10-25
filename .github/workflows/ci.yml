@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  guard:
+    # Deliberately outside any cancellable concurrency group: a cancelled guard run would leave its commits unchecked.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve the range and the guard of the base revision
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="$PR_BASE"; HEAD="$PR_HEAD"
+          else
+            HEAD="$GITHUB_SHA"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              BASE="$BEFORE"
+            else
+              # A new branch, or a force-push whose old head is gone: check everything since the merge-base with main.
+              BASE="$(git merge-base origin/main "$HEAD")" || { echo "guard: no merge-base with origin/main"; exit 1; }
+              echo "guard: push base '$BEFORE' unavailable; using the merge-base with origin/main ($BASE)"
+            fi
+          fi
+          # Run the guard as of the base revision, so a commit cannot weaken its own check.
+          if git cat-file -e "$BASE:scripts/guard/guard.py" 2>/dev/null; then
+            git show "$BASE:scripts/guard/guard.py" > "$RUNNER_TEMP/guard.py"
+            echo "guard: using scripts/guard/guard.py from the base revision $BASE"
+          else
+            cp scripts/guard/guard.py "$RUNNER_TEMP/guard.py"
+            echo "guard: the base revision has no scripts/guard/guard.py (first introduction); using the commit's own copy"
+          fi
+          echo "RANGE=$BASE..$HEAD" >> "$GITHUB_ENV"
+      - name: Commit and content guard
+        run: python3 "$RUNNER_TEMP/guard.py" ci --range "$RANGE"
+
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: unittest-${{ matrix.python-version }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e .
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
