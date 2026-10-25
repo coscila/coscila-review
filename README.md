@@ -38,6 +38,15 @@ digest-pinned instruments, the entry-level `citation-census@1` study commands,
 the scores database, estimands and facts export are described in
 [census-instrument.md](docs/census-instrument.md).
 
+For one manuscript, [`ocsl-review screen`](docs/claim-check.md) is research-integrity
+tooling for authors, reviewers and study teams: it resolves numeric, structured and
+author-year citations against the reference list, records reference integrity findings
+(never cited, cited but not listed, DOI registration, metadata agreement, duplicate
+identity, dated retraction and correction status), and judges each citation against its
+whole sentence with retrieval and model receipts. Hidden text and prompt-injection
+payloads never reach a judge prompt, confidential mode lets only identifiers leave, and
+`ocsl-review replay` re-derives every verdict without a model call.
+
 For a complete corpus and future research questions, the
 [reference-analysis skill](skills/ocsl-review-reference-analysis/SKILL.md)
 preserves source evidence, all citation loci and versioned assessments in a
@@ -160,6 +169,7 @@ commands on a deployment.
 - [Claim-citation evidence model](docs/evidence-model.md)
 - [Extensive literature workflow](docs/literature-review.md)
 - [Resumable citation-support census](docs/citation-census.md)
+- [Reference and claim screen](docs/claim-check.md)
 - [Workflow regression applicability](docs/workflow-regressions.md)
 - [Confidential review and egress](docs/confidentiality.md)
 - [Review environments](docs/environments.md)
@@ -189,7 +199,10 @@ PYTHONPATH="$OCSL_REVIEW_HOME/src" \
 The existing package is licensed under the [MIT License](LICENSE). The new
 `structured.py` and `census.py` modules, census prompt and assessment schema,
 structured/census tests and fixtures, census skill, and census guide are
-independently implemented Apache-2.0 originals, with the
+independently implemented Apache-2.0 originals, as are the `author_year.py`,
+`sanitize.py`, `retrieval.py`, `integrity.py`, `claim_check.py` and `screen.py`
+modules, the `schemas/claim-check.sql` extension, their tests and fixtures, and the
+claim-screen guide, with the
 [Apache license text](LICENSES/Apache-2.0.txt) included. Existing MIT assets
 remain under MIT. The adjacent
 `reference/nature-review-studio` project has no project license and is excluded

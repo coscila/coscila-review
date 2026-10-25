@@ -28,6 +28,21 @@ Primary environment: `review-literature`
 6. Trace review articles to the primary study when the manuscript represents a primary result, and identify shared datasets or version families.
 7. Reproduce quoted wording and numeric values against the source, including denominators and units.
 
+## Screening one manuscript (claim-check@1)
+
+`ocsl-review screen` judges every citation against the whole sentence that carries it: no
+citation carries over to a neighbouring sentence and no clause is parsed out. Verdicts use the
+citation-support@2 semantics above (exact quotes, explicit abstention). Evidence comes from the
+evidence store (`--evidence` JSON or JSON Lines, or `--library` for a literature database)
+through BM25 retrieval with receipts; manuscript and cited text are sanitised before any judge
+prompt (hidden text and prompt-injection payloads removed, with digests recorded). Uncited
+sentences get no attribution; they are flagged only when the claim inventory says they need a
+citation. `ocsl-review replay --run <dir>` re-derives every verdict from the stored request and
+response bytes without a model call. Confidential mode is the default: only identifiers leave the
+machine, only an on-prem judge (`--judge-url` on an allowed host) receives text, and every egress
+decision is recorded in the run's hash-chained `egress.jsonl`. See
+`$OCSL_REVIEW_HOME/docs/claim-check.md`.
+
 ## Abstention rules
 
 For repeated or large-scope worker measurements, use
