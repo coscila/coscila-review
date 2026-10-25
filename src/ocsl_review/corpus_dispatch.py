@@ -2,8 +2,6 @@
 """Durable corpus batches through the scoped Lab broker, with per-item recovery."""
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
 import hashlib
 import http.client
 import json
@@ -14,7 +12,7 @@ import socket
 import urllib.parse
 
 from .confidentiality import authorize_egress, append_egress_event, load_scholarly_context, _audit_event
-from .corpus_store import CorpusRepository, canonical, identity, json_safe
+from .corpus_store import CorpusRepository, canonical, controller_lock, identity, json_safe
 from .corpus_library import now
 from .corpus_assessment import AssessmentValidator, AssessmentError, build_messages, output_schema, PROMPT_PATH
 from .errors import ConfidentialityError, ReviewError, ValidationError
@@ -83,19 +81,6 @@ class Broker:
             raise ReviewError("worker broker unavailable; retained batch can be resumed") from exc
         finally:
             connection.close()
-
-
-@contextmanager
-def controller_lock(repo):
-    with (repo.root / "controller.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValidationError("another corpus controller owns this library") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def authorize(repo, paths, catalog, worker, tasks, inputs):

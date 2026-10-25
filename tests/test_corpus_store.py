@@ -202,6 +202,14 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
         self.assertEqual(reopened.migrate()["migrations"], [])
         self.assertEqual(len(list(legacy.root.glob("corpus-v2-backup*"))), 1)
 
+    def test_migration_refuses_while_another_controller_owns_the_library(self):
+        legacy = legacy_v2_library(self.root)
+        with corpus_store.controller_lock(legacy):
+            with self.assertRaisesRegex(ValidationError, "another corpus controller"):
+                CorpusRepository(self.root, "work/legacy").migrate()
+        self.assertEqual(CorpusRepository(self.root, "work/legacy").version, 2)
+        self.assertEqual(list(legacy.root.glob("corpus-v*-backup*")), [])
+
     def test_migration_never_overwrites_a_backup_and_refuses_snapshots(self):
         legacy = legacy_v2_library(self.root)
         occupied = legacy.root / "corpus-v2-backup.sqlite3"

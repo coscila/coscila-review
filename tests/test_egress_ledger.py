@@ -164,6 +164,14 @@ class EgressLedgerTests(unittest.TestCase):
             append_egress_event(self.workspace, {"operation": "later"})
             self.assertEqual(len(synced), 3)
 
+    def test_record_lines_are_the_canonical_encoding_of_their_fields(self) -> None:
+        event = {"operation": "résumé", "nested": {"b": [1, 2.5, None, True], "a": "\u2028"}, "argumentNames": ["doi"]}
+        line, digest = confidentiality._encode_record(event, 7, "f" * 64)
+        record = json.loads(line)
+        self.assertEqual(line, (confidentiality._ledger_canonical(record) + "\n").encode("utf-8"))
+        self.assertEqual(digest, confidentiality._record_digest(event, 7, "f" * 64))
+        self.assertEqual(confidentiality._decode_record(line[:-1], "fixture")["event"], event)
+
     def test_oversized_events_are_rejected_before_writing(self) -> None:
         with self.assertRaisesRegex(ValidationError, "record bound"):
             append_egress_event(self.workspace, {"argumentNames": ["x" * confidentiality.MAX_EGRESS_RECORD_BYTES]})
