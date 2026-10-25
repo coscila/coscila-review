@@ -31,6 +31,9 @@ HOME = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 3
 MIGRATIONS = {1: HOME / "schemas/corpus-v2.sql", 2: HOME / "schemas/corpus-v3.sql"}
 BATCH_ROWS = 5000
+# Writers checkpoint the WAL after this many pages instead of SQLite's 1,000, so bulk
+# imports pay the checkpoint fsyncs ten times less often.
+WAL_AUTOCHECKPOINT_PAGES = 10000
 # Below this many new files a per-file fsync is cheaper than a filesystem-wide barrier.
 SYNCFS_MIN_FILES = 8
 VERIFIED_CACHE_LIMIT = 200_000
@@ -199,6 +202,7 @@ class CorpusRepository:
         if write:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute(f"PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}")
         try:
             if not write:
                 connection.execute("PRAGMA query_only=ON")
@@ -302,12 +306,15 @@ class CorpusRepository:
     def json_artifact(self, value: Any, kind: str) -> str:
         return self.artifact(canonical(json_safe(value)).encode(), kind)
 
-    def stage_artifacts(self, entries: Iterable[tuple[bytes, str, str]]) -> list[tuple]:
+    def stage_artifacts(self, entries: Iterable[tuple[bytes, str, str]], *,
+                        pending: list[Path] | None = None) -> list[tuple]:
         """Write content-addressed files behind one durability barrier for the batch.
 
         Returns the source_artifacts rows (digest first, in input order) for the
         caller to register in the same transaction as the rows that refer to them,
-        so no committed row points at bytes that are not yet durable.
+        so no committed row points at bytes that are not yet durable. With
+        ``pending``, new files are collected there instead and the caller issues
+        one shared barrier (sync_staged) before committing any row that refers to them.
         """
         sources = self._sources()
         created_at = library.now()
@@ -319,8 +326,15 @@ class CorpusRepository:
                 seen.add(digest)
                 if self._write_source(sources, digest, body, durable=False):
                     written.append(sources / digest)
-        sync_batch(sources, written)
+        if pending is None:
+            sync_batch(sources, written)
+        else:
+            pending.extend(written)
         return rows
+
+    def sync_staged(self, paths: list[Path]) -> None:
+        """One durability barrier for files collected by stage_artifacts(pending=...)."""
+        sync_batch(self._sources(), paths)
 
     @staticmethod
     def register_artifacts(connection: sqlite3.Connection, rows: list[tuple]) -> None:
