@@ -25,6 +25,7 @@ from .util import is_within
 # the broker's limiter queues items globally, so the next job starts while one drains.
 MAX_JOBS_IN_FLIGHT = 3
 RESULT_PAGE_RECORDS = 100
+MAX_REQUEST_GROUP_BYTES = 6 * 1024 * 1024
 TERMINAL_RECORD_STATES = frozenset({"completed", "failed", "cancelled", "interrupted"})
 TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled", "interrupted", "paused"})
 ACTIVE_BATCH_STATES = ("running", "prepared", "paused")
@@ -274,7 +275,7 @@ class CorpusExecutor:
                 if not tasks:
                     break
                 groups, consumed = [], []
-                cursor = 0
+                cursor, encoded = 0, 2  # canonical size of the group list: brackets, items, commas
                 while cursor < len(tasks) and len(groups) < job_items:
                     size = 1 if tasks[cursor]["attempts"] else batch_size
                     chunk = tasks[cursor:cursor+size]
@@ -283,11 +284,12 @@ class CorpusExecutor:
                     messages = build_messages([t["spec"] for t in chunk], tier)
                     group = {"id": "item-" + identity([t["task_id"] for t in chunk], [t["attempts"] for t in chunk]),
                              "input": {"messages": messages}, "taskIds": [t["task_id"] for t in chunk]}
-                    if len(canonical(groups + [group]).encode()) > 6 * 1024 * 1024:
+                    grown = encoded + len(canonical(group).encode()) + (1 if groups else 0)
+                    if grown > MAX_REQUEST_GROUP_BYTES:
                         if not groups:
                             raise ValidationError("single evidence batch exceeds the broker request bound")
                         break
-                    groups.append(group); consumed.extend(chunk); cursor += len(chunk)
+                    groups.append(group); consumed.extend(chunk); cursor += len(chunk); encoded = grown
                 payload = {"items": [{"id": g["id"], "input": g["input"]} for g in groups],
                            "schema": output_schema(), "concurrency": job_concurrency, "configId": worker_id}
                 batch_id = "batch-" + identity(self.analysis, owner, payload)
