@@ -18,7 +18,7 @@
     "full-text": {
       "evidencePolicy": {"evidence": "retrieved window of the cited work's full text",
                          "retrieval": {"version": "retrieval-fts5-1", "tokenizer": "unicode61 remove_diacritics 2", "k": 5, "maxEvidenceCharacters": 11000},
-                         "sanitizer": "sanitize-1"},
+                         "sanitizer": "sanitize-2"},
       "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "groupedBy": "evidence tier", "extractor": "claim-sentence-1", "authorYearResolver": "author-year-1"},
       "request": {"api": "chat completions on an on-prem judge", "temperature": 0, "maxTokens": "max(3000, 700 * items)"},
       "repair": {"passes": 1}
@@ -26,7 +26,7 @@
     "abstract": {
       "evidencePolicy": {"evidence": "the complete abstract when no full text is available",
                          "retrieval": {"version": "retrieval-fts5-1", "tokenizer": "unicode61 remove_diacritics 2", "k": 5, "maxEvidenceCharacters": 11000},
-                         "sanitizer": "sanitize-1"},
+                         "sanitizer": "sanitize-2"},
       "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "groupedBy": "evidence tier", "extractor": "claim-sentence-1", "authorYearResolver": "author-year-1"},
       "request": {"api": "chat completions on an on-prem judge", "temperature": 0, "maxTokens": "max(3000, 700 * items)"},
       "repair": {"passes": 1}

@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import re
+import unicodedata
 import zipfile
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
@@ -29,7 +30,7 @@ from xml.etree import ElementTree as ET
 
 from .errors import ValidationError
 
-SANITIZER_VERSION = "sanitize-1"
+SANITIZER_VERSION = "sanitize-2"
 MODES = ("strip", "detect")
 
 _CHARACTER_CLASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -39,15 +40,26 @@ _CHARACTER_CLASSES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("variation-selector", re.compile("[︀-️\U000e0100-\U000e01ef]+")),
     ("annotation-control", re.compile("[￹-￻]+")),
     ("control-character", re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+")),
+    # Every other format character (Unicode category Cf) and the blank fillers that render as nothing.
+    ("format-character", re.compile("[\u034f\u0600-\u0605\u06dd\u070f\u0890\u0891\u08e2\u115f\u1160\u180b-\u180d"
+                                    "\u180f\u206a-\u206f\u2800\u3164\uffa0\U000110bd\U000110cd\U00013430-\U0001343f"
+                                    "\U0001bca0-\U0001bca3\U0001d173-\U0001d17a]+")),
     ("private-use", re.compile("[-\U000f0000-\U000ffffd\U00100000-\U0010fffd]+")),
 )
 _SOFT_HYPHEN = re.compile("­")
+_COVERED = frozenset("\u00ad")
+# Lookalike letters, mapped for matching only (never in the text a judge receives).
+_CONFUSABLES = {**dict(zip("авекмнорстухіјѕһԁԛԝӏ", "abekmhopctyxijshdqwl")),
+                **dict(zip("αβεζηικμνορτυχ", "abezniku" "voptux"))}
+_NEWLINES = "\n\r\x0b\x0c\x85\u2028\u2029"
 
 # Each rule names a pattern that addresses a model rather than a reader. Directive verbs count
 # only in imperative position (sentence start, after a colon, after "please" or "you must"), so
 # "participants were told to ignore the previous instructions" or "studies do not report
 # limitations" stay untouched. Matching is case-insensitive and runs on text that has already
-# lost its invisible characters, so "ig​nore" cannot evade it.
+# lost its invisible and format characters, on a compatibility-normalised copy (fullwidth letters,
+# accents and lookalikes) and on copies whose line breaks are spaces, so "ig​nore", "ｉｇｎｏｒｅ"
+# or a keyword split across lines cannot evade it.
 _LEAD = (r"(?:(?:^|(?<=[.!?:;\n\"'(\[*>]))\s*(?:(?:please|kindly|now|instead|also|and|then)\s+)?"
          r"|\b(?:please|kindly)\s+|\byou\s+(?:must|should|will|shall|are\s+to)\s+)")
 _INJECTION_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -83,7 +95,7 @@ _INJECTION_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("verdict-json", re.compile(
         r"[\"'](?:supportVerdict|escalate|escalationReason|verdict)[\"']\s*:\s*|\{\s*[\"']items[\"']\s*:\s*\[", re.I)),
 )
-_SENTENCE_END = re.compile(r"[.!?。！？]+[\"')\]]*\s+|\n\s*\n")
+_SENTENCE_END = re.compile(r"[.!?。！？．｡]+[\"')\]]*\s+|\n\s*\n")
 
 
 @dataclass(frozen=True)
@@ -152,6 +164,46 @@ def find_injections(text: str) -> list[tuple[int, int, str]]:
     return sorted(hits)
 
 
+def _normalized(text: str) -> tuple[str, list[int]]:
+    """A matching copy: compatibility-decomposed, without combining marks, casefolded, lookalikes mapped.
+
+    Fullwidth or mathematical letters, accents and Cyrillic or Greek lookalikes cannot then split a keyword.
+    Returns the copy and, per copy character, its position in ``text``.
+    """
+    out: list[str] = []
+    index: list[int] = []
+    for position, character in enumerate(text):
+        if character.isascii():
+            out.append(character)
+            index.append(position)
+        elif character.isspace():
+            out.append("\n" if character in _NEWLINES else " ")
+            index.append(position)
+        else:
+            decomposed = unicodedata.normalize("NFKD", character)
+            for mapped in "".join(c for c in decomposed if not unicodedata.combining(c)).casefold():
+                out.append(_CONFUSABLES.get(mapped, mapped))
+                index.append(position)
+    return "".join(out), index
+
+
+def _injection_hits(visible: str) -> list[tuple[int, int, str]]:
+    """Injection matches over the visible text, its normalised copy and copies whose line breaks are spaces."""
+
+    copies: list[tuple[str, list[int] | None]] = [(visible, None) if visible.isascii() else _normalized(visible)]
+    if any(newline in copies[0][0] for newline in _NEWLINES):
+        # A keyword split across lines still reads as one phrase; the copy keeps every position.
+        joined = copies[0][0]
+        for newline in _NEWLINES:
+            joined = joined.replace(newline, " ")
+        copies.append((joined, copies[0][1]))
+    hits = set()
+    for copy, index in copies:
+        for start, end, rule in find_injections(copy):
+            hits.add((start, end, rule) if index is None else (index[start], index[end - 1] + 1, rule))
+    return sorted(hits)
+
+
 def sanitize_text(text: str, *, mode: str = "strip", scope: str = "") -> Sanitized:
     """Remove (or, in detect mode, only record) hidden characters and injection sentences.
 
@@ -165,6 +217,12 @@ def sanitize_text(text: str, *, mode: str = "strip", scope: str = "") -> Sanitiz
     for kind, pattern in _CHARACTER_CLASSES:
         spans.extend((match.start(), match.end(), kind, kind) for match in pattern.finditer(source))
     spans.extend((match.start(), match.end(), "soft-hyphen", "soft-hyphen") for match in _SOFT_HYPHEN.finditer(source))
+    if not source.isascii():
+        # Format characters a newer Unicode version adds are caught by category, not only by the list above.
+        covered = {position for start, end, _, _ in spans for position in range(start, end)}
+        spans.extend((position, position + 1, "format-character", "format-character") for position, character
+                     in enumerate(source) if position not in covered and character not in _COVERED
+                     and unicodedata.category(character) == "Cf")
     # Injection matching runs on the text without invisible characters; map offsets back. Most
     # texts have none, and then the text and its offsets are used as they are.
     if spans:
@@ -176,7 +234,7 @@ def sanitize_text(text: str, *, mode: str = "strip", scope: str = "") -> Sanitiz
         visible = "".join(source[position] for position in visible_positions)
     else:
         visible_positions, visible = None, source
-    for start, end, rule in find_injections(visible):
+    for start, end, rule in _injection_hits(visible):
         while start < end and visible[start].isspace():
             start += 1
         if rule in {"control-token", "control-block"}:

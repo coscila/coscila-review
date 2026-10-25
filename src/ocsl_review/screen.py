@@ -53,7 +53,7 @@ from .corpus_assessment import AssessmentValidator
 from .errors import ReviewError, ValidationError
 from .ingest import ingest_manuscript
 from .retrieval import EvidenceIndex, Work, WorkCatalog, canonical, load_library, load_store, sha256_text
-from .sanitize import find_injections, sanitize_document
+from .sanitize import SANITIZER_VERSION, find_injections, sanitize_document
 
 REPORT_FORMAT = "ocsl-claim-screen"
 REPORT_VERSION = 1
@@ -176,7 +176,7 @@ def run_screen(manuscript_path: Path, *, run_root: Path, works: Sequence[Work], 
                 connection.execute("INSERT OR IGNORE INTO sanitization_records VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
                     "san-" + sha256_text(canonical([analysis_id, "document", removal]))[:24], analysis_id,
                     "manuscript-document", f"position-{removal['position']}", removal["kind"], removal["rule"], None, None,
-                    removal["length"], removal["sha256"], "sanitize-1"))
+                    removal["length"], removal["sha256"], SANITIZER_VERSION))
             if document_removals:
                 findings.append(I.finding("hidden-text", "manuscript", manuscript["manuscriptId"], detail={
                     "removed": len(document_removals), "rules": sorted({item["rule"] for item in document_removals}),
