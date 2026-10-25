@@ -141,6 +141,35 @@ class CorpusWorkflowTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(CorpusRepository(self.root, "work/cli").analysis()["analysis_id"], "cli")
 
+    def test_cli_init_and_branch_pin_a_study_bundle_instead_of_the_source_tree(self):
+        from ocsl_review import corpus_export, instruments
+        protocol, prompt = self.root / "protocol.json", self.root / "study-prompt.md"
+        protocol.write_text('{"version":2}')
+        prompt.write_text("Study prompt text.\n")
+        args = ["--workspace", str(self.root), "--question", "Q", "--protocol", str(protocol)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["corpus", "init", "--library", "work/pinned", "--analysis", "pinned",
+                                   "--study-prompt", str(prompt), *args]), 0)
+        repo = CorpusRepository(self.root, "work/pinned")
+        analysis = repo.analysis()
+        self.assertTrue(analysis["code_revision"].startswith(corpus_export.STUDY_BUNDLE_PREFIX))
+        bundle = corpus_export.check_study_bundle(repo, analysis)
+        self.assertEqual(bundle["studyPromptSha256"], hashlib.sha256(prompt.read_bytes()).hexdigest())
+        self.assertEqual(bundle["instruments"]["citation-support@2"], instruments.load("citation-support@2").digest)
+        self.assertEqual(bundle["packageTags"]["source-tree-sha256"], corpus_export.implementation_manifest()["sha256"])
+        with repo.connect() as connection:
+            kinds = {row[0] for row in connection.execute("SELECT artifact_kind FROM source_artifacts")}
+        self.assertTrue({"study-bundle", "implementation-manifest"} <= kinds)
+        repo.library.snapshot("results/pinned")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["corpus", "branch", "--library", "results/pinned", "--output", "work/fork",
+                                   "--analysis", "fork", *args]), 0)
+        fork = CorpusRepository(self.root, "work/fork")
+        forked = corpus_export.check_study_bundle(fork, fork.analysis())
+        parent = repo.library.__class__(repo.workspace, "results/pinned").verify(require_snapshot=True, level="light")
+        self.assertEqual(forked["datasetVersions"], {"parentSnapshot": parent["merkle_root"]})
+        self.assertNotEqual(forked["sha256"], bundle["sha256"])
+
     def test_cli_migrate_is_explicit_and_idempotent(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             code = main(["corpus", "migrate", "--workspace", str(self.root), "--library", "work/literature"])

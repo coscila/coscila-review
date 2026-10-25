@@ -12,9 +12,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 from urllib.parse import parse_qs, urlsplit
 
+from ocsl_review import corpus_export, instruments
 from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.corpus_assessment import build_messages
 from ocsl_review.corpus_dispatch import CorpusExecutor, authorize
@@ -335,6 +336,63 @@ class CorpusDispatchTests(unittest.TestCase):
         self.assertEqual({table: len(self.rows(table)) for table in before}, before)
         self.assertEqual(before["model_receipts"], 5)
         self.repo.library.verify()
+
+    def pinned_analysis(self, name="pinned", protocol=None):
+        protocol = protocol or {"version": 2, "kind": "calibration"}
+        bundle = corpus_export.study_bundle(protocol)
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Pinned question", name, protocol=protocol,
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        corpus_export.record_study_bundle(self.repo, name, bundle)
+        return bundle
+
+    def executor_for(self, analysis):
+        return CorpusExecutor(self.repo, broker=self.broker, authorization=lambda *args: None, analysis_id=analysis)
+
+    def test_study_bundle_pin_survives_executor_changes_but_refuses_a_changed_instrument(self):
+        bundle = self.pinned_analysis()
+        self.assertEqual(bundle["instruments"], {"citation-support@2": instruments.load("citation-support@2").digest})
+        self.add_tasks(3, "pinned")
+        changed_tree = {"format": "ocsl-corpus-implementation-v1", "files": [], "sha256": "f" * 64}
+        with patch.object(corpus_export, "implementation_manifest", return_value=changed_tree):
+            # Execution code changed after the pin: the analysis continues and receipts name the serving code.
+            job = self.executor_for("pinned").submit("w1")["submitted"][0]["jobId"]
+            self.broker.complete(job)
+            self.executor_for("pinned").resume()
+        receipts = [json.loads(row["parameters_json"]) for row in self.rows("model_receipts")]
+        self.assertTrue(receipts)
+        self.assertEqual({receipt["codeTag"] for receipt in receipts}, {"source-tree-sha256:" + "f" * 64})
+        with patch.object(instruments.Instrument, "digest", new_callable=PropertyMock, return_value="0" * 64):
+            with self.assertRaisesRegex(ValidationError, "citation-support@2 changed since the analysis was pinned"):
+                self.executor_for("pinned").submit("w1")
+        with self.repo.connect(write=True) as connection:
+            connection.execute("UPDATE processing_state SET checkpoint_json=json_set(checkpoint_json,'$.protocolSha256',?) "
+                               "WHERE analysis_id='pinned' AND task_key='study-bundle'", ("0" * 64,))
+        with self.assertRaisesRegex(ValidationError, "differs from the analysis pin"):
+            self.executor_for("pinned").submit("w1")
+
+    def test_variants_use_their_parents_bundle_and_source_tree_pins_keep_the_old_check(self):
+        bundle = self.pinned_analysis()
+        variant = "pinned:calibration:none1"
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Variant", variant,
+                         protocol={"version": 2, "kind": "calibration", "parentAnalysisId": "pinned"},
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Old pin", "old",
+                         protocol={"version": 2, "kind": "calibration"},
+                         code_revision=corpus_export.SOURCE_TREE_PREFIX + "0" * 64)
+        self.add_tasks(1, variant)
+        self.add_tasks(1, "old")
+        self.assertEqual(len(self.executor_for(variant).submit("w1")["submitted"]), 1)
+        with self.assertRaisesRegex(ValidationError, "implementation changed"):
+            self.executor_for("old").submit("w1")
+        with self.repo.connect(write=True) as connection:
+            add_analysis(connection, self.repo.analysis()["corpus_id"], "Unrecorded", "unrecorded",
+                         protocol={"version": 2, "kind": "calibration"},
+                         code_revision=corpus_export.STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        self.add_tasks(1, "unrecorded")
+        with self.assertRaisesRegex(ValidationError, "study bundle is not recorded"):
+            self.executor_for("unrecorded").submit("w1")
 
     def test_paused_job_is_not_resubmitted_until_new_approved_owner(self):
         task = self.add_tasks(1)[0]
