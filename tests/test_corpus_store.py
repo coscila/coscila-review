@@ -302,6 +302,8 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
             # The short writer was not the last connection, so the WAL was not checkpointed away.
             self.assertTrue(wal.exists())
         self.assertIsNone(repo._held)
+        # The held connection closed last and checkpointed the WAL away.
+        self.assertFalse(wal.exists())
         with self.assertRaises(sqlite3.ProgrammingError):
             held.execute("SELECT 1")
         self.assertEqual(repo.status()["counts"]["source_artifacts"], len(list((repo.root / "sources").iterdir())))

@@ -214,23 +214,24 @@ class CorpusRepository:
 
     @contextmanager
     def held_open(self) -> Iterator[None]:
-        """Keep one idle connection open around a bulk operation.
+        """Keep one idle writable connection open around a bulk operation.
 
         Short-lived connections then neither checkpoint the WAL when they close nor
-        rebuild its index when they open; automatic checkpoints still bound the WAL,
-        and the final close checkpoints as usual.
+        rebuild its index when they open; automatic checkpoints still bound the WAL.
+        The held connection closes last and, being writable, checkpoints and removes
+        the WAL as any last writer does, so later readers open it cheaply.
         """
-        if self._held is not None:
+        if self._held is not None or (self.root / "manifest.json").exists():
+            # Re-entrant; an immutable snapshot is only read, so nothing is held.
             yield
             return
-        connection = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=30, check_same_thread=False)
-        try:
+        with self.connect(write=True) as connection:
             connection.execute("PRAGMA user_version").fetchone()
             self._held = connection
-            yield
-        finally:
-            self._held = None
-            connection.close()
+            try:
+                yield
+            finally:
+                self._held = None
 
     def analysis(self, analysis_id: str | None = None) -> dict[str, Any]:
         if analysis_id is None:
