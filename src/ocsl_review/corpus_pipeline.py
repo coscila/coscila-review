@@ -471,22 +471,23 @@ def prepare_tasks(repo: CorpusRepository, *, tier: str = "abstract", context_cha
         escalated = _escalated_loci(connection, analysis) if tier == "full-text" else None
     count = blocked = 0
     after = 0
-    while True:
-        with repo.connect() as connection:
-            page = connection.execute(_LOCUS_PAGE, (after, PLANNER_PAGE_ROWS)).fetchall()
-            if not page:
-                break
-            after = page[-1]["locus_rowid"]
-            done = _planned_loci(connection, analysis, tier, [row["locus_id"] for row in page])
-            rows = [row for row in page if row["locus_id"] not in done
-                    and (escalated is None or row["locus_id"] in escalated)]
-            works = evidence.get_many(connection, [row["resolved_work_id"] for row in rows])
-            reviews = _review_proofs(connection, proofs, list(dict.fromkeys(row["review_id"] for row in rows)))
-        items = [_plan_locus(planner, row, tier, context_chars,
-                             works.get(row["resolved_work_id"]) if row["resolved_work_id"] else None,
-                             reviews[row["review_id"]]) for row in rows]
-        repo.add_tasks(analysis, items, supersede_blocked=True)
-        count += len(items); blocked += sum(1 for item in items if item[3])
+    with repo.held_open():
+        while True:
+            with repo.connect() as connection:
+                page = connection.execute(_LOCUS_PAGE, (after, PLANNER_PAGE_ROWS)).fetchall()
+                if not page:
+                    break
+                after = page[-1]["locus_rowid"]
+                done = _planned_loci(connection, analysis, tier, [row["locus_id"] for row in page])
+                rows = [row for row in page if row["locus_id"] not in done
+                        and (escalated is None or row["locus_id"] in escalated)]
+                works = evidence.get_many(connection, [row["resolved_work_id"] for row in rows])
+                reviews = _review_proofs(connection, proofs, list(dict.fromkeys(row["review_id"] for row in rows)))
+            items = [_plan_locus(planner, row, tier, context_chars,
+                                 works.get(row["resolved_work_id"]) if row["resolved_work_id"] else None,
+                                 reviews[row["review_id"]]) for row in rows]
+            repo.add_tasks(analysis, items, supersede_blocked=True)
+            count += len(items); blocked += sum(1 for item in items if item[3])
     return {"analysisId": analysis, "tier": tier, "tasks": count, "blocked": blocked}
 
 

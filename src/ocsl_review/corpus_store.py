@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import tempfile
 from typing import Any, Iterable, Iterator
@@ -108,6 +109,7 @@ class CorpusRepository:
         # An older library stays at its version until an operator runs migrate().
         self.version = version
         self._verified_artifacts = {}
+        self._held = None
 
     @classmethod
     def create(cls, workspace: Path, relative: str, question: str, analysis_id: str,
@@ -191,6 +193,26 @@ class CorpusRepository:
             connection.rollback()
             raise
         finally:
+            connection.close()
+
+    @contextmanager
+    def held_open(self) -> Iterator[None]:
+        """Keep one idle connection open around a bulk operation.
+
+        Short-lived connections then neither checkpoint the WAL when they close nor
+        rebuild its index when they open; automatic checkpoints still bound the WAL,
+        and the final close checkpoints as usual.
+        """
+        if self._held is not None:
+            yield
+            return
+        connection = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=30, check_same_thread=False)
+        try:
+            connection.execute("PRAGMA user_version").fetchone()
+            self._held = connection
+            yield
+        finally:
+            self._held = None
             connection.close()
 
     def analysis(self, analysis_id: str | None = None) -> dict[str, Any]:
@@ -296,15 +318,34 @@ class CorpusRepository:
             raise ValidationError("artifact is not registered")
         return rows
 
+    def _source_paths(self):
+        """Resolve sources/<digest> under the once-validated sources directory.
+
+        Anything other than a regular local file (missing, a symlink, a parent
+        snapshot's source) takes the fully checked library path.
+        """
+        sources = self.workspace.path(f"{self.relative}/sources")
+
+        def resolve(item) -> Path:
+            if item["relative_path"] == "sources/" + item["sha256"]:
+                candidate = sources / item["sha256"]
+                try:
+                    if stat.S_ISREG(os.lstat(candidate).st_mode):
+                        return candidate
+                except FileNotFoundError:
+                    pass
+            return self.library.source(item)
+        return resolve
+
     def read_artifacts(self, digests: Iterable[str], *, connection: sqlite3.Connection | None = None) -> dict[str, bytes]:
         """Read and verify many registered artifacts through one connection."""
         digests = list(digests)
         if connection is None:
             with self.connect() as own:
                 return self.read_artifacts(digests, connection=own)
-        result = {}
+        result, source = {}, self._source_paths()
         for digest, item in self._artifact_rows(connection, digests).items():
-            path = self.library.source(item)
+            path = source(item)
             stat = path.stat()
             signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
             body = path.read_bytes()
@@ -323,9 +364,9 @@ class CorpusRepository:
         if connection is None:
             with self.connect() as own:
                 return self.verify_artifacts(digests, connection=own)
+        source = self._source_paths()
         for digest, item in self._artifact_rows(connection, digests).items():
-            path = self.library.source(item)
-            if not self._existing_matches(path, digest):
+            if not self._existing_matches(source(item), digest):
                 raise ValidationError("registered artifact hash mismatch")
 
     def verify_artifact(self, digest: str) -> Path:

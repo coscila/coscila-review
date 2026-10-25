@@ -263,7 +263,7 @@ class CorpusExecutor:
             raise ValidationError("broker omitted active attempt ownership")
         limit, job_concurrency = min(max_jobs, MAX_JOBS_IN_FLIGHT), self._job_concurrency(worker, concurrency)
         submitted, held = [], 0
-        with controller_lock(self.repo):
+        with controller_lock(self.repo), self.repo.held_open():
             # A prepared request is persisted before enqueue, so retrying it is safe.
             with self.repo.connect() as connection:
                 prepared = [dict(r) for r in connection.execute("SELECT * FROM corpus_batches WHERE analysis_id=? AND state='prepared' AND owner_attempt=? AND worker_id=?", (self.analysis, owner, worker_id))]
@@ -444,7 +444,7 @@ class CorpusExecutor:
 
     def resume(self):
         harvested = []
-        with controller_lock(self.repo):
+        with controller_lock(self.repo), self.repo.held_open():
             with self.repo.connect() as connection:
                 batches = [dict(r) for r in connection.execute("SELECT * FROM corpus_batches WHERE analysis_id=? AND state IN (?,?,?)", (self.analysis, *ACTIVE_BATCH_STATES))]
             owner = self.broker.catalog().get("authorization", {}).get("attemptId")
