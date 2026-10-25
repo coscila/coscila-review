@@ -177,8 +177,10 @@ ocsl-review study verify-facts --facts results/facts/facts.json
 Runs are resumable per batch; receipts are written per call, and one process
 writes a database at a time (a lock beside it refuses a second writer). A call
 that gets no response after its transport attempts leaves its entries open,
-never invalid: an entry is invalid only when a response arrived and no
-parseable line followed the repair pass. A batch whose first call was answered
+never invalid: an entry is invalid only when a response arrived (a completion,
+an empty completion, or a refusal of the request itself: HTTP 400, 413 or 422,
+sent once) and no parseable line followed the repair pass. Authentication,
+not-found, throttling and server errors are not answers and leave entries open. A batch whose first call was answered
 but whose repair call was not resumes with that repair call. When consecutive
 batches get no response at all, the pass stops dispatching; open entries are
 retried in further passes after a growing cooldown (`--transport-retries`,
