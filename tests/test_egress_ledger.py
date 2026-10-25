@@ -31,6 +31,12 @@ class EgressLedgerTests(unittest.TestCase):
         self.workspace.mkdir()
         self.audit = self.workspace / ".ocsl-review"
         confidentiality._HEADS.clear()
+        with confidentiality._SYNC_GUARD:
+            if confidentiality._FLUSH_TIMER is not None:
+                confidentiality._FLUSH_TIMER.cancel()
+            confidentiality._FLUSH_TIMER = None
+            confidentiality._UNSYNCED.clear()
+            confidentiality._LAST_SYNC.clear()
 
     def events(self, count: int, start: int = 0) -> list[dict]:
         return [_audit_event("provider", "resolve_reference", {"doi": f"10.1234/{i}"}, decision="allowed-minimized")
@@ -148,14 +154,15 @@ class EgressLedgerTests(unittest.TestCase):
 
     def test_sync_runs_at_most_once_per_interval_and_pending_events_flush(self) -> None:
         clock = [1000.0]
-        synced = []
+        synced, armed = [], []
         with patch.object(confidentiality.time, "monotonic", lambda: clock[0]), \
+                patch.object(confidentiality, "_schedule_flush", side_effect=lambda: armed.append(1)), \
                 patch.object(confidentiality, "_datasync", side_effect=lambda fd: synced.append(fd)):
             append_egress_event(self.workspace, {"operation": "first"})
-            self.assertEqual(len(synced), 1)
+            self.assertEqual((len(synced), len(armed)), (1, 0))
             for _ in range(5):
                 append_egress_event(self.workspace, {"operation": "burst"})
-            self.assertEqual(len(synced), 1)
+            self.assertEqual((len(synced), len(armed)), (1, 5))
             flush_egress_ledgers()
             self.assertEqual(len(synced), 2)
             flush_egress_ledgers()
@@ -163,6 +170,18 @@ class EgressLedgerTests(unittest.TestCase):
             clock[0] += confidentiality.EGRESS_SYNC_SECONDS
             append_egress_event(self.workspace, {"operation": "later"})
             self.assertEqual(len(synced), 3)
+
+    def test_a_burst_tail_is_flushed_by_the_timer_without_further_events(self) -> None:
+        synced = threading.Event()
+        real = confidentiality._datasync
+        with patch.object(confidentiality, "EGRESS_SYNC_SECONDS", 0.5), \
+                patch.object(confidentiality, "_datasync", side_effect=lambda fd: (real(fd), synced.set())):
+            append_egress_event(self.workspace, {"operation": "first"})
+            synced.clear()
+            append_egress_event(self.workspace, {"operation": "burst"})
+            self.assertFalse(synced.is_set())
+            self.assertTrue(synced.wait(5), "the armed timer flushes the unsynced tail")
+        self.assertEqual(confidentiality._UNSYNCED, set())
 
     def test_record_lines_are_the_canonical_encoding_of_their_fields(self) -> None:
         event = {"operation": "résumé", "nested": {"b": [1, 2.5, None, True], "a": "\u2028"}, "argumentNames": ["doi"]}

@@ -26,8 +26,9 @@ MAX_EGRESS_PLAN_BYTES = 64 * 1024
 MAX_EGRESS_LEDGER_BYTES = 8 * 1024 * 1024
 MAX_EGRESS_SEGMENT_BYTES = 8 * 1024 * 1024
 MAX_EGRESS_RECORD_BYTES = 64 * 1024
-# Appends reach the kernel before the request they authorize; fdatasync runs at most this
-# often per ledger and process, at every segment seal and at interpreter exit.
+# Appends reach the kernel before the request they authorize. fdatasync runs at most this
+# often per ledger and process, at the latest this long after an unsynced append (timer),
+# at every segment seal and at interpreter exit.
 EGRESS_SYNC_SECONDS = 1.0
 EGRESS_GENESIS = "0" * 64
 _LEGACY_LEDGER = "egress-events.json"
@@ -37,6 +38,7 @@ _LEDGER_LOCK = "egress-events.lock"
 _SYNC_GUARD = threading.Lock()
 _LAST_SYNC: dict[str, float] = {}
 _UNSYNCED: set[str] = set()
+_FLUSH_TIMER: threading.Timer | None = None
 # Per process: the active segment's identity and size after this process's last append, with
 # the chain head written then. A size change by another writer forces a tail read.
 _HEADS: dict[str, tuple[int, int, int, int, str]] = {}
@@ -672,12 +674,32 @@ def _datasync(descriptor: int) -> None:
     getattr(os, "fdatasync", os.fsync)(descriptor)
 
 
+def _schedule_flush() -> None:
+    """Arm one daemon timer so a burst's unsynced tail is flushed within the interval."""
+
+    global _FLUSH_TIMER
+    if _FLUSH_TIMER is None:
+        _FLUSH_TIMER = threading.Timer(EGRESS_SYNC_SECONDS, _timed_flush)
+        _FLUSH_TIMER.daemon = True
+        _FLUSH_TIMER.start()
+
+
+def _timed_flush() -> None:
+    global _FLUSH_TIMER
+    with _SYNC_GUARD:
+        _FLUSH_TIMER = None
+    flush_egress_ledgers()
+
+
 def flush_egress_ledgers() -> None:
     """Flush segments that received events since their last sync in this process."""
 
     with _SYNC_GUARD:
         pending = sorted(_UNSYNCED)
         _UNSYNCED.clear()
+        now = time.monotonic()
+        for path in pending:
+            _LAST_SYNC[path] = now
     for path in pending:
         try:
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -736,6 +758,7 @@ def append_egress_event(workspace: Path, event: Mapping[str, Any]) -> None:
                         _UNSYNCED.discard(key)
                     else:
                         _UNSYNCED.add(key)
+                        _schedule_flush()
                 if due:
                     _datasync(active)
             finally:

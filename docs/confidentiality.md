@@ -178,10 +178,11 @@ and `read_egress_events` returns all events in order after that check.
 
 Each event reaches the operating system before the request it authorizes is
 sent, so it survives a crash of the process. The ledger calls `fdatasync` at
-most once per second per process, when a segment is sealed and at interpreter
-exit; a power failure can therefore lose at most about the last second of
-events at the end of the ledger, never an event inside the chain. An
-incomplete final line is refused, not repaired automatically.
+most once per second per process and at the latest one second after an
+unsynced event, when a segment is sealed and at interpreter exit; a power
+failure can therefore lose at most about the last second of events at the end
+of the ledger, never an event inside the chain. An incomplete final line is
+refused, not repaired automatically.
 
 The extensive CLI workflow uses this same validated context and ledger. Its
 user confirmation records permission for the review's scope; it does not
