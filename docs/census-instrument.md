@@ -106,6 +106,13 @@ except that abstracts are not cut. Verdicts go to the history as variant
  "identities": {"12": {"workKey": "work-key", "identity": "resolved", "method": "supplied"}}}
 ```
 
+`study abstracts --input reviews.jsonl --output reviews.abstracts.jsonl` fills
+missing abstracts from one provider, Europe PMC `resultType=core`, 40 DOIs per
+query with a PMID fallback, and records the provider outcome per work
+(`europe-pmc-core`, `europe-pmc-core-pmid`, `europe-pmc-no-abstract`,
+`europe-pmc-no-hit`, `europe-pmc-failed`, `no-identifier`); requests carry
+identifiers only.
+
 Document paths are relative to the manifest. A review without a document is
 recorded with provenance class `unavailable`. Extraction is
 `structured.extract` (recursive serialisation, range expansion, tables,

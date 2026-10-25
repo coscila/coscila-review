@@ -33,8 +33,8 @@ def add_commands(families, register):
 
     study = families.add_parser("study", help="run a census study with a registered instrument")
     actions = study.add_subparsers(dest="study_command", required=True)
-    for name in ("prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze", "export",
-                 "estimands", "facts", "verify-facts", "cross-validate"):
+    for name in ("abstracts", "prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze",
+                 "export", "estimands", "facts", "verify-facts", "cross-validate"):
         command = actions.add_parser(name)
         if name in ("prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze"):
             command.add_argument("--database", required=True, help="working census database")
@@ -42,6 +42,10 @@ def add_commands(families, register):
             command.add_argument("--seed", type=int, required=True, help="protocol seed")
         if name == "prepare":
             command.add_argument("--input", required=True, help="JSONL review records; document paths are relative to it")
+        if name == "abstracts":
+            command.add_argument("--input", required=True, help="JSONL review records")
+            command.add_argument("--output", required=True, help="JSONL review records with Europe PMC abstracts")
+            command.add_argument("--overwrite", action="store_true", help="replace abstracts already present")
         if name in ("judge", "full-text", "no-truncation", "replicate"):
             command.add_argument("--base-url", required=True, help="chat-completions base URL of the judge")
             command.add_argument("--api-key-env", help="environment variable holding the judge key")
@@ -126,6 +130,21 @@ def gates(status: dict[str, Any]) -> dict[str, Any]:
 def command(args) -> Any:
     from .census_runner import load_records, read_document
     action = args.study_command
+    if action == "abstracts":
+        import json
+        from .census_abstracts import fill_record, http_get
+        source, output = Path(args.input), Path(args.output)
+        if output.resolve() == source.resolve():
+            raise ValidationError("write enriched records to a new file")
+        get = http_get()
+        records = [fill_record(record, get, overwrite=args.overwrite) for record in load_records(source)]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records), encoding="utf-8")
+        sources: dict[str, int] = {}
+        for record in records:
+            for work in record["works"].values():
+                sources[work.get("abstractSource") or "supplied"] = sources.get(work.get("abstractSource") or "supplied", 0) + 1
+        return {"records": len(records), "output": str(output), "abstractSources": sources}
     if action == "prepare":
         run = _run(args)
         try:
