@@ -47,8 +47,14 @@ def _count_facts(journal: str) -> dict[str, tuple[str, str]]:
     c = f"FROM citations WHERE journal={j}"
     return {
         "reviews": (f"SELECT COUNT(*) FROM reviews WHERE journal={j}", "reviews enumerated for this journal"),
-        "reviews_read": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND document_sha256 IS NOT NULL",
+        "reviews_read": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND document_sha256 IS NOT NULL "
+                         "AND json_extract(extraction_json, '$.extractionFailed') IS NULL",
                          "reviews with an extracted document"),
+        "reviews_extraction_failed": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND "
+                                      "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL",
+                                      "reviews whose document could not be extracted (kept in coverage)"),
+        "reviews_unavailable": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND provenance_class='unavailable'",
+                                "reviews without a readable document"),
         "reviews_uncovered": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND uncovered>0",
                               "reviews with anchors not owned exactly once (gate: 0)"),
         "entries_printed": (f"SELECT COUNT(*) {c}", "printed bibliography entries"),
@@ -118,7 +124,8 @@ def _coverage_facts(connection: sqlite3.Connection, journal: str) -> dict[str, t
             prefix = f"coverage.{name}.{value if isinstance(value, int) else slug(str(value))}"
             facts.update({
                 f"{prefix}.reviews": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell}", f"reviews with {cell}"),
-                f"{prefix}.reviews_read": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell} AND document_sha256 IS NOT NULL",
+                f"{prefix}.reviews_read": (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell} AND document_sha256 IS NOT NULL "
+                                           "AND json_extract(extraction_json, '$.extractionFailed') IS NULL",
                                            f"reviews with {cell} and an extracted document"),
                 f"{prefix}.entries_printed": (f"SELECT COUNT(*) {c}", f"printed entries in reviews with {cell}"),
                 f"{prefix}.entries_cited_inbody": (f"SELECT COUNT(*) {c} AND cited_inbody=1", f"in-body entries, {cell}"),

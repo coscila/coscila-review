@@ -113,6 +113,71 @@ class CommandLineTests(RunnerTestCase):
         self.assertTrue(outputs[4]["complete"])
         self.assertTrue(outputs[6]["ok"])
 
+    def test_prepare_records_unreadable_reviews_and_continues(self):
+        folder = self.root / "input"
+        folder.mkdir()
+        good = (FIXTURES / "review.xml").read_bytes()
+        (folder / "review.xml").write_bytes(good)
+        # Two bibliography labels that collide after normalisation make the structured extraction refuse it.
+        (folder / "ambiguous.xml").write_bytes(good.replace(b"<label>2.</label>", b"<label>1</label>", 1))
+        failed_works = {**record()["works"], "work-1": {**record()["works"]["work-1"], "europePmcOutcome": "europe-pmc-failed"}}
+        records = [
+            {**record(doi="10.5555/ambiguous"), "document": {"path": "ambiguous.xml", "kind": "jats"}},
+            {**record(doi="10.5555/missing"), "document": {"path": "missing.xml", "kind": "jats"}},
+            {**record(doi="10.5555/digest"), "document": {"path": "review.xml", "kind": "jats", "sha256": "0" * 64}},
+            {**record(doi="10.5555/lookup"), "works": failed_works},
+            record(),
+        ]
+        manifest = folder / "reviews.jsonl"
+        manifest.write_text("".join(json.dumps(item) + "\n" for item in records))
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(0, main(["study", "prepare", "--database", str(self.database), "--seed", "5", "--input",
+                                      str(manifest)]))
+        result = json.loads(buffer.getvalue())
+        self.assertEqual(1, result["prepared"])
+        self.assertEqual({"prepared": 1, "extraction-failed": 1, "unavailable": 2, "skipped-abstract-lookup-failed": 1},
+                         result["states"])
+        reviews = {r["doi"]: r for r in self.rows("SELECT doi, provenance_class, abstract_state, extraction_json FROM reviews")}
+        self.assertNotIn("10.5555/lookup", reviews, "a failed abstract lookup waits for study abstracts")
+        self.assertIn("extractionFailed", reviews["10.5555/ambiguous"]["extraction_json"])
+        self.assertEqual(("unavailable", "completed"), (reviews["10.5555/missing"]["provenance_class"],
+                                                        reviews["10.5555/missing"]["abstract_state"]))
+        self.assertIn("digest", reviews["10.5555/digest"]["extraction_json"])
+        from ocsl_review.census_runner import census_status
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            self.assertEqual(1, census_status(connection)["extractionFailedReviews"])
+            coverage = {row["cell"]: row for row in __import__("ocsl_review.estimands", fromlist=["coverage"]).coverage(
+                connection, JOURNAL, "year")}
+        self.assertEqual((5 - 1, 1, 1), (coverage[2021]["reviews"], coverage[2021]["reviews_read"],
+                                         coverage[2021]["reviews_extraction_failed"]))
+
+    def test_abstracts_stream_into_a_partial_file_and_resume(self):
+        from ocsl_review.study_cli import fill_abstracts
+        source = self.root / "reviews.jsonl"
+        output = self.root / "out" / "reviews.abstracts.jsonl"
+        records = [{"journal": JOURNAL, "doi": "10.5555/r%d" % i, "works": {"w": {"doi": "10.5555/n.%d" % (i + 1)}}}
+                   for i in range(3)]
+        source.write_text("".join(json.dumps(item) + "\n" for item in records))
+        queries = []
+
+        def get(params):
+            queries.append(params)
+            doi = params["query"].split('"')[1]
+            return {"resultList": {"result": [{"doi": doi, "abstractText": "Abstract of %s." % doi}]}}
+        output.parent.mkdir()
+        first = json.dumps({**records[0], "works": {"w": {"doi": "10.5555/n.1", "abstract": "A.", "abstractSource": "europe-pmc-core"}}})
+        Path(str(output) + ".partial").write_text(first + "\n" + '{"journal": "cut off')
+        result = fill_abstracts(source, output, get)
+        self.assertEqual((3, 1, 0), (result["records"], result["resumed"], result["lookupFailed"]))
+        self.assertEqual(2, len(queries), "the record written before the crash is not looked up again")
+        lines = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual([r["doi"] for r in records], [line["doi"] for line in lines])
+        self.assertFalse(Path(str(output) + ".partial").exists())
+        Path(str(output) + ".partial").write_text(json.dumps({"journal": JOURNAL, "doi": "10.5555/other"}) + "\n")
+        with self.assertRaisesRegex(ValidationError, "does not continue this input"):
+            fill_abstracts(source, output, get)
+
     def test_cross_validate_command(self):
         buffer = io.StringIO()
         with redirect_stdout(buffer):

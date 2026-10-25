@@ -448,7 +448,10 @@ def coverage(connection: sqlite3.Connection, journal: str, by: str = "year") -> 
     column = PANELS[by]
     rows = _rows(connection, f"""
       SELECT {column} AS cell, COUNT(DISTINCT r.doi) AS reviews,
-        COUNT(DISTINCT CASE WHEN r.document_sha256 IS NOT NULL THEN r.doi END) AS reviews_read,
+        COUNT(DISTINCT CASE WHEN r.document_sha256 IS NOT NULL AND json_extract(r.extraction_json, '$.extractionFailed')
+              IS NULL THEN r.doi END) AS reviews_read,
+        COUNT(DISTINCT CASE WHEN json_extract(r.extraction_json, '$.extractionFailed') IS NOT NULL THEN r.doi END)
+              AS reviews_extraction_failed,
         SUM(c.label IS NOT NULL) AS printed, SUM(c.cited_inbody=1) AS cited_inbody,
         SUM(c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified')) AS resolved,
         SUM(c.model_judged=1) AS judged, SUM(c.abs_basis LIKE 'invalid%') AS invalid,
