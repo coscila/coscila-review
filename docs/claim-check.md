@@ -47,11 +47,21 @@ An evidence-store work looks like this (one per line in JSON Lines):
 
 ## Pipeline
 
-1. **Sanitise the document** (`sanitize.py`). Hidden content is removed before ingestion: DOCX
-   runs marked vanish, hidden by a style, white or 1-point text; HTML/XML elements hidden by style
-   or attribute, templates and comments; HTML comments and hidden spans in Markdown; invisible
-   Unicode (zero-width, bidirectional and tag characters). Removals are recorded with kind,
-   position, length and sha256, never the text. PDF hidden text is a declared limitation.
+1. **Sanitise the document** (`sanitize.py`, version `sanitize-2`). Hidden content is removed
+   before ingestion: DOCX runs that are vanish, white or near-white (including the background theme
+   colour) or 2-point and smaller, through direct formatting or inherited character, paragraph and
+   default styles, and alternate-content fallback branches; HTML/XML elements hidden by an inline
+   style (display, visibility, opacity, transparent or white text, tiny fonts, off-screen positions,
+   clipping), by the document's own stylesheet rules (tag, class, id and attribute selectors with
+   descendant and child chains), by attribute, templates and comments; HTML comments, hidden tags
+   and comment link definitions in Markdown; invisible Unicode (zero-width, bidirectional, tag and
+   every other format character, blank fillers). A DOCX that declares a DTD or entities, or a
+   stylesheet that hides content with selectors the check cannot evaluate, is refused; text hidden
+   by an external stylesheet is a declared limitation, as is PDF hidden text. Injection rules match
+   a compatibility-normalised copy and copies whose line breaks are spaces. Removals are recorded
+   with kind, position, length and sha256, never the text. Every string of a judge prompt (claim,
+   context, section, marker, cited title and container, identifiers, evidence) passes the
+   sanitizer; a task whose fields still carry content after it is blocked with that reason.
 2. **Ingest** the sanitised copy. Author-year citations are detected in parenthetical and narrative
    form and resolved against the reference list at ingest (`author_year.py`, below).
 3. **Identify** every reference in the evidence store: printed identifier first (DOI, PMID, PMCID),
