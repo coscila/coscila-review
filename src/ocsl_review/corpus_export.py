@@ -171,17 +171,107 @@ FACT_QUERIES = {
 }
 
 
+# Rows per keyset page of the input digest; memory stays at one page whatever the table size.
+DIGEST_PAGE_ROWS = 5000
+
+
+def keyset_pages(connection, source, column, condition="", params=(), *, page=None):
+    """Yield the values of a unique column in ascending order, as lists of at most ``page`` values.
+
+    Each page is one query that continues after the previous page's last value
+    (``column > ?``) along the column's index, so there is no OFFSET and no sort; in a branch,
+    SQLite merges the index ranges of the branch table and the parent table behind the union
+    view. NULLs come first, where ORDER BY puts them. A ``condition`` on an indexed column must
+    disable that index (``+column=?``) so that the scan keeps walking ``column``'s index.
+    """
+    page = page or DIGEST_PAGE_ROWS
+    extra = f" AND ({condition})" if condition else ""
+    cursor = connection.cursor()
+    cursor.row_factory = None
+    nulls = cursor.execute(f"SELECT count(*) FROM {source} WHERE {column} IS NULL{extra}", params).fetchone()[0]
+    for start in range(0, nulls, page):
+        yield [None] * min(page, nulls - start)
+    values = [row[0] for row in cursor.execute(
+        f"SELECT {column} FROM {source} WHERE {column} IS NOT NULL{extra} ORDER BY {column} LIMIT ?", (*params, page))]
+    while values:
+        yield values
+        if len(values) < page:
+            return
+        values = [row[0] for row in cursor.execute(
+            f"SELECT {column} FROM {source} WHERE {column} > ?{extra} ORDER BY {column} LIMIT ?", (values[-1], *params, page))]
+
+
+class Scan:
+    """A JSON array whose items arrive as consecutive lists (pages), so a digest never holds the whole array."""
+
+    __slots__ = ("pages",)
+
+    def __init__(self, pages):
+        self.pages = pages
+
+
+def streamed_identity(*values):
+    """``identity(*values)`` where any array may be a ``Scan``: the same canonical JSON, hashed as it is produced."""
+    digest = hashlib.sha256()
+
+    def emit(value):
+        if isinstance(value, Scan):
+            digest.update(b"[")
+            separator = b""
+            for page in value.pages:
+                if page:
+                    # canonical(page) is "[item,...,item]": hash its items and keep the array open.
+                    digest.update(separator + canonical(page)[1:-1].encode())
+                    separator = b","
+            digest.update(b"]")
+        elif isinstance(value, dict) and all(isinstance(key, str) for key in value):
+            digest.update(b"{")
+            for number, key in enumerate(sorted(value)):
+                digest.update(("," if number else "").encode() + canonical(key).encode() + b":")
+                emit(value[key])
+            digest.update(b"}")
+        elif isinstance(value, (list, tuple)):
+            digest.update(b"[")
+            for number, item in enumerate(value):
+                if number:
+                    digest.update(b",")
+                emit(item)
+            digest.update(b"]")
+        else:
+            digest.update(canonical(value).encode())
+
+    emit(values)
+    return digest.hexdigest()
+
+
+def read_facts(connection, analysis):
+    """The facts of ``analysis`` and the digest of their inputs, read in one transaction.
+
+    The facts and every page of the digest see the same database state. The digest is
+    ``identity`` of the analysis, its protocol digest, every registered artifact digest
+    (fact derivations excepted), the analysis's assessment ids and the facts' digest, with
+    both lists streamed in key order.
+    """
+    connection.execute("BEGIN")
+    try:
+        result = {key: [dict(r) for r in connection.execute(sql, (analysis["analysis_id"],) if "?" in sql else ())]
+                  for key, sql in FACT_QUERIES.items()}
+        input_digest = streamed_identity({
+            "analysis": analysis["analysis_id"], "protocolSha256": analysis["protocol_sha256"],
+            "artifacts": Scan(keyset_pages(connection, "source_artifacts", "sha256", "artifact_kind!='fact-derivation'")),
+            "assessments": Scan(keyset_pages(connection, "assessments", "assessment_id", "+analysis_id=?",
+                                             (analysis["analysis_id"],))),
+            "factsSha256": identity(result)})
+    finally:
+        connection.rollback()
+    return result, input_digest
+
+
 def derive_facts(repo, analysis_id=None):
     analysis = repo.analysis(analysis_id)
     with repo.connect() as connection:
-        result = {key: [dict(r) for r in connection.execute(sql, (analysis["analysis_id"],) if "?" in sql else ())]
-                  for key, sql in FACT_QUERIES.items()}
-        inputs = {"analysis": analysis["analysis_id"], "protocolSha256": analysis["protocol_sha256"],
-                  "artifacts": [r[0] for r in connection.execute("SELECT sha256 FROM source_artifacts WHERE artifact_kind!='fact-derivation' ORDER BY sha256")],
-                  "assessments": [r[0] for r in connection.execute("SELECT assessment_id FROM assessments WHERE analysis_id=? ORDER BY assessment_id", (analysis["analysis_id"],))],
-                  "factsSha256": identity(result)}
+        result, input_digest = read_facts(connection, analysis)
     derivation = repo.json_artifact({"version": 2, "queries": FACT_QUERIES}, "fact-derivation")
-    input_digest = identity(inputs)
     with repo.connect(write=True) as connection:
         for key, value in result.items():
             connection.execute("INSERT OR IGNORE INTO facts VALUES (?,?,?,?,?,?,?)", (
