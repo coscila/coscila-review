@@ -31,9 +31,27 @@ from . import citation_census as C
 from . import scores_db
 from .census_extraction import extract_review, resolve_identity
 from .errors import ConfidentialityError, ReviewError, ValidationError
+from .sanitize import SANITIZER_VERSION, sanitize_text
 
 IDENTITY_LADDER = "identity-ladder@1"
 RESOLVED = ("resolved", "resolved_unverified")
+
+
+def detected_rows(field: str, text: str | None, *, journal: str | None = None, doi: str | None = None,
+                  label: str | None = None, seq: int | None = None, evidence_id: str | None = None) -> list[tuple]:
+    """Hidden characters and injection sentences in text the judge will see, recorded without changing it.
+
+    citation-census@1 sends its inputs byte for byte, so the sanitizer only detects here
+    (claim-check@1 strips the same findings before its prompts). Only digests are kept.
+    """
+    scope = "evidence" if evidence_id else "citation"
+    rows = []
+    for removal in sanitize_text(text or "", mode="detect", scope=field).removals:
+        key = canonical([scope, journal, doi, label, seq, evidence_id, field, removal.start, removal.kind, removal.rule])
+        rows.append(("finding-" + sha256_text(key)[:32], scope, journal, doi, label, seq, evidence_id, field,
+                     removal.kind, removal.rule, removal.start, removal.length, removal.sha256, SANITIZER_VERSION,
+                     utc_now()))
+    return rows
 
 
 class TransportError(ReviewError):
@@ -211,7 +229,7 @@ class CensusRun:
         works = {key: dict(value) for key, value in (record.get("works") or {}).items()}
         supplied = record.get("identities") or {}
         title = record.get("title") or review["title"] or ""
-        rows, loci, identities, evidence, history = [], [], [], {}, []
+        rows, loci, identities, evidence, history, findings = [], [], [], {}, [], []
         now = utc_now()
         for entry in review["entries"]:
             if entry.label in supplied:
@@ -233,6 +251,9 @@ class CensusRun:
                              locus.unit_tag, int("table" in locus.flags), int("fig" in locus.flags),
                              int("box" in locus.flags), int("list" in locus.flags),
                              int(seq < C.max_citing_sentences())))
+                if deterministic is None and seq < C.max_citing_sentences():
+                    findings += detected_rows("citing_sentence", locus.sentence, journal=journal, doi=doi,
+                                              label=entry.label, seq=seq)
             abstract_id, cut, sent_chars = None, None, None
             if work and deterministic is None:
                 abstract = work.get("abstract") or ""
@@ -263,6 +284,12 @@ class CensusRun:
                                 canonical(deterministic), now))
             rows.append(row)
         uncovered = review["diagnostics"]["uncovered"]
+        with self.lock:
+            known = {row[0] for row in self.connection.execute(
+                "SELECT evidence_id FROM evidence WHERE evidence_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(evidence)),))}
+        for evidence_id in sorted(set(evidence) - known):  # each abstract is checked once per database
+            findings += detected_rows("abstract", evidence[evidence_id][11], evidence_id=evidence_id)
         with self.lock, self.connection:
             self.connection.execute(
                 "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, route, provenance_class,"
@@ -287,13 +314,15 @@ class CensusRun:
                     f"INSERT INTO citations({', '.join(row)}) VALUES({', '.join('?' * len(row))})", tuple(row.values()))
             self.connection.executemany("INSERT INTO loci VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", loci)
             self.connection.executemany("INSERT INTO identity VALUES(?,?,?,?,?,?,?,?,?)", identities)
+            self.connection.executemany("INSERT OR IGNORE INTO sanitizer_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                        findings)
             self.connection.executemany(
                 "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
                 " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 history)
             scores_db.aggregate_reviews(self.connection, journal, doi)
         return {"doi": doi, "state": "prepared", "entries": len(rows), "uncovered": uncovered,
-                "judgeable": sum(1 for r in rows if "abs_class" not in r)}
+                "judgeable": sum(1 for r in rows if "abs_class" not in r), "sanitizerFindings": len(findings)}
 
     # ------------------------------------------------------------------ abstract tier
     def _items(self, journal: str, doi: str) -> list[dict[str, Any]]:
@@ -578,9 +607,15 @@ class CensusRun:
                 passages = [{"sentence": r["sentence"], "section": r["section"]}
                             for r in self._loci(journal, doi, row["label"])]
             year = int(work["year"]) if isinstance(work["year"], str) and work["year"].isdigit() else work["year"]
+            window = C.full_text_window(text, C.claim_text(passages[:3]))
+            findings = detected_rows("fulltext_window", window, journal=journal, doi=doi, label=row["label"])
+            if findings:
+                with self.lock, self.connection:
+                    self.connection.executemany(
+                        "INSERT OR IGNORE INTO sanitizer_findings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", findings)
             retrieved.append({"label": row["label"], "citing_passages": passages,
                               "cited_work": {"title": work["title"], "venue": work["venue"], "year": year},
-                              "fulltext_window": C.full_text_window(text, C.claim_text(passages[:3])),
+                              "fulltext_window": window,
                               "_entry": {"row": row, "outcome": outcome, "source": source, "provenance": provenance}})
         return doi, journal, title, retrieved
 

@@ -23,7 +23,7 @@ from .errors import ValidationError
 
 SCHEMA_VERSION = 1
 TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "history",
-          "review_scores", "work_scores", "data_dictionary")
+          "review_scores", "work_scores", "sanitizer_findings", "data_dictionary")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS review_scores(
 CREATE TABLE IF NOT EXISTS work_scores(
   work_key TEXT PRIMARY KEY, n_citations INTEGER NOT NULL, n_classifiable INTEGER NOT NULL,
   n_not_supported INTEGER NOT NULL, expected REAL, excess REAL, p_value REAL, q_value REAL);
+CREATE TABLE IF NOT EXISTS sanitizer_findings(
+  finding_id TEXT PRIMARY KEY, scope TEXT NOT NULL CHECK(scope IN ('citation', 'evidence')),
+  journal TEXT, doi TEXT, label TEXT, seq INTEGER, evidence_id TEXT, field TEXT NOT NULL, kind TEXT NOT NULL,
+  rule TEXT NOT NULL, start INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL, sanitizer TEXT NOT NULL,
+  created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS data_dictionary(
   table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
   PRIMARY KEY(table_name, column_name));
@@ -189,6 +194,17 @@ DICTIONARY: dict[str, dict[str, str]] = {
     "work_scores": {"work_key": "cited work", "n_citations": "citing entries", "n_classifiable": "classifiable citing entries",
                     "n_not_supported": "sure not supported", "expected": "expected count", "excess": "observed minus expected",
                     "p_value": "upper-tail p-value", "q_value": "Benjamini-Hochberg q-value"},
+    "sanitizer_findings": {
+        "finding_id": "finding id (digest of scope, field, offset and rule)",
+        "scope": "citation (a citing sentence or a full-text window of one entry) or evidence (an abstract)",
+        "journal": "journal (citation scope)", "doi": "citing review DOI (citation scope)",
+        "label": "bibliography label (citation scope)", "seq": "locus order of the citing sentence",
+        "evidence_id": "abstract evidence unit (evidence scope)",
+        "field": "citing_sentence, abstract or fulltext_window", "kind": "prompt-injection or a hidden-character class",
+        "rule": "sanitizer rule that matched", "start": "offset of the match in the text (characters)",
+        "length": "matched characters", "sha256": "sha256 of the matched text; the text itself is not copied",
+        "sanitizer": "sanitizer version (detect mode: the text sent to the judge is unchanged)",
+        "created_at": "detection time"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }
 
