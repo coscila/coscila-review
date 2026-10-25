@@ -102,8 +102,14 @@ and raw captures through a verified adapter. Review its reconciliation before
 judging. A seed contributes source material and labelled history; it never
 pre-accepts new tasks. Initialization and branching register the implementation
 files, schemas, prompts, dependency versions and licenses as immutable artifacts.
-The run's code revision identifies the source tree, and dispatch rejects a
-changed implementation under the same pinned analysis.
+A new analysis is pinned to a study bundle (`study-bundle-sha256:`): its protocol,
+the optional `--study-prompt` file, the registry digest of `citation-support@2`
+(prompt, schema and validator), dataset versions (a branch records its parent
+snapshot's Merkle root) and package tags. Dispatch refuses the analysis when that
+instrument has changed; executor, storage and transport fixes do not affect the
+pin, and every receipt records the code that served it (`codeTag`). Analyses
+pinned to a whole source tree (`source-tree-sha256:`) keep rejecting any changed
+implementation.
 
 ## Calibrate the instrument, then execute
 

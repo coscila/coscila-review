@@ -26,6 +26,7 @@ def add_commands(families, register):
             command.add_argument("--question", required=True)
             command.add_argument("--analysis", required=True)
             command.add_argument("--protocol", required=True)
+            command.add_argument("--study-prompt", help="study prompt file, pinned by digest in the study bundle")
         if name in {"import-manifest", "import-legacy", "import-snapshot"}:
             command.add_argument("input")
         if name == "import-legacy":
@@ -71,6 +72,10 @@ def add_commands(families, register):
 
 def repository(args):
     return CorpusRepository(Path(args.workspace).absolute(), args.library)
+
+
+def _study_prompt(args):
+    return Path(args.study_prompt).read_bytes() if getattr(args, "study_prompt", None) else b""
 
 
 def acquirer(args, repo):
@@ -189,12 +194,14 @@ def command(args):
         from .corpus_export import import_snapshot
         return import_snapshot(Path(args.workspace).absolute(), args.library, args.input)
     if name == "init":
-        from .corpus_export import implementation_manifest, record_implementation
+        from .corpus_export import STUDY_BUNDLE_PREFIX, implementation_manifest, record_implementation, record_study_bundle, study_bundle
         protocol = json.loads(Path(args.protocol).read_text())
         manifest = implementation_manifest()
+        bundle = study_bundle(protocol, study_prompt=_study_prompt(args), manifest=manifest)
         repo = CorpusRepository.create(Path(args.workspace).absolute(), args.library, args.question, args.analysis, protocol,
-                                       "source-tree-sha256:" + manifest["sha256"])
+                                       STUDY_BUNDLE_PREFIX + bundle["sha256"])
         record_implementation(repo, manifest)
+        record_study_bundle(repo, args.analysis, bundle)
         return repo.status()
     repo = repository(args)
     if name == "status":
@@ -208,11 +215,16 @@ def command(args):
     if name == "snapshot":
         return repo.library.snapshot(args.output)
     if name == "branch":
-        from .corpus_export import implementation_manifest, record_implementation
+        from .corpus_export import STUDY_BUNDLE_PREFIX, implementation_manifest, record_implementation, record_study_bundle, study_bundle
+        protocol = json.loads(Path(args.protocol).read_text())
         manifest = implementation_manifest()
-        result = repo.library.branch(args.output, args.question, args.analysis, json.loads(Path(args.protocol).read_text()),
-                                     "source-tree-sha256:" + manifest["sha256"])
-        record_implementation(CorpusRepository(repo.workspace.root, args.output), manifest)
+        parent = repo.library.verify(require_snapshot=True, level="light")
+        bundle = study_bundle(protocol, study_prompt=_study_prompt(args), manifest=manifest,
+                              dataset_versions={"parentSnapshot": parent.get("merkle_root") or parent["manifest_sha256"]})
+        result = repo.library.branch(args.output, args.question, args.analysis, protocol, STUDY_BUNDLE_PREFIX + bundle["sha256"])
+        branch = CorpusRepository(repo.workspace.root, args.output)
+        record_implementation(branch, manifest)
+        record_study_bundle(branch, args.analysis, bundle)
         return result
     if name == "import-manifest":
         from .corpus_ingest import import_manifest

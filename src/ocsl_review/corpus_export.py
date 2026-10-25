@@ -62,6 +62,83 @@ def implementation_manifest():
     return {"format": "ocsl-corpus-implementation-v1", "files": records, "sha256": identity(records)}
 
 
+# Instruments the corpus executor judges with; a study bundle pins their registry digests.
+EXECUTOR_INSTRUMENTS = ("citation-support@2",)
+STUDY_BUNDLE_PREFIX = "study-bundle-sha256:"
+SOURCE_TREE_PREFIX = "source-tree-sha256:"
+
+
+def package_tags(manifest=None):
+    """Package version and source-tree digest: provenance of a pin, never compared at dispatch."""
+    try:
+        version = importlib.metadata.version("ocsl-review")
+    except importlib.metadata.PackageNotFoundError:
+        import tomllib
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        version = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    return {"ocsl-review": version, "source-tree-sha256": (manifest or implementation_manifest())["sha256"]}
+
+
+def study_bundle(protocol, *, study_prompt=b"", dataset_versions=None, manifest=None):
+    """The study-bundle pin of a new analysis: protocol, study prompt, instrument digests, datasets, packages.
+
+    Execution code is outside the pin, so executor fixes never force a new analysis;
+    the code that served each call is recorded per receipt instead.
+    """
+    from .instruments import load, study_bundle_digest
+    return study_bundle_digest(protocol=protocol, study_prompt=study_prompt,
+                               instruments={instrument: load(instrument).digest for instrument in EXECUTOR_INSTRUMENTS},
+                               dataset_versions=dataset_versions or {}, package_tags=package_tags(manifest))
+
+
+def record_study_bundle(repo, analysis_id, bundle):
+    digest = repo.json_artifact(bundle, "study-bundle")
+    with repo.connect(write=True) as connection:
+        connection.execute("INSERT OR IGNORE INTO processing_state VALUES (?,?,?,'completed',0,?,?)",
+                           (analysis_id, "study-bundle", "pin", canonical({**bundle, "artifactSha256": digest}), now()))
+    return digest
+
+
+def pinned_study_bundle(repo, analysis):
+    """The recorded bundle behind a study-bundle pin (calibration and validation variants use their parent's)."""
+    from .errors import ValidationError
+    from .instruments import canonical as bundle_canonical, sha256_bytes
+    expected = analysis["code_revision"][len(STUDY_BUNDLE_PREFIX):]
+    current, seen, row = analysis, set(), None
+    while current is not None and current["analysis_id"] not in seen:
+        seen.add(current["analysis_id"])
+        with repo.connect() as connection:
+            row = connection.execute("SELECT checkpoint_json FROM processing_state WHERE analysis_id=? AND "
+                                     "task_key='study-bundle' AND phase='pin'", (current["analysis_id"],)).fetchone()
+        if row is not None:
+            break
+        parent = current["protocol"].get("parentAnalysisId")
+        current = repo.analysis(parent) if isinstance(parent, str) and parent else None
+    if row is None:
+        raise ValidationError("the analysis's study bundle is not recorded; branch a new analysis")
+    bundle = json.loads(row[0])
+    bundle.pop("artifactSha256", None)
+    record = {key: value for key, value in bundle.items() if key != "sha256"}
+    if bundle.get("sha256") != expected or sha256_bytes(bundle_canonical(record).encode("utf-8")) != expected:
+        raise ValidationError("the recorded study bundle differs from the analysis pin")
+    return bundle
+
+
+def check_study_bundle(repo, analysis):
+    """Refuse dispatch when an instrument the analysis pinned has changed (prompt, schema or validator)."""
+    from .errors import ValidationError
+    from .instruments import load
+    bundle = pinned_study_bundle(repo, analysis)
+    for instrument in EXECUTOR_INSTRUMENTS:
+        try:
+            current = load(instrument).digest
+        except ValidationError as error:
+            raise ValidationError(f"instrument {instrument} no longer verifies; branch a new analysis ({error})") from None
+        if bundle["instruments"].get(instrument) != current:
+            raise ValidationError(f"instrument {instrument} changed since the analysis was pinned; branch a new analysis")
+    return bundle
+
+
 def record_implementation(repo, manifest=None):
     manifest = manifest or implementation_manifest()
     home = Path(__file__).resolve().parents[2]

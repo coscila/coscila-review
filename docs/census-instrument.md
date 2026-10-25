@@ -34,7 +34,9 @@ equivalence gate between instruments are deferred.
 
 `instruments.study_bundle_digest` pins a study by its protocol, study prompt,
 template, instrument digests, dataset versions and package tags; the code tag
-of every call is recorded in its receipt.
+of every call is recorded in its receipt. `ocsl-review corpus init` and
+`corpus branch` pin new corpus analyses this way (see
+[corpus review](corpus-review.md)).
 
 ## citation-census@1
 

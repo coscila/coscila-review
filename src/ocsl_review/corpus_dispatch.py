@@ -166,6 +166,8 @@ class CorpusExecutor:
         self.validator = AssessmentValidator()
         self.analysis = repo.analysis(analysis_id)["analysis_id"]
         self._batches = {}
+        self._code_tag = None
+        self._bundle_checked = None
 
     def _catalog_worker(self, worker_id):
         catalog = self.broker.catalog()
@@ -174,12 +176,27 @@ class CorpusExecutor:
             raise ValidationError("select a configured bulk worker")
         return catalog, workers[0]
 
+    @property
+    def code_tag(self):
+        """The code that serves this executor's calls, recorded on every receipt."""
+        if self._code_tag is None:
+            from .corpus_export import SOURCE_TREE_PREFIX, implementation_manifest
+            self._code_tag = SOURCE_TREE_PREFIX + implementation_manifest()["sha256"]
+        return self._code_tag
+
     def _pin(self, catalog, worker, tier, batch_size):
         # Capacity may change; the scientific model, prompt and schema may not.
-        revision = self.repo.analysis(self.analysis)["code_revision"]
-        if revision and revision.startswith("source-tree-sha256:"):
-            from .corpus_export import implementation_manifest
-            if revision != "source-tree-sha256:" + implementation_manifest()["sha256"]:
+        analysis = self.repo.analysis(self.analysis)
+        revision = analysis["code_revision"] or ""
+        from .corpus_export import SOURCE_TREE_PREFIX, STUDY_BUNDLE_PREFIX, check_study_bundle
+        if revision.startswith(STUDY_BUNDLE_PREFIX):
+            # A study-bundle pin covers the instruments, not execution code (checked once per executor).
+            if self._bundle_checked != revision:
+                check_study_bundle(self.repo, analysis)
+                self._bundle_checked = revision
+        elif revision.startswith(SOURCE_TREE_PREFIX):
+            # Analyses pinned to the whole source tree keep the old check.
+            if revision != self.code_tag:
                 raise ValidationError("implementation changed; branch a new analysis with the current code")
         scientific = {k: v for k, v in worker.items() if k != "bulkConcurrencyLimit"}
         pin = {"worker": scientific, "revision": catalog["revision"],
@@ -419,7 +436,8 @@ class CorpusExecutor:
                 receipt_rows.append((
                     receipt_id, self.analysis, record["id"], batch["input_sha256"], receipt_sha,
                     record.get("providerId") or "unrecorded", record.get("model") or "unrecorded",
-                    canonical({"worker": context["worker"], "promptSha256": record.get("promptSha256"), "batchId": batch["batch_id"], "jobId": batch["job_id"]}),
+                    canonical({"worker": context["worker"], "promptSha256": record.get("promptSha256"), "batchId": batch["batch_id"],
+                               "jobId": batch["job_id"], "codeTag": self.code_tag}),
                     canonical(record.get("usage") or {}), "completed" if accepted else "failed", batch["created_at"], now()))
                 for task in tasks:
                     task_id = task["task_id"]
