@@ -252,6 +252,26 @@ class CorpusDispatchTests(unittest.TestCase):
         self.assertEqual({self.states()[task] for task in tasks}, {("completed", 1)})
         self.assertEqual(self.executor.in_flight(), 0)
 
+    def test_request_bound_splits_jobs_exactly_where_the_canonical_group_list_overflows(self):
+        from ocsl_review.corpus_store import identity
+        for name, slack, expected in (("exact", 0, [3, 2]), ("short", -1, [2, 2, 1])):
+            with self.subTest(bound=name):
+                executor = self.add_analysis(name)
+                self.add_tasks(5, name)
+                tasks = self.repo.tasks(name, state="pending")
+                groups = [{"id": "item-" + identity([t["task_id"]], [0]),
+                           "input": {"messages": build_messages([t["spec"]], "abstract")},
+                           "taskIds": [t["task_id"]]} for t in tasks]
+                bound = len(canonical(groups[:3]).encode()) + slack
+                with patch("ocsl_review.corpus_dispatch.MAX_REQUEST_GROUP_BYTES", bound):
+                    jobs = executor.submit("w1")["submitted"]
+                self.assertEqual([j["tasks"] for j in jobs], expected)
+        with patch("ocsl_review.corpus_dispatch.MAX_REQUEST_GROUP_BYTES", 10):
+            tiny = self.add_analysis("tiny")
+            self.add_tasks(1, "tiny")
+            with self.assertRaisesRegex(ValidationError, "exceeds the broker request bound"):
+                tiny.submit("w1")
+
     def write_statements(self):
         """Statements per write connection, to count page transactions."""
         transactions, original = [], CorpusRepository.connect
