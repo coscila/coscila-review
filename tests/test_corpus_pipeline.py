@@ -425,6 +425,33 @@ class PlannerEquivalenceTests(unittest.TestCase):
         self.assertFalse(task["spec"]["complete"])
         self.assertEqual(sum(len(unit["text"]) for unit in task["spec"]["evidenceUnits"]), 1000)
 
+    def test_branch_plans_its_own_and_its_parent_loci_once_like_the_frozen_planner(self):
+        # A delta branch has no rowid on its union views; the planner pages each physical source.
+        self.repo.library.snapshot("results/snapshot")
+        CorpusRepository(self.root, "results/snapshot").library.branch("work/fork", "Fork question", "fork", {"v": 2})
+        fork = CorpusRepository(self.root, "work/fork")
+        with fork.connect(write=True) as connection:
+            connection.executemany("INSERT INTO claim_loci VALUES (?,?,?,?,?,?,?)", [
+                (f"fork-locus-{n}", "e1", self.manuscript, f"fork-locator-{n}",
+                 f"Fork claim {n}: randomised patients outcome.", canonical([f"Fork context {n}."]), "fixture")
+                for n in range(3)])
+            # Copy-on-write: the branch's version of a parent locus must hide the parent's row.
+            connection.execute("UPDATE claim_loci SET claim_text='Revised claim: randomised patients outcome.' "
+                               "WHERE locus_id=?", (self.loci[4],))
+        expected = reference_plan(fork)
+        self.assertEqual(len(expected), len(self.loci) + 3)
+        with patch.object(corpus_pipeline, "PLANNER_PAGE_ROWS", 2):
+            result = prepare_tasks(fork)
+        with fork.connect() as connection:
+            rows = [dict(row) for row in connection.execute("SELECT * FROM corpus_tasks WHERE analysis_id='fork'")]
+        self.assertEqual(result["tasks"], len(expected))
+        self.assertEqual({row["locus_id"]: (row["task_id"], row["reason"]) for row in rows}, expected)
+        self.assertEqual(len(rows), len(expected), "every locus is planned exactly once")
+        self.assertEqual(prepare_tasks(fork)["tasks"], sum(1 for _, reason in expected.values() if reason))
+        sources = fork.library.keyset_sources("claim_loci", "l")
+        self.assertEqual(len(sources), 2)
+        self.assertEqual(self.repo.library.keyset_sources("claim_loci", "l"), [("claim_loci AS l", "l.rowid", "")])
+
 
 class EscalationFetchTests(unittest.TestCase):
     def setUp(self):

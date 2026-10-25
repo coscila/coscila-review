@@ -309,6 +309,24 @@ class Library:
             return self.overlay.ordered(table, alias)
         return table, (f"{alias}." if alias else "") + "rowid"
 
+    def keyset_sources(self, table, alias):
+        """[(FROM source, rowid expression, extra condition)] that cover a table's rows once each.
+
+        Keyset pages advance by rowid, which a branch's union view does not have: a
+        branch pages its own rows first, then the parent snapshot's rows it does not
+        override, each through its physical table's rowid.
+        """
+        spec = self.overlay.tables.get(table) if self.overlay is not None else None
+        if spec is None or not spec.shared or not spec.rowid:
+            return [(f"{table} AS {alias}", f"{alias}.rowid", "")]
+        own = f"main.{quote(spec.physical)}"
+        hidden = ""
+        if spec.key:
+            match = " AND ".join(f"d.{quote(c)}={alias}.{quote(c)}" for c in spec.key)
+            hidden = f" AND NOT EXISTS (SELECT 1 FROM {own} AS d WHERE {match})"
+        return [(f"{own} AS {alias}", f"{alias}.rowid", ""),
+                (f"{PARENT}.{quote(table)} AS {alias}", f"{alias}.rowid", hidden)]
+
     # ------------------------------------------------------------------ blobs
     def _loose(self, digest):
         if not SHA256.fullmatch(digest):
