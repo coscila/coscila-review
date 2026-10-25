@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import http.client
-import ipaddress
 import json
 import os
 import re
@@ -167,6 +166,22 @@ def _payload_digest(value: Any) -> str:
                        (value.decode("utf-8", "replace") if isinstance(value, bytes) else value))
 
 
+def normalize_endpoint(url: str) -> tuple[str, str, int, str]:
+    """(scheme, host, port, path) of an http(s) endpoint; the comparison form of the on-prem allow-list."""
+    parsed = urllib.parse.urlsplit(str(url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValidationError(f"an endpoint must be an http(s) URL with a host: {url!r}")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValidationError("an endpoint carries no credentials, query or fragment")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return parsed.scheme, parsed.hostname.lower(), port, parsed.path or "/"
+
+
+def endpoint_text(endpoint: tuple[str, str, int, str]) -> str:
+    scheme, host, port, path = endpoint
+    return f"{scheme}://{'[' + host + ']' if ':' in host else host}:{port}{path}"
+
+
 @dataclass(frozen=True)
 class ConfidentialPolicy:
     """Operator-managed egress policy for one screen run; its digest is recorded with the run.
@@ -174,11 +189,15 @@ class ConfidentialPolicy:
     ``confidential-manuscript``: only identifiers (DOI, PMID, PMCID) may reach external
     providers, and only an on-prem judge may receive manuscript or cited text.
     ``public-literature``: the manuscript is public; providers and judges are still recorded.
+
+    On-prem judges are named explicitly: ``on_prem_endpoints`` lists each endpoint (scheme, host, port
+    and path, a path ending in ``/`` covering what lies below it), optionally with the served models it
+    may answer with. An address alone never makes a judge on-prem: a loopback or private-network
+    relay can forward to a hosted service. The list is empty by default.
     """
 
     mode: str = "confidential-manuscript"
-    on_prem_hosts: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
-    allow_private_networks: bool = True
+    on_prem_endpoints: tuple[tuple[tuple[str, str, int, str], frozenset[str]], ...] = ()
     provider_hosts: frozenset[str] = frozenset({"doi.org", "api.crossref.org", "www.ebi.ac.uk",
                                                  "eutils.ncbi.nlm.nih.gov"})
 
@@ -193,29 +212,38 @@ class ConfidentialPolicy:
         return self.mode == "confidential-manuscript"
 
     def record(self) -> dict[str, Any]:
-        return {"policy": "claim-check-egress", "version": 1, "mode": self.mode,
-                "onPremHosts": sorted(self.on_prem_hosts), "allowPrivateNetworks": self.allow_private_networks,
+        return {"policy": "claim-check-egress", "version": 2, "mode": self.mode,
+                "onPremEndpoints": [{"url": endpoint_text(endpoint), "models": sorted(models)}
+                                    for endpoint, models in self.on_prem_endpoints],
                 "providerHosts": sorted(self.provider_hosts)}
 
     @property
     def digest(self) -> str:
         return sha256_text(canonical(self.record()))
 
+    def with_mode(self, mode: str) -> ConfidentialPolicy:
+        return ConfidentialPolicy(mode, self.on_prem_endpoints, self.provider_hosts)
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> ConfidentialPolicy:
-        known = {"policy", "version", "mode", "onPremHosts", "allowPrivateNetworks", "providerHosts"}
+        known = {"policy", "version", "mode", "onPremEndpoints", "providerHosts"}
+        if value.get("version") == 1 or "onPremHosts" in value or "allowPrivateNetworks" in value:
+            raise ValidationError("policy version 1 inferred on-prem judges from their address; list every on-prem "
+                                  "judge endpoint in onPremEndpoints (version 2)")
         if set(value) - known:
             raise ValidationError(f"unknown policy fields: {sorted(set(value) - known)}")
-        if value.get("policy", "claim-check-egress") != "claim-check-egress" or value.get("version", 1) != 1:
+        if value.get("policy", "claim-check-egress") != "claim-check-egress" or value.get("version", 2) != 2:
             raise ValidationError("unsupported claim-check policy")
-        hosts = value.get("onPremHosts", sorted(cls.on_prem_hosts))
         providers = value.get("providerHosts", sorted(cls.provider_hosts))
-        if not all(isinstance(item, str) and item for item in [*hosts, *providers]):
+        if not all(isinstance(item, str) and item for item in providers):
             raise ValidationError("policy host lists must contain non-empty strings")
-        private = value.get("allowPrivateNetworks", True)
-        if not isinstance(private, bool):
-            raise ValidationError("allowPrivateNetworks must be boolean")
-        return cls(str(value.get("mode", "confidential-manuscript")), frozenset(h.lower() for h in hosts), private,
+        endpoints = []
+        for item in value.get("onPremEndpoints", []):
+            url, models = (item, []) if isinstance(item, str) else (item.get("url"), item.get("models", []))
+            if not isinstance(models, list) or not all(isinstance(model, str) and model for model in models):
+                raise ValidationError("onPremEndpoints models must be a list of model names")
+            endpoints.append((normalize_endpoint(url), frozenset(models)))
+        return cls(str(value.get("mode", "confidential-manuscript")), tuple(sorted(endpoints, key=lambda e: e[0])),
                    frozenset(h.lower() for h in providers))
 
     @classmethod
@@ -238,15 +266,27 @@ class ConfidentialPolicy:
         return EgressPlan(confidential=True, allow_sanitized_queries=False) if self.confidential else \
             EgressPlan(confidential=False)
 
-    def host_is_on_prem(self, host: str) -> bool:
-        host = (host or "").strip("[]").lower()
-        if host in self.on_prem_hosts:
-            return True
+    def endpoint_entry(self, url: str) -> frozenset[str] | None:
+        """The allowed models of the allow-list entry covering ``url`` (empty set: any model), or None."""
         try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
+            scheme, host, port, path = normalize_endpoint(url)
+        except ValidationError:
+            return None
+        for (e_scheme, e_host, e_port, e_path), models in self.on_prem_endpoints:
+            if (scheme, host, port) == (e_scheme, e_host, e_port) and (
+                    path == e_path or (e_path.endswith("/") and path.startswith(e_path))):
+                return models
+        return None
+
+    def endpoint_on_prem(self, url: str) -> bool:
+        return self.endpoint_entry(url) is not None
+
+    def _on_prem(self, judge: Any) -> bool:
+        if getattr(judge, "location", "") != "on-prem":
             return False
-        return address.is_loopback or (self.allow_private_networks and address.is_private)
+        endpoint = getattr(judge, "endpoint", None)
+        # A judge without a network endpoint runs in this process (a local model, a test).
+        return endpoint is None or self.endpoint_on_prem(endpoint)
 
     def authorize_provider(self, ledger: EgressLedger | None, provider: str, operation: str,
                            arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -277,17 +317,26 @@ class ConfidentialPolicy:
 
         if not self.confidential:
             return True
-        return getattr(judge, "location", "") == "on-prem" and self.host_is_on_prem(getattr(judge, "host", ""))
+        return self._on_prem(judge)
+
+    def served_model_allowed(self, judge: Any, served: str | None) -> bool:
+        """Whether the model an on-prem endpoint answered with is one its allow-list entry names (if it names any)."""
+        endpoint = getattr(judge, "endpoint", None)
+        if not self.confidential or endpoint is None:
+            return True
+        models = self.endpoint_entry(endpoint)
+        return models is not None and (not models or served in models)
 
     def authorize_model(self, ledger: EgressLedger | None, judge: Any, *, payload_sha256: str, items: int) -> dict[str, Any]:
         """Manuscript and cited text may reach only an on-prem judge in confidential mode."""
 
-        on_prem = getattr(judge, "location", "") == "on-prem" and self.host_is_on_prem(getattr(judge, "host", ""))
+        on_prem = self._on_prem(judge)
         destination_class = "on-prem-model" if on_prem else "external-model"
-        event = {"destination": f"{getattr(judge, 'name', 'judge')}@{getattr(judge, 'host', '')}",
+        endpoint = getattr(judge, "endpoint", None)
+        event = {"destination": endpoint or f"in-process:{getattr(judge, 'name', 'judge')}",
                  "destinationClass": destination_class, "operation": TASK, "argumentNames": ["messages"],
                  "payloadSha256": payload_sha256, "items": items, "contentClass": "manuscript-and-cited-text",
-                 "policyDigest": self.digest}
+                 "requestedModel": getattr(judge, "model", ""), "policyDigest": self.digest}
         if self.confidential and not on_prem:
             if ledger is not None:
                 ledger.append(**event, decision="refused")
@@ -381,6 +430,7 @@ class HttpJudge:
             raise ValidationError("judge URL must be http(s) with a host")
         self.url, self.model, self.location = url, model, location
         self.host = parsed.hostname
+        self.endpoint = endpoint_text(normalize_endpoint(url))
         self.name = name or f"http-judge:{parsed.hostname}"
         self.timeout = timeout
         self.headers = dict(headers or {})
@@ -825,6 +875,7 @@ def _receipt(connection: sqlite3.Connection, context: CheckContext, task_key: st
     connection.execute("INSERT INTO model_receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
         receipt_id, context.analysis_id, task_key, request_sha, response_sha, getattr(judge, "name", "judge"), served,
         canonical({**settings, "location": getattr(judge, "location", ""), "host": getattr(judge, "host", ""),
+                   "endpoint": getattr(judge, "endpoint", None),
                    "instrumentDigest": instrument_digest(context.definition), **extra}),
         canonical(dict(usage)), outcome, started, now()))
     return receipt_id
@@ -876,6 +927,20 @@ def judge_tasks(connection: sqlite3.Connection, context: CheckContext, planned: 
                     summary["failedCalls"] += 1
                     for task_id in pending:
                         outcomes[task_id] = ("rejected", {"code": "transport_failure", "message": type(error).__name__}, receipt_id)
+                    break
+                if not context.policy.served_model_allowed(judge, response.model):
+                    # The endpoint answered with a model its allow-list entry does not name: no verdict is used.
+                    receipt_id = _receipt(connection, context, task_key, request, response.text.encode("utf-8"), judge,
+                                          response.model, settings, response.usage, "failed", started,
+                                          {"error": "served-model-not-allowed"})
+                    context.ledger.append(destination=getattr(judge, "endpoint", None), destinationClass="on-prem-model",
+                                          operation=TASK, decision="response-refused", argumentNames=["messages"],
+                                          payloadSha256=sha256_bytes(request), servedModel=response.model,
+                                          policyDigest=context.policy.digest)
+                    summary["failedCalls"] += 1
+                    for task_id in pending:
+                        outcomes[task_id] = ("rejected", {"code": "served_model_not_allowed",
+                                                          "message": str(response.model)[:120]}, receipt_id)
                     break
                 receipt_id = _receipt(connection, context, task_key, request, response.text.encode("utf-8"), judge,
                                       response.model, settings, response.usage, "completed", started,

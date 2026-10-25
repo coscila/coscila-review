@@ -178,6 +178,21 @@ class CommandLineTests(RunnerTestCase):
         with self.assertRaisesRegex(ValidationError, "does not continue this input"):
             fill_abstracts(source, output, get)
 
+    def test_on_premises_needs_a_policy_that_lists_the_judge(self):
+        from ocsl_review.errors import ConfidentialityError
+        from ocsl_review.study_cli import _transport
+        import argparse
+        args = argparse.Namespace(base_url=self.base, api_key_env=None, on_premises=True, policy=None)
+        with self.assertRaisesRegex(ConfidentialityError, "needs --policy"):
+            _transport(args)
+        policy = self.root / "policy.json"
+        policy.write_text(json.dumps({"version": 2, "onPremEndpoints": ["http://127.0.0.1:1/v1/chat/completions"]}))
+        with self.assertRaisesRegex(ConfidentialityError, "not an on-prem endpoint"):
+            _transport(argparse.Namespace(**{**vars(args), "policy": str(policy)}))
+        policy.write_text(json.dumps({"version": 2, "onPremEndpoints": [self.base + "/"]}))
+        self.assertTrue(_transport(argparse.Namespace(**{**vars(args), "policy": str(policy)})).on_premises)
+        self.assertFalse(_transport(argparse.Namespace(**{**vars(args), "on_premises": False})).on_premises)
+
     def test_cross_validate_command(self):
         buffer = io.StringIO()
         with redirect_stdout(buffer):
