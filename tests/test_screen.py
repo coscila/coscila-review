@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ocsl_review.claim_check import ConfidentialPolicy, EgressLedger, FunctionJudge, JudgeResponse, PolicyTransport
 from ocsl_review.cli import main
+from ocsl_review.confidentiality import read_egress_events, verify_egress_ledger
 from ocsl_review.errors import ConfidentialityError
 from ocsl_review.integrity import RetractionWatchDataset
 from ocsl_review.retrieval import load_store
@@ -127,6 +128,36 @@ class ConfidentialEgressAcceptanceTests(unittest.TestCase):
             self.assertFalse(_grams(json.dumps(event)) & manuscript_grams)
         self.assertEqual({"registered"}, {item["registry"] for item in report["references"]})
         self.assertEqual({"no-notice-found"}, {item["status"]["state"] for item in report["references"]})
+
+    def test_a_screen_in_a_workspace_records_every_decision_in_the_workspace_ledger_too(self):
+        records = {work["identifiers"]["doi"]: F.crossref_message(work["identifiers"]["doi"], work["title"],
+                                                                   [("Ann", "Rivers")], work["year"]) for work in F.ATTRIBUTION_WORKS}
+        scholarly, registry, judge = F.OfflineScholarlyTransport(records), F.FakeRegistry(), F.QuoteJudge()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            path = root / "draft.md"
+            path.write_text(F.attribution_markdown(), encoding="utf-8")
+            run_screen(path, run_root=root / "run", works=load_store(F.write_store(root / "store.jsonl")), judge=judge,
+                       policy=ConfidentialPolicy(), offline=False, registry_transport=registry,
+                       scholarly_transport=scholarly, reference_year=2026, scholarly_workspace=workspace)
+            run_events = EgressLedger(root / "run" / "egress.jsonl").events()
+            workspace_events = read_egress_events(workspace)
+            self.assertEqual(verify_egress_ledger(workspace)["chainedEvents"], len(workspace_events))
+            source = path.read_text(encoding="utf-8")
+        mirrored = {event["runLedgerSha256"]: event for event in workspace_events if event.get("source") == "claim-check@1"}
+        expected = [event for event in run_events if not (event["operation"] == "http-get" and event["decision"] == "allowed")]
+        self.assertEqual(sorted(mirrored), sorted(event["hash"] for event in expected))
+        models = [event for event in mirrored.values() if event["destinationClass"] == "on-prem-model"]
+        self.assertEqual(len(models), len(judge.calls))
+        self.assertTrue(any(event["operation"] == "doi_registry_check" for event in mirrored.values()))
+        # Provider fetches are recorded once, by the scholarly client, not again from the run ledger.
+        self.assertFalse(any(event.get("operation") == "http-get" and event.get("decision") == "allowed"
+                             for event in workspace_events))
+        self.assertTrue(any("source" not in event for event in workspace_events))
+        for event in workspace_events:
+            self.assertFalse(_grams(json.dumps(event)) & _grams(source))
 
     def test_an_external_judge_is_refused_before_any_call(self):
         calls = []

@@ -36,7 +36,7 @@ from typing import Any, Protocol
 
 from .author_year import RESOLVER_VERSION
 from .claim_inventory import _claim_type, _origin, citation_requirement
-from .confidentiality import IDENTIFIER_PATTERNS, EgressPlan, authorize_egress
+from .confidentiality import IDENTIFIER_PATTERNS, EgressPlan, append_egress_event, authorize_egress
 from .corpus_assessment import (
     MAX_BATCH_ITEMS,
     PROMPT_PATH,
@@ -108,11 +108,19 @@ def judge_settings(items: int) -> dict[str, Any]:
 # Egress ledger and confidential policy -----------------------------------------------------
 
 class EgressLedger:
-    """Append-only JSON Lines with a per-event hash chain; records names and digests only."""
+    """Append-only JSON Lines with a per-event hash chain; records names and digests only.
 
-    def __init__(self, path: Path):
+    The run ledger travels with the run. With a ``workspace``, every decision is also
+    appended to that workspace's egress ledger (confidentiality.append_egress_event),
+    linked by the run record's hash, so the workspace record of what left it is
+    complete; allowed provider fetches are already recorded there by the scholarly
+    client and are not repeated.
+    """
+
+    def __init__(self, path: Path, *, workspace: Path | None = None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.workspace = Path(workspace) if workspace is not None else None
         self._last = "0" * 64
         self._seq = 0
         if self.path.exists():
@@ -131,6 +139,15 @@ class EgressLedger:
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(canonical(record) + "\n")
         self._last, self._seq = record["hash"], record["seq"]
+        if self.workspace is not None and not (record.get("operation") == "http-get"
+                                               and record.get("decision") == "allowed"):
+            append_egress_event(self.workspace, {
+                "timestamp": record["at"], "provider": record.get("destination"), "operation": record.get("operation"),
+                "decision": record.get("decision"), "argumentNames": record.get("argumentNames", []),
+                "payloadSha256": record.get("payloadSha256"),
+                **{key: record[key] for key in ("destinationClass", "contentClass", "items", "policyDigest")
+                   if key in record},
+                "source": TASK, "runLedgerSha256": record["hash"]})
         return record
 
     def verify(self) -> dict[str, Any]:

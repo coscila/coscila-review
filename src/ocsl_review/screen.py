@@ -99,7 +99,7 @@ def run_screen(manuscript_path: Path, *, run_root: Path, works: Sequence[Work], 
     original = manuscript_path.read_bytes()
     cleaned, document_removals, limitations = sanitize_document(original, suffix)
     store = RunStore(run_root, create=True)
-    ledger = EgressLedger(store.root / "egress.jsonl")
+    ledger = EgressLedger(store.root / "egress.jsonl", workspace=scholarly_workspace)
     if judge is not None and not policy.judge_allowed(judge):
         # Refuse before any manuscript text is read into a prompt; the refusal is recorded.
         policy.authorize_model(ledger, judge, payload_sha256=sha256_bytes(b""), items=0)
