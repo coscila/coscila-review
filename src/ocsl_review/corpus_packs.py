@@ -44,6 +44,7 @@ PACK_NAME = re.compile(r"pack-[0-9a-f]{32}\.pack")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 CHUNK = 1024 * 1024
 STREAM_THRESHOLD = 64 * CHUNK  # larger files are streamed into a pack instead of read whole
+BATCH_ROWS = 100000  # a batch also flushes after this many blobs, bounding its pending rows
 
 INDEX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS packs (
@@ -565,7 +566,7 @@ class _Writer:
             self.store._pending[sha256] = location
         self.pack[3], self.pack[4] = end + record_length, count + 1
         self.dirty.add(pack_id)
-        if not self.deferred:
+        if not self.deferred or len(self.rows) >= BATCH_ROWS:
             self.flush()
         if self.pack[3] >= self.store.target_bytes:
             self.flush()
@@ -576,10 +577,13 @@ class _Writer:
         if self.pack is not None and self.dirty:
             os.fsync(self.pack[2])
         if self.rows or self.dirty:
+            before = self.connection.total_changes
+            self.connection.executemany("INSERT OR IGNORE INTO blobs VALUES (?,?,?,?,?,?)", self.rows)
             if self.pack is not None:
+                # A duplicate append stays an unindexed record; blob_count counts indexed blobs only.
+                self.pack[4] -= len(self.rows) - (self.connection.total_changes - before)
                 pack_id, _, _, end, count = self.pack
                 self.connection.execute("UPDATE packs SET byte_count=?,blob_count=? WHERE id=?", (end, count, pack_id))
-            self.connection.executemany("INSERT OR IGNORE INTO blobs VALUES (?,?,?,?,?,?)", self.rows)
             self.connection.commit()
             with self.store._state:
                 for row in self.rows:

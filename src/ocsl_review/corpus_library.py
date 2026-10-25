@@ -239,11 +239,19 @@ class Library:
 
     # ------------------------------------------------------------ connections
     def open(self, *, write=False, timeout=5.0):
-        """A connection whose unqualified table names see the whole library."""
-        connection = sqlite3.connect(self.db.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True,
-                                     timeout=timeout)
+        """A connection whose unqualified table names see the whole library.
+
+        Sealed snapshots (no journal sidecars, checked by verification) are read
+        immutable, which also works on read-only dataset mounts.
+        """
+        mode = "rw" if write else ("ro&immutable=1" if self.is_snapshot else "ro")
+        connection = sqlite3.connect(self.db.as_uri() + "?mode=" + mode, uri=True, timeout=timeout)
         if self.overlay is not None:
-            self.overlay.attach(connection)
+            try:
+                self.overlay.attach(connection)
+            except BaseException:
+                connection.close()
+                raise
         return connection
 
     @contextmanager
