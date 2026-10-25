@@ -72,7 +72,8 @@ class ReferenceLibraryTests(unittest.TestCase):
         branch = library.Library(self.workspace, "work/new-question")
         self.assertEqual(result["parent_manifest_sha256"], saved["manifest_sha256"])
         self.assertEqual(list((branch.root / "sources").iterdir()), [])
-        self.assertLess(branch.db.stat().st_size, parent.db.stat().st_size + 1)
+        with contextlib.closing(sqlite3.connect(branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
+            self.assertEqual(raw.execute("SELECT count(*) FROM ocsl_delta_works").fetchone()[0], 0)
         self.assertEqual(branch.verify()["counts"]["analyses"], 2)
         conn = branch.open(write=True)
         try:

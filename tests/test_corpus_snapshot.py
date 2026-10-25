@@ -148,8 +148,9 @@ class BranchTests(unittest.TestCase):
 
     def test_branch_reads_the_parent_through_attach_without_copying_it(self):
         with contextlib.closing(sqlite3.connect(self.branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
-            self.assertEqual(raw.execute("SELECT count(*) FROM works").fetchone()[0], 0)
-            self.assertEqual(raw.execute("SELECT count(*) FROM analyses").fetchone()[0], 1)
+            # The branch database holds only its own rows, in prefixed tables.
+            self.assertEqual(raw.execute("SELECT count(*) FROM ocsl_delta_works").fetchone()[0], 0)
+            self.assertEqual(raw.execute("SELECT count(*) FROM ocsl_delta_analyses").fetchone()[0], 1)
         self.assertEqual(self.branch.status()["counts"]["works"], 3)
         self.assertEqual({row["analysis_id"] for row in self.branch.library.verify()["analyses"]}, {"first", "second"})
         self.assertEqual(self.branch.analysis()["analysis_id"], "second")
@@ -172,7 +173,7 @@ class BranchTests(unittest.TestCase):
                              "Fixture work w0")
             self.assertIsNone(connection.execute("SELECT 1 FROM works WHERE work_id=?", (new,)).fetchone())
         with contextlib.closing(sqlite3.connect(self.branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
-            self.assertEqual(raw.execute("SELECT count(*) FROM works").fetchone()[0], 2)
+            self.assertEqual(raw.execute("SELECT count(*) FROM ocsl_delta_works").fetchone()[0], 2)
         with self.assertRaisesRegex(sqlite3.IntegrityError, "parent snapshot are immutable"):
             with self.branch.connect(write=True) as connection:
                 connection.execute("DELETE FROM works WHERE work_id=?", (self.works[1],))
@@ -192,7 +193,7 @@ class BranchTests(unittest.TestCase):
     def test_verification_resolves_references_over_parent_and_branch(self):
         with contextlib.closing(sqlite3.connect(self.branch.db)) as raw, raw:
             # Bypass the branch triggers: verification must still find the dangling reference.
-            raw.execute("INSERT INTO work_identifiers VALUES ('nowhere','doi','10.1/x',?)", ("0" * 64,))
+            raw.execute("INSERT INTO ocsl_delta_work_identifiers VALUES ('nowhere','doi','10.1/x',?)", ("0" * 64,))
         with self.assertRaisesRegex(ValueError, "foreign key"):
             self.branch.library.verify()
 

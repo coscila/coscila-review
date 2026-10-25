@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """A delta database over an immutable parent snapshot (Python stdlib).
 
-A branch keeps only its own rows. Each connection ATTACHes the parent database
-read-only and immutable and shadows the shared tables with TEMP views: reads
-see the branch's rows and every parent row the branch does not override.
-INSTEAD OF triggers send writes to the branch; updating a parent row first
-copies it into the branch (copy-on-write) so the branch's own triggers still
-enforce append-only tables, and parent rows cannot be deleted. Analysis queue
-tables stay branch-local. SQLite cannot enforce foreign keys across databases,
-so branch connections disable them and TEMP triggers check every declared
-reference of an inserted or updated row against the union instead;
-verification repeats that check for all branch rows.
+A branch keeps only its own rows. Its database holds the shared corpus tables
+under a prefix (``ocsl_delta_<table>``) and the analysis queue tables under
+their own names. Each connection ATTACHes the parent database read-only and
+immutable and creates TEMP views under the shared tables' names: reads see the
+branch's rows and every parent row the branch does not override. INSTEAD OF
+triggers send writes to the branch tables (whose prefix lets trigger bodies
+name them unqualified, which every SQLite version accepts); updating a parent
+row first copies it into the branch (copy-on-write) so the branch's own
+triggers still enforce append-only tables, and parent rows cannot be deleted.
+
+SQLite cannot enforce foreign keys across databases, so branch connections
+disable them and TEMP triggers check every declared reference of an inserted
+or updated row against the union instead; verification repeats that check for
+all branch rows.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ import sqlite3
 
 
 PARENT = "ocsl_parent"
+PREFIX = "ocsl_delta_"
 ORDERED_PREFIX = "ocsl_ordered_"
 # Shared corpus tables; anything else (task queues, batches, processing
 # checkpoints and tables added by later schema versions) stays branch-local.
@@ -37,40 +42,52 @@ def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def logical(name: str) -> str:
+    return name[len(PREFIX):] if name.startswith(PREFIX) else name
+
+
 @dataclass(frozen=True)
 class Table:
-    name: str
+    name: str          # logical name, as queries spell it
+    physical: str      # name in the branch database
     columns: tuple[str, ...]
     key: tuple[str, ...]
     uniques: tuple[tuple[str, ...], ...]
     defaults: dict
     rowid: bool
+    shared: bool
 
 
-def _tables(connection: sqlite3.Connection, schema: str = "main") -> dict[str, Table]:
-    tables = {}
-    rows = connection.execute(f"SELECT name,sql FROM {schema}.sqlite_master WHERE type='table' "
-                              "AND name NOT LIKE 'sqlite_%' ORDER BY rowid").fetchall()
-    for name, sql in rows:
-        info = connection.execute(f"PRAGMA {schema}.table_info({quote(name)})").fetchall()
-        columns = tuple(row[1] for row in info)
-        key = tuple(row[1] for row in sorted((r for r in info if r[5]), key=lambda r: r[5]))
-        defaults = {row[1]: row[4] for row in info if row[3] and row[4] is not None}
-        uniques = []
-        for index in connection.execute(f"PRAGMA {schema}.index_list({quote(name)})").fetchall():
-            # (seq, name, unique, origin, partial); origin u = UNIQUE constraint, c = CREATE UNIQUE INDEX
-            if index[2] and index[3] in ("u", "c") and not index[4]:
-                members = tuple(row[2] for row in connection.execute(
-                    f"PRAGMA {schema}.index_info({quote(index[1])})").fetchall())
-                if members and None not in members and members != key:
-                    uniques.append(members)
-        rowid = "WITHOUT ROWID" not in (sql or "").upper()
-        tables[name] = Table(name, columns, key, tuple(uniques), defaults, rowid)
-    return tables
+def _describe(connection: sqlite3.Connection, schema: str, name: str, sql: str):
+    info = connection.execute(f"PRAGMA {schema}.table_info({quote(name)})").fetchall()
+    columns = tuple(row[1] for row in info)
+    key = tuple(row[1] for row in sorted((r for r in info if r[5]), key=lambda r: r[5]))
+    defaults = {row[1]: row[4] for row in info if row[3] and row[4] is not None}
+    uniques = []
+    for index in connection.execute(f"PRAGMA {schema}.index_list({quote(name)})").fetchall():
+        # (seq, name, unique, origin, partial); origin u = UNIQUE constraint, c = CREATE UNIQUE INDEX
+        if index[2] and index[3] in ("u", "c") and not index[4]:
+            members = tuple(row[2] for row in connection.execute(
+                f"PRAGMA {schema}.index_info({quote(index[1])})").fetchall())
+            if members and None not in members and members != key:
+                uniques.append(members)
+    rowid = "WITHOUT ROWID" not in (sql or "").upper()
+    return columns, key, tuple(uniques), defaults, rowid
 
 
 def _match(columns, left: str, right: str) -> str:
     return " AND ".join(f"{left}.{quote(c)}={right}.{quote(c)}" for c in columns)
+
+
+def prefix_shared_tables(connection: sqlite3.Connection) -> list[str]:
+    """Rename the shared tables of a new branch database (references and triggers follow)."""
+    present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    renamed = []
+    for name in SHARED:
+        if name in present:
+            connection.execute(f"ALTER TABLE {quote(name)} RENAME TO {quote(PREFIX + name)}")
+            renamed.append(name)
+    return renamed
 
 
 class Overlay:
@@ -83,36 +100,45 @@ class Overlay:
         probe = sqlite3.connect(self.delta.as_uri() + "?mode=ro", uri=True)
         try:
             probe.execute(f"ATTACH DATABASE ? AS {PARENT}", (self.parent_uri,))
-            self.tables = _tables(probe)
-            parent = _tables(probe, PARENT)
-            self.shared = []
-            for name in SHARED:
-                if name not in self.tables:
-                    continue
-                if name not in parent or parent[name].columns != self.tables[name].columns:
+            parent = {name: _describe(probe, PARENT, name, sql)[0] for name, sql in probe.execute(
+                f"SELECT name,sql FROM {PARENT}.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            self.tables: dict[str, Table] = {}
+            for physical, sql in probe.execute("SELECT name,sql FROM main.sqlite_master WHERE type='table' "
+                                               "AND name NOT LIKE 'sqlite_%' ORDER BY rowid").fetchall():
+                name = logical(physical)
+                shared = physical.startswith(PREFIX)
+                if shared and name not in SHARED:
+                    raise ValueError(f"unexpected branch table: {physical}")
+                if not shared and name in SHARED:
+                    raise ValueError("branch database predates the prefixed layout; branch the parent again")
+                columns, key, uniques, defaults, rowid = _describe(probe, "main", physical, sql)
+                if shared and parent.get(name) != columns:
                     raise ValueError(f"branch schema differs from its parent snapshot: {name}")
-                # An empty parent table needs no view; the branch table answers alone.
-                if probe.execute(f"SELECT EXISTS(SELECT 1 FROM {PARENT}.{quote(name)})").fetchone()[0]:
-                    self.shared.append(name)
+                self.tables[name] = Table(name, physical, columns, key, uniques, defaults, rowid, shared)
             self.parent_version = probe.execute(f"PRAGMA {PARENT}.user_version").fetchone()[0]
             self.version = probe.execute("PRAGMA main.user_version").fetchone()[0]
-            self.foreign_keys = {name: probe.execute(f"PRAGMA foreign_key_list({quote(name)})").fetchall()
-                                 for name in self.tables}
+            self.foreign_keys = {table.name: probe.execute(f"PRAGMA foreign_key_list({quote(table.physical)})").fetchall()
+                                 for table in self.tables.values()}
         finally:
             probe.close()
         if self.parent_version != self.version:
             raise ValueError("branch schema version differs from its parent snapshot")
+        self.shared = [name for name, table in self.tables.items() if table.shared]
         self.script = "\n".join(self._statements())
 
+    def physical(self, name: str) -> str:
+        table = self.tables.get(name)
+        return table.physical if table else name
+
     def _references(self, name):
-        """[(target, local columns, target columns)] for each declared foreign key of a table."""
+        """[(target, local columns, target columns)] for each declared foreign key, in logical names."""
         groups: dict[int, list] = {}
         for row in self.foreign_keys.get(name, ()):
             groups.setdefault(row[0], []).append(row)
         references = []
         for members in groups.values():
             members.sort(key=lambda r: r[1])
-            target = members[0][2]
+            target = logical(members[0][2])
             local = [r[3] for r in members]
             remote = [r[4] for r in members]
             if any(column is None for column in remote) and target in self.tables:
@@ -134,28 +160,28 @@ class Overlay:
 
     def _statements(self):
         for name, table in self.tables.items():
-            if name in self.shared:
+            if table.shared:
                 continue
             checks = self._checks(name)
             if checks:
-                # Branch-local tables and empty shared tables are written directly.
+                # Branch-local tables are written directly.
                 for action in ("INSERT", "UPDATE"):
                     yield (f"CREATE TEMP TRIGGER {quote('ocsl_fk_' + action.lower() + '_' + name)} BEFORE {action} "
                            f"ON main.{quote(name)} BEGIN {checks} END;")
         for name in self.shared:
             table = self.tables[name]
-            t = quote(name)
+            t, d = quote(name), quote(table.physical)
             columns = ", ".join(quote(c) for c in table.columns)
             parent_columns = ", ".join("p." + quote(c) for c in table.columns)
             if table.key:
-                hidden = f" WHERE NOT EXISTS (SELECT 1 FROM main.{t} AS d WHERE {_match(table.key, 'd', 'p')})"
+                hidden = f" WHERE NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {_match(table.key, 'd', 'p')})"
             else:
                 hidden = ""
-            yield (f"CREATE TEMP VIEW {t} AS SELECT {columns} FROM main.{t} UNION ALL "
+            yield (f"CREATE TEMP VIEW {t} AS SELECT {columns} FROM main.{d} UNION ALL "
                    f"SELECT {parent_columns} FROM {PARENT}.{t} AS p{hidden};")
             if table.rowid:
                 yield (f"CREATE TEMP VIEW {quote(ORDERED_PREFIX + name)} AS "
-                       f"SELECT 0 AS ocsl_source, rowid AS ocsl_rowid, {columns} FROM main.{t} UNION ALL "
+                       f"SELECT 0 AS ocsl_source, rowid AS ocsl_rowid, {columns} FROM main.{d} UNION ALL "
                        f"SELECT 1, p.rowid, {parent_columns} FROM {PARENT}.{t} AS p{hidden};")
             values = ", ".join(f"coalesce(NEW.{quote(c)}, {table.defaults[c]})" if c in table.defaults
                                else f"NEW.{quote(c)}" for c in table.columns)
@@ -167,21 +193,22 @@ class Overlay:
                 strict = (f"SELECT RAISE(ABORT, 'UNIQUE constraint failed: {name} exists in the parent snapshot') "
                           f"WHERE EXISTS (SELECT 1 FROM {PARENT}.{t} AS p WHERE {_match(table.key, 'p', 'NEW')}); ")
             checks = self._checks(name)
+            # Trigger bodies name the branch table unqualified (older SQLite rejects schema-qualified targets).
             yield (f"CREATE TEMP TRIGGER {quote('ocsl_insert_' + name)} INSTEAD OF INSERT ON {t} BEGIN {strict}"
-                   f"{checks} INSERT INTO main.{t}({columns}) SELECT {values}{guard}; END;")
+                   f"{checks} INSERT INTO {d}({columns}) SELECT {values}{guard}; END;")
             if table.key:
                 assignments = ", ".join(f"{quote(c)}=NEW.{quote(c)}" for c in table.columns)
                 old = " AND ".join(f"{quote(c)}=OLD.{quote(c)}" for c in table.key)
                 parent_old = " AND ".join(f"p.{quote(c)}=OLD.{quote(c)}" for c in table.key)
                 delta_old = " AND ".join(f"d.{quote(c)}=OLD.{quote(c)}" for c in table.key)
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_update_' + name)} INSTEAD OF UPDATE ON {t} BEGIN {checks} "
-                       f"INSERT INTO main.{t}({columns}) SELECT {parent_columns} FROM {PARENT}.{t} AS p "
-                       f"WHERE {parent_old} AND NOT EXISTS (SELECT 1 FROM main.{t} AS d WHERE {delta_old}); "
-                       f"UPDATE main.{t} SET {assignments} WHERE {old}; END;")
+                       f"INSERT INTO {d}({columns}) SELECT {parent_columns} FROM {PARENT}.{t} AS p "
+                       f"WHERE {parent_old} AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old}); "
+                       f"UPDATE {d} SET {assignments} WHERE {old}; END;")
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_delete_' + name)} INSTEAD OF DELETE ON {t} BEGIN "
                        f"SELECT RAISE(ABORT, '{name}: rows of the parent snapshot are immutable') "
                        f"WHERE EXISTS (SELECT 1 FROM {PARENT}.{t} AS p WHERE {parent_old}); "
-                       f"DELETE FROM main.{t} WHERE {old}; END;")
+                       f"DELETE FROM {d} WHERE {old}; END;")
             else:
                 for action in ("UPDATE", "DELETE"):
                     yield (f"CREATE TEMP TRIGGER {quote('ocsl_' + action.lower() + '_' + name)} INSTEAD OF {action} "
@@ -203,7 +230,7 @@ class Overlay:
     def foreign_key_problems(self, connection: sqlite3.Connection, limit: int = 20) -> list[str]:
         """Branch rows whose declared references resolve neither in the branch nor in the parent."""
         problems = []
-        for name in self.tables:
+        for name, table in self.tables.items():
             for target, local, remote in self._references(name):
                 if target not in self.tables or len(remote) != len(local) or None in remote:
                     problems.append(f"{name}: reference to unknown table {target}")
@@ -211,7 +238,7 @@ class Overlay:
                 present = " AND ".join(f"c.{quote(c)} IS NOT NULL" for c in local)
                 matched = " AND ".join(f"r.{quote(rc)}=c.{quote(lc)}" for lc, rc in zip(local, remote))
                 count = connection.execute(
-                    f"SELECT count(*) FROM main.{quote(name)} AS c WHERE {present} AND NOT EXISTS "
+                    f"SELECT count(*) FROM main.{quote(table.physical)} AS c WHERE {present} AND NOT EXISTS "
                     f"(SELECT 1 FROM {quote(target)} AS r WHERE {matched})").fetchone()[0]
                 if count:
                     problems.append(f"{name}({', '.join(local)}) -> {target}: {count} unresolved")

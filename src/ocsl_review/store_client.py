@@ -129,7 +129,7 @@ class StoreClient:
         doi = doi.lower()
         rows = []
         with self.repo.connect() as connection:
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE name='retained_sources'").fetchone():
+            if _has_table(connection, "retained_sources"):
                 rows += [{**dict(row), "store": None} for row in connection.execute(
                     "SELECT * FROM retained_sources WHERE doi=? ORDER BY capture_sha256", (doi,))]
         if rows:
@@ -246,7 +246,7 @@ def retained_captures(repo, doi: str) -> list[dict]:
     """
     doi = doi.lower()
     with repo.connect() as connection:
-        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retained_sources'").fetchone():
+        if _has_table(connection, "retained_sources"):
             rows = [dict(row) for row in connection.execute(
                 "SELECT * FROM retained_sources WHERE doi=? ORDER BY capture_sha256", (doi,))]
             if rows:
@@ -261,6 +261,12 @@ def retained_captures(repo, doi: str) -> list[dict]:
             client.adopt_blob(store, row["capture_sha256"])
         found.append(row)
     return found
+
+
+def _has_table(connection, name: str) -> bool:
+    """A table, or a branch's view of it, is visible under this name."""
+    return connection.execute("SELECT 1 FROM sqlite_master WHERE name=? AND type='table' UNION ALL "
+                              "SELECT 1 FROM sqlite_temp_master WHERE name=? AND type='view'", (name, name)).fetchone() is not None
 
 
 def _digests(value):

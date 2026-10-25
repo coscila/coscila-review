@@ -31,7 +31,7 @@ import tempfile
 import time
 import uuid
 
-from .corpus_overlay import Overlay, quote
+from .corpus_overlay import Overlay, prefix_shared_tables, quote
 from .corpus_packs import INDEX as PACK_INDEX, PACK_NAME, SHA256, PackIntegrityError, PackStore, build_index
 
 
@@ -374,9 +374,16 @@ class Library:
                 raise ValueError("snapshot has an unexpected SQLite journal; use a fresh backup snapshot")
 
     def _tables(self, connection):
-        names = [row[0] for row in connection.execute(
-            "SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        if self.overlay is not None:
+            names = sorted(self.overlay.tables)  # Logical names: shared tables count parent and branch rows.
+        else:
+            names = [row[0] for row in connection.execute(
+                "SELECT name FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
         return {name: connection.execute(f"SELECT count(*) FROM {quote(name)}").fetchone()[0] for name in names}
+
+    def _own(self, table):
+        """The table holding this library's own rows (a branch's prefixed table)."""
+        return f"main.{quote(self.overlay.physical(table))}" if self.overlay is not None else table
 
     def _logical(self, connection, *, deep):
         version = connection.execute("PRAGMA main.user_version").fetchone()[0]
@@ -399,8 +406,7 @@ class Library:
         analyses = [dict(row) for row in connection.execute("SELECT * FROM analyses ORDER BY analysis_id")]
         if deep or not self.is_snapshot:
             # Branches recheck only their own rows; the parent snapshot was verified when it was sealed.
-            sections = "main.source_sections" if self.overlay is not None else "source_sections"
-            runs = "main.runs" if self.overlay is not None else "runs"
+            sections, runs = self._own("source_sections"), self._own("runs")
             for row in connection.execute(f"SELECT extracted_text, text_sha256 FROM {sections}"):
                 if hashlib.sha256(row[0].encode()).hexdigest() != row[1]:
                     raise ValueError("extracted source text hash mismatch")
@@ -412,7 +418,7 @@ class Library:
 
     def _artifact_problems(self, connection, *, deep, verify_packs=True):
         """Every registered artifact must be packed, loose, or in the parent snapshot."""
-        table = "main.source_artifacts" if self.overlay is not None else "source_artifacts"
+        table = self._own("source_artifacts")
         stores = self.pack_stores()
         for number, store in enumerate(stores):
             connection.execute(f"ATTACH DATABASE ? AS ocsl_packs{number}",
@@ -628,7 +634,7 @@ class Library:
                 for name, table in self.overlay.tables.items():
                     columns = ", ".join(quote(c) for c in table.columns)
                     connection.execute(f"INSERT OR REPLACE INTO main.{quote(name)}({columns}) "
-                                       f"SELECT {columns} FROM ocsl_delta.{quote(name)}")
+                                       f"SELECT {columns} FROM ocsl_delta.{quote(table.physical)}")
             connection.execute("DETACH DATABASE ocsl_delta")
             connection.execute("PRAGMA journal_mode=DELETE")
         finally:
@@ -770,6 +776,8 @@ class Library:
         target = sqlite3.connect(destination)
         try:
             target.executescript(";\n".join(statements) + ";")
+            # Shared tables carry a prefix; connections show the parent's rows under the plain names.
+            prefix_shared_tables(target)
             target.execute(f"PRAGMA user_version={int(version)}")
             target.commit()
         finally:
@@ -793,17 +801,21 @@ class Library:
                     raise ValueError("branch expects one corpus per library")
                 if clash:
                     raise ValueError("analysis ID already exists in the parent snapshot")
-                with database(delta) as connection:
-                    add_analysis(connection, corpus[0][0], question, analysis_id,
-                                 parent["manifest_sha256"], protocol, code_revision)
                 PackStore.create(root / "packs")
                 write_json(root / "bundle.json", {
                     "version": 2, "kind": "delta-branch", "parent_snapshot": self.relative,
                     "parent_manifest_sha256": parent["manifest_sha256"],
                     "parent_merkle_root": parent.get("merkle_root"), "active_analysis_id": analysis_id,
                 })
-            with clock("check"):
                 created = Library(self.workspace, destination)
+                connection = created.open(write=True)
+                try:
+                    with connection:
+                        add_analysis(connection, corpus[0][0], question, analysis_id,
+                                     parent["manifest_sha256"], protocol, code_revision)
+                finally:
+                    connection.close()
+            with clock("check"):
                 connection = created.open()
                 try:
                     connection.row_factory = sqlite3.Row
@@ -826,8 +838,7 @@ class Library:
         packed = present = byte_total = 0
         connection = self.open()
         try:
-            table = "main.source_artifacts" if self.overlay is not None else "source_artifacts"
-            rows = connection.execute(f"SELECT sha256, byte_count FROM {table} ORDER BY sha256")
+            rows = connection.execute(f"SELECT sha256, byte_count FROM {self._own('source_artifacts')} ORDER BY sha256")
             with self.packs.batch():
                 for digest, byte_count in rows:
                     if self.packs.contains(digest):
