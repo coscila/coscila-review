@@ -527,6 +527,23 @@ class OutageTests(RunnerTestCase):
         self.assertEqual((2, 9), (positions["2"], positions["9"]))
         self.assertEqual(0, run.status()["duplicateJudgments"])
 
+    def test_a_refused_request_is_answered_and_invalid_not_retried_or_left_open(self):
+        import io
+        import urllib.error
+        sent = []
+
+        def opener(request, timeout):
+            sent.append(request)
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(b"too long"))
+        run = CensusRun(self.database, seed=1234, transport=HttpChatTransport("http://127.0.0.1:9/v1", opener=opener),
+                        concurrency=2, sleep=lambda s: None)
+        self.addCleanup(run.close)
+        self.prepare(run)
+        result = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 0, 15, 1), (result["state"], result["accepted"], result["invalid"], result["passes"]))
+        self.assertEqual(2, len(sent), "one first and one repair call, each sent once")
+        self.assertEqual([1, 1], [r["attempts"] for r in self.rows("SELECT attempts FROM calls")])
+
     def test_disconnects_and_malformed_bodies_are_transport_failures(self):
         import http.client
         attempts = []

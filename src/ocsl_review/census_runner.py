@@ -58,7 +58,18 @@ def detected_rows(field: str, text: str | None, *, journal: str | None = None, d
 
 
 class TransportError(ReviewError):
-    """A call failed after its bounded transport attempts."""
+    """A call failed after its bounded transport attempts.
+
+    ``refused``: the server answered and rejected this request itself (400, 413, 422); repeating it changes
+    nothing, so it counts as an answered call, unlike a connection failure, a timeout or a server error.
+    """
+
+    def __init__(self, message: str = "", *, refused: bool = False):
+        super().__init__(message)
+        self.refused = refused
+
+
+REFUSED_STATUS = frozenset({400, 413, 422})
 
 
 class ModelDrift(ReviewError):
@@ -115,7 +126,7 @@ class HttpChatTransport:
             with self.opener(request, timeout=timeout) as response:
                 payload = json.loads(response.read())
         except urllib.error.HTTPError as error:
-            raise TransportError(f"HTTP {error.code}") from error
+            raise TransportError(f"HTTP {error.code}", refused=error.code in REFUSED_STATUS) from error
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as error:
             # HTTPException covers a body cut off mid-response (IncompleteRead) and malformed status lines.
             raise TransportError(f"{type(error).__name__}: {str(error)[:120]}") from error
@@ -171,7 +182,7 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
     """One logical call with the instrument's transport attempts; returns the receipt fields.
 
     ``responded`` tells a call that never got a response (retryable later) from one whose last attempt was
-    answered with an empty completion (a response without any parseable line).
+    answered with an empty completion or a refusal of the request (an answer without any parseable line).
     """
     spec = C.settings(tier)
     attempts = int(spec["transport"]["attempts"])
@@ -181,7 +192,7 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
     settings = {k: v for k, v in payload.items() if k != "messages"}
     receipt = {**C.digests(payload["messages"], body), "settings_sha256": sha256_text(canonical(settings)),
                "max_tokens": payload["max_tokens"], "request_model": payload["model"], "attempts": 0, "error": None}
-    error, empty = None, None
+    error, empty, refused = None, None, False
     for attempt in range(attempts):
         receipt["attempts"] = attempt + 1
         started = time.monotonic()
@@ -192,7 +203,10 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
         except TransportError as failure:
             error = str(failure)
             empty = response if isinstance(failure, EmptyCompletion) else None
+            refused = getattr(failure, "refused", False)
             receipt["seconds"] = round(time.monotonic() - started, 3)
+            if refused:
+                break       # the server rejected this very request; sending it again cannot help
             if attempt + 1 < attempts:
                 sleep(backoff[min(attempt, len(backoff) - 1)])
             continue
@@ -207,7 +221,7 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
         receipt["error"] = "model_drift" if receipt["served_model"] != required_model else error
         return CallResult(receipt, None, receipt["served_model"])
     receipt["error"] = error or "transport failure"
-    return CallResult(receipt, None, None, responded=False)
+    return CallResult(receipt, None, None, responded=refused)
 
 
 def writer_lock(database: Path) -> int:
