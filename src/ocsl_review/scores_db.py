@@ -109,7 +109,8 @@ CREATE TRIGGER IF NOT EXISTS calls_no_update BEFORE UPDATE ON calls
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
-    "meta": {"key": "run metadata key (schema version, instrument id and digest, protocol digest, journal, seed, code revision)",
+    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state; when frozen: completeness "
+                    "and the entitled-text redaction)",
              "value": "metadata value"},
     "reviews": {
         "journal": "journal of the review (study input)", "doi": "review DOI, lower case", "paper_key": "local review key",
@@ -131,7 +132,8 @@ DICTIONARY: dict[str, dict[str, str]] = {
     "citations": {
         "journal": "journal of the citing review", "doi": "citing review DOI", "label": "printed bibliography label (alphanumeric)",
         "ordinal": "position in the printed bibliography (document order)", "target_id": "bibliography target id in the markup",
-        "printed": "printed bibliography entry text", "cited_inbody": "1 when at least one in-body locus exists",
+        "printed": "printed bibliography entry text (removed for entitled reviews in a frozen database)",
+        "cited_inbody": "1 when at least one in-body locus exists",
         "n_loci": "in-body citation loci (one per marker occurrence)", "n_outside_body_loci": "loci outside the body (diagnostic only)",
         "identity": "resolved, resolved_unverified or unresolved", "identity_version": "identity ladder version of the cited work",
         "map_method": "how the identity was found (markup-doi, markup-pmid, printed-doi, title, label, supplied)",
@@ -156,7 +158,8 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "ft_position": "position within the full-text call", "ft_evidence_id": "full-text evidence unit",
         "ft_window_characters": "full-text window characters sent"},
     "loci": {"journal": "journal", "doi": "citing review DOI", "label": "bibliography label", "seq": "document order of the locus",
-             "sentence": "citing sentence as rendered for the judge", "section": "section trail", "unit": "citing unit index",
+             "sentence": "citing sentence as rendered for the judge (sha256:<hex> of it for entitled reviews in a frozen database)",
+             "section": "section trail", "unit": "citing unit index",
              "char_offset": "marker offset in the rendered unit", "unit_tag": "markup tag of the citing unit",
              "in_table": "inside a table", "in_fig": "inside a figure", "in_box": "inside a box", "in_list": "inside a list",
              "sent": "1 when the sentence was among the citing sentences sent"},
@@ -316,23 +319,88 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def freeze(source: Path, output: Path, *, keep_text: bool = False) -> dict[str, Any]:
-    """Write the closed scores database: rollback journal, no WAL, read-only, evidence text removed by default."""
+def completeness(connection: sqlite3.Connection) -> dict[str, Any]:
+    """Whether a run is finished: not paused, no review pending in either tier, no open entry."""
+    state = (connection.execute("SELECT value FROM meta WHERE key='runState'").fetchone() or ["active"])[0]
+    abstract = connection.execute("SELECT COUNT(*) FROM reviews WHERE abstract_state!='completed'").fetchone()[0]
+    full_text = connection.execute("SELECT COUNT(*) FROM reviews WHERE full_text_state!='completed'").fetchone()[0]
+    problems = []
+    if str(state).startswith("paused"):
+        problems.append(f"run state is {state}")
+    if abstract:
+        problems.append(f"{abstract} reviews pending in the abstract tier")
+    if full_text:
+        problems.append(f"{full_text} reviews pending in the full-text tier")
+    return {"complete": not problems, "runState": state, "abstractPending": abstract, "fullTextPending": full_text,
+            "problems": problems}
+
+
+ENTITLED_REVIEWS = "(SELECT journal, doi FROM reviews WHERE provenance_class='entitled')"
+
+
+def redact_entitled(connection: sqlite3.Connection) -> dict[str, int]:
+    """Replace entitled text in a frozen copy: citing sentences, printed entries, rationales and full-text quotes.
+
+    Citing sentences become ``sha256:<hex>`` of the text (lengths stay derivable from the original only), and
+    the append-only history of those entries loses its quotes, rationales and parsed records. Abstract quotes
+    are kept: abstracts are public evidence.
+    """
+    counts = {}
+    entitled = f"(journal, doi) IN {ENTITLED_REVIEWS}"
+    connection.create_function("ocsl_sha256", 1, lambda value: None if value is None else
+                               "sha256:" + hashlib.sha256(str(value).encode("utf-8")).hexdigest(), deterministic=True)
+    counts["sentences"] = connection.execute(
+        f"UPDATE loci SET sentence=ocsl_sha256(sentence) WHERE {entitled} AND sentence NOT LIKE 'sha256:%'").rowcount
+    counts["printedEntries"] = connection.execute(
+        f"UPDATE citations SET printed=NULL WHERE {entitled} AND printed IS NOT NULL").rowcount
+    counts["rationales"] = connection.execute(
+        f"UPDATE citations SET abs_reason=NULL, ft_reason=NULL WHERE {entitled} AND "
+        "(abs_reason IS NOT NULL OR ft_reason IS NOT NULL)").rowcount
+    counts["fullTextQuotes"] = connection.execute(
+        f"UPDATE citations SET ft_quote=NULL WHERE ft_quote IS NOT NULL AND ({entitled} OR ft_source='entitled' "
+        "OR ft_evidence_id IN (SELECT evidence_id FROM evidence WHERE provenance_class='entitled'))").rowcount
+    # The history is append-only in a working database; the frozen copy is a derived artefact.
+    connection.execute("DROP TRIGGER IF EXISTS history_no_update")
+    counts["historyRows"] = connection.execute(
+        f"UPDATE history SET quote=NULL, reason=NULL, record_json=NULL WHERE ({entitled} OR (tier='full-text' AND "
+        f"(journal, doi, label) IN (SELECT journal, doi, label FROM citations WHERE ft_source='entitled'))) AND "
+        "(quote IS NOT NULL OR reason IS NOT NULL OR record_json IS NOT NULL)").rowcount
+    connection.execute("CREATE TRIGGER history_no_update BEFORE UPDATE ON history "
+                       "BEGIN SELECT RAISE(ABORT, 'verdict history is append-only'); END")
+    return counts
+
+
+def freeze(source: Path, output: Path, *, keep_text: bool = False, allow_incomplete: bool = False) -> dict[str, Any]:
+    """Write the closed scores database: rollback journal, no WAL, read-only, evidence and entitled text removed.
+
+    A paused run or a run with pending reviews is refused unless ``allow_incomplete``, which is then recorded
+    in the frozen metadata (``complete`` = 0) so facts export refuses it too unless told otherwise.
+    """
     output = Path(output)
     if output.exists():
         raise ValidationError("frozen scores database already exists; freeze into a new path")
-    output.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(Path(source))) as connection:
+        state = completeness(connection)
+        if not state["complete"] and not allow_incomplete:
+            raise ValidationError("census run is incomplete: " + "; ".join(state["problems"])
+                                  + " (finish the run, or freeze with allow_incomplete to record it as incomplete)")
+        output.parent.mkdir(parents=True, exist_ok=True)
         aggregate_reviews(connection)
         scores = write_scores(connection)
         connection.commit()
         connection.execute("VACUUM INTO ?", (str(output),))
+    redacted: dict[str, int] = {}
     with closing(sqlite3.connect(output)) as frozen:
         frozen.execute("PRAGMA journal_mode=DELETE")
         if not keep_text:
             frozen.execute("UPDATE evidence SET text=NULL")
-        frozen.execute("INSERT OR REPLACE INTO meta VALUES('frozen', '1')")
-        frozen.execute("INSERT OR REPLACE INTO meta VALUES('evidenceTextKept', ?)", ("1" if keep_text else "0",))
+            redacted = redact_entitled(frozen)
+        meta_rows = {"frozen": "1", "evidenceTextKept": "1" if keep_text else "0",
+                     "entitledTextRedacted": "0" if keep_text else "1",
+                     "redaction": json.dumps(redacted, sort_keys=True),
+                     "complete": "1" if state["complete"] else "0",
+                     "incompleteReason": "; ".join(state["problems"])}
+        frozen.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", sorted(meta_rows.items()))
         frozen.commit()
         frozen.execute("VACUUM")
     for suffix in ("-wal", "-shm", "-journal"):
@@ -340,6 +408,7 @@ def freeze(source: Path, output: Path, *, keep_text: bool = False) -> dict[str, 
             raise ValidationError("frozen scores database left a journal behind")
     os.chmod(output, 0o444)
     return {"path": str(output), "sha256": file_sha256(output), "bytes": output.stat().st_size, "evidenceTextKept": keep_text,
+            "entitledTextRedacted": redacted, "complete": state["complete"], "incomplete": state["problems"],
             "scored": scores}
 
 
@@ -374,9 +443,20 @@ def _arrow_schema(pa, connection: sqlite3.Connection, table: str, columns: list[
     return pa.schema([(column, kinds.get(declared.get(column, ""), pa.string())) for column in columns])
 
 
-def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet: bool = True) -> dict[str, Any]:
-    """TSV (always) and Parquet (when pyarrow is importable) for each table, plus a manifest with digests."""
+def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet: bool = True,
+           allow_entitled_text: bool = False) -> dict[str, Any]:
+    """TSV (always) and Parquet (when pyarrow is importable) for each table, plus a manifest with digests.
+
+    A database frozen with its text kept still holds entitled review text; exporting it needs
+    ``allow_entitled_text`` (exports are made to be shared).
+    """
     output = Path(output)
+    with closing(open_frozen(path)) as connection:
+        kept = meta(connection).get("entitledTextRedacted", "0") != "1"
+        entitled = connection.execute("SELECT COUNT(*) FROM reviews WHERE provenance_class='entitled'").fetchone()[0]
+    if kept and entitled and not allow_entitled_text:
+        raise ValidationError(f"{entitled} entitled reviews keep their text in this database; export a database frozen "
+                              "without --keep-text, or pass allow_entitled_text for a private export")
     output.mkdir(parents=True, exist_ok=True)
     files, parquet_state = [], "not requested"
     try:
@@ -422,3 +502,21 @@ def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet:
                 "parquet": parquet_state, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
+def open_readonly(path: Path) -> sqlite3.Connection:
+    """A read-only connection to a working or frozen scores database: no DDL, no metadata pins, no writes."""
+    path = Path(path)
+    if not path.is_file():
+        raise ValidationError(f"scores database is missing: {path}")
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
+    connection.row_factory = sqlite3.Row
+    try:
+        version = connection.execute("SELECT value FROM meta WHERE key='schemaVersion'").fetchone()
+    except sqlite3.DatabaseError as error:
+        connection.close()
+        raise ValidationError("not a census scores database") from error
+    if not version or int(version[0]) != SCHEMA_VERSION:
+        connection.close()
+        raise ValidationError("unsupported scores database schema version")
+    return connection
+
+

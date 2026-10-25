@@ -154,7 +154,7 @@ def build_scores(path: Path) -> None:
                    ("J2", "s2", 2021, "Review", "html", "entitled"), ("J1", "r4", 2022, "Review", None, "unavailable")]
         for order, (journal, doi, year, stratum, route, provenance) in enumerate(reviews):
             c.execute("INSERT INTO reviews(journal, doi, year, stratum, route, provenance_class, topic, country, review_order,"
-                      " document_sha256) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      " document_sha256, abstract_state, full_text_state) VALUES(?,?,?,?,?,?,?,?,?,?,'completed','completed')",
                       (journal, doi, year, stratum, route, provenance, "breast", "Italy", order, None if route is None else "d"))
         rows = []
 

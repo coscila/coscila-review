@@ -83,6 +83,63 @@ class ScoresDatabaseTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             scores_db.freeze(self.path, frozen)
 
+    def test_incomplete_runs_freeze_only_on_request_and_facts_refuse_them(self):
+        from ocsl_review import corpus_facts
+        with closing(scores_db.connect(self.path)) as c:
+            c.execute("UPDATE reviews SET full_text_state='pending' WHERE doi='r2'")
+            c.execute("INSERT INTO meta VALUES('runState', 'paused:model_drift')")
+            c.commit()
+        with self.assertRaisesRegex(ValidationError, "incomplete: run state is paused:model_drift; 1 reviews pending"):
+            scores_db.freeze(self.path, self.root / "refused.sqlite3")
+        self.assertFalse((self.root / "refused.sqlite3").exists())
+        report = scores_db.freeze(self.path, self.root / "partial.sqlite3", allow_incomplete=True)
+        self.assertFalse(report["complete"])
+        with closing(scores_db.open_frozen(self.root / "partial.sqlite3")) as c:
+            meta = scores_db.meta(c)
+            self.assertEqual("0", meta["complete"])
+            self.assertIn("paused:model_drift", meta["incompleteReason"])
+        with self.assertRaisesRegex(ValidationError, "incomplete run"):
+            corpus_facts.export_facts(self.root / "partial.sqlite3", self.root / "facts", ["J1"], b=10, seed=1)
+        result = corpus_facts.export_facts(self.root / "partial.sqlite3", self.root / "facts", ["J1"], b=10, seed=1,
+                                           allow_incomplete=True, code_revision="t")
+        bundle = json.loads(Path(result["facts"]).read_text())
+        self.assertFalse(bundle["provenance"]["inputs"]["runComplete"])
+
+    def test_freeze_redacts_entitled_review_text(self):
+        with closing(scores_db.connect(self.path)) as c:
+            c.execute("UPDATE citations SET printed='Printed entry', abs_reason='because', abs_quote='abstract words', "
+                      "ft_quote='full text words', ft_source='entitled' WHERE journal='J1' AND doi='r2' AND label='6'")
+            c.execute("UPDATE citations SET printed='Public entry', abs_reason='public reason' WHERE doi='r1' AND label='1'")
+            c.execute("INSERT INTO loci VALUES('J1','r2','1',0,'Entitled citing sentence.','Intro',0,0,'p',0,0,0,0,1)")
+            c.execute("INSERT INTO loci VALUES('J1','r1','1',0,'Public citing sentence.','Intro',0,0,'p',0,0,0,0,1)")
+            c.execute("INSERT INTO history(journal, doi, label, tier, variant, outcome, quote, reason, record_json, created_at) "
+                      "VALUES('J1','r2','1','abstract','primary','accepted','q','why','{}','t')")
+            c.commit()
+        frozen = self.root / "redacted.sqlite3"
+        report = scores_db.freeze(self.path, frozen)
+        self.assertEqual(1, report["entitledTextRedacted"]["sentences"])
+        with closing(scores_db.open_frozen(frozen)) as c:
+            sentences = {r["doi"]: r["sentence"] for r in c.execute("SELECT doi, sentence FROM loci")}
+            self.assertTrue(sentences["r2"].startswith("sha256:"))
+            self.assertEqual("Public citing sentence.", sentences["r1"])
+            entitled = c.execute("SELECT printed, abs_reason, ft_quote, abs_quote FROM citations WHERE doi='r2' AND label='6'").fetchone()
+            self.assertEqual((None, None, None, "abstract words"), tuple(entitled))
+            public = c.execute("SELECT printed, abs_reason FROM citations WHERE doi='r1' AND label='1'").fetchone()
+            self.assertEqual(("Public entry", "public reason"), tuple(public))
+            history = c.execute("SELECT quote, reason, record_json FROM history WHERE doi='r2' AND label='1' "
+                                "AND variant='primary'").fetchone()
+            self.assertEqual((None, None, None), tuple(history))
+            self.assertEqual("1", scores_db.meta(c)["entitledTextRedacted"])
+            triggers = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            self.assertLessEqual({"history_no_update", "history_no_delete", "calls_no_update"}, triggers)
+        scores_db.export(frozen, self.root / "export-redacted", parquet=False)
+        kept = self.root / "kept-text.sqlite3"
+        scores_db.freeze(self.path, kept, keep_text=True)
+        with self.assertRaisesRegex(ValidationError, "entitled reviews keep their text"):
+            scores_db.export(kept, self.root / "export-kept", parquet=False)
+        manifest = scores_db.export(kept, self.root / "export-private", parquet=False, allow_entitled_text=True)
+        self.assertTrue(manifest["files"])
+
     def test_export_tsv_and_manifest(self):
         frozen = self.root / "scores.sqlite3"
         scores_db.freeze(self.path, frozen)

@@ -189,9 +189,8 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
 def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b: int = E.DEFAULT_B, seed: int = 0,
                  ratio_pair: tuple[str, str] | None = None, trend_years: tuple[int, int] | None = None,
                  panels: Sequence[str] = ("year", "stratum", "topic", "country"),
-                 code_revision: str | None = None) -> dict[str, Any]:
+                 code_revision: str | None = None, allow_incomplete: bool = False) -> dict[str, Any]:
     scores_path, output = Path(scores_path), Path(output)
-    output.mkdir(parents=True, exist_ok=True)
     database = output / "facts.sqlite3"
     if database.exists() or (output / "facts.json").exists():
         raise ValidationError("facts export already exists; export into a new directory")
@@ -199,6 +198,11 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
         meta = scores_db.meta(frozen)
         if meta.get("frozen") != "1":
             raise ValidationError("facts need a frozen scores database")
+        if meta.get("complete") != "1" and not allow_incomplete:
+            raise ValidationError("the frozen scores database records an incomplete run ("
+                                  + (meta.get("incompleteReason") or "completeness not recorded")
+                                  + "); facts need a complete run unless allow_incomplete")
+        output.mkdir(parents=True, exist_ok=True)
         known = {r[0] for r in frozen.execute("SELECT DISTINCT journal FROM reviews")}
         missing = set(journals) - known
         if missing:
@@ -218,7 +222,7 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
         target.executemany("INSERT INTO fact_inputs VALUES(?,?)", [
             ("scoresSha256", scores_sha), ("instrumentDigest", meta.get("instrumentDigest", "")),
             ("instrumentId", meta.get("instrumentId", "")), ("codeRevision", revision),
-            ("bootstrapB", str(b)), ("seed", str(seed))])
+            ("bootstrapB", str(b)), ("seed", str(seed)), ("complete", meta.get("complete", "unknown"))])
         target.commit()
         target.execute("VACUUM")
     for suffix in ("-wal", "-shm", "-journal"):
@@ -227,7 +231,8 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     os.chmod(database, 0o444)
     database_sha = scores_db.file_sha256(database)
     inputs = {"scoresSha256": scores_sha, "instrumentDigest": meta.get("instrumentDigest"),
-              "instrumentId": meta.get("instrumentId"), "estimandsModule": "ocsl_review.estimands"}
+              "instrumentId": meta.get("instrumentId"), "estimandsModule": "ocsl_review.estimands",
+              "runComplete": meta.get("complete") == "1"}
     queries: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     for journal in journals:
         s = slug(journal)

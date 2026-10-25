@@ -95,6 +95,7 @@ class CommandLineTests(RunnerTestCase):
         outputs = []
         for argv in (["study", "prepare", "--database", str(self.database), "--seed", "5", "--input", str(manifest)],
                      ["study", "judge", "--database", str(self.database), "--seed", "5", "--base-url", self.base],
+                     ["study", "full-text", "--database", str(self.database), "--seed", "5", "--base-url", self.base],
                      ["study", "gates", "--database", str(self.database)],
                      ["study", "freeze", "--database", str(self.database), "--output", str(self.root / "frozen.sqlite3")],
                      ["study", "facts", "--scores", str(self.root / "frozen.sqlite3"), "--output", str(self.root / "facts"),
@@ -107,8 +108,10 @@ class CommandLineTests(RunnerTestCase):
             outputs.append(json.loads(buffer.getvalue()))
         self.assertEqual(1, outputs[0]["prepared"])
         self.assertEqual("completed", outputs[1]["state"])
-        self.assertTrue(outputs[2]["checks"]["invalidOutputsAtMostOnePercent"])
-        self.assertTrue(outputs[5]["ok"])
+        self.assertEqual("completed", outputs[2]["state"])
+        self.assertTrue(outputs[3]["ok"], outputs[3])
+        self.assertTrue(outputs[4]["complete"])
+        self.assertTrue(outputs[6]["ok"])
 
     def test_cross_validate_command(self):
         buffer = io.StringIO()

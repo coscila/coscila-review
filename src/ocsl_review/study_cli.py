@@ -70,13 +70,19 @@ def add_commands(families, register):
             command.add_argument("--entries", type=int, required=True, help="entries to re-judge, stratified by journal and year")
         if name == "freeze":
             command.add_argument("--output", required=True)
-            command.add_argument("--keep-text", action="store_true")
+            command.add_argument("--keep-text", action="store_true",
+                                 help="keep evidence and entitled review text (a private dataset; exports refuse it)")
+        if name in ("freeze", "facts"):
+            command.add_argument("--allow-incomplete", action="store_true",
+                                 help="accept a paused run or pending reviews and record the run as incomplete")
         if name in ("export", "estimands", "facts"):
             command.add_argument("--scores", required=True, help="frozen scores database")
         if name in ("export", "facts"):
             command.add_argument("--output", required=True)
         if name == "export":
             command.add_argument("--no-parquet", action="store_true")
+            command.add_argument("--allow-entitled-text", action="store_true",
+                                 help="export a database frozen with --keep-text (a private export)")
         if name in ("estimands", "facts"):
             command.add_argument("--journal", action="append", required=True)
             command.add_argument("--b", type=int, default=10_000)
@@ -215,10 +221,12 @@ def command(args) -> Any:
         return status if action == "status" else gates(status)
     if action == "freeze":
         from .scores_db import freeze
-        return freeze(Path(args.database), Path(args.output), keep_text=args.keep_text)
+        return freeze(Path(args.database), Path(args.output), keep_text=args.keep_text,
+                      allow_incomplete=args.allow_incomplete)
     if action == "export":
         from .scores_db import export
-        return export(Path(args.scores), Path(args.output), parquet=not args.no_parquet)
+        return export(Path(args.scores), Path(args.output), parquet=not args.no_parquet,
+                      allow_entitled_text=args.allow_entitled_text)
     if action in ("estimands", "facts"):
         trend = (args.trend_from, args.trend_to) if args.trend_from is not None and args.trend_to is not None else None
         if (args.trend_from is None) != (args.trend_to is None):
@@ -230,7 +238,8 @@ def command(args) -> Any:
                                         ratio_pair=tuple(args.ratio) if args.ratio else None, trend_years=trend)
         from .corpus_facts import export_facts
         result = export_facts(Path(args.scores), Path(args.output), args.journal, b=args.b, seed=args.bootstrap_seed,
-                              ratio_pair=tuple(args.ratio) if args.ratio else None, trend_years=trend)
+                              ratio_pair=tuple(args.ratio) if args.ratio else None, trend_years=trend,
+                              allow_incomplete=args.allow_incomplete)
         result.pop("report", None)
         return result
     if action == "verify-facts":
