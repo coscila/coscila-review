@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import skills
+from .config import bio_repo
 from .errors import ReviewError, ValidationError
 from .util import (
     atomic_json,
@@ -240,8 +241,8 @@ def snapshot_siblings(paths: Any) -> dict[str, dict[str, str]]:
     candidates: list[tuple[Path, bool]] = []
     if paths.lab_repo:
         candidates.append((paths.lab_repo.resolve(), True))
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
+    bio = bio_repo(paths.home)
+    if bio is not None:
         candidates.append((bio.resolve(), True))
     snapshots: dict[str, dict[str, str]] = {}
     seen: set[Path] = set()
@@ -499,8 +500,8 @@ def install_integration(
     protected_sources = [paths.home.resolve()]
     if paths.lab_repo:
         protected_sources.append(paths.lab_repo.resolve())
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
+    bio = bio_repo(paths.home)
+    if bio is not None:
         protected_sources.append(bio.resolve())
     config_resolved = Path(mcp_config).resolve()
     staged_config_resolved = (
