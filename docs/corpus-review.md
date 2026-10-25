@@ -69,6 +69,16 @@ checks. Legacy abstract fields without sufficient provenance remain incomplete a
 require acquisition; an old publication-status observation does not establish a
 paper's current status.
 
+A review bound from a retained structured capture has the provenance class
+`entitled` (licensed text); a review and cited evidence from public providers
+have the class `public`. Entitled tasks are dispatched only to on-prem judges:
+workers whose broker configuration carries the `entitled-institutional`
+evidence policy. A `public-literature` worker never receives them, the egress
+gate refuses such a batch even under an explicit operator plan, and every
+egress event records the provenance classes it carried. When the only pending
+tasks are held for an on-prem judge, `corpus execute` stops with
+`waiting_input` and the number of held tasks instead of polling.
+
 For a verified reusable seed supplied by the operator, import the external
 snapshot, then branch it into a new analysis. The operator supplies the actual
 seed location; `/external/seed` below is an example, not a deployed path.
@@ -93,8 +103,10 @@ changed implementation under the same pinned analysis.
 
 Verify actual worker IDs with `node tools/ocsl-workers.mjs configs`. The template
 uses `none` for primary abstract assessment, `low` for targeted full-text
-assessment, and `none` for selected blind replication. All share the same
-aggregate capacity budget of 60. The launch default is **one locus per call**.
+assessment, and `none` for selected blind replication. Each job asks for its
+worker's capacity-group limit as reported by the broker configuration, and the
+broker's limiter queues items across all jobs, so the roles still share the
+group's capacity (60 by default). The launch default is **one locus per call**.
 
 ```bash
 ocsl-review corpus calibrate --workspace . --library work/literature \
@@ -126,9 +138,11 @@ tests do not establish that the live gate has passed.
 
 After a qualifying recorded calibration, execute with `--batch-size 4`. Each item
 retains its locus, task and evidence identity; a four-item call is transport
-grouping, not a merged scientific unit. `--max-jobs N` bounds a continuation
-segment; it does not declare the remaining corpus complete. Avoid multiplying
-the concurrency budget by the number of reviewers or worker roles.
+grouping, not a merged scientific unit. Up to three jobs of one analysis stay in
+flight, so the next job starts while another drains; `--max-jobs N` lowers that
+bound and does not declare the remaining corpus complete. Jobs of other analyses
+are neither blocked by nor charged for them. Avoid multiplying the concurrency
+budget by the number of reviewers or worker roles.
 
 For managed end-to-end execution after preparation/calibration:
 
@@ -184,6 +198,38 @@ or all-unit ID echo. Local validation checks each item independently. Accepted
 peers survive invalid or missing peers; preserve rejected attempts. Format
 repair is bounded. Missing evidence, changed source identity and inadequate
 coverage require their own resolution rather than repeating the same inference.
+
+## Storage, progress and schema upgrades
+
+Planning reads citation loci in keyset pages of 5,000 rows, loads each cited
+work's evidence once per pass and stores task inputs in transactions of at most
+5,000 rows behind one durability barrier per batch. Result import parses each
+batch request once and writes every result page of up to 100 records, with its
+broker cursor, in one transaction; a replayed page imports nothing twice.
+
+Libraries at schema version 3 keep progress counters in the same transactions
+as the rows they count, so `corpus status`, the progress heartbeat and the
+execute loop read counters instead of scanning tables. Opening an older library
+never changes its schema. Upgrade it explicitly:
+
+```bash
+ocsl-review corpus migrate --workspace . --library work/literature
+```
+
+Each step first writes and checks a backup (`corpus-v<N>-backup.sqlite3`, never
+overwriting an earlier one) and refuses immutable snapshots; branch a snapshot
+first. Until then, status of an older library scans its tables and says so.
+`corpus verify` compares the counters with the stored rows; `corpus migrate
+--rebuild-counters` recomputes them.
+
+An opt-in synthetic benchmark generates a corpus in a new temporary workspace
+and reports preparation, import, status and egress-ledger rates against the
+execution targets (2,000 tasks/s, 1,000 results/s, 50 ms, 100,000 events in
+10 s). It uses an in-process broker and touches no deployment path:
+
+```bash
+PYTHONPATH=src python3 tests/benchmark_corpus_executor.py --loci 200000
+```
 
 ## Resume, export and branch
 
