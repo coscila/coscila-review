@@ -1,0 +1,49 @@
+{
+  "id": "claim-check@1",
+  "name": "claim-check",
+  "version": 1,
+  "status": "active",
+  "description": "Claim checking with zero to many citations per claim: every citation is judged against the whole sentence that carries its marker, with retrieved evidence, exact quotes and explicit abstention (citation-support@2 semantics). Research-integrity tooling for authors, reviewers and study teams (ocsl-review screen).",
+  "unit": "sentence carrying the citation marker; no carry-over, no clause parsing",
+  "parameters": {
+    "k": {"type": "integer", "description": "retrieved evidence units per cited work (default 5)"},
+    "maxEvidenceCharacters": {"type": "integer", "description": "evidence window per citation in characters (default 11000)"}
+  },
+  "files": {
+    "systemPrompt": {"repoPath": "prompts/citation-support-v2.txt", "sha256": "cf075fee7e7aeaad9acd73c25928dcb4f8604fd4c024248983f06e62cab531d6", "mediaType": "text/plain; charset=utf-8"},
+    "outputSchema": {"repoPath": "schemas/corpus-assessment-v2.schema.json", "sha256": "8547779a0ab620cbc74cf6a25bb015be145a3aa939644524146480aa89521b59", "mediaType": "application/schema+json"},
+    "runSchema": {"repoPath": "schemas/claim-check.sql", "sha256": "5e4d49b565cac8e391c1c30fb846f8757b4bd55338f3946a370630a48bc8ce78", "mediaType": "application/sql"}
+  },
+  "tiers": {
+    "full-text": {
+      "evidencePolicy": {"evidence": "retrieved window of the cited work's full text",
+                         "retrieval": {"version": "retrieval-fts5-1", "tokenizer": "unicode61 remove_diacritics 2", "k": 5, "maxEvidenceCharacters": 11000},
+                         "sanitizer": "sanitize-1"},
+      "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "groupedBy": "evidence tier", "extractor": "claim-sentence-1", "authorYearResolver": "author-year-1"},
+      "request": {"api": "chat completions on an on-prem judge", "temperature": 0, "maxTokens": "max(3000, 700 * items)"},
+      "repair": {"passes": 1}
+    },
+    "abstract": {
+      "evidencePolicy": {"evidence": "the complete abstract when no full text is available",
+                         "retrieval": {"version": "retrieval-fts5-1", "tokenizer": "unicode61 remove_diacritics 2", "k": 5, "maxEvidenceCharacters": 11000},
+                         "sanitizer": "sanitize-1"},
+      "geometry": {"itemsPerCall": {"min": 1, "max": 40}, "groupedBy": "evidence tier", "extractor": "claim-sentence-1", "authorYearResolver": "author-year-1"},
+      "request": {"api": "chat completions on an on-prem judge", "temperature": 0, "maxTokens": "max(3000, 700 * items)"},
+      "repair": {"passes": 1}
+    }
+  },
+  "requiredModel": {"served": "the judge declared by the screen's egress policy (an on-prem model in confidential mode)", "fingerprint": "record-when-offered", "onMismatch": "reject"},
+  "validator": {"id": "citation-support-v2", "module": "ocsl_review.corpus_assessment"},
+  "builder": {"module": "ocsl_review.corpus_assessment"},
+  "classMap": {"id": "support-verdict@2",
+               "supported": ["direct-support", "scope-caveat"], "adverse": ["contradicted", "not-addressed"],
+               "uncertain": ["partial-indirect", "abstain"],
+               "errorCategories": {"contradicted": "contradicts", "not-addressed": "not substantiated",
+                                   "scope-caveat": "oversimplifies", "partial-indirect": "indirect"}},
+  "deterministicRows": {"integrity": "integrity-1",
+                        "classes": ["never cited", "cited but not listed", "ambiguous", "identity unresolved",
+                                    "DOI registration", "metadata disagreement", "impossible year", "duplicate identity",
+                                    "dated retraction, expression of concern and correction status"]},
+  "notes": ["Every adverse flag reads 'check suggested' until a calibration set measures its positive predictive value.",
+            "A screen run records this registry digest and the digest of claim_check.instrument_definition(), whose fields this bundle mirrors (checked by the tests)."]
+}

@@ -66,7 +66,7 @@ def forbidden_hits(text: str, table=None) -> list[int]:
 
 class RegistryTests(unittest.TestCase):
     def test_registered_instruments_verify(self):
-        self.assertEqual(["citation-census@1", "citation-support@2"], instruments.available())
+        self.assertEqual(["citation-census@1", "citation-support@2", "claim-check@1"], instruments.available())
         for instrument_id in instruments.available():
             report = instruments.verify(instruments.load(instrument_id, check=False))
             self.assertTrue(report["ok"], report["problems"])

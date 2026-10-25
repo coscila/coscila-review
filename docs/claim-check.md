@@ -68,6 +68,8 @@ An evidence-store work looks like this (one per line in JSON Lines):
    semantics: one verdict per citation, exact quotes, explicit abstention, one repair pass,
    batches of at most 40 items per evidence tier, temperature 0.
 7. **Report**: a deterministic `report.json` (digest `reportSha256`), `report.md` and `dossier.md`.
+   The report names the instrument by the digest of its run definition and by its registry digest
+   (`instruments/claim-check/1`, see [the instrument registry](census-instrument.md)).
 
 ## Attribution rules
 

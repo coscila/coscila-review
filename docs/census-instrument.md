@@ -28,6 +28,7 @@ different instrument. Transport, retries and storage are outside the digest.
 |---|---|---|
 | `citation-census@1` | frozen | entry-level census: abstract tier and full-text tier |
 | `citation-support@2` | active | per-locus support with exact quotes; claim checking; registered unchanged, so analyses pinned to its prompt and schema still verify |
+| `claim-check@1` | active | one verdict per citation against the whole sentence that carries it, with retrieved evidence (`ocsl-review screen`, [claim screen](claim-check.md)); citation-support@2 prompt, schema and validator |
 
 A compact per-locus `citation-support@3`, alternative batch geometries and an
 equivalence gate between instruments are deferred.

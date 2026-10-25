@@ -283,6 +283,33 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual("claim-check@1", definition["id"])
         self.assertEqual("citation-support-v2", definition["verdictProtocol"])
 
+    def test_registered_bundle_mirrors_the_run_definition(self):
+        from ocsl_review import instruments
+        bundle = instruments.load("claim-check@1")
+        manifest, definition = bundle.manifest, instrument_definition()
+        self.assertEqual(manifest["unit"], definition["unit"])
+        self.assertEqual(manifest["files"]["systemPrompt"]["sha256"], definition["promptSha256"])
+        self.assertEqual(manifest["files"]["outputSchema"]["sha256"], definition["schemaSha256"])
+        self.assertEqual(manifest["validator"]["id"], definition["verdictProtocol"])
+        self.assertEqual(manifest["classMap"]["errorCategories"], definition["errorCategories"])
+        self.assertEqual(manifest["deterministicRows"]["integrity"], definition["integrity"])
+        for tier in manifest["tiers"].values():
+            self.assertEqual(tier["evidencePolicy"]["retrieval"], definition["retrieval"])
+            self.assertEqual(tier["evidencePolicy"]["sanitizer"], definition["sanitizer"])
+            self.assertEqual((tier["geometry"]["itemsPerCall"]["max"], tier["geometry"]["groupedBy"]),
+                             (definition["batch"]["maxItems"], definition["batch"]["groupedBy"]))
+            self.assertEqual((tier["geometry"]["extractor"], tier["geometry"]["authorYearResolver"]),
+                             (definition["extractor"], definition["authorYearResolver"]))
+            self.assertEqual({key: tier["request"][key] for key in ("temperature", "maxTokens")}, definition["settings"])
+            self.assertEqual(tier["repair"]["passes"], definition["repairPasses"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "draft.md"
+            path.write_text(F.attribution_markdown(), encoding="utf-8")
+            report = run_screen(path, run_root=root / "run", works=load_store(F.write_store(root / "store.jsonl")),
+                                judge=F.QuoteJudge(), reference_year=2026)
+        self.assertEqual(report["instrument"]["registryDigest"], bundle.digest)
+
 
 class VerdictTests(unittest.TestCase):
     def test_repair_pass_contradiction_category_and_unresolved_identity(self):
