@@ -270,10 +270,8 @@ def paper_batches(items: Sequence[dict[str, Any]], size: int | None = None) -> l
     return [list(items[i:i + width]) for i in range(0, len(items), width)]
 
 
-def full_text_calls(escalations: Sequence[Any], seed: int, *, review: Callable[[Any], str],
-                    retrievable: Callable[[Any], bool], size: int | None = None) -> list[tuple[str, list[Any]]]:
-    """Seeded shuffle, grouping by review in first-seen order, then calls of ``size`` retrievable entries."""
-    width = items_per_call("full-text") if size is None else size
+def full_text_groups(escalations: Sequence[Any], seed: int, *, review: Callable[[Any], str]) -> list[tuple[str, list[Any]]]:
+    """Seeded shuffle of the escalated entries, grouped by review in first-seen order."""
     if not isinstance(seed, int) or isinstance(seed, bool):
         raise ValidationError("the full-text geometry needs an integer protocol seed")
     shuffled = list(escalations)
@@ -281,10 +279,21 @@ def full_text_calls(escalations: Sequence[Any], seed: int, *, review: Callable[[
     grouped: dict[str, list[Any]] = {}
     for entry in shuffled:
         grouped.setdefault(review(entry), []).append(entry)
+    return list(grouped.items())
+
+
+def full_text_chunks(entries: Sequence[Any], size: int | None = None) -> list[list[Any]]:
+    """Calls of ``size`` retrieved entries of one review, in group order."""
+    width = items_per_call("full-text") if size is None else size
+    return [list(entries[i:i + width]) for i in range(0, len(entries), width)]
+
+
+def full_text_calls(escalations: Sequence[Any], seed: int, *, review: Callable[[Any], str],
+                    retrievable: Callable[[Any], bool], size: int | None = None) -> list[tuple[str, list[Any]]]:
+    """Seeded shuffle, grouping by review in first-seen order, then calls of ``size`` retrievable entries."""
     calls = []
-    for key, entries in grouped.items():
-        kept = [entry for entry in entries if retrievable(entry)]
-        calls.extend((key, kept[i:i + width]) for i in range(0, len(kept), width))
+    for key, entries in full_text_groups(escalations, seed, review=review):
+        calls.extend((key, chunk) for chunk in full_text_chunks([e for e in entries if retrievable(e)], size))
     return calls
 
 

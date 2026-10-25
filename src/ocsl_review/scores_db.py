@@ -239,8 +239,9 @@ def meta(connection: sqlite3.Connection) -> dict[str, str]:
     return {r["key"]: r["value"] for r in connection.execute("SELECT key, value FROM meta")}
 
 
-def aggregate_reviews(connection: sqlite3.Connection) -> None:
+def aggregate_reviews(connection: sqlite3.Connection, journal: str | None = None, doi: str | None = None) -> None:
     """Recompute per-review counts from the citation rows (3 classes x 2 tiers, plus never cited)."""
+    where, params = ("WHERE journal=? AND doi=?", (journal, doi)) if journal is not None else ("", ())
     connection.execute("""
       UPDATE reviews SET
         n_printed = (SELECT COUNT(*) FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi),
@@ -255,14 +256,14 @@ def aggregate_reviews(connection: sqlite3.Connection) -> None:
         ft_sure_supported = (SELECT COUNT(*) FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND c.ft_class='sure_supported'),
         ft_unsure = (SELECT COUNT(*) FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND c.ft_class='unsure'),
         ft_sure_not_supported = (SELECT COUNT(*) FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND c.ft_class='sure_not_supported')
-    """)
+    """ + where, params)
     connection.execute("""
       UPDATE reviews SET
         abs_not_supported_share = CASE WHEN abs_sure_supported + abs_sure_not_supported > 0
           THEN 1.0 * abs_sure_not_supported / (abs_sure_supported + abs_sure_not_supported) END,
         ft_not_supported_share = CASE WHEN ft_sure_supported + ft_sure_not_supported > 0
           THEN 1.0 * ft_sure_not_supported / (ft_sure_supported + ft_sure_not_supported) END
-    """)
+    """ + where, params)
 
 
 def write_scores(connection: sqlite3.Connection) -> dict[str, int]:
@@ -330,6 +331,13 @@ def open_frozen(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _arrow_schema(pa, connection: sqlite3.Connection, table: str, columns: list[str]):
+    """Parquet column types from the declared SQLite types (INTEGER, REAL, otherwise text)."""
+    declared = {r[1]: (r[2] or "").upper() for r in connection.execute(f"PRAGMA table_info({table})")}
+    kinds = {"INTEGER": pa.int64(), "REAL": pa.float64()}
+    return pa.schema([(column, kinds.get(declared.get(column, ""), pa.string())) for column in columns])
+
+
 def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet: bool = True) -> dict[str, Any]:
     """TSV (always) and Parquet (when pyarrow is importable) for each table, plus a manifest with digests."""
     output = Path(output)
@@ -345,19 +353,35 @@ def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet:
         parquet = False
     with closing(open_frozen(path)) as connection:
         for table in tables:
-            cursor = connection.execute(f"SELECT * FROM {table} ORDER BY rowid" if table != "meta" else "SELECT * FROM meta ORDER BY key")
+            order = "ORDER BY key" if table == "meta" else "ORDER BY rowid"
+            cursor = connection.execute(f"SELECT * FROM {table} {order}")
             columns = [d[0] for d in cursor.description]
-            rows = [tuple(r) for r in cursor]
             target = output / f"{table}.tsv"
+            count = 0
+            writer_parquet = None
             with target.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
                 writer.writerow(columns)
-                writer.writerows(["" if v is None else v for v in row] for row in rows)
-            files.append({"path": target.name, "rows": len(rows), "sha256": file_sha256(target)})
+                while True:
+                    rows = cursor.fetchmany(20_000)
+                    if not rows:
+                        break
+                    writer.writerows(["" if v is None else v for v in row] for row in rows)
+                    count += len(rows)
+                    if parquet:
+                        if writer_parquet is None:
+                            schema = _arrow_schema(pa, connection, table, columns)
+                            writer_parquet = pq.ParquetWriter(output / f"{table}.parquet", schema)
+                        writer_parquet.write_table(pa.table({column: [row[i] for row in rows] for i, column in enumerate(columns)},
+                                                            schema=writer_parquet.schema))
+            files.append({"path": target.name, "rows": count, "sha256": file_sha256(target)})
             if parquet:
-                data = {column: [row[i] for row in rows] for i, column in enumerate(columns)}
-                pq.write_table(pa.table(data), output / f"{table}.parquet")
-                files.append({"path": f"{table}.parquet", "rows": len(rows), "sha256": file_sha256(output / f"{table}.parquet")})
+                if writer_parquet is None:
+                    schema = _arrow_schema(pa, connection, table, columns)
+                    pq.write_table(pa.table({column: [] for column in columns}, schema=schema), output / f"{table}.parquet")
+                else:
+                    writer_parquet.close()
+                files.append({"path": f"{table}.parquet", "rows": count, "sha256": file_sha256(output / f"{table}.parquet")})
     manifest = {"format": "ocsl-census-scores-export-v1", "source": {"path": Path(path).name, "sha256": file_sha256(path)},
                 "parquet": parquet_state, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

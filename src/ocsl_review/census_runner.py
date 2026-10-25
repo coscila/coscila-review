@@ -216,6 +216,8 @@ class CensusRun:
             if entry.label in supplied:
                 ident = dict(supplied[entry.label])
                 ident.setdefault("method", "supplied")
+                if ident.get("workKey"):
+                    ident.setdefault("identity", "resolved_unverified")
             else:
                 ident = resolve_identity(entry, works)
             key = ident.get("workKey")
@@ -288,7 +290,7 @@ class CensusRun:
                 "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
                 " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 history)
-            scores_db.aggregate_reviews(self.connection)
+            scores_db.aggregate_reviews(self.connection, journal, doi)
         return {"doi": doi, "state": "prepared", "entries": len(rows), "uncovered": uncovered,
                 "judgeable": sum(1 for r in rows if "abs_class" not in r)}
 
@@ -418,205 +420,235 @@ class CensusRun:
                         counts["invalid"] += 1
             if variant == "primary":
                 self.connection.execute("UPDATE reviews SET abstract_state='completed' WHERE journal=? AND doi=?", (journal, doi))
-                scores_db.aggregate_reviews(self.connection)
+                scores_db.aggregate_reviews(self.connection, journal, doi)
         return counts
 
     def _pause(self, reason: str) -> None:
         with self.lock, self.connection:
             self.connection.execute("INSERT OR REPLACE INTO meta VALUES('runState', ?)", ("paused:" + reason,))
 
-    def run_abstract(self, *, limit: int | None = None) -> dict[str, Any]:
-        if self.transport is None:
-            raise ValidationError("a transport is required to run the census")
-        state = scores_db.meta(self.connection).get("runState", "")
-        if state.startswith("paused:model_drift"):
+    def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]]]]]], *, cut: Any,
+                  variant: str) -> tuple[dict[str, int], str | None]:
+        """Run review batches with at most two batches per stream in flight; write each review when complete."""
+        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0}
+        pending: dict[tuple[str, str], dict[str, Any]] = {}
+        drift: list[str] = []
+        limit = 2 * self.concurrency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            inflight: dict[concurrent.futures.Future, tuple[str, str]] = {}
+
+            def collect() -> None:
+                done, _ = concurrent.futures.wait(list(inflight), return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    key = inflight.pop(future)
+                    outcome = future.result()
+                    totals["transportFailures"] += outcome["failures"]
+                    if outcome["drift"] is not None:
+                        drift.append(outcome["drift"])
+                    if drift:
+                        continue
+                    slot = pending[key]
+                    slot["outcomes"].append(outcome)
+                    slot["left"] -= 1
+                    if slot["left"] == 0:
+                        counts = self._write_abstract(key[0], key[1], sorted(slot["outcomes"], key=lambda o: o["batch"]),
+                                                      cut=cut, variant=variant)
+                        totals["accepted"] += counts["accepted"]
+                        totals["invalid"] += counts["invalid"]
+                        totals["reviews"] += 1
+                        del pending[key]
+
+            for journal, doi, title, batches in work:
+                if drift:
+                    break
+                key = (journal, doi)
+                if not batches:
+                    if variant == "primary":
+                        self._write_abstract(journal, doi, [], cut=cut, variant=variant)
+                        totals["reviews"] += 1
+                    continue
+                pending[key] = {"left": len(batches), "outcomes": []}
+                for index, batch in batches:
+                    while len(inflight) >= limit and not drift:
+                        collect()
+                    if drift:
+                        break
+                    future = pool.submit(self._judge_batch, journal, doi, title, index, batch, cut=cut, variant=variant)
+                    inflight[future] = key
+            while inflight:
+                collect()
+        return totals, (drift[0] if drift else None)
+
+    def _resume_after_drift(self) -> None:
+        if scores_db.meta(self.connection).get("runState", "").startswith("paused:model_drift"):
             with self.lock, self.connection:
                 self.connection.execute("DELETE FROM meta WHERE key='runState'")
-        reviews = self.connection.execute(
-            "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()
+
+    def _paused(self, totals: dict[str, Any], drift: str | None) -> dict[str, Any]:
+        if drift is None:
+            return {**totals, "state": "completed"}
+        self._pause("model_drift")
+        return {**totals, "state": "paused", "reason": f"model_drift: served {drift!r}, required {self.required_model!r}"}
+
+    def run_abstract(self, *, limit: int | None = None) -> dict[str, Any]:
+        """Abstract tier for every pending review, in enumeration order; resumable per review."""
+        if self.transport is None:
+            raise ValidationError("a transport is required to run the census")
+        self._resume_after_drift()
+        with self.lock:
+            reviews = self.connection.execute(
+                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()
         if limit is not None:
             reviews = reviews[:limit]
-        plans = []
-        for review in reviews:
-            items = self._items(review["journal"], review["doi"])
-            plans.append((review, C.paper_batches(items)))
-        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "calls": 0, "state": "completed"}
-        pending = {}
-        drift = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            futures = {}
-            for review, batches in plans:
-                key = (review["journal"], review["doi"])
-                pending[key] = {"left": len(batches), "outcomes": [], "title": review["title"] or ""}
-                if not batches:
-                    self._write_abstract(key[0], key[1], [], cut=True, variant="primary")
-                    totals["reviews"] += 1
-                    continue
-                for index, batch in enumerate(batches):
-                    future = pool.submit(self._judge_batch, key[0], key[1], review["title"] or "", index, batch)
-                    futures[future] = key
-            for future in concurrent.futures.as_completed(futures):
-                if future.cancelled():
-                    continue
-                key = futures[future]
-                outcome = future.result()
-                totals["transportFailures"] += outcome["failures"]
-                if outcome["drift"] is not None or drift is not None:
-                    drift = drift or outcome["drift"]
-                    for other in futures:
-                        other.cancel()
-                    continue
-                slot = pending[key]
-                slot["outcomes"].append(outcome)
-                slot["left"] -= 1
-                if slot["left"] == 0:
-                    counts = self._write_abstract(key[0], key[1], sorted(slot["outcomes"], key=lambda o: o["batch"]),
-                                                  cut=True, variant="primary")
-                    totals["accepted"] += counts["accepted"]
-                    totals["invalid"] += counts["invalid"]
-                    totals["reviews"] += 1
-        totals["calls"] = self.connection.execute("SELECT COUNT(*) FROM calls WHERE run_id=? AND tier='abstract'",
-                                                  (self.run_id,)).fetchone()[0]
-        if drift is not None:
-            self._pause("model_drift")
-            totals["state"] = "paused"
-            totals["reason"] = f"model_drift: served {drift!r}, required {self.required_model!r}"
-        return totals
+
+        def work():
+            for review in reviews:
+                with self.lock:
+                    items = self._items(review["journal"], review["doi"])
+                yield review["journal"], review["doi"], review["title"] or "", list(enumerate(C.paper_batches(items)))
+        totals, drift = self._schedule(work(), cut=True, variant="primary")
+        with self.lock:
+            totals["calls"] = self.connection.execute("SELECT COUNT(*) FROM calls WHERE run_id=? AND tier='abstract'",
+                                                      (self.run_id,)).fetchone()[0]
+        return self._paused(totals, drift)
 
     # ------------------------------------------------------------------ full-text tier
-    def _full_text(self, work: Mapping[str, Any], fetch_xml, entitled) -> tuple[str | None, str, str | None, bytes | None, str]:
-        """Return (text, outcome, source, raw bytes, provenance class) for a cited work."""
+    def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled) -> tuple[str | None, str, str | None, str]:
+        """Full text of a cited work: (text, outcome, source, provenance class); cached per identity version."""
         with self.lock:
             cached = self.connection.execute(
                 "SELECT text, provider, provenance_class FROM evidence WHERE work_key=? AND identity_version=? "
                 "AND unit='full-text' AND text IS NOT NULL AND route='source' ORDER BY evidence_id LIMIT 1",
                 (work["work_key"], work["identity_version"])).fetchone()
         if cached:
-            return cached["text"], "cache", cached["provider"], None, cached["provenance_class"]
+            return cached["text"], "cache", cached["provider"], cached["provenance_class"]
+        text = raw = source = None
+        provenance = "public"
         if work.get("pmcid") and fetch_xml is not None:
             pmcid = work["pmcid"] if str(work["pmcid"]).upper().startswith("PMC") else "PMC%s" % work["pmcid"]
-            raw = fetch_xml(pmcid)
-            if raw:
+            fetched = fetch_xml(pmcid)
+            if fetched:
                 try:
-                    return C.jats_to_text(raw), "europe-pmc-fulltextxml", "europe-pmc-fulltextxml", raw, "public"
+                    text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
                 except ValidationError:
-                    pass
-        if entitled is not None:
+                    text = None
+        if text is None and entitled is not None:
             supplied = entitled(dict(work))
             if supplied:
                 raw, media = supplied
                 text = C.jats_to_text(raw) if "xml" in media else raw.decode("utf-8")
-                return text, "entitled", "entitled", raw, "entitled"
-        return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, None, "public"
+                source, provenance = "entitled", "entitled"
+        if text is None:
+            return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, provenance
+        with self.lock, self.connection:
+            self.connection.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+                "src-" + sha256_text(canonical([work["work_key"], work["identity_version"], sha256_text(text)]))[:32],
+                work["work_key"], work["identity_version"], "full-text", sha256_text(text), source, "source", provenance,
+                utc_now(), len(text), hashlib.sha256(raw).hexdigest() if raw else None, text))
+        return text, source, source, provenance
+
+    def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
+                       allow_entitled: bool) -> tuple[str, str, str, list[dict[str, Any]]]:
+        """Retrieve every entry of one review's group, record failed retrievals, build the windows."""
+        journal, title = group[0]["journal"], group[0]["title"] or ""
+        retrieved = []
+        for row in group:
+            work = works[row["cited_work_key"]]
+            text, outcome, source, provenance = self._retrieve(work, fetch_xml, entitled)
+            if text is not None and provenance == "entitled" and not allow_entitled:
+                text, outcome = None, "entitled-blocked"
+            if text is None:
+                with self.lock, self.connection:
+                    self.connection.execute("UPDATE citations SET ft_retrieval=? WHERE journal=? AND doi=? AND label=?",
+                                            (outcome, journal, doi, row["label"]))
+                continue
+            with self.lock:
+                passages = [{"sentence": r["sentence"], "section": r["section"]}
+                            for r in self._loci(journal, doi, row["label"])]
+            year = int(work["year"]) if isinstance(work["year"], str) and work["year"].isdigit() else work["year"]
+            retrieved.append({"label": row["label"], "citing_passages": passages,
+                              "cited_work": {"title": work["title"], "venue": work["venue"], "year": year},
+                              "fulltext_window": C.full_text_window(text, C.claim_text(passages[:3])),
+                              "_entry": {"row": row, "outcome": outcome, "source": source, "provenance": provenance}})
+        return doi, journal, title, retrieved
+
+    def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]]):
+        messages = C.build_full_text_messages(items, title, journal)
+        payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
+        result = execute(self.transport, payload, tier="full-text", required_model=self.required_model, sleep=self.sleep)
+        labels = [it["label"] for it in items]
+        if result.text is None:
+            self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
+                          kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0)
+            return {"drift": result.served_model if result.receipt.get("error") == "model_drift" else None,
+                    "failed": result.receipt.get("error") != "model_drift", "judged": 0, "missing": 0}
+        records, problems, missing = C.parse_labels(result.text, labels, stage="fulltext")
+        call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
+                                kind="full-text", labels=labels, parsed=len(records), missing=len(missing),
+                                problems=len(problems))
+        self._record_full_text(journal, doi, items, records, call_id)
+        return {"drift": None, "failed": False, "judged": len(records), "missing": len(missing)}
 
     def run_full_text(self, *, fetch_xml: Callable[[str], bytes | None] | None = None,
                       entitled: Callable[[dict[str, Any]], tuple[bytes, str] | None] | None = None,
                       fetch_workers: int = 8) -> dict[str, Any]:
-        """Escalated entries: retrieve, window, call five per call (reasoning low, no repair)."""
+        """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
-        rows = self.connection.execute(
-            "SELECT c.journal, c.doi, c.label, c.cited_work_key, r.title, r.review_order, c.ordinal "
-            "FROM citations c JOIN reviews r ON r.journal=c.journal AND r.doi=c.doi WHERE c.model_judged=1 AND c.abs_escalated=1 "
-            "AND c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') AND c.ft_retrieval IS NULL "
-            "ORDER BY r.review_order, c.ordinal").fetchall()
-        works = {r["work_key"]: dict(r) for r in self.connection.execute("SELECT * FROM works")}
-        texts: dict[str, tuple] = {}
+        self._resume_after_drift()
+        with self.lock:
+            rows = [dict(r) for r in self.connection.execute(
+                "SELECT c.journal, c.doi, c.label, c.cited_work_key, r.title FROM citations c JOIN reviews r "
+                "ON r.journal=c.journal AND r.doi=c.doi WHERE c.model_judged=1 AND c.abs_escalated=1 AND c.cited_inbody=1 "
+                "AND c.identity IN ('resolved','resolved_unverified') AND c.ft_retrieval IS NULL "
+                "ORDER BY r.review_order, c.ordinal")]
+            works = {r["work_key"]: dict(r) for r in self.connection.execute("SELECT * FROM works")}
+        groups = C.full_text_groups(rows, self.seed, review=lambda row: row["doi"])
+        allow_entitled = bool(getattr(self.transport, "on_premises", False))
+        totals = {"escalated": len(rows), "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0}
+        drift: list[str] = []
+        limit = 4 * self.concurrency
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as fetch_pool, \
+                concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as call_pool:
+            retrievals = [fetch_pool.submit(self._prepare_group, doi, group, works, fetch_xml, entitled, allow_entitled)
+                          for doi, group in groups]
+            calls: set[concurrent.futures.Future] = set()
 
-        def retrieve(key):
-            return key, self._full_text(works[key], fetch_xml, entitled)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as pool:
-            for key, result in pool.map(retrieve, sorted({r["cited_work_key"] for r in rows})):
-                texts[key] = result
-        now = utc_now()
-        with self.lock, self.connection:
-            for key, (text, outcome, source, raw, provenance) in texts.items():
-                if text is not None and outcome != "cache":
-                    work = works[key]
-                    self.connection.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-                        "src-" + sha256_text(canonical([key, work["identity_version"], sha256_text(text)]))[:32], key,
-                        work["identity_version"], "full-text", sha256_text(text), source, "source", provenance, now,
-                        len(text), hashlib.sha256(raw).hexdigest() if raw else None, text))
-        allowed_entitled = bool(getattr(self.transport, "on_premises", False))
-        entries = []
-        for row in rows:
-            text, outcome, source, raw, provenance = texts[row["cited_work_key"]]
-            if text is not None and provenance == "entitled" and not allowed_entitled:
-                text, outcome = None, "entitled-blocked"
-            passages = [{"sentence": r["sentence"], "section": r["section"]}
-                        for r in self._loci(row["journal"], row["doi"], row["label"])]
-            entries.append({"row": row, "text": text, "outcome": outcome, "source": source, "provenance": provenance,
-                            "passages": passages})
-        calls = C.full_text_calls(entries, self.seed, review=lambda e: e["row"]["doi"],
-                                  retrievable=lambda e: e["text"] is not None)
-        with self.lock, self.connection:
-            for entry in entries:
-                if entry["text"] is None:
-                    row = entry["row"]
-                    self.connection.execute("UPDATE citations SET ft_retrieval=? WHERE journal=? AND doi=? AND label=?",
-                                            (entry["outcome"], row["journal"], row["doi"], row["label"]))
-        totals = {"escalated": len(rows), "retrieved": sum(1 for e in entries if e["text"] is not None),
-                  "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0, "state": "completed"}
+            def collect(block: bool) -> None:
+                done, _ = concurrent.futures.wait(list(calls), timeout=None if block else 0,
+                                                  return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    calls.discard(future)
+                    outcome = future.result()
+                    if outcome["drift"] is not None:
+                        drift.append(outcome["drift"])
+                    totals["transportFailures"] += int(outcome["failed"])
+                    totals["calls"] += int(not outcome["failed"] and outcome["drift"] is None)
+                    totals["judged"] += outcome["judged"]
+                    totals["missing"] += outcome["missing"]
 
-        def judge(call_index, doi, group):
-            row0 = group[0]["row"]
-            journal, title = row0["journal"], row0["title"] or ""
-            items = []
-            for entry in group:
-                row = entry["row"]
-                work = works[row["cited_work_key"]]
-                year = int(work["year"]) if isinstance(work["year"], str) and work["year"].isdigit() else work["year"]
-                window = C.full_text_window(entry["text"], C.claim_text(entry["passages"][:3]))
-                items.append({"label": row["label"], "citing_passages": entry["passages"],
-                              "cited_work": {"title": work["title"], "venue": work["venue"], "year": year},
-                              "fulltext_window": window, "_entry": entry})
-            messages = C.build_full_text_messages(items, title, journal)
-            payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
-            result = execute(self.transport, payload, tier="full-text", required_model=self.required_model, sleep=self.sleep)
-            return call_index, doi, journal, items, result
-        jobs, per_review = [], {}
-        for doi, group in calls:
-            index = per_review.get(doi, 0)
-            per_review[doi] = index + 1
-            jobs.append((index, doi, group))
-        drift = None
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            futures = [pool.submit(judge, *job) for job in jobs]
-            for future in concurrent.futures.as_completed(futures):
-                if future.cancelled():
+            for future in concurrent.futures.as_completed(retrievals):
+                doi, journal, title, retrieved = future.result()
+                totals["retrieved"] += len(retrieved)
+                if drift:
                     continue
-                index, doi, journal, items, result = future.result()
-                labels = [it["label"] for it in items]
-                if result.text is None:
-                    self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
-                                  kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0)
-                    if result.receipt.get("error") == "model_drift":
-                        drift = drift or result.served_model
-                        for other in futures:
-                            other.cancel()
-                    else:
-                        totals["transportFailures"] += 1
-                    continue
-                records, problems, missing = C.parse_labels(result.text, labels, stage="fulltext")
-                call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
-                                        kind="full-text", labels=labels, parsed=len(records), missing=len(missing),
-                                        problems=len(problems))
-                self._record_full_text(journal, doi, items, records, call_id)
-                totals["calls"] += 1
-                totals["judged"] += len(records)
-                totals["missing"] += len(missing)
+                for index, chunk in enumerate(C.full_text_chunks(retrieved)):
+                    while len(calls) >= limit:
+                        collect(True)
+                    calls.add(call_pool.submit(self._judge_full_text, journal, doi, title, index, chunk))
+                if calls:
+                    collect(False)
+            while calls:
+                collect(True)
         with self.lock, self.connection:
-            scores_db.aggregate_reviews(self.connection)
+            for journal, doi in {(row["journal"], row["doi"]) for row in rows}:
+                scores_db.aggregate_reviews(self.connection, journal, doi)
             self.connection.execute(
                 "UPDATE reviews SET full_text_state='completed' WHERE abstract_state='completed' AND NOT EXISTS ("
                 "SELECT 1 FROM citations c WHERE c.journal=reviews.journal AND c.doi=reviews.doi AND c.model_judged=1 "
                 "AND c.abs_escalated=1 AND c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') "
                 "AND c.ft_retrieval IS NULL)")
-        if drift is not None:
-            self._pause("model_drift")
-            totals["state"] = "paused"
-            totals["reason"] = f"model_drift: served {drift!r}, required {self.required_model!r}"
-        return totals
+        return self._paused(totals, drift[0] if drift else None)
 
     def _loci(self, journal: str, doi: str, label: str):
         return self.connection.execute(
@@ -665,13 +697,13 @@ class CensusRun:
     def no_truncation_sample(self, entries: int | None = None) -> list[tuple[str, str, int]]:
         """Seeded whole review batches with at least one cut abstract, until ``entries`` entries are covered."""
         target = entries or int(self.instrument.manifest["sensitivities"]["no-truncation"]["sampleEntries"])
-        batches = self.connection.execute(
-            "SELECT journal, doi, abs_batch AS batch, COUNT(*) AS n, SUM(abs_cut=1) AS cut FROM citations "
-            "WHERE abs_batch IS NOT NULL AND cited_inbody=1 AND identity IN ('resolved','resolved_unverified') "
-            "GROUP BY journal, doi, abs_batch HAVING cut > 0 ORDER BY journal, doi, abs_batch").fetchall()
-        rng = random.Random(f"{self.seed}:no-truncation")
+        with self.lock:
+            batches = self.connection.execute(
+                "SELECT journal, doi, abs_batch AS batch, COUNT(*) AS n, SUM(abs_cut=1) AS cut FROM citations "
+                "WHERE abs_batch IS NOT NULL AND cited_inbody=1 AND identity IN ('resolved','resolved_unverified') "
+                "GROUP BY journal, doi, abs_batch HAVING cut > 0 ORDER BY journal, doi, abs_batch").fetchall()
         order = [(b["journal"], b["doi"], b["batch"], b["n"]) for b in batches]
-        rng.shuffle(order)
+        random.Random(f"{self.seed}:no-truncation").shuffle(order)
         selected, covered = [], 0
         for journal, doi, batch, n in order:
             if covered >= target:
@@ -681,26 +713,31 @@ class CensusRun:
         return selected
 
     def run_no_truncation(self, *, entries: int | None = None) -> dict[str, Any]:
+        """Re-run the sampled batches unchanged except for the abstract cut; history only, variant no-truncation."""
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        self._resume_after_drift()
         selected = self.no_truncation_sample(entries)
-        done = {(r[0], r[1], r[2]) for r in self.connection.execute(
-            "SELECT journal, doi, batch FROM calls WHERE variant='no-truncation' AND kind='first' AND error IS NULL")}
-        totals = {"batches": 0, "accepted": 0, "invalid": 0}
+        with self.lock:
+            done = {(r[0], r[1], r[2]) for r in self.connection.execute(
+                "SELECT DISTINCT h.journal, h.doi, c.abs_batch FROM history h JOIN citations c ON c.journal=h.journal "
+                "AND c.doi=h.doi AND c.label=h.label WHERE h.variant='no-truncation'")}
+        by_review: dict[tuple[str, str], list[int]] = {}
         for journal, doi, batch in selected:
-            if (journal, doi, batch) in done:
-                continue
-            title = self.connection.execute("SELECT title FROM reviews WHERE journal=? AND doi=?", (journal, doi)).fetchone()[0]
-            items = C.paper_batches(self._items(journal, doi))[batch]
-            outcome = self._judge_batch(journal, doi, title or "", batch, items, cut=None, variant="no-truncation")
-            if outcome["drift"] is not None:
-                self._pause("model_drift")
-                return {**totals, "state": "paused", "reason": "model_drift"}
-            counts = self._write_abstract(journal, doi, [outcome], cut=None, variant="no-truncation")
-            totals["batches"] += 1
-            totals["accepted"] += counts["accepted"]
-            totals["invalid"] += counts["invalid"]
-        return {**totals, "state": "completed", "selectedBatches": len(selected)}
+            if (journal, doi, batch) not in done:
+                by_review.setdefault((journal, doi), []).append(batch)
+
+        def work():
+            for (journal, doi), indices in by_review.items():
+                with self.lock:
+                    title = self.connection.execute("SELECT title FROM reviews WHERE journal=? AND doi=?",
+                                                    (journal, doi)).fetchone()[0]
+                    batches = C.paper_batches(self._items(journal, doi))
+                yield journal, doi, title or "", [(index, batches[index]) for index in sorted(indices)]
+        totals, drift = self._schedule(work(), cut=None, variant="no-truncation")
+        totals["batches"] = sum(len(v) for v in by_review.values())
+        totals["selectedBatches"] = len(selected)
+        return self._paused(totals, drift)
 
     # ------------------------------------------------------------------ status and gates
     def status(self) -> dict[str, Any]:

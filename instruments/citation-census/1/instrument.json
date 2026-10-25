@@ -58,7 +58,7 @@
   },
   "requiredModel": {"served": "nvidia/Qwen3.8-Flash-Next-NVFP4", "fingerprint": "record-when-offered", "onMismatch": "pause"},
   "validator": {"id": "citation-census-labels@1", "module": "ocsl_review.citation_census",
-                "sha256": "d0d7cdd3aacfab290321e6964da6dbae51d4b54d0b6338bbfccf6230df85fe0a"},
+                "sha256": "f560b4a1e4d4de1bdd5a3d0ef8f990b98dda0da3b9956cffaf23ba860c1ab8c5"},
   "builder": {"module": "ocsl_review.citation_census"},
   "classMap": {"id": "census-three-class@1",
                "abstract": {"sure_supported": "T and not escalated", "sure_not_supported": "F and not escalated",
