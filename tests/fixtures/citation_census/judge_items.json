@@ -1,0 +1,1143 @@
+{
+ "license": "Apache-2.0 synthetic fixture; no publisher content",
+ "journals": [
+  "Synthetic Journal of Examples"
+ ],
+ "papers": [
+  {
+   "key": "paper-a",
+   "title": "Synthetic review of tumour–stroma signalling: ≥3 pathways",
+   "items": [
+    {
+     "label": "1",
+     "printed_entry": "1. Author A, Author B. Fictional study 1. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 1",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.1",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 1 reports an invented association between marker β1 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "  First passage with a line\nbreak and “curly quotes” ⟨R1⟩ .  ",
+       "section": "Introduction"
+      },
+      {
+       "sentence": "Second passage ≤ 5 % of cases ⟨R1⟩ ⟨R7⟩ .",
+       "section": "Results > Subgroups"
+      },
+      {
+       "sentence": "Third passage with μg/mL dosing ⟨R1⟩ .",
+       "section": "Table 2"
+      },
+      {
+       "sentence": "Fourth passage is never sent ⟨R1⟩ .",
+       "section": "Discussion"
+      }
+     ]
+    },
+    {
+     "label": "2",
+     "printed_entry": "2. Author A, Author B. Fictional study 2. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 2",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.2",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 2 reports an invented association between marker β2 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "",
+       "section": "Empty"
+      },
+      {
+       "sentence": "   ",
+       "section": "Blank"
+      },
+      {
+       "sentence": "Only this sentence survives ⟨R2⟩ .",
+       "section": "Body"
+      }
+     ]
+    },
+    {
+     "label": "3",
+     "printed_entry": "3. Author A, Author B. Fictional study 3. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 3",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.3",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 3 reports an invented association between marker β3 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "No section here ⟨R3⟩ .",
+       "section": null
+      },
+      {
+       "sentence": "Empty section here ⟨R3⟩ .",
+       "section": ""
+      }
+     ]
+    },
+    {
+     "label": "4",
+     "printed_entry": "4. Author A, Author B. Fictional study 4. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 4",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.4",
+      "pmid": null,
+      "retracted": true,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 4 reports an invented association between marker β4 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β4 changes the invented outcome ⟨R4⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "5",
+     "printed_entry": "5. Author A, Author B. Fictional study 5. Example Journal. 2021.",
+     "cited_work": {
+      "title": null,
+      "venue": "",
+      "year": null,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.5",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 5 reports an invented association between marker β5 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β5 changes the invented outcome ⟨R5⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "6",
+     "printed_entry": "6. Author A, Author B. Fictional study 6. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 6",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2019,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.6",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 6 reports an invented association between marker β6 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β6 changes the invented outcome ⟨R6⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "7",
+     "printed_entry": "7. Author A, Author B. Fictional study 7. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 7",
+      "venue": "Example Journal of Synthetic Results",
+      "year": "2018",
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.7",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 7 reports an invented association between marker β7 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β7 changes the invented outcome ⟨R7⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "8",
+     "printed_entry": "8. Author A, Author B. Fictional study 8. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 8",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 0,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.8",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 8 reports an invented association between marker β8 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β8 changes the invented outcome ⟨R8⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "9",
+     "printed_entry": "9. Author A, Author B. Fictional study 9. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 9",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.9",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "  \n Synthetic sentence 901 describes a fictional cohort of 356 participants, an imaginary marker α-901 and a made-up outcome measured at week 4. Synthetic sentence 902 describes a fictional cohort of 367 participants, an imaginary marker α-902 and a made-up outcome measured at week 7. Synthetic sentence 903 describes a fictional cohort of 378 participants, an imaginary marker α-903 and a made-up outcome measured at week 10. Synthetic sentence 904 describes a fictional cohort of 389 participants, an imaginary marker α-904 and a made-up outcome measured at week 13. Synthetic sentence 905 describes a fictional cohort of 400 participants, an imaginary marker α-905 and a made-up outcome measured at week 16.\nSynthetic sentence 906 describes a fictional cohort of 411 participants, an imaginary marker α-906 and a made-up outcome measured at week 19. Synthetic sentence 907 describes a fictional cohort of 422 participants, an imaginary marker α-907 and a made-up outcome measured at week 22. Synthetic sentence 908 describes a fictional cohort of 433 participants, an imaginary marker α-908 and a made-up outcome measured at week 25. Synthetic sentence 909 describes a fictional cohort of 444 participants, an imaginary marker α-909 and a made-up outcome measured at week 28. Synthetic sentence 910 describes a fictional cohort of 455 participants, an imaginary marker α-910 and a made-up outcome measured at week 31.\nSynthetic sentence 911 describes a fictional cohort of 466 participants, an imaginary marker α-911 and a made-up outcome measured at week 34. Synthetic sentence 912 describes a fictional cohort of 477 participants, an imaginary marker α-912 and a made-up outcome measured at week 37. Synthetic sentence 913 describes a fictional cohort of 488 participants, an imaginary marker α-913 and a made-up outcome measured at week 40. Synthetic sentence 914 describes a fictional cohort of 499 participants, an imaginary marker α-914 and a made-up outcome measured at week 43. Synthetic sentence 915 describes a fictional cohort of 510 participants, an imaginary marker α-915 and a made-up outcome measured at week 46.\nSynthetic sentence 916 describes a fictional cohort of 521 participants, an imaginary marker α-916 and a made-up outcome measured at week 49. Synthetic sentence 917 describes a fictional cohort of 532 participants, an imaginary marker α-917 and a made-up outcome measured at week 52. Synthetic sentence 918 describes a fictional cohort of 543 participants, an imaginar",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β9 changes the invented outcome ⟨R9⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "10",
+     "printed_entry": "10. Author A, Author B. Fictional study 10. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 10",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.10",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "Synthetic sentence 1001 describes a fictional cohort of 393 participants, an imaginary marker α-1001 and a made-up outcome measured at week 4. Synthetic sentence 1002 describes a fictional cohort of 404 participants, an imaginary marker α-1002 and a made-up outcome measured at week 7. Synthetic sentence 1003 describes a fictional cohort of 415 participants, an imaginary marker α-1003 and a made-up outcome measured at week 10. Synthetic sentence 1004 describes a fictional cohort of 426 participants, an imaginary marker α-1004 and a made-up outcome measured at week 13. Synthetic sentence 1005 describes a fictional cohort of 437 participants, an imaginary marker α-1005 and a made-up outcome measured at week 16. Synthetic sentence 1006 describes a fictional cohort of 448 participants, an imaginary marker α-1006 and a made-up outcome measured at week 19. Synthetic sentence 1007 describes a fictional cohort of 459 participants, an imaginary marker α-1007 and a made-up outcome measured at week 22. Synthetic sentence 1008 describes a fictional cohort of 470 participants, an imaginary marker α-1008 and a made-up outcome measured at week 25. Synthetic sentence 1009 describes a fictional cohort of 481 participants, an imaginary marker α-1009 and a made-up outcome measured at week 28. Synthetic sentence 1010 describes a fictional cohort of 492 participants, an imaginary marker α-1010 and a made-up outcome measured at week 31. Synthetic sentence 1011 describes a fictional cohort of 503 participants, an imaginary marker α-1011 and a made-up outcome measured at week 34. Synthetic sentence 1012 describes a fictional cohort of 514 participants, an imaginary marker α-1012 and a made-up outcome measured at week 37. Synthetic sentence 1013 describes a fictional cohort of 525 participants, an imaginary marker α-1013 and a made-up outcome measured at week 40. Synthetic sentence 1014 describes a fictional cohort of 536 participants, an imaginary marker α-1014 and a made-up outcome measured at week 43. Synthetic sentence 1015 describes a fictional cohort of 547 participants, an imaginary marker α-1015 and a made-up outcome measured at week 46. Synthetic sentence 1016 describes a fictio",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β10 changes the invented outcome ⟨R10⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "11",
+     "printed_entry": "11. Author A, Author B. Fictional study 11. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 11",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.11",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "Synthetic sentence 1101 describes a fictional cohort of 430 participants, an imaginary marker α-1101 and a made-up outcome measured at week 4. Synthetic sentence 1102 describes a fictional cohort of 441 participants, an imaginary marker α-1102 and a made-up outcome measured at week 7. Synthetic sentence 1103 describes a fictional cohort of 452 participants, an imaginary marker α-1103 and a made-up outcome measured at week 10. Synthetic sentence 1104 describes a fictional cohort of 463 participants, an imaginary marker α-1104 and a made-up outcome measured at week 13. Synthetic sentence 1105 describes a fictional cohort of 474 participants, an imaginary marker α-1105 and a made-up outcome measured at week 16. Synthetic sentence 1106 describes a fictional cohort of 485 participants, an imaginary marker α-1106 and a made-up outcome measured at week 19. Synthetic sentence 1107 describes a fictional cohort of 496 participants, an imaginary marker α-1107 and a made-up outcome measured at week 22. Synthetic sentence 1108 describes a fictional cohort of 507 participants, an imaginary marker α-1108 and a made-up outcome measured at week 25. Synthetic sentence 1109 describes a fictional cohort of 518 participants, an imaginary marker α-1109 and a made-up outcome measured at week 28. Synthetic sentence 1110 describes a fictional cohort of 529 participants, an imaginary marker α-1110 and a made-up outcome measured at week 31. Synthetic sentence 1111 describes a fictional cohort of 540 participants, an imaginary marker α-1111 and a made-up outcome measured at week 34. Synthetic sentence 1112 describes a fictional cohort of 551 participants, an imaginary marker α-1112 and a made-up outcome measured at week 37. Synthetic sentence 1113 describes a fictional cohort of 562 participants, an imaginary marker α-1113 and a made-up outcome measured at week 40. Synthetic sentence 1114 describes a fictional cohort of 573 participants, an imaginary marker α-1114 and a made-up outcome measured at week 43. Synthetic sentence 1115 describes a fictional cohort of 584 participants, an imaginary marker α-1115 and a made-up outcome measured at week 46. Synthetic sentence 1116 describes a fiction",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β11 changes the invented outcome ⟨R11⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "12",
+     "printed_entry": "12. Author A, Author B. Fictional study 12. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 12",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.12",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": null,
+     "abstract_available": false,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β12 changes the invented outcome ⟨R12⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "13",
+     "printed_entry": "13. Author A, Author B. Fictional study 13. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 13",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.13",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "   \n  ",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β13 changes the invented outcome ⟨R13⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "14",
+     "printed_entry": "14. Author A, Author B. Fictional study 14. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 14",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.14",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 14 reports an invented association between marker β14 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic"
+    },
+    {
+     "label": "15",
+     "printed_entry": "15. Author A, Author B. Fictional study 15. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 15",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.15",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 15 reports an invented association between marker β15 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": []
+    },
+    {
+     "label": "16",
+     "printed_entry": "16. Author A, Author B. Fictional study 16. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 16",
+      "venue": "Synthetic Letters | Section B",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.16",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 16 reports an invented association between marker β16 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β16 changes the invented outcome ⟨R16⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "17",
+     "printed_entry": "17. Author A, Author B. Fictional study 17. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional 100% response and 5%s token study",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.17",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 17 reports an invented association between marker β17 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β17 changes the invented outcome ⟨R17⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "18",
+     "printed_entry": "18. Author A, Author B. Fictional study 18. Example Journal. 2021.",
+     "cited_work": {
+      "title": "  Leading and trailing spaces in a title  ",
+      "venue": "  Spaced Venue ",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.18",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 18 reports an invented association between marker β18 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β18 changes the invented outcome ⟨R18⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "19",
+     "printed_entry": "19. Author A, Author B. Fictional study 19. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 19",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.19",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "Line one of an abstract.\r\nLine two after CRLF.\n\nLine four after a blank line.\t Tabbed.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β19 changes the invented outcome ⟨R19⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "20",
+     "printed_entry": "20. Author A, Author B. Fictional study 20. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 20",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.20",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 20 reports an invented association between marker β20 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "Section given as a number ⟨R20⟩ .",
+       "section": 3
+      }
+     ]
+    },
+    {
+     "label": "21",
+     "printed_entry": "21. Author A, Author B. Fictional study 21. Example Journal. 2021.",
+     "abstract": "A fictional abstract for item 21 reports an invented association between marker β21 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β21 changes the invented outcome ⟨R21⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "22",
+     "printed_entry": "22. Author A, Author B. Fictional study 22. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 22",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2020.0,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.22",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 22 reports an invented association between marker β22 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β22 changes the invented outcome ⟨R22⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "23",
+     "printed_entry": "23. Author A, Author B. Fictional study 23. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 23",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.23",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 23 reports an invented association between marker β23 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β23 changes the invented outcome ⟨R23⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "24",
+     "printed_entry": "24. Author A, Author B. Fictional study 24. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 24",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.24",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 24 reports an invented association between marker β24 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β24 changes the invented outcome ⟨R24⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "25",
+     "printed_entry": "25. Author A, Author B. Fictional study 25. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 25",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.25",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 25 reports an invented association between marker β25 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β25 changes the invented outcome ⟨R25⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "26",
+     "printed_entry": "26. Author A, Author B. Fictional study 26. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 26",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.26",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 26 reports an invented association between marker β26 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β26 changes the invented outcome ⟨R26⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "27",
+     "printed_entry": "27. Author A, Author B. Fictional study 27. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 27",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.27",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 27 reports an invented association between marker β27 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β27 changes the invented outcome ⟨R27⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "28",
+     "printed_entry": "28. Author A, Author B. Fictional study 28. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 28",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.28",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 28 reports an invented association between marker β28 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β28 changes the invented outcome ⟨R28⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "29",
+     "printed_entry": "29. Author A, Author B. Fictional study 29. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 29",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.29",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 29 reports an invented association between marker β29 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β29 changes the invented outcome ⟨R29⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "30",
+     "printed_entry": "30. Author A, Author B. Fictional study 30. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 30",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.30",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 30 reports an invented association between marker β30 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β30 changes the invented outcome ⟨R30⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "31",
+     "printed_entry": "31. Author A, Author B. Fictional study 31. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 31",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.31",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 31 reports an invented association between marker β31 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β31 changes the invented outcome ⟨R31⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "32",
+     "printed_entry": "32. Author A, Author B. Fictional study 32. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 32",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.32",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 32 reports an invented association between marker β32 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β32 changes the invented outcome ⟨R32⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "33",
+     "printed_entry": "33. Author A, Author B. Fictional study 33. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 33",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.33",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 33 reports an invented association between marker β33 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β33 changes the invented outcome ⟨R33⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "34",
+     "printed_entry": "34. Author A, Author B. Fictional study 34. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 34",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.34",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 34 reports an invented association between marker β34 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β34 changes the invented outcome ⟨R34⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "35",
+     "printed_entry": "35. Author A, Author B. Fictional study 35. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 35",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.35",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 35 reports an invented association between marker β35 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β35 changes the invented outcome ⟨R35⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "36",
+     "printed_entry": "36. Author A, Author B. Fictional study 36. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 36",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.36",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 36 reports an invented association between marker β36 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β36 changes the invented outcome ⟨R36⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "37",
+     "printed_entry": "37. Author A, Author B. Fictional study 37. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 37",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.37",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 37 reports an invented association between marker β37 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β37 changes the invented outcome ⟨R37⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "38",
+     "printed_entry": "38. Author A, Author B. Fictional study 38. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 38",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.38",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 38 reports an invented association between marker β38 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β38 changes the invented outcome ⟨R38⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "39",
+     "printed_entry": "39. Author A, Author B. Fictional study 39. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 39",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.39",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 39 reports an invented association between marker β39 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β39 changes the invented outcome ⟨R39⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "40",
+     "printed_entry": "40. Author A, Author B. Fictional study 40. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 40",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.40",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 40 reports an invented association between marker β40 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β40 changes the invented outcome ⟨R40⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "41",
+     "printed_entry": "41. Author A, Author B. Fictional study 41. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 41",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.41",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 41 reports an invented association between marker β41 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β41 changes the invented outcome ⟨R41⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "42",
+     "printed_entry": "42. Author A, Author B. Fictional study 42. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 42",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.42",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 42 reports an invented association between marker β42 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β42 changes the invented outcome ⟨R42⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "43",
+     "printed_entry": "43. Author A, Author B. Fictional study 43. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 43",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.43",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 43 reports an invented association between marker β43 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β43 changes the invented outcome ⟨R43⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "44",
+     "printed_entry": "44. Author A, Author B. Fictional study 44. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 44",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.44",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 44 reports an invented association between marker β44 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β44 changes the invented outcome ⟨R44⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "45",
+     "printed_entry": "45. Author A, Author B. Fictional study 45. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 45",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.45",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 45 reports an invented association between marker β45 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β45 changes the invented outcome ⟨R45⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    }
+   ],
+   "repair_labels": [
+    [
+     "3",
+     "9",
+     "17"
+    ],
+    [
+     "41",
+     "45"
+    ]
+   ]
+  },
+  {
+   "key": "paper-b",
+   "title": "",
+   "items": [
+    {
+     "label": "1",
+     "printed_entry": "1. Author A, Author B. Fictional study 1. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional work about cell – matrix crosstalk",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.1",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 1 reports an invented association between marker β1 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β1 changes the invented outcome ⟨R1⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "2",
+     "printed_entry": "2. Author A, Author B. Fictional study 2. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 2",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.2",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "Short.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "The synthetic review states that marker β2 changes the invented outcome ⟨R2⟩ .",
+       "section": "Background > Mechanisms"
+      }
+     ]
+    },
+    {
+     "label": "3",
+     "printed_entry": "3. Author A, Author B. Fictional study 3. Example Journal. 2021.",
+     "cited_work": {
+      "title": "Fictional study 3",
+      "venue": "Example Journal of Synthetic Results",
+      "year": 2021,
+      "first_author": "Author",
+      "doi": "10.5555/synthetic.3",
+      "pmid": null,
+      "retracted": false,
+      "open_access": false
+     },
+     "abstract": "A fictional abstract for item 3 reports an invented association between marker β3 and a synthetic outcome.",
+     "abstract_available": true,
+     "abstract_source": "synthetic",
+     "citing_passages": [
+      {
+       "sentence": "A claim with 12.5 mg/kg dose ⟨R3⟩ ⟨R4⟩ .",
+       "section": "Therapy"
+      }
+     ]
+    }
+   ],
+   "repair_labels": [
+    [
+     "2"
+    ]
+   ]
+  }
+ ]
+}
