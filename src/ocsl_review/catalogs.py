@@ -13,6 +13,7 @@ import jsonschema
 import yaml
 
 from . import repositories, skills
+from .config import bio_repo
 from .errors import ValidationError
 from .mcp_protocol import CATALOG_TOOLS, SCHOLAR_TOOLS, schema_hash
 from .util import is_within, load_toml, sha256_file
@@ -171,8 +172,8 @@ def validate_path_boundaries(paths: Any) -> dict[str, Any]:
     protected = [paths.home.resolve()]
     if paths.lab_repo:
         protected.append(paths.lab_repo.resolve())
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
+    bio = bio_repo(paths.home)
+    if bio is not None:
         protected.append(bio.resolve())
     for source in protected:
         if is_within(state, source) or is_within(source, state):

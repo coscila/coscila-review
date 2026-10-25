@@ -31,12 +31,28 @@ def state_root(explicit: str | None = None, *, required: bool = True) -> Path | 
     return None
 
 
+# Sibling checkouts keep their old directory names on the lab host and use the coscila-* names in newer clones.
+LAB_REPO_NAMES = ("oc-science-lab", "coscila")
+BIO_REPO_NAMES = ("oc-science-lab-bio", "coscila-bio")
+
+
+def sibling_checkout(home: Path, names: tuple[str, ...]) -> Path | None:
+    for name in names:
+        candidate = home.parent / name
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def bio_repo(home: Path) -> Path | None:
+    return sibling_checkout(home, BIO_REPO_NAMES)
+
+
 def science_lab_repo(explicit: str | None, home: Path) -> Path | None:
     value = explicit or os.environ.get("OCSL_REPO")
     if value:
         return Path(value).expanduser().resolve()
-    sibling = home.parent / "oc-science-lab"
-    return sibling if sibling.is_dir() else None
+    return sibling_checkout(home, LAB_REPO_NAMES)
 
 
 @dataclass(frozen=True)
@@ -105,8 +121,8 @@ def protected_source_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
     candidates: list[tuple[str, Path]] = [("companion source", paths.home)]
     if paths.lab_repo is not None:
         candidates.append(("OC Science Lab source", paths.lab_repo))
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
+    bio = bio_repo(paths.home)
+    if bio is not None:
         candidates.append(("OC Science Lab Bio source", bio))
 
     result: list[tuple[str, Path]] = []
