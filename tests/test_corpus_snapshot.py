@@ -38,6 +38,33 @@ class SnapshotTests(unittest.TestCase):
         self.repo = CorpusRepository.create(self.root, "work/literature", "Fixture question", "first", {"v": 1})
         self.works = populate(self.repo)
 
+    def test_backup_finishes_while_another_connection_keeps_committing(self):
+        import threading
+        import time
+        with sqlite3.connect(self.repo.library.db) as connection:
+            connection.execute("CREATE TABLE padding(body BLOB)")
+            connection.executemany("INSERT INTO padding VALUES (?)", ((os.urandom(4000),) for _ in range(20000)))
+        stop, commits = threading.Event(), [0]
+
+        def writer():
+            with sqlite3.connect(self.repo.library.db, timeout=30) as connection:
+                while not stop.is_set():
+                    with connection:
+                        connection.execute("INSERT INTO padding VALUES (x'00')")
+                    commits[0] += 1
+                    time.sleep(0.002)
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        done = threading.Event()
+        threading.Thread(target=lambda: (self.repo.library.backup(self.root / "copy.sqlite3"), done.set()), daemon=True).start()
+        finished = done.wait(timeout=60)
+        stop.set()
+        thread.join(timeout=10)
+        self.assertTrue(finished, "the backup restarted on every concurrent commit")
+        self.assertGreater(commits[0], 0)
+        with sqlite3.connect(self.root / "copy.sqlite3") as copy:
+            self.assertGreaterEqual(copy.execute("SELECT COUNT(*) FROM padding").fetchone()[0], 20000)
+
     def test_snapshot_is_a_closed_database_hard_linked_packs_and_a_merkle_root(self):
         result = self.repo.library.snapshot("results/snapshot")
         snapshot = Library(self.repo.workspace, "results/snapshot")
