@@ -391,7 +391,7 @@ def resolve_identity(entry: Entry, works: Mapping[str, Mapping[str, Any]], *,
 
     ``works`` maps work keys to records with ``doi``, ``pmid`` and ``title``.
     Classes: resolved (identifier and title agree), resolved_unverified
-    (identifier only, or label on verified numbering), unresolved.
+    (identifier only, title containment only, or label on verified numbering), unresolved.
     """
     by_doi = {str(w.get("doi") or "").lower(): key for key, w in works.items() if w.get("doi")}
     by_pmid = {str(w.get("pmid")): key for key, w in works.items() if w.get("pmid")}
@@ -424,7 +424,8 @@ def resolve_identity(entry: Entry, works: Mapping[str, Mapping[str, Any]], *,
     key, method = candidates[0]
     title = _norm_title(works[key].get("title"))
     agrees = bool(title) and title[:40] in printed
-    identity = "resolved" if method == "title" or (method != "label" and agrees) else "resolved_unverified"
+    # "resolved" needs an identifier and title agreement; a title or label match alone stays unverified.
+    identity = "resolved" if method not in ("label", "title") and agrees else "resolved_unverified"
     return {"workKey": key, "identity": identity, "method": method, "titleAgrees": agrees}
 
 

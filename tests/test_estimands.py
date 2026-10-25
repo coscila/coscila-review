@@ -261,6 +261,14 @@ class DatabaseEstimandTests(unittest.TestCase):
         self.assertEqual((5, 11), steps["europe-pmc-abstracts-only"])
         self.assertEqual((2, 2), steps["no-truncation"])
 
+    def test_europe_pmc_ladder_counts_only_europe_pmc_abstracts(self):
+        rows = self.c.execute("SELECT COUNT(*) FROM citations WHERE journal='J1' AND " + dict(
+            (name, condition) for name, _, condition in E.LADDERS)["europe-pmc-abstracts-only"]).fetchone()[0]
+        total = self.c.execute("SELECT COUNT(*) FROM citations WHERE journal='J1' AND abs_source LIKE 'europe-pmc-core%'").fetchone()[0]
+        self.assertEqual(total, rows)
+        for source in ("europe-pmc-no-abstract", "europe-pmc-no-hit", "europe-pmc-failed", "fallback:semantic-scholar"):
+            self.assertEqual(0, self.c.execute("SELECT ? IN ('europe-pmc-core','europe-pmc-core-pmid')", (source,)).fetchone()[0])
+
     def test_no_truncation_comparison(self):
         result = E.no_truncation_comparison(self.c, "J1")
         self.assertEqual(2, result["entries"])

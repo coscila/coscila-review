@@ -137,8 +137,9 @@ class IdentityTests(unittest.TestCase):
 
     def test_title_and_label_fallbacks_and_conflicts(self):
         works = {"w": {"doi": None, "pmid": None, "title": "Never cited source without identifiers"}}
-        self.assertEqual(("w", "title", "resolved"), tuple(X.resolve_identity(self.entries["17"], works)[k]
-                                                          for k in ("workKey", "method", "identity")))
+        # Title containment alone finds the work but does not verify it.
+        self.assertEqual(("w", "title", "resolved_unverified"), tuple(X.resolve_identity(self.entries["17"], works)[k]
+                                                                     for k in ("workKey", "method", "identity")))
         label = X.resolve_identity(self.entries["17"], {"w": {"title": "unrelated"}}, numbering_verified=True,
                                    by_label={"17": "w"})
         self.assertEqual(("w", "label", "resolved_unverified"), (label["workKey"], label["method"], label["identity"]))

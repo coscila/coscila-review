@@ -353,7 +353,8 @@ LADDERS = (
     ("position-31-40", "entries at call positions 31 to 40", "abs_position BETWEEN 31 AND 40"),
     ("uncut-abstracts", "entries whose abstract was not cut", "abs_cut=0"),
     ("cut-abstracts", "entries whose abstract was cut", "abs_cut=1"),
-    ("europe-pmc-abstracts-only", "abstracts from Europe PMC only", "abs_source LIKE 'europe%'"),
+    ("europe-pmc-abstracts-only", "abstracts from Europe PMC only",
+     "abs_source IN ('europe-pmc-core','europe-pmc-core-pmid')"),
 )
 
 
