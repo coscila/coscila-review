@@ -369,11 +369,12 @@ def _escalated_loci(connection, analysis):
 PLANNER_PAGE_ROWS = 5000
 EVIDENCE_CACHE_WORKS = 20000
 REVIEW_PROOF_CACHE = 20000
-# Keyset page over citation loci; review checkpoints are loaded once per review.
-_LOCUS_PAGE = ("SELECT l.rowid AS locus_rowid,l.*,b.resolved_work_id,b.identity_state,b.candidate_identifiers_json,"
-               "b.review_id,w.metadata_json FROM claim_loci l JOIN bibliography_entries b USING(entry_id) "
+# Keyset page over citation loci; review checkpoints are loaded once per review. A branch
+# pages its own loci and then its parent's (Library.keyset_sources).
+_LOCUS_PAGE = ("SELECT {position} AS locus_rowid,l.*,b.resolved_work_id,b.identity_state,b.candidate_identifiers_json,"
+               "b.review_id,w.metadata_json FROM {loci} JOIN bibliography_entries b USING(entry_id) "
                "LEFT JOIN works w ON w.work_id=b.resolved_work_id JOIN corpus_reviews c USING(review_id) "
-               "WHERE l.rowid>? ORDER BY l.rowid LIMIT ?")
+               "WHERE {position}>?{hidden} ORDER BY {position} LIMIT ?")
 
 
 class _EvidenceCache:
@@ -474,24 +475,25 @@ def prepare_tasks(repo: CorpusRepository, *, tier: str = "abstract", context_cha
     with repo.connect() as connection:
         escalated = _escalated_loci(connection, analysis) if tier == "full-text" else None
     count = blocked = 0
-    after = 0
     with repo.held_open():
-        while True:
-            with repo.connect() as connection:
-                page = connection.execute(_LOCUS_PAGE, (after, PLANNER_PAGE_ROWS)).fetchall()
-                if not page:
-                    break
-                after = page[-1]["locus_rowid"]
-                done = _planned_loci(connection, analysis, tier, [row["locus_id"] for row in page])
-                rows = [row for row in page if row["locus_id"] not in done
-                        and (escalated is None or row["locus_id"] in escalated)]
-                works = evidence.get_many(connection, [row["resolved_work_id"] for row in rows])
-                reviews = _review_proofs(connection, proofs, list(dict.fromkeys(row["review_id"] for row in rows)))
-            items = [_plan_locus(planner, row, tier, context_chars,
-                                 works.get(row["resolved_work_id"]) if row["resolved_work_id"] else None,
-                                 reviews[row["review_id"]]) for row in rows]
-            repo.add_tasks(analysis, items, supersede_blocked=True)
-            count += len(items); blocked += sum(1 for item in items if item[3])
+        for loci, position, hidden in repo.library.keyset_sources("claim_loci", "l"):
+            query, after = _LOCUS_PAGE.format(loci=loci, position=position, hidden=hidden), 0
+            while True:
+                with repo.connect() as connection:
+                    page = connection.execute(query, (after, PLANNER_PAGE_ROWS)).fetchall()
+                    if not page:
+                        break
+                    after = page[-1]["locus_rowid"]
+                    done = _planned_loci(connection, analysis, tier, [row["locus_id"] for row in page])
+                    rows = [row for row in page if row["locus_id"] not in done
+                            and (escalated is None or row["locus_id"] in escalated)]
+                    works = evidence.get_many(connection, [row["resolved_work_id"] for row in rows])
+                    reviews = _review_proofs(connection, proofs, list(dict.fromkeys(row["review_id"] for row in rows)))
+                items = [_plan_locus(planner, row, tier, context_chars,
+                                     works.get(row["resolved_work_id"]) if row["resolved_work_id"] else None,
+                                     reviews[row["review_id"]]) for row in rows]
+                repo.add_tasks(analysis, items, supersede_blocked=True)
+                count += len(items); blocked += sum(1 for item in items if item[3])
     return {"analysisId": analysis, "tier": tier, "tasks": count, "blocked": blocked}
 
 
