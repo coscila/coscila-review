@@ -27,6 +27,8 @@ from html.parser import HTMLParser
 from typing import Any, Iterable, Mapping
 from xml.etree import ElementTree as ET
 
+from .errors import ValidationError
+
 SANITIZER_VERSION = "sanitize-1"
 MODES = ("strip", "detect")
 
@@ -250,6 +252,7 @@ def assert_prompt_clean(messages: list[Mapping[str, str]]) -> None:
 # Document-level hidden content -------------------------------------------------------------
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_DTD = re.compile(br"<!(?:DOCTYPE|ENTITY)\b", re.I)
 _HIDDEN_STYLE = re.compile(
     r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|font-size\s*:\s*0(?:\.0+)?(?:px|pt|em|rem|%)?\s*(?:;|$)"
     r"|opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)|color\s*:\s*(?:#f{3}(?:f{3})?\b|white\b|rgba?\(\s*255\s*,\s*255\s*,\s*255\s*[,)])"
@@ -284,8 +287,8 @@ def _docx_hidden_styles(archive: zipfile.ZipFile) -> tuple[set[str], set[str]]:
         styles = archive.read("word/styles.xml")
     except KeyError:
         return set(), set()
-    if re.search(br"<!ENTITY\b", styles, re.I):
-        return set(), set()
+    if _DTD.search(styles):
+        raise ValidationError("DOCX word/styles.xml declares a DTD or entities; the document is refused")
     try:
         root = ET.fromstring(styles)
     except ET.ParseError:
@@ -333,8 +336,9 @@ def _sanitize_docx(data: bytes) -> tuple[bytes, list[dict[str, Any]]]:
         document = archive.read("word/document.xml")
     except (zipfile.BadZipFile, KeyError):
         return data, removals
-    if re.search(br"<!ENTITY\b", document, re.I):
-        return data, removals
+    if _DTD.search(document):
+        # Office Open XML never needs a DTD; an entity could hide what the hidden-text check would see.
+        raise ValidationError("DOCX word/document.xml declares a DTD or entities; the document is refused")
     try:
         root = ET.fromstring(document)
     except ET.ParseError:
