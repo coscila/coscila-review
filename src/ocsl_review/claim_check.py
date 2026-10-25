@@ -254,6 +254,13 @@ class ConfidentialPolicy:
                  "contentClass": content, "policyDigest": self.digest}
         return ledger.append(**event) if ledger is not None else event
 
+    def judge_allowed(self, judge: Any) -> bool:
+        """Whether this judge may receive manuscript text under the policy (no ledger entry)."""
+
+        if not self.confidential:
+            return True
+        return getattr(judge, "location", "") == "on-prem" and self.host_is_on_prem(getattr(judge, "host", ""))
+
     def authorize_model(self, ledger: EgressLedger | None, judge: Any, *, payload_sha256: str, items: int) -> dict[str, Any]:
         """Manuscript and cited text may reach only an on-prem judge in confidential mode."""
 
