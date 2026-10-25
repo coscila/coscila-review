@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ocsl_review import corpus_library, corpus_store
+from ocsl_review import corpus_library, corpus_packs, corpus_store
 from ocsl_review.corpus_store import CorpusRepository, canonical, identity
 from ocsl_review.corpus_ingest import import_manifest, ingest_file
 from ocsl_review.errors import ValidationError
@@ -25,6 +25,18 @@ def legacy_v2_library(root, relative="work/legacy"):
     finally:
         connection.close()
     return CorpusRepository(root, relative)
+
+
+def loose_library(root, relative="work/loose"):
+    """A current-schema library whose artifacts are loose files, as written before packs existed."""
+    corpus_library.initialize(corpus_library.Workspace(root), relative, "Loose question", "main", {"version": 2})
+    packs = root / relative / "packs"
+    for item in packs.iterdir():
+        item.unlink()
+    packs.rmdir()
+    repo = CorpusRepository(root, relative)
+    repo.migrate()
+    return repo
 
 
 @contextmanager
@@ -259,8 +271,9 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
                 (f"locus-{i}", "entry-1", manuscript, f"p{i}", "Claim.", "[]", "fixture") for i in range(7)])
         items = [(f"locus-{i}", "abstract", {"claim": f"claim {i}", "evidenceUnits": [{"id": "u", "text": "x" * i}]},
                   None) for i in range(7)]
-        writes, barriers = [], []
-        original_connect, original_sync = CorpusRepository.connect, corpus_store.sync_batch
+        writes, barriers, fsyncs = [], [], []
+        original_connect, original_sync = CorpusRepository.connect, CorpusRepository.sync_staged
+        real_fsync = corpus_packs.os.fsync
 
         @contextmanager
         def counting_connect(self, *, write=False):
@@ -269,14 +282,16 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
             with original_connect(self, write=write) as connection:
                 yield connection
 
-        def counting_sync(directory, paths):
-            barriers.append(len(paths))
-            return original_sync(directory, paths)
+        def counting_sync(self, staged):
+            barriers.append(len(staged))
+            return original_sync(self, staged)
 
         with patch.object(corpus_store, "BATCH_ROWS", 3), patch.object(CorpusRepository, "connect", counting_connect), \
-                patch.object(corpus_store, "sync_batch", counting_sync):
+                patch.object(CorpusRepository, "sync_staged", counting_sync), \
+                patch.object(corpus_packs.os, "fsync", side_effect=lambda fd: fsyncs.append(fd) or real_fsync(fd)):
             ids = repo.add_tasks("main", items)
         self.assertEqual((len(writes), barriers), (3, [3, 3, 1]))
+        self.assertEqual(len(fsyncs), 3, "each staged chunk is made durable by one pack fsync")
         self.assertEqual(ids, ["task-" + identity("main", locus, tier, spec) for locus, tier, spec, _ in items])
         stored = {task["task_id"]: task for task in repo.tasks("main")}
         for task_id, (_, _, spec, _) in zip(ids, items):
@@ -306,10 +321,11 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
         self.assertFalse(wal.exists())
         with self.assertRaises(sqlite3.ProgrammingError):
             held.execute("SELECT 1")
-        self.assertEqual(repo.status()["counts"]["source_artifacts"], len(list((repo.root / "sources").iterdir())))
+        stored = len(list((repo.root / "sources").iterdir())) + repo.library.packs.stats()["blobs"]
+        self.assertEqual(repo.status()["counts"]["source_artifacts"], stored)
 
     def test_reads_resolve_local_sources_quickly_and_refuse_swapped_symlinks(self):
-        repo = CorpusRepository.create(self.root, "work/corpus", "Question", "main", {"version": 2})
+        repo = loose_library(self.root)
         digest = repo.artifact(b"original evidence", "test")
         self.assertEqual(repo.read_artifacts([digest]), {digest: b"original evidence"})
         path = repo.root / "sources" / digest
@@ -323,8 +339,31 @@ class CorpusSchemaAndCounterTests(unittest.TestCase):
         with self.assertRaises((ValueError, ValidationError)):
             repo.verify_artifacts([digest])
 
-    def test_batch_barrier_uses_syncfs_once_or_fsyncs_every_new_file(self):
+    def test_packed_reads_verify_every_blob_and_report_damage(self):
         repo = CorpusRepository.create(self.root, "work/corpus", "Question", "main", {"version": 2})
+        rows = repo.stage_artifacts([(f"packed {i}".encode(), "test", "text/plain") for i in range(4)])
+        with repo.connect(write=True) as connection:
+            repo.register_artifacts(connection, rows)
+        digests = [row[0] for row in rows]
+        self.assertEqual(list((repo.root / "sources").iterdir()), [])
+        self.assertEqual(repo.read_artifacts(digests), {d: f"packed {i}".encode() for i, d in enumerate(digests)})
+        repo.verify_artifacts(digests)
+        kind, store, location = repo.library.locate(digests[2])
+        self.assertEqual(kind, "pack")
+        path = store.pack_path(location.pack)
+        path.chmod(0o644)
+        with path.open("r+b") as handle:
+            handle.seek(location.offset)
+            first = handle.read(1)
+            handle.seek(location.offset)
+            handle.write(bytes([first[0] ^ 0xFF]))
+        with self.assertRaisesRegex(ValidationError, "hash mismatch"):
+            repo.read_artifacts(digests)
+        with self.assertRaisesRegex(ValidationError, "hash mismatch"):
+            CorpusRepository(self.root, "work/corpus").verify_artifacts(digests)
+
+    def test_batch_barrier_uses_syncfs_once_or_fsyncs_every_new_file(self):
+        repo = loose_library(self.root)
         calls = []
         with patch.object(corpus_store, "_syncfs_function", return_value=lambda descriptor: calls.append(descriptor) or 0):
             repo.stage_artifacts([(f"body {i}".encode(), "test", "text/plain") for i in range(10)])

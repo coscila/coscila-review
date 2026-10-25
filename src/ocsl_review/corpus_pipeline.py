@@ -133,7 +133,11 @@ def _retained_abstract(repo, identifiers):
 
     The original provider record establishes identity again; a cached work ID or
     alias is only a lookup hint. Printed-reference reconciliation still follows.
+    A pinned read-only store (store_client) is asked only when the study has no
+    row for these identifiers; what it holds is copied in and re-checked below.
     """
+    if repo.store_client is not None:
+        repo.store_client.adopt_for_identifiers(identifiers, tiers=("abstract",))
     candidate_ids = {"work-" + identity(f"{scheme}:{value.lower()}") for scheme, value in identifiers.items()}
     with repo.connect() as connection:
         for scheme, value in identifiers.items():
