@@ -16,6 +16,7 @@ import re
 import statistics
 import subprocess
 import tempfile
+import unicodedata
 import zipfile
 from collections.abc import Iterable, Iterator, Sequence
 from io import BytesIO
@@ -58,6 +59,11 @@ _KNOWN_SECTION_TITLES = {
     "supplementary information",
 }
 _BIBLIOGRAPHY_TITLES = {"references", "bibliography", "works cited"}
+
+
+def _bibliography_title(text: str) -> bool:
+    """A heading names the reference list, ignoring invisible format characters left by copy and paste."""
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf").strip().casefold() in _BIBLIOGRAPHY_TITLES
 _FIGURE_CAPTION = re.compile(
     r"^\s*(?:figure|fig\.)\s*([A-Za-z]?\d+[A-Za-z]?)\s*[:.\-]?\s*(.*)$", re.IGNORECASE
 )
@@ -199,7 +205,7 @@ def _text_blocks(text: str, *, markdown: bool) -> list[dict[str, Any]]:
                         "headingLevel": level,
                     }
                 )
-                bibliography_mode = heading_text.casefold() in _BIBLIOGRAPHY_TITLES
+                bibliography_mode = _bibliography_title(heading_text)
                 i += 1
                 continue
             if markdown and _looks_like_markdown_table(lines, i):
@@ -968,7 +974,7 @@ def _assemble(
                     block = {**block, "headingLevel": block.get("headingLevel") or level}
             if is_heading:
                 current_section = create_section(text, paragraph_id)
-                bibliography_mode = text.casefold() in _BIBLIOGRAPHY_TITLES
+                bibliography_mode = _bibliography_title(text)
             section = need_section()
             paragraph_kind = "heading" if is_heading else "body"
             if block.get("caption") or _FIGURE_CAPTION.match(text):
