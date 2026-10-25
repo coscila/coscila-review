@@ -33,7 +33,10 @@ preserves independent abstract, full-text and panel runs, complete evidence,
 native or API worker jobs, configuration revisions and assessment history. Its
 SQL/hash facts export supports reproducible writing without treating model
 judgments as scientific ground truth. Local JATS and publisher HTML ingestion
-preserve citation targets and display loci before measurement.
+preserve citation targets and display loci before measurement. Registered,
+digest-pinned instruments, the entry-level `citation-census@1` study commands,
+the scores database, estimands and facts export are described in
+[census-instrument.md](docs/census-instrument.md).
 
 For a complete corpus and future research questions, the
 [reference-analysis skill](skills/ocsl-review-reference-analysis/SKILL.md)

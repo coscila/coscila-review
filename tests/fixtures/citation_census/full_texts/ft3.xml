@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apache-2.0 synthetic fixture; no publisher content. -->
+<article xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:mml="http://www.w3.org/1998/Math/MathML" article-type="research-article"><front><article-meta><title-group><article-title>A synthetic article without a body section list</article-title></title-group><abstract><title>Abstract</title><p>Only an abstract paragraph and loose body paragraphs exist here.</p></abstract></article-meta></front><body><p>Loose paragraph one.</p><boxed-text><p>Boxed paragraph with “quotes”.</p></boxed-text><list><list-item><p>Listed paragraph.</p></list-item></list></body><back><ref-list><ref id="b1"><mixed-citation>Synthetic reference.</mixed-citation></ref></ref-list></back></article>

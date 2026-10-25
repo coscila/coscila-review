@@ -1,0 +1,79 @@
+{
+  "id": "citation-census@1",
+  "name": "citation-census",
+  "version": 1,
+  "status": "frozen",
+  "description": "Entry-level citation support census. One verdict per printed bibliography entry, judged from at most three citing sentences against the cited work's title and abstract (abstract tier); escalated entries are re-read against a claim-targeted full-text window (full-text tier).",
+  "unit": "printed bibliography entry",
+  "parameters": {
+    "journal": {"type": "string", "token": "{{journal}}", "required": true,
+                "description": "Journal of the reviews under study; substituted once into the system prompt. A study input, never part of the instrument."}
+  },
+  "files": {
+    "systemPrompt": {"path": "system-prompt.txt", "sha256": "e12996191d4e4ad18fe7f21921ff7a3b3f98889031dc5975fff31074c17b9a52", "mediaType": "text/plain; charset=utf-8"},
+    "fullTextNote": {"path": "full-text-note.txt", "sha256": "c4e8c46ad014ecdf1ce14fa9f17a9f8f10c9936ad88fee473c7553ba93de8874", "mediaType": "text/plain; charset=utf-8"},
+    "labelSchema": {"path": "label.schema.json", "sha256": "e894d13ba0c0edea2e149fc3e56ab20a238f8da24d008c31cf594fb5ac270d6a", "mediaType": "application/schema+json"}
+  },
+  "tiers": {
+    "abstract": {
+      "worker": "w1",
+      "population": "in-body entries with a resolved identity, in bibliography order",
+      "evidencePolicy": {
+        "citingSentences": {"max": 3, "order": "document", "unit": "sentence carrying the marker; one per marker occurrence"},
+        "citedWork": ["title", "venue", "year", "retracted"],
+        "abstract": {"cutCharacters": 2200, "cutRecordedPerEntry": true, "normalisation": "strip, newline to space"},
+        "abstractProvider": "europe-pmc-core, recorded per entry",
+        "neverSent": ["printed entry", "identifiers", "open-access flag", "abstract provider"]
+      },
+      "geometry": {"itemsPerCall": 40, "grouping": "review", "crossReview": false, "ordering": "bibliography order",
+                   "positionsRecorded": true, "positionBase": 1},
+      "request": {"api": "chat.completions", "temperature": 0.0, "seed": null, "reasoningEffort": "none", "stream": false,
+                  "maxOutputTokens": {"floor": 3000, "perItem": 700, "rule": "max(floor, perItem * items)"},
+                  "timeoutSeconds": 1500},
+      "repair": {"passes": 1, "scope": "labels without a parseable line, including items of a failed call",
+                 "note": "Emit one JSONL line per item, no prose."},
+      "transport": {"attempts": 3, "backoffSeconds": [2, 4, 6]}
+    },
+    "full-text": {
+      "worker": "w2",
+      "population": "abstract-tier entries with escalate = 1",
+      "evidencePolicy": {
+        "citingSentences": {"max": 3, "order": "document"},
+        "citedWork": ["title", "venue", "year"],
+        "sources": ["europe-pmc-fulltextxml", "entitled"],
+        "entitledRouting": "on-premises judges only",
+        "window": {"characters": 11000, "selection": "claim keywords over paragraphs plus the opening paragraphs and the abstract",
+                   "field": "FULL TEXT"},
+        "retrievalOutcomes": ["cache", "europe-pmc-fulltextxml", "entitled", "fetch-failed", "no-pmcid"],
+        "failedRetrieval": "never a support verdict; recorded per entry"
+      },
+      "geometry": {"itemsPerCall": 5, "grouping": "review", "crossReview": false, "ordering": "seeded shuffle with the protocol seed, grouped by review in first-seen order",
+                   "positionsRecorded": true, "positionBase": 1},
+      "request": {"api": "chat.completions", "temperature": 0.0, "seed": null, "reasoningEffort": "low", "stream": false,
+                  "maxOutputTokens": {"floor": 3000, "perItem": 700, "rule": "max(floor, perItem * items)"},
+                  "timeoutSeconds": 1500},
+      "repair": {"passes": 0},
+      "transport": {"attempts": 3, "backoffSeconds": [2, 4, 6]}
+    }
+  },
+  "requiredModel": {"served": "nvidia/Qwen3.8-Flash-Next-NVFP4", "fingerprint": "record-when-offered", "onMismatch": "pause"},
+  "validator": {"id": "citation-census-labels@1", "module": "ocsl_review.citation_census",
+                "sha256": "f560b4a1e4d4de1bdd5a3d0ef8f990b98dda0da3b9956cffaf23ba860c1ab8c5"},
+  "builder": {"module": "ocsl_review.citation_census"},
+  "classMap": {"id": "census-three-class@1",
+               "abstract": {"sure_supported": "T and not escalated", "sure_not_supported": "F and not escalated",
+                            "unsure": "N, U, escalated, unresolved identity or no parseable output", "not_cited": "no in-body citation"},
+               "full-text": {"sure_supported": "T", "sure_not_supported": "F", "unsure": "N or U"}},
+  "deterministicRows": {"notCited": "not_cited, outside denominator 2, never a support verdict",
+                        "unresolvedIdentity": "unsure, never F"},
+  "sensitivities": {
+    "no-truncation": {"tier": "abstract", "abstractCut": null, "sampleEntries": 20000,
+                      "selection": "seeded whole review batches that contain at least one cut abstract, re-run unchanged except for the cut",
+                      "predeclared": true}
+  },
+  "transport": {"messages": "verbatim", "sentBytesRecorded": true},
+  "notes": [
+    "The instructions are fixed; only the journal parameter varies. Geometry, request settings and the repair pass are part of the instrument.",
+    "Confidence derived from category and escalation is stored but never reported as calibrated."
+  ]
+}
