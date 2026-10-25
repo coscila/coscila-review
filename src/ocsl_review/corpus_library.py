@@ -3,7 +3,9 @@
 """Initialize, verify, snapshot and branch a literature library (Python stdlib).
 
 This manages storage, not ingestion, scientific judging, or a worker scheduler.
-Paths are relative to an explicit workspace.
+Paths are relative to an explicit workspace, or absolute inside the study root
+(OCSL_STUDY_ROOT) that the platform may provide outside the workspace; parent
+snapshots may also be read from a mounted dataset root (OCSL_DATASET_ROOT).
 
 Artifacts are stored in append-only content-addressed packs (corpus_packs);
 loose sources/<sha256> files of older libraries stay readable. A snapshot is a
@@ -43,7 +45,11 @@ V2_TABLES = ("corpus_reviews", "corpus_documents", "corpus_tasks", "corpus_batch
 SCHEMA = Path(__file__).resolve().parents[2] / "skills/ocsl-review-reference-analysis/assets/literature-schema.sql"
 SNAPSHOT_FORMAT = "ocsl-literature-snapshot"
 MERKLE_ALGORITHM = "sha256-files-v1"
+STUDY_ROOT_ENV = "OCSL_STUDY_ROOT"
+DATASET_ROOT_ENV = "OCSL_DATASET_ROOT"
 LEVELS = ("light", "standard", "deep")
+PATH_RULE = ("paths must be nonempty workspace-relative paths without '..' "
+             f"(or absolute paths inside {STUDY_ROOT_ENV})")
 
 
 def now():
@@ -91,6 +97,22 @@ def merkle_root(files):
     return level[0].hex()
 
 
+def _external_root(value, name):
+    raw = Path(value)
+    if not raw.is_absolute():
+        raise ValueError(f"{name} must be an absolute path")
+    if any(p.is_symlink() for p in (raw, *raw.parents)):
+        raise ValueError(f"{name} must not use symlinks")
+    root = raw.resolve(strict=True)
+    if not root.is_dir() or root == Path(root.anchor):
+        raise ValueError(f"{name} must be an existing directory")
+    return root
+
+
+def _overlaps(path, protected):
+    return any(path == p or p in path.parents or path in p.parents for p in protected)
+
+
 def link_or_copy(source, target):
     """Share an immutable file by hard link; copy only across filesystems."""
     try:
@@ -105,7 +127,7 @@ def link_or_copy(source, target):
 
 
 class Workspace:
-    def __init__(self, path):
+    def __init__(self, path, *, study_root=None, dataset_roots=None):
         raw = Path(path).absolute()
         if any(p.is_symlink() for p in (raw, *raw.parents)):
             raise ValueError("workspace must not use symlinks")
@@ -120,34 +142,61 @@ class Workspace:
         self.protected = protected
         if any(self.root == p or p in self.root.parents for p in protected):
             raise ValueError("workspace must be separate from companion source and operator state")
+        study = os.environ.get(STUDY_ROOT_ENV) if study_root is None else study_root
+        self.study_root = _external_root(study, STUDY_ROOT_ENV) if study else None
+        datasets = (os.environ.get(DATASET_ROOT_ENV, "").split(os.pathsep) if dataset_roots is None
+                    else [str(item) for item in dataset_roots])
+        self.dataset_roots = [_external_root(item, DATASET_ROOT_ENV) for item in datasets if item]
+        for root in ([self.study_root] if self.study_root else []) + self.dataset_roots:
+            if _overlaps(root, protected):
+                raise ValueError("study and dataset roots must be separate from companion source and operator state")
+
+    def _base(self, candidate):
+        for root in ([self.study_root] if self.study_root else []) + self.dataset_roots:
+            if candidate.is_relative_to(root) and candidate != root:
+                return root
+        raise ValueError(PATH_RULE)
 
     def path(self, relative):
         candidate = Path(relative)
-        if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
-            raise ValueError("paths must be nonempty workspace-relative paths without '..'")
-        current = self.root
-        for part in candidate.parts:
+        if not candidate.parts or ".." in candidate.parts:
+            raise ValueError(PATH_RULE)
+        if candidate.is_absolute():
+            base = self._base(candidate)
+            parts = candidate.relative_to(base).parts
+        else:
+            base, parts = self.root, candidate.parts
+        current = base
+        for part in parts:
             current = current / part
             if current.is_symlink():
                 raise ValueError(f"symlink is not allowed: {relative}")
-        if not current.is_relative_to(self.root):
+        if not (current.is_relative_to(base) and current != base):
             raise ValueError("path leaves workspace")
         if any(current == p or p in current.parents for p in self.protected):
             raise ValueError("library path overlaps companion source or operator state")
         return current
 
+    def writable(self, path):
+        return not any(path.is_relative_to(root) for root in self.dataset_roots) or (
+            self.study_root is not None and path.is_relative_to(self.study_root))
+
     def relative(self, path):
-        return path.relative_to(self.root).as_posix()
+        path = Path(path)
+        return path.relative_to(self.root).as_posix() if path.is_relative_to(self.root) else str(path)
 
     @contextmanager
     def create(self, relative):
         destination = self.path(relative)
+        if not self.writable(destination):
+            raise ValueError("dataset roots are read-only; create libraries in the workspace or study root")
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.mkdir(mode=0o700)  # Never overwrite an existing bundle.
         try:
             (destination / "sources").mkdir()
             yield destination
         except BaseException:
+            # Never chmod here: hard-linked packs share their inode with the source library.
             shutil.rmtree(destination)
             raise
 
