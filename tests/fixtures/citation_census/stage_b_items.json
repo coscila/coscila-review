@@ -1,0 +1,107 @@
+{
+ "license": "Apache-2.0 synthetic fixture",
+ "title": "Synthetic review of zeta-kinase in fictional cancers",
+ "items": [
+  {
+   "label": "4",
+   "full_text": "ft2.xml",
+   "cited_work": {
+    "title": "A long synthetic cohort study",
+    "venue": "Example Journal",
+    "year": 2022
+   },
+   "citing_passages": [
+    {
+     "sentence": "Zeta-kinase inhibition prolonged survival ⟨R4⟩ .",
+     "section": "Therapy"
+    },
+    {
+     "sentence": "Zeta-kinase high tumours regressed more often ⟨R4⟩ ⟨R5⟩ .",
+     "section": "Therapy > Response"
+    }
+   ]
+  },
+  {
+   "label": "9",
+   "full_text": "ft1.xml",
+   "cited_work": {
+    "title": "A short synthetic trial report",
+    "venue": null,
+    "year": null
+   },
+   "citing_passages": [
+    {
+     "sentence": "The response rate was 41 % ⟨R9⟩ .",
+     "section": ""
+    }
+   ]
+  },
+  {
+   "label": "12",
+   "full_text": "ft3.xml",
+   "cited_work": {
+    "title": "",
+    "venue": "Example Journal",
+    "year": "2020"
+   },
+   "citing_passages": [
+    {
+     "sentence": "Boxed findings were reported ⟨R12⟩ .",
+     "section": null
+    }
+   ]
+  },
+  {
+   "label": "15",
+   "full_text": "ft4.xml",
+   "cited_work": {
+    "title": "Abstract only",
+    "venue": "Example Journal",
+    "year": 2019
+   },
+   "citing_passages": []
+  },
+  {
+   "label": "21",
+   "full_text": "ft2.xml",
+   "cited_work": {
+    "title": "A long synthetic cohort study",
+    "venue": "Example Journal",
+    "year": 2022
+   },
+   "citing_passages": [
+    {
+     "sentence": "No toxicity association was seen with the marker ⟨R21⟩ .",
+     "section": "Safety"
+    }
+   ]
+  },
+  {
+   "label": "30",
+   "full_text": "ft1.xml",
+   "cited_work": {
+    "title": "A short synthetic trial report",
+    "venue": "Example Journal",
+    "year": 2021
+   },
+   "citing_passages": [
+    {
+     "sentence": "Median survival was 14.2 months ⟨R30⟩ .",
+     "section": "Outcomes"
+    },
+    {
+     "sentence": "Dose was 5 mg/kg ⟨R30⟩ .",
+     "section": "Outcomes"
+    },
+    {
+     "sentence": "Randomised synthetic participants ⟨R30⟩ .",
+     "section": "Outcomes"
+    },
+    {
+     "sentence": "A fourth passage is not sent ⟨R30⟩ .",
+     "section": "Outcomes"
+    }
+   ]
+  }
+ ]
+}
