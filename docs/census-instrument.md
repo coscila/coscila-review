@@ -231,8 +231,13 @@ values: system prompts, first and repair calls, the label parser, JATS
 conversion, full-text windows, full-text call geometry and prompts built from
 fixture documents through the maintained extraction. It reads inputs only.
 Setting `OCSL_REVIEW_CENSUS_FIDELITY_RECORDS` to a JSON-lines file of recorded
-calls (`title`, `journal`, `items`, `note`, `userSha256`, `systemSha256`) adds
-a check against a private record set.
+calls (`title`, `journal`, `items`, `note`, and any of `systemSha256`,
+`userSha256` and `messagesSha256`, the sha256 of the JSON message list) adds a
+check against a private record set. Every digest a record carries must match
+the rebuilt call; a record whose user digest is the digest of an empty string
+holds no rebuilt prompt and is counted as unusable, never as a pass, and the
+check needs at least one usable record. Records for each journal have to come
+from that journal's own recorded calls.
 
 ## Limits
 

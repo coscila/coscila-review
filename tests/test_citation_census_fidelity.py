@@ -346,24 +346,63 @@ class ClassMapTests(unittest.TestCase):
         self.assertTrue(C.quote_check({"category": "false", "quote": "An  Invented"}, "an invented association")["quoteInEvidence"])
 
 
+EMPTY_SHA256 = sha("")
+DIGESTS = ("systemSha256", "userSha256", "messagesSha256")
+
+
+def check_record(record: dict) -> str:
+    """'checked' when every digest a record carries matches the rebuilt call; 'unusable' for an empty recorded prompt.
+
+    A record carries any of systemSha256, userSha256 and messagesSha256 (sha256 of the JSON message list,
+    ensure_ascii=False). A user digest equal to the digest of the empty string means that no prompt was
+    rebuilt when the record was made; such a record cannot check anything and is counted apart.
+    """
+    if record.get("userSha256") == EMPTY_SHA256:
+        return "unusable"
+    if not any(record.get(name) for name in DIGESTS):
+        raise AssertionError("a fidelity record carries no digest")
+    messages = C.build_abstract_messages(record["items"], record["title"], record["journal"], note=record.get("note", ""))
+    digests = C.digests(messages)
+    for name in DIGESTS:
+        if record.get(name) and record[name] != digests[name]:
+            raise AssertionError(f"{name} differs for a recorded {record['journal']} call")
+    return "checked"
+
+
+class RecordCheckTests(unittest.TestCase):
+    """The private-record check itself, on records built here."""
+
+    def setUp(self):
+        self.items = load("judge_items.json")["papers"][0]["items"][:3]
+        self.messages = C.build_abstract_messages(self.items, REVIEW_TITLE, "Synthetic Journal of Examples")
+        self.base = {"title": REVIEW_TITLE, "journal": "Synthetic Journal of Examples", "items": self.items}
+
+    def test_message_list_digest_is_checked(self):
+        record = {**self.base, "messagesSha256": hashlib.sha256(json.dumps(self.messages, ensure_ascii=False).encode()).hexdigest()}
+        self.assertEqual("checked", check_record(record))
+        with self.assertRaises(AssertionError):
+            check_record({**record, "messagesSha256": "0" * 64})
+        repair = C.build_repair_messages(self.items, REVIEW_TITLE, "Synthetic Journal of Examples")
+        self.assertEqual("checked", check_record({**self.base, "note": C.repair_note(),
+                                                  "messagesSha256": C.digests(repair)["messagesSha256"]}))
+
+    def test_an_empty_recorded_prompt_is_unusable_not_a_pass(self):
+        self.assertEqual("unusable", check_record({**self.base, "userSha256": EMPTY_SHA256, "systemSha256": "0" * 64}))
+        with self.assertRaises(AssertionError):
+            check_record(dict(self.base))
+
+
 @unittest.skipUnless(os.environ.get("OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"), "private fidelity records not configured")
 class PrivateRecordTests(unittest.TestCase):
-    """JSONL records {"title", "journal", "items", "note", "userSha256", "systemSha256"} from a private fixture."""
+    """JSONL records {"title", "journal", "items", "note", and digests: see check_record} from a private fixture."""
 
     def test_private_records(self):
         path = Path(os.environ["OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"])
-        count = 0
+        outcomes = {"checked": 0, "unusable": 0}
         for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            messages = C.build_abstract_messages(record["items"], record["title"], record["journal"],
-                                                 note=record.get("note", ""))
-            digests = C.digests(messages)
-            self.assertEqual(record["systemSha256"], digests["systemSha256"])
-            self.assertEqual(record["userSha256"], digests["userSha256"])
-            count += 1
-        self.assertGreater(count, 0)
+            if line.strip():
+                outcomes[check_record(json.loads(line))] += 1
+        self.assertGreater(outcomes["checked"], 0, outcomes)
 
 
 if __name__ == "__main__":
