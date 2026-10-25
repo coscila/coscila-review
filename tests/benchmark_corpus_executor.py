@@ -7,8 +7,10 @@ workspace and measures, with the maintained code paths:
 
 - task preparation (keyset-streamed planner, batched task storage);
 - result import from an in-memory broker (one transaction per result page);
+- the per-task evidence checks of dispatch authorization (one job's tasks);
 - status latency (progress counters);
-- egress-ledger appends (chained JSONL segments).
+- egress-ledger appends (chained JSONL segments);
+- with --branch, the same preparation, import, authorization and status in a delta branch of a snapshot.
 
 No network, model endpoint, deployment path or existing library is touched; the
 broker is an in-process stand-in and the workspace is created fresh and removed
@@ -30,8 +32,10 @@ import tempfile
 import time
 
 from ocsl_review.confidentiality import _audit_event, append_egress_event, verify_egress_ledger
-from ocsl_review.corpus_dispatch import CorpusExecutor
-from ocsl_review.corpus_library import now
+from ocsl_review.corpus_assessment import build_messages
+from ocsl_review.corpus_dispatch import CorpusExecutor, authorize
+from ocsl_review.corpus_library import Library, now
+from ocsl_review.errors import ValidationError
 from ocsl_review.corpus_pipeline import prepare_tasks
 from ocsl_review.corpus_store import CorpusRepository, canonical, identity, sync_batch
 
@@ -203,6 +207,32 @@ def measure_import(repo: CorpusRepository, broker: SyntheticBroker, *, limit: in
             "submittedTasksPerSecond": round(imported / submit_seconds, 1) if submit_seconds else None}
 
 
+def measure_authorize(repo: CorpusRepository, broker: SyntheticBroker, tasks: int = 1000) -> dict:
+    """The per-task evidence checks of dispatch authorization for one job of pending tasks.
+
+    Authorization verifies every task's stored spec, source, locus and sections before the workspace
+    egress decision; this stand-in workspace has no scholarly context, so the measurement stops at that
+    decision, after every per-task check.
+    """
+    executor = CorpusExecutor(repo, broker=broker, authorization=lambda *args: None)
+    pending = executor._tasks([t["task_id"] for t in repo.tasks(executor.analysis, state="pending", tier="abstract",
+                                                                limit=tasks)])
+    if not pending:
+        return {"tasks": 0}
+    inputs = [{"id": f"item-{i}", "input": {"messages": build_messages([t["spec"]], "abstract")}}
+              for i, t in enumerate(pending)]
+    catalog, worker = executor._catalog_worker("w1")
+    started = time.perf_counter()
+    try:
+        authorize(repo, None, catalog, worker, pending, inputs)
+        reached = "authorized"
+    except ValidationError as error:
+        reached = str(error)[:80]
+    seconds = time.perf_counter() - started
+    return {"tasks": len(pending), "seconds": round(seconds, 3), "tasksPerSecond": round(len(pending) / seconds, 1),
+            "stoppedAt": reached}
+
+
 def measure_status(repo: CorpusRepository, calls: int = 200) -> dict:
     samples = []
     for _ in range(calls):
@@ -229,8 +259,32 @@ def measure_egress(workspace: Path, count: int) -> dict:
             "verifySeconds": round(time.perf_counter() - started, 3)}
 
 
+def measure_branch(repo: CorpusRepository, workspace: Path, *, results: int | None, job_items: int) -> dict:
+    """Snapshot the generated library, branch it into a new analysis and repeat the measurements there."""
+    started = time.perf_counter()
+    repo.library.snapshot("work/snapshot")
+    snapshot_seconds = time.perf_counter() - started
+    started = time.perf_counter()
+    Library(repo.workspace, "work/snapshot").branch("work/branch", "Synthetic follow-up", "follow-up",
+                                                     {"version": 2, "kind": "synthetic-benchmark"})
+    branch_seconds = time.perf_counter() - started
+    branch = CorpusRepository(workspace, "work/branch")
+    started = time.perf_counter()
+    planned = prepare_tasks(branch, tier="abstract")
+    prepare_seconds = time.perf_counter() - started
+    broker = SyntheticBroker(workspace)
+    authorization = measure_authorize(branch, broker)
+    imported = measure_import(branch, broker, limit=results, job_items=job_items)
+    status = measure_status(branch, 50)
+    return {"snapshotSeconds": round(snapshot_seconds, 3), "branchSeconds": round(branch_seconds, 3),
+            "prepare": {"tasks": planned["tasks"], "seconds": round(prepare_seconds, 3),
+                        "tasksPerSecond": round(planned["tasks"] / prepare_seconds, 1)},
+            "authorize": authorization, "import": imported, "status": status}
+
+
 def run_benchmark(*, loci: int = 200_000, results: int | None = None, egress_events: int = 100_000,
-                  job_items: int = 1000, parent: Path | None = None, keep: bool = False) -> dict:
+                  job_items: int = 1000, parent: Path | None = None, keep: bool = False,
+                  branch: bool = False) -> dict:
     if os.environ.get("LAB_WORKSPACE_ROOT") and parent is not None:
         root = Path(os.environ["LAB_WORKSPACE_ROOT"]).resolve()
         if parent.resolve() == root or root in parent.resolve().parents:
@@ -246,14 +300,21 @@ def run_benchmark(*, loci: int = 200_000, results: int | None = None, egress_eve
         prepare = {"tasks": planned["tasks"], "blocked": planned["blocked"], "seconds": round(prepare_seconds, 3),
                    "tasksPerSecond": round(planned["tasks"] / prepare_seconds, 1)}
         status_before = measure_status(repo)
+        authorization = measure_authorize(repo, SyntheticBroker(workspace))
         imported = measure_import(repo, SyntheticBroker(workspace), limit=results, job_items=job_items)
         status_after = measure_status(repo)
         egress = measure_egress(workspace, egress_events)
         status = status_after if status_after["p95Milliseconds"] >= status_before["p95Milliseconds"] else status_before
-        report = {"corpus": corpus, "prepare": prepare, "import": imported,
+        report = {"corpus": corpus, "prepare": prepare, "authorize": authorization, "import": imported,
                   "status": {"beforeImport": status_before, "afterImport": status_after}, "egress": egress,
                   "counts": repo.status()["counts"], "python": sys.version.split()[0],
                   "workspace": str(workspace) if keep else None}
+        if branch:
+            report["branch"] = measure_branch(repo, workspace, results=results, job_items=job_items)
+            report["branchAcceptance"] = {
+                "prepare": report["branch"]["prepare"]["tasksPerSecond"] >= ACCEPTANCE["prepareTasksPerSecond"],
+                "import": (report["branch"]["import"]["resultsPerSecond"] or 0) >= ACCEPTANCE["importResultsPerSecond"],
+                "status": report["branch"]["status"]["p95Milliseconds"] <= ACCEPTANCE["statusMilliseconds"]}
         report["acceptance"] = {
             "prepare": prepare["tasksPerSecond"] >= ACCEPTANCE["prepareTasksPerSecond"],
             "import": (imported["resultsPerSecond"] or 0) >= ACCEPTANCE["importResultsPerSecond"],
@@ -276,11 +337,13 @@ def main(argv=None) -> int:
     parser.add_argument("--parent", type=Path, default=None, help="directory for the temporary workspace")
     parser.add_argument("--keep", action="store_true", help="keep the generated workspace")
     parser.add_argument("--check", action="store_true", help="exit 1 when an acceptance threshold is missed")
+    parser.add_argument("--branch", action="store_true", help="also measure a delta branch of a snapshot")
     args = parser.parse_args(argv)
     report = run_benchmark(loci=args.loci, results=args.results, egress_events=args.egress_events,
-                           job_items=args.job_items, parent=args.parent, keep=args.keep)
+                           job_items=args.job_items, parent=args.parent, keep=args.keep, branch=args.branch)
     print(json.dumps(report, indent=2, sort_keys=True))
-    passed = all(value for key, value in report["acceptance"].items() if key != "thresholds")
+    passed = all(value for key, value in report["acceptance"].items() if key != "thresholds") and \
+        all(report.get("branchAcceptance", {}).values())
     return 0 if passed or not args.check else 1
 
 

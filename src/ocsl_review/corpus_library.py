@@ -32,7 +32,7 @@ import tempfile
 import time
 import uuid
 
-from .corpus_overlay import PARENT, Overlay, prefix_shared_tables, quote
+from .corpus_overlay import COUNTED, OVERRIDES_MAINTAINED, PARENT, Overlay, prefix_shared_tables, quote
 from .corpus_packs import INDEX as PACK_INDEX, PACK_NAME, SHA256, PackIntegrityError, PackStore, build_index
 
 
@@ -45,7 +45,7 @@ TABLES = (
 V2_TABLES = ("corpus_reviews", "corpus_documents", "corpus_tasks", "corpus_batches", "corpus_imports")
 SCHEMA_VERSIONS = (1, 2, 3)
 # Tables whose row totals status reports; schema 3 keeps them in progress_counters.
-COUNTED_TABLES = ("reviews", "bibliography_entries", "works", "claim_loci", "source_artifacts", "source_sections")
+COUNTED_TABLES = COUNTED
 SCHEMA = Path(__file__).resolve().parents[2] / "skills/ocsl-review-reference-analysis/assets/literature-schema.sql"
 SNAPSHOT_FORMAT = "ocsl-literature-snapshot"
 MERKLE_ALGORITHM = "sha256-files-v1"
@@ -486,12 +486,43 @@ class Library:
         """Schema-3 progress counters recomputed from the rows their triggers count.
 
         A branch's triggers live on its own (prefixed) tables, so its stored counters
-        cover the branch's own rows; the parent snapshot keeps its own counters.
+        cover the branch's own rows; the parent snapshot keeps its own counters. A
+        branch also counts the parent rows it has copied (overrides) and marks that it
+        keeps them, so status reads them instead of scanning its tables.
         """
-        return expected_progress_counters(connection, self._own)
+        expected = expected_progress_counters(connection, self._own)
+        if self.overlay is not None and "progress_counters" in self.overlay.tables:
+            expected.update(self._scanned_overrides(connection))
+            expected[OVERRIDES_MAINTAINED] = 1
+        return expected
 
     def rebuild_counters(self, connection):
-        return rebuild_progress_counters(connection, self._own)
+        expected = self.expected_counters(connection)
+        connection.execute("DELETE FROM main.progress_counters")
+        connection.executemany("INSERT INTO main.progress_counters VALUES (?,?,?,?,?)",
+                               [(*key, value) for key, value in sorted(expected.items())])
+        return expected
+
+    def _scanned_overrides(self, connection):
+        """{('overrides', '', table, ''): n, ('override-reviews', '', phase, state): n} by scanning the branch."""
+        found = {}
+        tables = self.overlay.tables
+        for name in COUNTED_TABLES:
+            table = tables.get(name)
+            if table is not None and table.shared and table.key:
+                match = " AND ".join(f"p.{quote(c)}=d.{quote(c)}" for c in table.key)
+                count = connection.execute(
+                    f"SELECT count(*) FROM main.{quote(table.physical)} AS d WHERE EXISTS "
+                    f"(SELECT 1 FROM {PARENT}.{quote(name)} AS p WHERE {match})").fetchone()[0]
+                if count:
+                    found[("overrides", "", name, "")] = count
+        reviews = tables.get("corpus_reviews")
+        if reviews is not None and reviews.shared:
+            for phase, state, count in connection.execute(
+                    f"SELECT p.phase,p.state,count(*) FROM main.{quote(reviews.physical)} AS d "
+                    f"JOIN {PARENT}.corpus_reviews AS p ON p.review_id=d.review_id GROUP BY p.phase,p.state"):
+                found[("override-reviews", "", phase, state)] = count
+        return found
 
     def progress_counters(self, connection, analysis_id):
         """{(counter, dimension, state): value} of the library totals and one analysis (schema 3).
@@ -508,6 +539,11 @@ class Library:
         counters = read("main")
         if self.overlay is None:
             return counters
+        stored = {tuple(row[:4]): row[4] for row in connection.execute(
+            "SELECT counter,analysis_id,dimension,state,value FROM main.progress_counters "
+            "WHERE counter IN ('overrides','override-reviews','overrides-maintained')")}
+        for key in [key for key in counters if key[0] in ("overrides", "override-reviews", "overrides-maintained")]:
+            del counters[key]
         for key, value in read(PARENT).items():
             if key[0] != "tasks":
                 counters[key] = counters.get(key, 0) + value
@@ -516,21 +552,14 @@ class Library:
         def subtract(key, value):
             counters[key] = counters.get(key, 0) - value
 
-        for name in COUNTED_TABLES:
-            table = tables.get(name)
-            if table is not None and table.shared and table.key:
-                match = " AND ".join(f"p.{quote(c)}=d.{quote(c)}" for c in table.key)
-                subtract(("rows", name, ""), connection.execute(
-                    f"SELECT count(*) FROM main.{quote(table.physical)} AS d WHERE EXISTS "
-                    f"(SELECT 1 FROM {PARENT}.{quote(name)} AS p WHERE {match})").fetchone()[0])
-        reviews = tables.get("corpus_reviews")
-        if reviews is not None and reviews.shared:
-            for phase, state, count in connection.execute(
-                    f"SELECT p.phase,p.state,count(*) FROM main.{quote(reviews.physical)} AS d "
-                    f"JOIN {PARENT}.corpus_reviews AS p ON p.review_id=d.review_id GROUP BY p.phase,p.state"):
-                subtract(("reviews", phase, state), count)
+        # A branch made by this version counts the parent rows it copies; older branches are scanned.
+        overrides = ({key: value for key, value in stored.items() if key[0] != "overrides-maintained"}
+                     if OVERRIDES_MAINTAINED in stored else self._scanned_overrides(connection))
+        for (counter, _, dimension, state), value in overrides.items():
+            subtract(("rows", dimension, "") if counter == "overrides" else ("reviews", dimension, state), value)
         assessments = tables.get("assessments")
-        if assessments is not None and assessments.shared:
+        if assessments is not None and assessments.shared and connection.execute(
+                f"SELECT 1 FROM {PARENT}.assessments WHERE analysis_id=? LIMIT 1", (analysis_id,)).fetchone():
             # Loci assessed at the same level and state in both count once in the union.
             for level, state, count in connection.execute(
                     "SELECT d.evidence_level,d.validation_state,count(DISTINCT d.locus_id) "
@@ -981,6 +1010,9 @@ class Library:
                     with connection:
                         add_analysis(connection, corpus[0][0], question, analysis_id,
                                      parent["manifest_sha256"], protocol, code_revision)
+                        if "progress_counters" in created.overlay.tables:
+                            connection.execute("INSERT OR IGNORE INTO main.progress_counters VALUES (?,?,?,?,1)",
+                                               OVERRIDES_MAINTAINED)
                 finally:
                     connection.close()
             with clock("check"):
