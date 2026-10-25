@@ -408,12 +408,15 @@ class PackStore:
 
     def remember(self, name: str, sha256: str) -> None:
         """Record the current stat signature of a verified sealed pack."""
-        if self.readonly:
+        self.remember_many([(name, sha256)])
+
+    def remember_many(self, packs: list[tuple[str, str]]) -> None:
+        if self.readonly or not packs:
             return
-        current = signature(self.pack_path(name))
+        rows = [(name, *signature(self.pack_path(name)), sha256) for name, sha256 in packs]
         connection = self._connect(write=True)
         try:
-            connection.execute("INSERT OR REPLACE INTO stat_cache VALUES (?,?,?,?,?,?,?)", (name, *current, sha256))
+            connection.executemany("INSERT OR REPLACE INTO stat_cache VALUES (?,?,?,?,?,?,?)", rows)
             connection.commit()
         finally:
             connection.close()
@@ -636,26 +639,48 @@ class _Writer:
 def build_index(destination: Path, packs: list[dict], sources: list[Path]) -> Path:
     """Write a closed index for the listed sealed packs from one or more source indexes.
 
+    The first source is copied page by page (a consistent read, also of a live WAL
+    index) and trimmed to the listed packs; further sources are merged row by row.
     A blob stored in two packs is indexed once (first source wins); every blob of
     every listed pack must be resolvable in the result.
     """
     destination = Path(destination)
-    connection = sqlite3.connect(destination)
-    try:
+    listed = {p["name"]: p for p in packs}
+    if sources:
+        source = sqlite3.connect(Path(sources[0]).absolute().as_uri() + "?mode=ro", uri=True)
+        connection = sqlite3.connect(destination)
+        try:
+            source.backup(connection)
+        finally:
+            source.close()
+    else:
+        connection = sqlite3.connect(destination)
         connection.executescript(INDEX_SCHEMA)
-        connection.execute("DROP TABLE stat_cache")
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("DROP TABLE IF EXISTS stat_cache")
+        present = {name for (name,) in connection.execute("SELECT name FROM packs")}
+        unlisted = sorted(present - listed.keys())
+        for start in range(0, len(unlisted), 500):
+            names = unlisted[start:start + 500]
+            marks = ",".join("?" for _ in names)
+            connection.execute(f"DELETE FROM blobs WHERE pack_id IN (SELECT id FROM packs WHERE name IN ({marks}))", names)
+            connection.execute(f"DELETE FROM packs WHERE name IN ({marks})", names)
         connection.executemany(
             "INSERT INTO packs(name,state,byte_count,blob_count,sha256,created_at,sealed_at) VALUES (?,?,?,?,?,?,?)",
             [(p["name"], "sealed", p["byte_count"], 0, p["sha256"], p.get("created_at") or now(),
-              p.get("sealed_at") or now()) for p in sorted(packs, key=lambda item: item["name"])])
+              p.get("sealed_at") or now()) for name, p in sorted(listed.items()) if name not in present])
+        connection.executemany("UPDATE packs SET state='sealed', sha256=?, byte_count=? WHERE name=?",
+                               [(p["sha256"], p["byte_count"], name) for name, p in sorted(listed.items())])
         connection.commit()
-        for number, source in enumerate(sources):
+        for number, source in enumerate(sources[1:]):
             alias = f"source{number}"
             # mode=ro, never immutable: a source may be a live WAL index.
             connection.execute(f"ATTACH DATABASE ? AS {alias}", (Path(source).absolute().as_uri() + "?mode=ro",))
             connection.execute(
                 f"INSERT OR IGNORE INTO main.blobs SELECT b.sha256,d.id,b.offset,b.stored_length,b.raw_length,b.codec "
-                f"FROM {alias}.blobs b JOIN {alias}.packs s ON s.id=b.pack_id JOIN main.packs d ON d.name=s.name")
+                f"FROM {alias}.blobs b JOIN {alias}.packs s ON s.id=b.pack_id JOIN main.packs d ON d.name=s.name "
+                f"ORDER BY b.sha256")
             missing = connection.execute(
                 f"SELECT count(*) FROM {alias}.blobs b JOIN {alias}.packs s ON s.id=b.pack_id "
                 f"JOIN main.packs d ON d.name=s.name WHERE NOT EXISTS (SELECT 1 FROM main.blobs m WHERE m.sha256=b.sha256)"
@@ -666,7 +691,8 @@ def build_index(destination: Path, packs: list[dict], sources: list[Path]) -> Pa
                 raise PackIntegrityError("index rows of a listed pack were not copied")
         connection.execute("UPDATE packs SET blob_count=(SELECT count(*) FROM blobs WHERE pack_id=packs.id)")
         connection.commit()
-        connection.execute("PRAGMA journal_mode=DELETE")
+        if connection.execute("SELECT count(*) FROM packs").fetchone()[0] != len(listed):
+            raise PackIntegrityError("index packs differ from the listed packs")
     finally:
         connection.close()
     return destination

@@ -635,108 +635,126 @@ class Library:
             connection.close()
 
     def snapshot(self, destination):
-        started = time.monotonic()
+        """Closed database copy, hard-linked sealed packs, a small manifest and a Merkle root.
+
+        Sealed packs are checked by their stat signature (rehashed only when it changed)
+        and shared by hard link; loose artifacts are packed into the snapshot. The result
+        reports the wall time of each phase.
+        """
+        clock = _Phases()
         if self.manifest_path.exists():
             # Never bless tampering: a snapshot source must still match its own manifest.
-            self.verify(require_snapshot=True, level="light")
+            with clock("verify_source"):
+                self.verify(require_snapshot=True, level="light")
         active = self.active_analysis_id()
         with self.workspace.create(destination) as root:
             db = root / "corpus.sqlite3"
-            if self.overlay is not None:
-                self._flatten(db)
-            else:
-                self.backup(db)
+            with clock("database"):
+                if self.overlay is not None:
+                    self._flatten(db)
+                else:
+                    self.backup(db)
             stores = self.pack_stores()
-            for store in stores:
-                if not store.readonly:
-                    store.seal_open()
+            with clock("seal"):
+                for store in stores:
+                    if not store.readonly:
+                        store.seal_open()
             packs_dir = root / "packs"
             packs_dir.mkdir(mode=0o700)
             listed, linked = {}, 0
-            for store in stores:
-                for pack in store.packs("sealed"):
-                    if pack["name"] in listed:
-                        continue
-                    source = store.pack_path(pack["name"])
-                    if source.is_symlink() or not source.is_file():
-                        raise PackIntegrityError(f"pack is missing: {pack['name']}")
-                    if store.readonly:
-                        if source.stat().st_size != pack["byte_count"]:
-                            raise PackIntegrityError(f"sealed pack size changed: {pack['name']}")
-                    else:
-                        store.sealed_digest(pack["name"], pack["sha256"], remember=True)
-                    if link_or_copy(source, packs_dir / pack["name"]) == "copied":
-                        if digest_file(packs_dir / pack["name"]) != pack["sha256"]:
-                            raise PackIntegrityError(f"sealed pack changed after sealing: {pack['name']}")
-                    else:
-                        linked += 1
-                    store.remember(pack["name"], pack["sha256"])
-                    listed[pack["name"]] = pack
+            with clock("link"):
+                for store in stores:
+                    shared = []
+                    for pack in store.packs("sealed"):
+                        if pack["name"] in listed:
+                            continue
+                        source = store.pack_path(pack["name"])
+                        if source.is_symlink() or not source.is_file():
+                            raise PackIntegrityError(f"pack is missing: {pack['name']}")
+                        if store.readonly:
+                            if source.stat().st_size != pack["byte_count"]:
+                                raise PackIntegrityError(f"sealed pack size changed: {pack['name']}")
+                        else:
+                            store.sealed_digest(pack["name"], pack["sha256"], remember=True)
+                        if link_or_copy(source, packs_dir / pack["name"]) == "copied":
+                            if digest_file(packs_dir / pack["name"]) != pack["sha256"]:
+                                raise PackIntegrityError(f"sealed pack changed after sealing: {pack['name']}")
+                        else:
+                            linked += 1
+                        shared.append((pack["name"], pack["sha256"]))
+                        listed[pack["name"]] = pack
+                    # Linking changes the inode's ctime: refresh the stat cache in one transaction.
+                    store.remember_many(shared)
             index = packs_dir / PACK_INDEX
             sources = [store.index_path for store in stores]
-            build_index(index, list(listed.values()), sources)
-            missing = self._registered_unpacked(db, index)
-            if missing:
-                # Loose artifacts (older libraries, legacy archives) are packed into the snapshot itself.
-                staging = PackStore.create(root / ".packing", target_bytes=1 << 62)
-                with staging.batch():
-                    for digest, byte_count in missing:
-                        staging.put(self.read_blob(digest, byte_count), digest)
-                staging.seal_open()
-                for item in staging.packs("sealed"):
-                    os.rename(staging.pack_path(item["name"]), packs_dir / item["name"])
-                    listed[item["name"]] = item
-                index.unlink()
-                build_index(index, list(listed.values()), sources + [staging.index_path])
-                staging.close()
-                shutil.rmtree(root / ".packing")
-                if self._registered_unpacked(db, index):
-                    raise ValueError("snapshot could not pack every registered artifact")
-            connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
-            try:
-                connection.row_factory = sqlite3.Row
-                connection.execute("ATTACH DATABASE ? AS ocsl_index", (index.as_uri() + "?mode=ro",))
-                bad = connection.execute(
-                    "SELECT s.relative_path FROM source_artifacts s JOIN ocsl_index.blobs b USING(sha256) "
-                    "WHERE b.raw_length != s.byte_count OR s.relative_path != 'sources/' || s.sha256 LIMIT 1").fetchone()
+            with clock("index"):
+                build_index(index, list(listed.values()), sources)
+            with clock("loose"):
+                found = self._unpacked(db, index)
+                missing = [(digest, size) for digest, size, packed in found if packed is None]
+                if missing:
+                    # Loose artifacts (older libraries, legacy archives) are packed into the snapshot itself.
+                    staging = PackStore.create(root / ".packing", target_bytes=1 << 62)
+                    with staging.batch():
+                        for digest, byte_count in missing:
+                            staging.put(self.read_blob(digest, byte_count), digest)
+                    staging.seal_open()
+                    for item in staging.packs("sealed"):
+                        os.rename(staging.pack_path(item["name"]), packs_dir / item["name"])
+                        listed[item["name"]] = item
+                    index.unlink()
+                    build_index(index, list(listed.values()), sources + [staging.index_path])
+                    shutil.rmtree(root / ".packing")
+                    found = self._unpacked(db, index)
+            with clock("check"):
+                bad = found
                 if bad:
-                    raise ValueError(f"source hash/size mismatch: {bad[0]}")
-                version = connection.execute("PRAGMA main.user_version").fetchone()[0]
-                if version not in (1, 2):
-                    raise ValueError("unsupported database schema version")
-                if connection.execute("PRAGMA main.quick_check").fetchone()[0] != "ok":
-                    raise ValueError("database integrity check failed")
-                counts = self._tables(connection)
-                analyses = [dict(row) for row in connection.execute("SELECT * FROM analyses ORDER BY analysis_id")]
-                artifacts = connection.execute(
-                    "SELECT count(*), coalesce(sum(byte_count),0) FROM source_artifacts").fetchone()
-            finally:
-                connection.close()
+                    if bad[0][2] is None:
+                        raise ValueError("snapshot could not pack every registered artifact")
+                    raise ValueError(f"source hash/size mismatch: sources/{bad[0][0]}")
+                connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+                try:
+                    connection.row_factory = sqlite3.Row
+                    version = connection.execute("PRAGMA main.user_version").fetchone()[0]
+                    if version not in (1, 2):
+                        raise ValueError("unsupported database schema version")
+                    if connection.execute("PRAGMA main.quick_check").fetchone()[0] != "ok":
+                        raise ValueError("database integrity check failed")
+                    counts = self._tables(connection)
+                    analyses = [dict(row) for row in connection.execute("SELECT * FROM analyses ORDER BY analysis_id")]
+                    artifacts = connection.execute(
+                        "SELECT count(*), coalesce(sum(byte_count),0) FROM source_artifacts").fetchone()
+                finally:
+                    connection.close()
             if active not in {row["analysis_id"] for row in analyses}:
                 raise ValueError("active analysis is not present in the captured database")
-            files = [{"path": "corpus.sqlite3", "sha256": digest_file(db), "byte_count": db.stat().st_size},
-                     {"path": "packs/" + PACK_INDEX, "sha256": digest_file(index), "byte_count": index.stat().st_size}]
-            files += [{"path": "packs/" + name, "sha256": pack["sha256"], "byte_count": pack["byte_count"]}
-                      for name, pack in sorted(listed.items())]
-            manifest = snapshot_manifest(files, version=version, counts=counts, analyses=analyses,
-                                         artifacts={"count": artifacts[0], "bytes": artifacts[1]}, active=active)
-            write_json(root / "manifest.json", manifest)
-            for path in (db, index, root / "manifest.json"):
-                path.chmod(0o444)
+            with clock("manifest"):
+                files = [{"path": "corpus.sqlite3", "sha256": digest_file(db), "byte_count": db.stat().st_size},
+                         {"path": "packs/" + PACK_INDEX, "sha256": digest_file(index),
+                          "byte_count": index.stat().st_size}]
+                files += [{"path": "packs/" + name, "sha256": pack["sha256"], "byte_count": pack["byte_count"]}
+                          for name, pack in sorted(listed.items())]
+                manifest = snapshot_manifest(files, version=version, counts=counts, analyses=analyses,
+                                             artifacts={"count": artifacts[0], "bytes": artifacts[1]}, active=active)
+                write_json(root / "manifest.json", manifest)
+                for path in (db, index, root / "manifest.json"):
+                    path.chmod(0o444)
             return {"bundle": destination, "manifest_sha256": digest_file(root / "manifest.json"),
                     "merkle_root": manifest["merkle"]["root"], "counts": counts, "portable": True,
                     "packs": len(listed), "linked_packs": linked, "files": len(files) + 1,
                     "manifest_bytes": (root / "manifest.json").stat().st_size,
-                    "seconds": round(time.monotonic() - started, 3)}
+                    "seconds": clock.total(), "phases": clock.phases}
 
     @staticmethod
-    def _registered_unpacked(db, index):
+    def _unpacked(db, index):
+        """Registered artifacts that the index lacks (packed is None) or holds with another size."""
         connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
         try:
             connection.execute("ATTACH DATABASE ? AS ocsl_index", (index.as_uri() + "?mode=ro",))
             return connection.execute(
-                "SELECT sha256, byte_count FROM source_artifacts s WHERE NOT EXISTS "
-                "(SELECT 1 FROM ocsl_index.blobs b WHERE b.sha256=s.sha256) ORDER BY sha256").fetchall()
+                "SELECT s.sha256, s.byte_count, b.raw_length FROM source_artifacts s LEFT JOIN ocsl_index.blobs b "
+                "ON b.sha256=s.sha256 WHERE b.sha256 IS NULL OR b.raw_length != s.byte_count "
+                "OR s.relative_path != 'sources/' || s.sha256 ORDER BY s.sha256").fetchall()
         finally:
             connection.close()
 
@@ -758,39 +776,45 @@ class Library:
             target.close()
 
     def branch(self, destination, question, analysis_id, protocol=None, code_revision=None):
+        """A delta database over this snapshot; the parent database is never copied."""
         if not self.manifest_path.exists():
             raise ValueError("branch requires a snapshot; take a snapshot first")
-        parent = self.verify(require_snapshot=True, level="light")
+        clock = _Phases()
+        with clock("verify_parent"):
+            parent = self.verify(require_snapshot=True, level="light")
         with self.workspace.create(destination) as root:
-            delta = root / "corpus.sqlite3"
-            self._create_delta(delta)
-            with self.connect() as connection:
-                corpus = connection.execute("SELECT corpus_id FROM corpora").fetchall()
-                clash = connection.execute("SELECT 1 FROM analyses WHERE analysis_id=?", (analysis_id,)).fetchone()
-            if len(corpus) != 1:
-                raise ValueError("branch expects one corpus per library")
-            if clash:
-                raise ValueError("analysis ID already exists in the parent snapshot")
-            with database(delta) as connection:
-                add_analysis(connection, corpus[0][0], question, analysis_id,
-                             parent["manifest_sha256"], protocol, code_revision)
-            PackStore.create(root / "packs")
-            write_json(root / "bundle.json", {
-                "version": 2, "kind": "delta-branch", "parent_snapshot": self.relative,
-                "parent_manifest_sha256": parent["manifest_sha256"],
-                "parent_merkle_root": parent.get("merkle_root"), "active_analysis_id": analysis_id,
-            })
-            created = Library(self.workspace, destination)
-            connection = created.open()
-            try:
-                connection.row_factory = sqlite3.Row
-                created._logical(connection, deep=False)
-            finally:
-                connection.close()
+            with clock("delta"):
+                delta = root / "corpus.sqlite3"
+                self._create_delta(delta)
+                with self.connect() as connection:
+                    corpus = connection.execute("SELECT corpus_id FROM corpora").fetchall()
+                    clash = connection.execute("SELECT 1 FROM analyses WHERE analysis_id=?", (analysis_id,)).fetchone()
+                if len(corpus) != 1:
+                    raise ValueError("branch expects one corpus per library")
+                if clash:
+                    raise ValueError("analysis ID already exists in the parent snapshot")
+                with database(delta) as connection:
+                    add_analysis(connection, corpus[0][0], question, analysis_id,
+                                 parent["manifest_sha256"], protocol, code_revision)
+                PackStore.create(root / "packs")
+                write_json(root / "bundle.json", {
+                    "version": 2, "kind": "delta-branch", "parent_snapshot": self.relative,
+                    "parent_manifest_sha256": parent["manifest_sha256"],
+                    "parent_merkle_root": parent.get("merkle_root"), "active_analysis_id": analysis_id,
+                })
+            with clock("check"):
+                created = Library(self.workspace, destination)
+                connection = created.open()
+                try:
+                    connection.row_factory = sqlite3.Row
+                    created._logical(connection, deep=False)
+                finally:
+                    connection.close()
             return {"bundle": destination, "analysis_id": analysis_id,
                     "parent_manifest_sha256": parent["manifest_sha256"],
                     "parent_merkle_root": parent.get("merkle_root"),
-                    "portable": False, "delta": True, "source_parent": self.relative}
+                    "portable": False, "delta": True, "source_parent": self.relative,
+                    "seconds": clock.total(), "phases": clock.phases}
 
     # -------------------------------------------------------------- migration
     def pack_loose(self):
@@ -823,6 +847,25 @@ class Library:
         finally:
             connection.close()
         return {"packed": packed, "packedBytes": byte_total, "alreadyPresent": present, **self.packs.stats()}
+
+
+class _Phases:
+    """Wall time per named phase of a storage operation."""
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.phases = {}
+
+    @contextmanager
+    def __call__(self, name):
+        began = time.monotonic()
+        try:
+            yield
+        finally:
+            self.phases[name] = round(self.phases.get(name, 0) + time.monotonic() - began, 3)
+
+    def total(self):
+        return round(time.monotonic() - self.started, 3)
 
 
 def snapshot_manifest(files, *, version, counts, analyses, artifacts, active=None, extra=None):
