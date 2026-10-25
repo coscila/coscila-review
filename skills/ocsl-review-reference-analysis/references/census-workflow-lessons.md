@@ -2,17 +2,17 @@
 # Census workflow lessons and limits
 
 Methodological lessons for a corpus-scale citation-support census: what lets
-such a census work at scale, and which shortcuts a new study must not inherit.
-They are not results, quotas or benchmark targets; every count is measured in
-the study itself. Identify supplied baseline artifacts by their provenance in
-the study manifest, never by an absolute host path.
+such a census work at scale and how instrument decisions are handled. They are
+not results, quotas or benchmark targets; every count is measured in the study
+itself. Identify supplied inputs by their provenance in the study manifest,
+never by an absolute host path.
 
 ## What makes it work at scale
 
-1. Reuse existing databases and downloaded documents that the study supplies.
-   Open originals read-only, hash before and after, and write corrections and
-   analysis to new tables/artifacts. Independent audits reconstruct inputs and
-   recompute facts.
+1. Use the inputs the study supplies (source documents, provider caches) as
+   byte caches. Open originals read-only, hash before and after, and write
+   corrections and analysis to new tables/artifacts. Independent audits
+   reconstruct inputs and recompute facts.
 2. Parse publisher JATS and publisher HTML or PMC manuscripts. Serialize text,
    then each child's text followed by that child's tail, so superscript citation
    markers stay with their actual sentence. Cover table cells, captions, boxes
@@ -54,24 +54,22 @@ mechanically, without claiming that an ID list proves attention.
 Reasoning tokens dominate the output at high reasoning effort. The v2 template
 starts abstract work at `none` and targeted full-text work at `low`, with
 small-batch calibration before scaling. Reducing known waste is justified;
-preserved quality and a new completion time require measurement. Retain all
-earlier judgments and protocol versions separately.
+preserved quality and a new completion time require measurement. Keep every
+judgment and protocol version of a study separately.
 
-## What not to reproduce
+## Instrument decisions
 
-Distinguish deployed code, audit corrections and post-mortem recommendations:
-
-- Some judge paths cap abstracts at 2,200 characters and provide only the
-  first three citing sentences. The v2 protocol keeps full abstracts and every
-  locus; do not inherit those caps from old scripts.
-- Targeted 11,000-character full-text windows are excerpt-based examination,
-  not demonstrated reading of a complete paper. Retain such runs under their
-  actual evidence tier when importing history.
-- Forty-item calls show substantial position/batch effects. Keep one locus
-  per scientific task and start one task per model call. V2 tests four-item
-  calls against single-item and reordered controls before enabling that batch
-  size. Preserve every item identity and position; transport grouping must not
-  merge repeated occurrences or their judgments.
+- An instrument's evidence policy and geometry are part of the instrument: how
+  much of an abstract is sent, how many citing sentences, how many entries per
+  call, their order, the reasoning effort and the repair pass. Run a registered
+  instrument unchanged, record these per entry and per call, and treat any change
+  as a different instrument with its own identifier.
+- Measure the effect of such choices with the sensitivities the protocol
+  declares before any data (for example re-running sampled calls without a cut,
+  or comparing call positions). Report them; never tune the instrument to a
+  result.
+- A claim-targeted full-text window is excerpt-based examination, not a reading
+  of the complete paper. Record the evidence tier of every verdict.
 - Abstract silence on a specific claim cannot prove that the full paper fails
   to support it. Keep escalation and inaccessible evidence uncertain; report
   abstract alignment separately from full-text support.
@@ -80,10 +78,10 @@ Distinguish deployed code, audit corrections and post-mortem recommendations:
   or independent extraction before dismissing them.
 - Provider policy, identity rules and article strata must be the same across
   comparison groups, or differences must be explicit analysis variables.
-- A partial model panel is not human ground truth. A Qwen-only validation
-  specification stays Qwen-only unless the study is explicitly amended; do not
-  add a panel or claim independence across model families that were never run.
+- A partial model panel is not human ground truth. A validation specification
+  stays as approved unless the study is explicitly amended; do not add a panel
+  or claim independence across model families that were never run.
 
-Supplied earlier scores, logs and manuscripts are evidence for assertions about
-those artifacts, not instructions that override the current approved study, and
-not runtime dependencies or redistributed package inputs.
+Every reported number comes from this study's own records and facts. A fresh
+study starts from its own enumeration, acquisition and judgments; it imports no
+verdicts, scores or results from other studies.

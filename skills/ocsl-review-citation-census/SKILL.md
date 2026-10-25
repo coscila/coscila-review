@@ -11,13 +11,22 @@ Use for an explicitly scoped, systematic citation audit or a study of model
 judgments. This produces model measurements with evidence and uncertainty;
 human-adjudicated labels need separate provenance.
 
+For an entry-level census with a registered census instrument
+(`citation-census@1`: one verdict per printed bibliography entry, with the
+instrument's fixed evidence policy, batch geometry and request settings), use
+`ocsl-review study`: prepare, abstracts, judge, full-text, the predeclared
+sensitivities, gates, freeze and facts. Read
+`$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the instrument runs
+unchanged and its decisions are recorded per entry.
+
 For a multi-paper corpus and a database that can support future questions, start
-with `ocsl-review-reference-analysis`. This census skill supplies the existing
-per-manuscript **v1** measurement lifecycle. New corpus studies use the maintained
-`ocsl-review corpus` v2 workflow through that reference-analysis skill. The v1
-rules below remain pinned for reproducibility; do not apply them to v2 or
-rewrite old assessments when changing instruments. Neither path transfers live
-broker jobs when a chat is forked.
+with `ocsl-review-reference-analysis`. This census skill also supplies the
+per-manuscript **v1** measurement lifecycle; per-locus corpus studies use the
+maintained `ocsl-review corpus` v2 workflow through that reference-analysis
+skill. The measurement rules below apply to those per-locus lifecycles, not to a
+registered census instrument, whose own evidence policy governs. Do not rewrite
+old assessments when changing instruments. No path transfers live broker jobs
+when a chat is forked.
 
 ## Runtime
 
