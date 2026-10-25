@@ -8,6 +8,7 @@ import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from ocsl_review.cli import build_parser, main
 from ocsl_review.corpus_store import CorpusRepository
@@ -94,6 +95,24 @@ class CorpusWorkflowTests(unittest.TestCase):
         self.assertNotIn("denominator", value)
         self.assertEqual(value["state"], "running")
         self.assertIn("+", value["updatedAt"])
+
+    def test_heartbeat_reads_counters_without_scanning_tables(self):
+        self.repo.review({"doi": "10.1234/review", "title": "Fixture"})
+        statements, original = [], CorpusRepository.connect
+
+        @contextlib.contextmanager
+        def traced(repo, *, write=False):
+            with original(repo, write=write) as connection:
+                connection.set_trace_callback(statements.append)
+                yield connection
+
+        with patch.object(CorpusRepository, "connect", traced):
+            Progress(self.repo)(force=True)
+        self.assertTrue(statements)
+        self.assertFalse([s for s in statements if "count(" in s.lower()])
+        status = json.loads((self.root / "results/.ocsl/corpus-status.json").read_text())
+        self.assertEqual(status["counts"]["reviews"], 1)
+        self.assertEqual(status["reviewStates"], [{"phase": "pending", "state": "pending", "count": 1}])
 
     def test_terminal_progress_survives_queued_heartbeats_and_stops_thread(self):
         with Progress(self.repo) as progress:
