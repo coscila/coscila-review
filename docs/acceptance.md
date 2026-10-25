@@ -39,6 +39,15 @@ A passing local suite is necessary but intentionally uses synthetic providers,
 temporary roots, and controlled subprocesses. It is not a substitute for the
 operator checks below.
 
+The claim screen's plan acceptance runs inside this suite with synthetic
+fixtures and mocked judges (see [the claim-screen guide](claim-check.md)): the
+three attribution cases in Markdown, DOCX and JATS; author-year resolution
+precision of at least 0.98 and recall of at least 0.95 on at least 200 citations
+from deterministically generated JATS; a 300-locus report within five minutes;
+and no manuscript text in any outbound request or egress-ledger event in
+confidential mode. Live judge throughput and provider behaviour still require
+deployment-specific checks.
+
 ### 3. Environment acceptance
 
 For every one of the six catalogued environments on the target platform:
