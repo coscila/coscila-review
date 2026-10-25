@@ -16,29 +16,44 @@ from ocsl_review.errors import ValidationError
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Study-identifying tokens (identifiers, file names, outcome figures, corpus totals, title fragments and a
-# date seed) are kept here only as sha256 digests, grouped by length; lab-facing files must contain none of
-# them at a word start.
+# Study-identifying tokens (session, workspace and chat identifiers, file names, outcome figures and interval
+# bounds, corpus totals, title fragments and a date seed) are kept here only as sha256 digests, grouped by
+# length; lab-facing files, and every tracked file outside tests, must contain none of them at a word start.
+# No-break and thin spaces count as spaces, so "16.0<NBSP>%" is the same token as "16.0 %".
 FORBIDDEN = {
     4: {"0c90dd551bf12b5fecc7a9c5caa5a728d45b1c2a5f1760aca9331c12ce0df252",
         "c31e0fcedb154b3269a7fbf9b8e71a41d16af95fd4b16cb805df3dcdddf0e700"},
-    5: {"a46773d48e58ed47190eba1132d7d735ab2d06fd94859332b8ead7bc2e5163e9",
-        "fc17580b56601023f5104f60e79b6e3390def8e30e35cc4fc0ab4ed1a5de3777",
+    5: {"0cbe66614a15a187a5aa341c71efafd84d550ff34dc178e773605f28f45cc84b",
         "1a5cf5c59619f15229f4f8c805d0667fd7c2e4001194717fb7ee62582f829045",
-        "b8ad25220cb9a5bcb26f18dac02f87a1e947b58e5cba443d566601a4e9cd601e",
-        "844cb8bb059c33fa526cb7124d8c52c6ff309f5113241e4dd16e04f20c9b005d",
-        "0cbe66614a15a187a5aa341c71efafd84d550ff34dc178e773605f28f45cc84b",
         "23c6a973a31b0bd5f99638209767556a02ac34bb793729382b6fd994d1e90b91",
-        "486f4110f8bbcf7eda1c0878929785fddddfa708c01ab0a7ef55a79c8ca6d834"},
-    6: {"36d383e4f228cc0bdbfcaaf4d78ef76bd7dc2767737a7af341e8c49277be30b7",
+        "486f4110f8bbcf7eda1c0878929785fddddfa708c01ab0a7ef55a79c8ca6d834",
+        "787e3c87ea2a0aa33edd0cc62d12ffd6d5c5457f12bbeab3bc9cedeffc06c8e9",
+        "844cb8bb059c33fa526cb7124d8c52c6ff309f5113241e4dd16e04f20c9b005d",
+        "94957c17d26f4b6175d2162c79e1165bd4071fbba49ae5797c00b1b3131b31b7",
+        "a46773d48e58ed47190eba1132d7d735ab2d06fd94859332b8ead7bc2e5163e9",
+        "b8ad25220cb9a5bcb26f18dac02f87a1e947b58e5cba443d566601a4e9cd601e",
+        "fc17580b56601023f5104f60e79b6e3390def8e30e35cc4fc0ab4ed1a5de3777"},
+    6: {"2c1ea11a3e37bce82366e296bbb04a05204ae360b5046b7ebe103682bfbace78",
+        "357bd9eef9d277dae8eabee6f41863f6a7489733bafdeb12c7770524a9e51b59",
+        "36d383e4f228cc0bdbfcaaf4d78ef76bd7dc2767737a7af341e8c49277be30b7",
         "3e933e14fd7af6bce60513e218c94d1210e2e43eaecb68c911762ace10142a55",
-        "2c1ea11a3e37bce82366e296bbb04a05204ae360b5046b7ebe103682bfbace78",
         "47214e5b4a0d19d7eda978b74955ba4e914e0bb4020ecca9dc036241424917d5",
-        "d7198881bf92a4872f10e9fa0ef00fb5c8860f56060f85642fcbe1d4ac05a6fd"},
-    7: {"c0c83edd9625e9bb2d3cd03550dc250197624f743a1a5bd3dad969167bdc8347"},
-    8: {"e89c2935a82eb5858fdb7b1ec108c72b5fc288730f5dfd123a53a591a625d4b9",
+        "d7198881bf92a4872f10e9fa0ef00fb5c8860f56060f85642fcbe1d4ac05a6fd",
+        "d88fb831cf45ec772adf0d3aa8537656fe3656b94c06965929d6cfe1d98c7e11"},
+    7: {"6736ce4e60cd6dd9edd3bf565368a5cb70c18b0a5c53f4b032f6fc81badd7ff0",
+        "9973b513d82595b8bd6b569b85ab24ea7d6793074697276db508ed424124e31a",
+        "c0c83edd9625e9bb2d3cd03550dc250197624f743a1a5bd3dad969167bdc8347"},
+    8: {"2991c4f2dbfc89e3e183e2afafd355e3901bce7b8c2752b280125ebd5648e769",
         "42474026dbf58ea83c4f5a17a2ce9f74e5690a9ab3b9195e8682d39ad3a17dd2",
-        "7d24b99d06d2eaaacb3962cbd29ebce5c4ccd4c3be5a1ebae44c370ff1d60d5b"},
+        "4636f0a96191eb01b381ce832aa8c719e1a4a92d106067a4102b7534cd7bd48b",
+        "7d24b99d06d2eaaacb3962cbd29ebce5c4ccd4c3be5a1ebae44c370ff1d60d5b",
+        "7fcf1fa435db30d801a0cabcf6b52a5a01b13c63cd9cf2dd2c2ebe5ce99b20ef",
+        "87e405c491a5436773e6386d96c2eabba587a224508a2eda3fcfe4333f3dfb27",
+        "a18577d59248e450bed92c174eaa2b1fdeacd73d7b417a819085dd8543c7b3eb",
+        "e89c2935a82eb5858fdb7b1ec108c72b5fc288730f5dfd123a53a591a625d4b9",
+        "f08b56e242e5cab22bfce9b61d13b457a8f7bf49db4343ff2243a1f72aa76550"},
+    9: {"5ae55e00a3e720f2689992cec849487cddbd3903ecabe29db9331004e2912045",
+        "ac3fdda654a75afb24caa46cfc59612c03d3daaee4cbfdb94833df7eee51e24e"},
     12: {"2463f01a9b90a2ad08a97f6c854d48e18ced053a7f61906c01e12b4ab438990b"},
     42: {"d8e6d64915d843b393a00b1c75711cf9b95a45cb5ec3ca55f2194600e4daea33"},
     53: {"4a644f4c0b74832906e22a4322b92a083cc26e14fa38b131b03fc46b4c16684e"},
@@ -52,7 +67,26 @@ LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/
               "src/ocsl_review/study_cli.py", "src/ocsl_review/census_abstracts.py"]
 
 
+SPACES = str.maketrans({"\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u200a": " ", "\u202f": " "})
+# Reviewed exclusions from the scan of every tracked file: the tests hold the digests themselves and synthetic
+# fixtures, never the tokens.
+SCAN_EXCLUDED = ("tests/",)
+
+
+def tracked_files() -> list[Path]:
+    """Every file of the checkout outside the reviewed exclusions (git's index, else a walk of the tree)."""
+    import subprocess
+    try:
+        names = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True,
+                               check=True, timeout=30).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        names = [str(p.relative_to(ROOT)) for p in ROOT.rglob("*")
+                 if p.is_file() and ".git" not in p.parts and "__pycache__" not in p.parts]
+    return [ROOT / name for name in sorted(names) if not name.startswith(SCAN_EXCLUDED) and (ROOT / name).is_file()]
+
+
 def forbidden_hits(text: str, table=None) -> list[int]:
+    text = text.translate(SPACES)
     hits = []
     for start in range(len(text)):
         if start and (text[start - 1].isalnum() or text[start - 1] == "."):
@@ -199,6 +233,17 @@ class BlindnessTests(unittest.TestCase):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], forbidden_hits(path.read_text(encoding="utf-8")))
 
+    def test_every_tracked_file_outside_tests_carries_no_study_identifiers(self):
+        files = tracked_files()
+        self.assertGreater(len(files), 50)
+        for path in files:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                self.assertEqual([], forbidden_hits(text))
+
     def test_bundled_study_prompt_offers_no_path_to_earlier_results(self):
         prompt = (ROOT / "skills/ocsl-review-reference-analysis/assets/meta-meta-literature-review-prompt.md").read_text()
         for phrase in ("import-legacy", "import-snapshot", "existing approval", "run state", "historical scores",
@@ -215,6 +260,8 @@ class BlindnessTests(unittest.TestCase):
     def test_scanner_detects_tokens_at_word_starts_only(self):
         table = {5: {hashlib.sha256(b"7.7 %").hexdigest()}}
         self.assertTrue(forbidden_hits("a share of 7.7 % here", table))
+        self.assertTrue(forbidden_hits("a share of 7.7\u202f% here", table))
+        self.assertTrue(forbidden_hits("a share of 7.7\u00a0% here", table))
         self.assertFalse(forbidden_hits("a share of 17.7 % here", table))
         self.assertFalse(forbidden_hits("a share of 1.7.7 % here", table))
 
