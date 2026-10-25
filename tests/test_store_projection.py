@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from ocsl_review import store_projection
+from ocsl_review.cli import main
 from ocsl_review.corpus_library import Library, Workspace, digest_file
 from ocsl_review.corpus_store import CorpusRepository, canonical
 from ocsl_review.errors import ValidationError
@@ -129,6 +130,13 @@ class ProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "different rules"):
             verify_projection(copy)
         shutil.rmtree(copy)
+
+    def test_cli_verifies_projections_and_refuses_existing_outputs(self):
+        self.assertEqual(main(["store", "verify", "--store", str(self.root / "projection"), "--level", "light"]), 0)
+        self.assertNotEqual(main(["store", "project", "--source", str(self.source), "--output",
+                                  str(self.root / "projection")]), 0)
+        self.assertNotEqual(main(["store", "project", "--source", str(self.source), "--output",
+                                  str(self.source / "inside")]), 0)
 
 
 class FailClosedTests(unittest.TestCase):

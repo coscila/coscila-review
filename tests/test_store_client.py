@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 
+from ocsl_review.cli import main
 from ocsl_review.confidentiality import EgressPlan
 from ocsl_review.corpus_acquisition import CorpusAcquirer
 from ocsl_review.corpus_library import digest_file, now
@@ -141,6 +142,13 @@ class StoreClientTests(unittest.TestCase):
         self.assertIsNone(client.adopt_for_identifiers({"doi": "10.1234/example"}))
         self.assertIsNone(client.adopt_for_identifiers({"doi": "10.1234/absent"}))
         repo.library.verify()
+
+    def test_cli_attach_and_verify(self):
+        CorpusRepository.create(self.workspace, "work/cli", "Q", "cli", {})
+        self.assertEqual(main(["store", "attach", "--workspace", str(self.workspace), "--library", "work/cli",
+                               "--store", str(self.store_path)]), 0)
+        self.assertEqual(CorpusRepository(self.workspace, "work/cli").library.bundle["stores"][0]["path"], str(self.store_path))
+        self.assertEqual(main(["store", "verify", "--store", str(self.store_path)]), 0)
 
 
 if __name__ == "__main__":
