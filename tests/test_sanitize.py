@@ -128,6 +128,39 @@ class DocumentSanitizerTests(unittest.TestCase):
         for hidden in ("IGNORE", "excellent", "tiny", "styled", "Hidden paragraph"):
             self.assertNotIn(hidden, texts)
 
+    def test_docx_declaring_a_dtd_or_entities_is_refused_by_sanitizer_and_reader(self):
+        from ocsl_review.errors import ValidationError
+        from ocsl_review.ingest import IngestionError
+        body = "<w:p>" + _run("Visible claim. ") + _run(PAYLOAD, "<w:vanish/>") + "</w:p>"
+        plain = _docx(body)
+        self.assertEqual(1, len(sanitize_document(plain, ".docx")[1]))
+        archive = zipfile.ZipFile(io.BytesIO(plain))
+        document = archive.read("word/document.xml").replace(
+            b"?><w:document", b'?><!DOCTYPE w:document [<!ENTITY unused "x">]><w:document', 1)
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as target:
+            for info in archive.infolist():
+                target.writestr(info, document if info.filename == "word/document.xml" else archive.read(info))
+        declared = output.getvalue()
+        with self.assertRaisesRegex(ValidationError, "DTD or entities"):
+            sanitize_document(declared, ".docx")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "draft.docx"
+            path.write_bytes(declared)
+            with self.assertRaisesRegex(IngestionError, "DTD or entities"):
+                ingest_manuscript(path)
+        styled = _docx(body, '<w:style w:type="character" w:styleId="S"><w:rPr><w:vanish/></w:rPr></w:style>')
+        archive = zipfile.ZipFile(io.BytesIO(styled))
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as target:
+            for info in archive.infolist():
+                data = archive.read(info)
+                if info.filename == "word/styles.xml":
+                    data = data.replace(b"?><w:styles", b'?><!DOCTYPE w:styles [<!ENTITY e "x">]><w:styles', 1)
+                target.writestr(info, data)
+        with self.assertRaisesRegex(ValidationError, "styles.xml"):
+            sanitize_document(output.getvalue(), ".docx")
+
     def test_unchanged_documents_keep_their_original_bytes(self):
         data = _docx("<w:p>" + _run("Only visible text.") + "</w:p>")
         self.assertEqual((data, [], []), sanitize_document(data, ".docx"))

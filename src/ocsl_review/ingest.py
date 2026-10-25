@@ -336,6 +336,9 @@ def _docx_blocks(
                 )
     except zipfile.BadZipFile as exc:
         raise IngestionError("DOCX is not a valid ZIP package") from exc
+    if re.search(rb"<!(?:DOCTYPE|ENTITY)\b", xml, re.I):
+        # Office Open XML needs no DTD; refusing it keeps the parser and the hidden-text check in agreement.
+        raise IngestionError("DOCX document XML declares a DTD or entities; the document is refused")
     try:
         root = ET.fromstring(xml)
     except ET.ParseError as exc:
