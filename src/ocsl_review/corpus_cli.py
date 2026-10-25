@@ -15,10 +15,13 @@ from .errors import ValidationError
 def add_commands(families, register):
     family = families.add_parser("corpus", help="build, assess, resume and fork a complete literature corpus")
     commands = family.add_subparsers(dest="corpus_command", required=True)
-    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate"):
+    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate", "migrate"):
         command = commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         command.add_argument("--library", default="work/literature")
+        if name == "migrate":
+            command.add_argument("--rebuild-counters", action="store_true",
+                                 help="recompute progress counters from the stored rows")
         if name in {"init", "branch"}:
             command.add_argument("--question", required=True)
             command.add_argument("--analysis", required=True)
@@ -184,6 +187,8 @@ def command(args):
     repo = repository(args)
     if name == "status":
         return repo.status()
+    if name == "migrate":
+        return repo.migrate(rebuild_counters=args.rebuild_counters)
     if name == "verify":
         return repo.library.verify()
     if name == "snapshot":

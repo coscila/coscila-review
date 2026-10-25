@@ -29,6 +29,9 @@ TABLES = (
     "work_observation_evidence", "processing_state", "facts",
 )
 V2_TABLES = ("corpus_reviews", "corpus_documents", "corpus_tasks", "corpus_batches", "corpus_imports")
+SCHEMA_VERSIONS = (1, 2, 3)
+# Tables whose row totals status reports; schema 3 keeps them in progress_counters.
+COUNTED_TABLES = ("reviews", "bibliography_entries", "works", "claim_loci", "source_artifacts", "source_sections")
 SCHEMA = Path(__file__).resolve().parents[2] / "skills/ocsl-review-reference-analysis/assets/literature-schema.sql"
 
 
@@ -52,6 +55,28 @@ def digest_file(path):
 def write_json(path, value):
     with path.open("xb") as handle:
         handle.write(encode(value))
+
+
+def expected_progress_counters(connection):
+    """Recompute every schema-3 progress counter from the stored rows (nonzero values only)."""
+    expected = {}
+    for table in COUNTED_TABLES:
+        expected[("rows", "", table, "")] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    queries = (
+        "SELECT 'tasks',analysis_id,tier,state,count(*) FROM corpus_tasks GROUP BY analysis_id,tier,state",
+        "SELECT 'reviews','',phase,state,count(*) FROM corpus_reviews GROUP BY phase,state",
+        "SELECT 'assessment-loci',analysis_id,evidence_level,validation_state,count(DISTINCT locus_id) "
+        "FROM assessments GROUP BY analysis_id,evidence_level,validation_state",
+    )
+    for query in queries:
+        for row in connection.execute(query):
+            expected[tuple(row[:4])] = row[4]
+    return {key: value for key, value in expected.items() if value}
+
+
+def stored_progress_counters(connection):
+    return {tuple(row[:4]): row[4] for row in connection.execute(
+        "SELECT counter,analysis_id,dimension,state,value FROM progress_counters WHERE value!=0")}
 
 
 @contextmanager
@@ -158,14 +183,17 @@ class Library:
     def inspect(self):
         with self.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (1, 2):
+            if version not in SCHEMA_VERSIONS:
                 raise ValueError("unsupported database schema version")
             if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("database integrity check failed")
             if connection.execute("PRAGMA foreign_key_check").fetchone():
                 raise ValueError("database foreign key check failed")
             counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                      for table in TABLES + (V2_TABLES if version == 2 else ())}
+                      for table in TABLES + (V2_TABLES if version >= 2 else ())}
+            if version >= 3 and stored_progress_counters(connection) != expected_progress_counters(connection):
+                raise ValueError("progress counters disagree with stored rows; "
+                                 "rebuild them with corpus migrate --rebuild-counters")
             analyses = [dict(row) for row in connection.execute(
                 "SELECT * FROM analyses ORDER BY analysis_id")]
             sources = [dict(row) for row in connection.execute(
