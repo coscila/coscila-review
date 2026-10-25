@@ -50,6 +50,15 @@ class CorpusRepository:
                 raise ValidationError("unsupported corpus database version")
         self.version = version
         self._verified_artifacts = {}
+        self._store_client = None
+
+    @property
+    def store_client(self):
+        """Read-only stores pinned in bundle.json (study-first lookups), or None."""
+        if self._store_client is None and self.library.bundle.get("stores"):
+            from .store_client import StoreClient
+            self._store_client = StoreClient.from_bundle(self)
+        return self._store_client
 
     @classmethod
     def create(cls, workspace: Path, relative: str, question: str, analysis_id: str,
