@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import config as review_config
 from . import skills
 from .errors import ReviewError, ValidationError
 from .util import (
@@ -237,12 +238,15 @@ def _git_snapshot(repository: Path) -> dict[str, str] | None:
 
 
 def snapshot_siblings(paths: Any) -> dict[str, dict[str, str]]:
+    # The lab checkout in use and the first bio sibling must be Git worktrees, as before; every further sibling under an
+    # old or a new name is snapshotted too when it is one.
     candidates: list[tuple[Path, bool]] = []
     if paths.lab_repo:
         candidates.append((paths.lab_repo.resolve(), True))
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
-        candidates.append((bio.resolve(), True))
+    for index, bio in enumerate(review_config.sibling_checkouts(paths.home, review_config.BIO_REPO_NAMES)):
+        candidates.append((bio.resolve(), index == 0))
+    for lab in review_config.sibling_checkouts(paths.home, review_config.LAB_REPO_NAMES):
+        candidates.append((lab.resolve(), False))
     snapshots: dict[str, dict[str, str]] = {}
     seen: set[Path] = set()
     for repository, required in candidates:
@@ -496,12 +500,7 @@ def install_integration(
     state_root = paths.need_state().resolve()
     if is_within(state_root, paths.home) or is_within(paths.home, state_root):
         raise ValidationError("review state and companion source must not overlap")
-    protected_sources = [paths.home.resolve()]
-    if paths.lab_repo:
-        protected_sources.append(paths.lab_repo.resolve())
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
-        protected_sources.append(bio.resolve())
+    protected_sources = [source for _, source in review_config.protected_source_roots(paths)]
     config_resolved = Path(mcp_config).resolve()
     staged_config_resolved = (
         Path(staged_mcp_config).resolve() if staged_mcp_config is not None else None

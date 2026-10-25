@@ -12,7 +12,7 @@ from typing import Any
 import jsonschema
 import yaml
 
-from . import repositories, skills
+from . import config, repositories, skills
 from .errors import ValidationError
 from .mcp_protocol import CATALOG_TOOLS, SCHOLAR_TOOLS, schema_hash
 from .util import is_within, load_toml, sha256_file
@@ -168,12 +168,7 @@ def validate_path_boundaries(paths: Any) -> dict[str, Any]:
     if paths.state is None:
         return {"ok": True, "state": None}
     state = paths.state.resolve()
-    protected = [paths.home.resolve()]
-    if paths.lab_repo:
-        protected.append(paths.lab_repo.resolve())
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
-        protected.append(bio.resolve())
+    protected = [source for _, source in config.protected_source_roots(paths)]
     for source in protected:
         if is_within(state, source) or is_within(source, state):
             raise ValidationError(f"mutable review state overlaps protected source: {source}")

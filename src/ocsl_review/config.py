@@ -31,11 +31,24 @@ def state_root(explicit: str | None = None, *, required: bool = True) -> Path | 
     return None
 
 
+# Sibling checkouts keep their old directory names on the lab host and use the coscila-* names in newer clones; both may
+# exist side by side, and every one of them is protected.
+LAB_REPO_NAMES = ("oc-science-lab", "coscila")
+BIO_REPO_NAMES = ("oc-science-lab-bio", "coscila-bio")
+
+
+def sibling_checkouts(home: Path, names: tuple[str, ...]) -> tuple[Path, ...]:
+    """Every existing sibling checkout of the companion under one of the names."""
+    return tuple(home.parent / name for name in names if (home.parent / name).is_dir())
+
+
 def science_lab_repo(explicit: str | None, home: Path) -> Path | None:
     value = explicit or os.environ.get("OCSL_REPO")
     if value:
         return Path(value).expanduser().resolve()
-    sibling = home.parent / "oc-science-lab"
+    # The automatic choice stays on the old name: deployment staging runs in this checkout, so a development clone's
+    # coscila sibling never becomes a staging target by accident. OCSL_REPO selects any other checkout.
+    sibling = home.parent / LAB_REPO_NAMES[0]
     return sibling if sibling.is_dir() else None
 
 
@@ -99,24 +112,38 @@ class Paths:
         return self.need_state() / "cache"
 
 
+def _unique_roots(candidates: list[tuple[str, Path]]) -> tuple[tuple[str, Path], ...]:
+    """Resolve and de-duplicate; a further root under a label already used is named by its directory."""
+    result: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    labels: set[str] = set()
+    for label, candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if label in labels:
+            label = f"{label} ({resolved.name})"
+        labels.add(label)
+        result.append((label, resolved))
+    return tuple(result)
+
+
+def sibling_source_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
+    """The lab checkout in use and every sibling lab or bio checkout under an old or a new name."""
+
+    candidates: list[tuple[str, Path]] = []
+    if paths.lab_repo is not None:
+        candidates.append(("OC Science Lab source", paths.lab_repo))
+    candidates += [("OC Science Lab source", lab) for lab in sibling_checkouts(paths.home, LAB_REPO_NAMES)]
+    candidates += [("OC Science Lab Bio source", bio) for bio in sibling_checkouts(paths.home, BIO_REPO_NAMES)]
+    return _unique_roots(candidates)
+
+
 def protected_source_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
     """Return every source checkout that review-time state must not overlap."""
 
-    candidates: list[tuple[str, Path]] = [("companion source", paths.home)]
-    if paths.lab_repo is not None:
-        candidates.append(("OC Science Lab source", paths.lab_repo))
-    bio = paths.home.parent / "oc-science-lab-bio"
-    if bio.is_dir():
-        candidates.append(("OC Science Lab Bio source", bio))
-
-    result: list[tuple[str, Path]] = []
-    seen: set[Path] = set()
-    for label, candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved not in seen:
-            seen.add(resolved)
-            result.append((label, resolved))
-    return tuple(result)
+    return _unique_roots([("companion source", paths.home), *sibling_source_roots(paths)])
 
 
 def protected_workspace_roots(paths: Paths) -> tuple[tuple[str, Path], ...]:
