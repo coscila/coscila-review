@@ -199,6 +199,19 @@ class BlindnessTests(unittest.TestCase):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], forbidden_hits(path.read_text(encoding="utf-8")))
 
+    def test_bundled_study_prompt_offers_no_path_to_earlier_results(self):
+        prompt = (ROOT / "skills/ocsl-review-reference-analysis/assets/meta-meta-literature-review-prompt.md").read_text()
+        for phrase in ("import-legacy", "import-snapshot", "existing approval", "run state", "historical scores",
+                       "earlier judgments", "original census", "40-item"):
+            self.assertNotIn(phrase, prompt)
+        lessons = (ROOT / "skills/ocsl-review-reference-analysis/references/census-workflow-lessons.md").read_text()
+        for phrase in ("2,200", "11,000", "Forty-item", "first three citing sentences", "earlier scores"):
+            self.assertNotIn(phrase, lessons)
+        for skill in ("ocsl-review-reference-analysis", "ocsl-review-citation-census"):
+            text = (ROOT / "skills" / skill / "SKILL.md").read_text()
+            self.assertIn("citation-census@1", text)
+            self.assertIn("ocsl-review study", text)
+
     def test_scanner_detects_tokens_at_word_starts_only(self):
         table = {5: {hashlib.sha256(b"7.7 %").hexdigest()}}
         self.assertTrue(forbidden_hits("a share of 7.7 % here", table))
