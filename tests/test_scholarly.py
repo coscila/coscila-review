@@ -8,7 +8,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from ocsl_review.confidentiality import EgressPlan
+from ocsl_review.confidentiality import EgressPlan, read_egress_events
 from ocsl_review.errors import ConfidentialityError, ProviderError, ReviewError
 from ocsl_review.scholarly import (
     MAX_RESPONSE_BYTES,
@@ -221,11 +221,7 @@ class ScholarlyTests(unittest.TestCase):
                 )
                 call_tool(client, requested, arguments)
                 self.assertGreater(len(transport.calls), 0)
-                events = json.loads(
-                    (workspace / ".ocsl-review" / "egress-events.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
+                events = read_egress_events(workspace)
                 self.assertTrue(events)
                 self.assertEqual({event["operation"] for event in events}, {requested})
 
