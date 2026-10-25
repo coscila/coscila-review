@@ -33,7 +33,7 @@ def add_commands(families, register):
     study = families.add_parser("study", help="run a census study with a registered instrument")
     actions = study.add_subparsers(dest="study_command", required=True)
     for name in ("prepare", "judge", "full-text", "no-truncation", "status", "gates", "freeze", "export",
-                 "estimands", "facts", "verify-facts"):
+                 "estimands", "facts", "verify-facts", "cross-validate"):
         command = actions.add_parser(name)
         if name in ("prepare", "judge", "full-text", "no-truncation", "status", "gates", "freeze"):
             command.add_argument("--database", required=True, help="working census database")
@@ -72,7 +72,11 @@ def add_commands(families, register):
             command.add_argument("--trend-to", type=int)
         if name == "verify-facts":
             command.add_argument("--facts", required=True)
-        trust = "read-only" if name in ("status", "gates", "estimands", "verify-facts") else "workspace"
+        if name == "cross-validate":
+            command.add_argument("--jats", required=True, help="JATS document of a review")
+            command.add_argument("--html", required=True, help="publisher HTML of the same review")
+            command.add_argument("--minimum-share", type=float, default=0.95)
+        trust = "read-only" if name in ("status", "gates", "estimands", "verify-facts", "cross-validate") else "workspace"
         register(command, "study_cli", "command", trust, state_required=False)
 
 
@@ -172,4 +176,11 @@ def command(args) -> Any:
     if action == "verify-facts":
         from .corpus_facts import verify_export
         return verify_export(Path(args.facts))
+    if action == "cross-validate":
+        from .census_extraction import cross_validate, cross_validation_gate, extract_review, uncovered_gate
+        jats = extract_review(Path(args.jats).read_bytes())
+        html = extract_review(Path(args.html).read_bytes(), html=True)
+        result = cross_validate(jats, html)
+        return {**result, "gate": cross_validation_gate([result], minimum_median=args.minimum_share),
+                "uncovered": {"jats": uncovered_gate(jats), "html": uncovered_gate(html)}}
     raise ValidationError(f"unknown study command: {action}")
