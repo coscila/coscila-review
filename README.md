@@ -43,7 +43,8 @@ For a complete corpus and future research questions, the
 preserves source evidence, all citation loci and versioned assessments in a
 portable literature database. The maintained [`ocsl-review corpus` workflow](docs/corpus-review.md)
 acquires shared sources, schedules per-locus v2 assessments, resumes durable
-queues and creates verified snapshots and analysis branches. It keeps legacy
+queues and creates verified snapshots and analysis branches ([storage](docs/storage.md):
+packs, Merkle-rooted snapshots, delta branches and read-only stores). It keeps legacy
 results separate and calibrates small batches before enabling them. The skill
 includes the earlier oncology census's measured workflow lessons and limitations;
 deployment authorization and live throughput still require their own checks.

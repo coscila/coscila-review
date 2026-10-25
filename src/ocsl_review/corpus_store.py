@@ -20,11 +20,11 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import sys
 from typing import Any, Iterable, Iterator
 
 from . import corpus_library as library
+from .corpus_packs import PackIntegrityError
 from .errors import ValidationError
 
 HOME = Path(__file__).resolve().parents[2]
@@ -127,6 +127,15 @@ class CorpusRepository:
         self.version = version
         self._verified_artifacts = {}
         self._held = None
+        self._store_client = None
+
+    @property
+    def store_client(self):
+        """Read-only stores pinned in bundle.json (study-first lookups), or None."""
+        if self._store_client is None and self.library.bundle.get("stores"):
+            from .store_client import StoreClient
+            self._store_client = StoreClient.from_bundle(self)
+        return self._store_client
 
     @classmethod
     def create(cls, workspace: Path, relative: str, question: str, analysis_id: str,
@@ -166,6 +175,10 @@ class CorpusRepository:
         """
         if (self.root / "manifest.json").exists():
             raise ValidationError("branch or copy an immutable snapshot before migrating")
+        if self.library.overlay is not None and self.version < SCHEMA_VERSION:
+            # A delta branch must keep its parent snapshot's schema version.
+            raise ValidationError("migrate the parent library, snapshot it and branch again; "
+                                  "a branch keeps its parent snapshot's schema")
         steps = []
         # No controller may write between the backup and the migration it protects.
         with controller_lock(self):
@@ -183,10 +196,7 @@ class CorpusRepository:
             if rebuild_counters:
                 # Counters are derived data; recomputing them needs no evidence backup.
                 with self.connect(write=True) as connection:
-                    expected = library.expected_progress_counters(connection)
-                    connection.execute("DELETE FROM progress_counters")
-                    connection.executemany("INSERT INTO progress_counters VALUES (?,?,?,?,?)",
-                                           [(*key, value) for key, value in sorted(expected.items())])
+                    self.library.rebuild_counters(connection)
         return {"schemaVersion": self.version, "migrations": steps, "countersRebuilt": rebuild_counters}
 
     @contextmanager
@@ -195,13 +205,15 @@ class CorpusRepository:
             raise ValidationError("immutable snapshots cannot be modified; branch first")
         if self.db.is_symlink() or (write and self.db.stat().st_nlink != 1):
             raise ValidationError("corpus database must not share mutable inodes")
-        connection = sqlite3.connect(self.db.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True, timeout=30)
+        # A branch connection also sees its parent snapshot (corpus_overlay); SQLite cannot
+        # enforce foreign keys across the two databases, so verification checks them.
+        connection = self.library.open(write=write, timeout=30)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA foreign_keys=OFF" if self.library.overlay else "PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
         if write:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA main.journal_mode=WAL")
+            connection.execute("PRAGMA main.synchronous=NORMAL")
             connection.execute(f"PRAGMA wal_autocheckpoint={WAL_AUTOCHECKPOINT_PAGES}")
         try:
             if not write:
@@ -266,7 +278,7 @@ class CorpusRepository:
         return True
 
     def _write_source(self, sources: Path, digest: str, body: bytes, *, durable: bool) -> bool:
-        """Create sources/<digest> exactly once; True when this call created it."""
+        """Create a loose sources/<digest> exactly once (libraries without packs); True when created."""
         path = sources / digest
         if os.path.lexists(path):
             if path.is_symlink() or not self._existing_matches(path, digest):
@@ -297,7 +309,14 @@ class CorpusRepository:
     def artifact(self, body: bytes, kind: str, media_type: str = "application/json") -> str:
         sources = self._sources()
         digest = hashlib.sha256(body).hexdigest()
-        self._write_source(sources, digest, body, durable=True)
+        # Bytes are durable (pack fsync or loose file fsync) before the registry row exists.
+        if self.library.packs is None:
+            self._write_source(sources, digest, body, durable=True)
+        else:
+            try:
+                self.library.store_blob(body, digest)
+            except PackIntegrityError as error:
+                raise ValidationError(str(error)) from None
         with self.connect(write=True) as connection:
             connection.execute("INSERT OR IGNORE INTO source_artifacts VALUES (?,?,?,?,?,?)",
                                (digest, "sources/" + digest, len(body), media_type, kind, library.now()))
@@ -307,34 +326,56 @@ class CorpusRepository:
         return self.artifact(canonical(json_safe(value)).encode(), kind)
 
     def stage_artifacts(self, entries: Iterable[tuple[bytes, str, str]], *,
-                        pending: list[Path] | None = None) -> list[tuple]:
-        """Write content-addressed files behind one durability barrier for the batch.
+                        pending: list | None = None) -> list[tuple]:
+        """Store content-addressed bytes behind one durability barrier for the batch.
 
         Returns the source_artifacts rows (digest first, in input order) for the
         caller to register in the same transaction as the rows that refer to them,
-        so no committed row points at bytes that are not yet durable. With
-        ``pending``, new files are collected there instead and the caller issues
-        one shared barrier (sync_staged) before committing any row that refers to them.
+        so no committed row points at bytes that are not yet durable. Libraries with
+        packs append the new bytes to a pack and fsync it once; older libraries write
+        loose files and issue one barrier. With ``pending``, the new bytes are
+        collected there instead and the caller issues one shared barrier
+        (sync_staged) before committing any row that refers to them.
         """
         sources = self._sources()
+        packed = self.library.packs is not None
         created_at = library.now()
-        rows, written, seen = [], [], set()
+        rows, new, seen = [], [], set()
         for body, kind, media_type in entries:
             digest = hashlib.sha256(body).hexdigest()
             rows.append((digest, "sources/" + digest, len(body), media_type, kind, created_at))
             if digest not in seen:
                 seen.add(digest)
-                if self._write_source(sources, digest, body, durable=False):
-                    written.append(sources / digest)
+                if packed:
+                    new.append((digest, body))
+                elif self._write_source(sources, digest, body, durable=False):
+                    new.append(sources / digest)
         if pending is None:
-            sync_batch(sources, written)
+            self.sync_staged(new)
         else:
-            pending.extend(written)
+            pending.extend(new)
         return rows
 
-    def sync_staged(self, paths: list[Path]) -> None:
-        """One durability barrier for files collected by stage_artifacts(pending=...)."""
-        sync_batch(self._sources(), paths)
+    def sync_staged(self, staged: list) -> None:
+        """One durability barrier for the bytes collected by stage_artifacts(pending=...).
+
+        Pack blobs are appended in one pack batch (one fsync before their index rows
+        commit); loose files of older libraries share one filesystem barrier.
+        """
+        blobs = [item for item in staged if isinstance(item, tuple)]
+        files = [item for item in staged if not isinstance(item, tuple)]
+        if blobs:
+            packs, parent = self.library.packs, self.library.parent
+            present = parent.locate_many([digest for digest, _ in blobs]) if parent is not None else {}
+            try:
+                with packs.batch():
+                    for digest, body in blobs:
+                        if digest not in present:  # a branch reads its parent snapshot's blobs
+                            packs.put(body, digest)
+            except PackIntegrityError as error:
+                raise ValidationError(str(error)) from None
+        if files:
+            sync_batch(self._sources(), files)
 
     @staticmethod
     def register_artifacts(connection: sqlite3.Connection, rows: list[tuple]) -> None:
@@ -350,26 +391,44 @@ class CorpusRepository:
         missing = [digest for digest in wanted if digest not in rows]
         if missing:
             raise ValidationError("artifact is not registered")
+        if any(item["relative_path"] != "sources/" + digest for digest, item in rows.items()):
+            raise ValidationError("artifact paths must be content-addressed sources/<sha256>")
         return rows
 
-    def _source_paths(self):
-        """Resolve sources/<digest> under the once-validated sources directory.
+    def _located(self, rows: dict[str, sqlite3.Row]) -> dict[str, tuple]:
+        """Storage of many registered artifacts: packs, loose files or the parent chain."""
+        found = self.library.locate_many(list(rows))
+        for digest, item in rows.items():
+            if digest not in found:
+                raise ValidationError(f"missing source: {item['relative_path']}")
+        return found
 
-        Anything other than a regular local file (missing, a symlink, a parent
-        snapshot's source) takes the fully checked library path.
-        """
-        sources = self.workspace.path(f"{self.relative}/sources")
-
-        def resolve(item) -> Path:
-            if item["relative_path"] == "sources/" + item["sha256"]:
-                candidate = sources / item["sha256"]
-                try:
-                    if stat.S_ISREG(os.lstat(candidate).st_mode):
-                        return candidate
-                except FileNotFoundError:
-                    pass
-            return self.library.source(item)
-        return resolve
+    def _checked(self, digest: str, item, location, *, keep: bool) -> bytes | None:
+        """Verified bytes of one located artifact; unchanged storage verified earlier is not rehashed."""
+        if location[0] == "pack":
+            path = location[1].pack_path(location[2].pack)
+        else:
+            path = location[1]
+        stat = os.stat(path, follow_symlinks=False)
+        signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        cached = self._verified_artifacts.get(digest) == signature
+        if cached and not keep:
+            return None
+        try:
+            if location[0] == "pack":
+                body = location[1].read(location[2])  # decoding checks length and SHA-256
+            else:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "rb") as handle:
+                    body = handle.read()
+                if not cached and hashlib.sha256(body).hexdigest() != digest:
+                    raise PackIntegrityError(digest)
+        except PackIntegrityError:
+            raise ValidationError("registered artifact hash mismatch") from None
+        if len(body) != item["byte_count"]:
+            raise ValidationError("registered artifact hash mismatch")
+        self._remember(digest, signature)
+        return body if keep else None
 
     def read_artifacts(self, digests: Iterable[str], *, connection: sqlite3.Connection | None = None) -> dict[str, bytes]:
         """Read and verify many registered artifacts through one connection."""
@@ -377,18 +436,9 @@ class CorpusRepository:
         if connection is None:
             with self.connect() as own:
                 return self.read_artifacts(digests, connection=own)
-        result, source = {}, self._source_paths()
-        for digest, item in self._artifact_rows(connection, digests).items():
-            path = source(item)
-            stat = path.stat()
-            signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-            body = path.read_bytes()
-            if self._verified_artifacts.get(digest) != signature:
-                if hashlib.sha256(body).hexdigest() != digest:
-                    raise ValidationError("registered artifact hash mismatch")
-                self._remember(digest, signature)
-            result[digest] = body
-        return result
+        rows = self._artifact_rows(connection, digests)
+        found = self._located(rows)
+        return {digest: self._checked(digest, item, found[digest], keep=True) for digest, item in rows.items()}
 
     def read_artifact(self, digest: str) -> bytes:
         return self.read_artifacts([digest])[digest]
@@ -398,25 +448,18 @@ class CorpusRepository:
         if connection is None:
             with self.connect() as own:
                 return self.verify_artifacts(digests, connection=own)
-        source = self._source_paths()
-        for digest, item in self._artifact_rows(connection, digests).items():
-            if not self._existing_matches(source(item), digest):
-                raise ValidationError("registered artifact hash mismatch")
+        rows = self._artifact_rows(connection, digests)
+        found = self._located(rows)
+        for digest, item in rows.items():
+            self._checked(digest, item, found[digest], keep=False)
 
-    def verify_artifact(self, digest: str) -> Path:
+    def verify_artifact(self, digest: str):
+        """Check a registered artifact's bytes; repeated checks of unchanged storage are cached."""
         with self.connect() as connection:
-            item = connection.execute("SELECT * FROM source_artifacts WHERE sha256=?", (digest,)).fetchone()
-        if item is None:
-            raise ValidationError("artifact is not registered")
-        path = self.library.source(item)
-        stat = path.stat()
-        signature = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
-        if self._verified_artifacts.get(digest) == signature:
-            return path
-        if library.digest_file(path) != digest:
-            raise ValidationError("registered artifact hash mismatch")
-        self._remember(digest, signature)
-        return path
+            rows = self._artifact_rows(connection, [digest])
+        found = self._located(rows)
+        self._checked(digest, rows[digest], found[digest], keep=False)
+        return found[digest]
 
     def work(self, metadata: dict[str, Any], *, key: str | None = None) -> str:
         identifiers = {k: str(metadata[k]).strip().lower() for k in ("doi", "pmid", "pmcid") if metadata.get(k)}
@@ -489,7 +532,8 @@ class CorpusRepository:
             row = connection.execute("SELECT * FROM corpus_documents WHERE work_id=? AND evidence_tier=? ORDER BY complete DESC,created_at DESC,document_id DESC LIMIT 1", (work_id, tier)).fetchone()
             if row is None:
                 return None
-            units = [dict(r) for r in connection.execute("SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM source_sections WHERE artifact_sha256=? AND work_id=? ORDER BY rowid", (row["artifact_sha256"], work_id))]
+            sections, order = self.library.ordered("source_sections")
+            units = [dict(r) for r in connection.execute(f"SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind FROM {sections} WHERE artifact_sha256=? AND work_id=? ORDER BY {order}", (row["artifact_sha256"], work_id))]
         self.verify_artifact(row["artifact_sha256"])
         return {"documentId": row["document_id"], "sourceSha256": row["artifact_sha256"], "evidenceTier": tier,
                 "evidenceUnits": units, "complete": bool(row["complete"]), "provider": row["provider"], "sourceUrl": row["source_url"]}
@@ -513,9 +557,10 @@ class CorpusRepository:
                 continue
             documents = {(row["artifact_sha256"], work) for work, row in best.items()}
             units: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            sections, order = self.library.ordered("source_sections")
             for row in connection.execute(
                     "SELECT section_id AS id,extracted_text AS text,locator,section_kind AS kind,artifact_sha256,work_id "
-                    "FROM source_sections WHERE work_id IN (SELECT value FROM json_each(?)) ORDER BY rowid",
+                    f"FROM {sections} WHERE work_id IN (SELECT value FROM json_each(?)) ORDER BY {order}",
                     (json.dumps(list(best)),)):
                 key = (row["artifact_sha256"], row["work_id"])
                 if key in documents:
@@ -605,9 +650,8 @@ class CorpusRepository:
         counts = dict.fromkeys(library.COUNTED_TABLES, 0)
         tasks, assessments, reviews = [], [], []
         with self.connect() as connection:
-            rows = connection.execute("SELECT counter,dimension,state,value FROM progress_counters "
-                                      "WHERE value>0 AND analysis_id IN ('',?)", (analysis["analysis_id"],)).fetchall()
-        for counter, dimension, state, value in rows:
+            counters = self.library.progress_counters(connection, analysis["analysis_id"])
+        for (counter, dimension, state), value in counters.items():
             if counter == "rows" and dimension in counts:
                 counts[dimension] = value
             elif counter == "tasks":

@@ -16,8 +16,12 @@ from .util import atomic_write
 
 
 def import_snapshot(workspace, destination, source_path):
-    """Copy a verified external seed into this chat before branching it."""
-    from .corpus_library import Workspace, Library
+    """Bring a verified external seed into this chat before branching it.
+
+    Snapshot files are immutable, so they are hard-linked when the seed is on the
+    same filesystem and copied otherwise; the copy is verified again.
+    """
+    from .corpus_library import Workspace, Library, link_or_copy
     from .errors import ValidationError
     source = Path(source_path).absolute()
     if any(p.is_symlink() for p in (source, *source.parents)):
@@ -26,19 +30,25 @@ def import_snapshot(workspace, destination, source_path):
     verified = original.verify(require_snapshot=True)
     selected = Workspace(workspace)
     with selected.create(destination) as target:
-        shutil.copyfile(original.db, target / "corpus.sqlite3")
-        with original.connect() as connection:
-            for artifact in connection.execute("SELECT * FROM source_artifacts"):
-                shutil.copyfile(original.source(artifact), target / artifact["relative_path"])
-                (target / artifact["relative_path"]).chmod(0o444)
+        if verified.get("format_version") == 2:
+            (target / "packs").mkdir(mode=0o700)
+            for item in original.manifest()["files"]:
+                link_or_copy(original.root / item["path"], target / item["path"])
+        else:
+            shutil.copyfile(original.db, target / "corpus.sqlite3")
+            with original.connect() as connection:
+                for artifact in connection.execute("SELECT * FROM source_artifacts"):
+                    shutil.copyfile(original.source(artifact), target / artifact["relative_path"])
+                    (target / artifact["relative_path"]).chmod(0o444)
+            (target / "corpus.sqlite3").chmod(0o444)
         shutil.copyfile(source / "manifest.json", target / "manifest.json")
+        (target / "manifest.json").chmod(0o444)
         captured = Library(selected, destination)
         result = captured.verify(require_snapshot=True)
         if result["manifest_sha256"] != verified["manifest_sha256"]:
             raise ValidationError("snapshot manifest changed during import")
-        (target / "corpus.sqlite3").chmod(0o444)
-        (target / "manifest.json").chmod(0o444)
-    return {"library": destination, "manifestSha256": verified["manifest_sha256"], "counts": result["counts"]}
+    return {"library": destination, "manifestSha256": verified["manifest_sha256"], "counts": result["counts"],
+            "merkleRoot": result.get("merkle_root")}
 
 
 def implementation_manifest():

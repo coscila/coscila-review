@@ -15,7 +15,7 @@ from .errors import ValidationError
 def add_commands(families, register):
     family = families.add_parser("corpus", help="build, assess, resume and fork a complete literature corpus")
     commands = family.add_subparsers(dest="corpus_command", required=True)
-    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "calibrate", "validate", "migrate"):
+    for name in ("init", "import-manifest", "import-legacy", "import-snapshot", "enumerate", "acquire", "prepare", "run", "resume", "execute", "status", "export", "snapshot", "branch", "verify", "pack", "calibrate", "validate", "migrate"):
         command = commands.add_parser(name)
         command.add_argument("--workspace", default=".")
         command.add_argument("--library", default="work/literature")
@@ -63,6 +63,9 @@ def add_commands(families, register):
             command.add_argument("--until-complete", action="store_true")
         if name in {"export", "snapshot", "branch"}:
             command.add_argument("--output", required=True)
+        if name == "verify":
+            command.add_argument("--level", choices=("light", "standard", "deep"), default="standard",
+                                 help="light: manifest, database and Merkle root; deep: every blob and row hash")
         register(command, "corpus_cli", "command", "read-only" if name in {"status", "verify"} else "workspace", state_required=False)
 
 
@@ -199,7 +202,9 @@ def command(args):
     if name == "migrate":
         return repo.migrate(rebuild_counters=args.rebuild_counters)
     if name == "verify":
-        return repo.library.verify()
+        return repo.library.verify(level=args.level)
+    if name == "pack":
+        return repo.library.pack_loose()
     if name == "snapshot":
         return repo.library.snapshot(args.output)
     if name == "branch":
