@@ -28,6 +28,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from . import instruments
 from . import integrity as I
 from .claim_check import (
     CALIBRATION_STATEMENT,
@@ -124,6 +125,7 @@ def run_screen(manuscript_path: Path, *, run_root: Path, works: Sequence[Work], 
                                             "application/json")
             evidence_sha = store.artifact(connection, evidence_bytes, "evidence-store", "application/json")
             protocol = {"task": TASK, "instrument": definition, "instrumentDigest": instrument_digest(definition),
+                        "registryDigest": instruments.load(TASK).digest,
                         "policy": policy.record(), "policyDigest": policy.digest,
                         "evidence": {"name": evidence_name, "snapshotSha256": evidence_sha, "indexDigest": index.digest},
                         "datasets": [dataset.version.record() for dataset in datasets], "offline": bool(offline),
@@ -426,7 +428,8 @@ def build_report(store: RunStore) -> dict[str, Any]:
     }
     report = {
         "format": REPORT_FORMAT, "version": REPORT_VERSION, "analysisId": analysis_id, "createdAt": run["analysis_created"],
-        "instrument": {"id": TASK, "digest": protocol["instrumentDigest"], "definition": protocol["instrument"]},
+        "instrument": {"id": TASK, "digest": protocol["instrumentDigest"], "registryDigest": protocol.get("registryDigest"),
+                       "definition": protocol["instrument"]},
         "policy": {"mode": protocol["policy"]["mode"], "digest": protocol["policyDigest"],
                    "evidencePolicy": protocol["policy"]["mode"]},
         "manuscript": protocol["manuscript"], "evidence": protocol["evidence"], "datasets": protocol["datasets"],
