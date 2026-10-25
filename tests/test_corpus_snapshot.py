@@ -184,6 +184,9 @@ class BranchTests(unittest.TestCase):
             with self.branch.connect(write=True) as connection:
                 connection.execute("INSERT INTO source_sections VALUES ('s','missing-work',?,'l','k','t',?,'v',1)",
                                    (digest, hashlib.sha256(b"t").hexdigest()))
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "keys of shared rows cannot change"):
+            with self.branch.connect(write=True) as connection:
+                connection.execute("UPDATE works SET work_id='renamed' WHERE work_id=?", (self.works[2],))
         with self.assertRaisesRegex(sqlite3.IntegrityError, "exists in the parent snapshot"):
             with self.branch.connect(write=True) as connection:
                 library.add_analysis(connection, self.branch.analysis()["corpus_id"], "Q", "first")
