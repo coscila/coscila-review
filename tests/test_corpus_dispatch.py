@@ -225,20 +225,84 @@ class CorpusDispatchTests(unittest.TestCase):
         self.assertEqual(len(self.rows("model_receipts")), 2)
         self.assertEqual(len([r for r in self.rows("assessments") if r["validation_state"] == "accepted"]), 1)
 
-    def test_aggregate_capacity_across_analyses_releases_after_harvest(self):
-        self.add_tasks(1)
+    def test_up_to_three_jobs_in_flight_sized_to_group_limit_and_scoped_to_analysis(self):
+        self.broker.settings["workers"][0]["bulkConcurrencyLimit"] = 30
+        tasks = self.add_tasks(7)
         other = self.add_analysis("second")
         self.add_tasks(1, "second")
-        first = self.executor.submit("w1", concurrency=40)["submitted"][0]["jobId"]
-        second = other.submit("w1", concurrency=60)["submitted"][0]["jobId"]
-        self.assertEqual(self.broker.jobs[first]["request"]["concurrency"], 40)
-        self.assertEqual(self.broker.jobs[second]["request"]["concurrency"], 20)
-        self.add_tasks(1)
-        self.assertEqual(self.executor.submit("w1", concurrency=60)["submitted"], [])
-        self.broker.complete(first)
+        jobs = [job["jobId"] for job in self.executor.submit("w1", concurrency=60, job_items=2)["submitted"]]
+        self.assertEqual(len(jobs), 3)
+        self.assertEqual([len(self.broker.jobs[j]["request"]["items"]) for j in jobs], [2, 2, 2])
+        self.assertEqual({self.broker.jobs[j]["request"]["concurrency"] for j in jobs}, {30})
+        # Another analysis is neither blocked by nor charged for these jobs.
+        second = other.submit("w1", concurrency=20)["submitted"]
+        self.assertEqual(self.broker.jobs[second[0]["jobId"]]["request"]["concurrency"], 20)
+        self.assertEqual(self.executor.submit("w1", job_items=2)["submitted"], [])
+        self.assertEqual(self.executor.in_flight(), 3)
+        self.assertEqual(sum(state == ("pending", 0) for state in self.states().values()), 1)
+        self.broker.complete(jobs[0])
         self.executor.resume()
-        next_job = self.executor.submit("w1", concurrency=60)["submitted"][0]["jobId"]
-        self.assertEqual(self.broker.jobs[next_job]["request"]["concurrency"], 40)
+        fourth = self.executor.submit("w1", job_items=2, max_jobs=10)["submitted"]
+        self.assertEqual(len(fourth), 1)
+        self.assertEqual(self.executor.in_flight(), 3)
+        for job in jobs[1:] + [fourth[0]["jobId"]]:
+            self.broker.complete(job)
+        self.executor.resume()
+        self.assertEqual({self.states()[task] for task in tasks}, {("completed", 1)})
+        self.assertEqual(self.executor.in_flight(), 0)
+
+    def write_statements(self):
+        """Statements per write connection, to count page transactions."""
+        transactions, original = [], CorpusRepository.connect
+
+        @contextmanager
+        def connect(repo, *, write=False):
+            with original(repo, write=write) as connection:
+                if write:
+                    statements = []
+                    transactions.append(statements)
+                    connection.set_trace_callback(statements.append)
+                yield connection
+        return transactions, connect
+
+    def test_each_result_page_is_one_transaction_with_its_cursor_and_replays_idempotently(self):
+        tasks = self.add_tasks(5)
+        job = self.executor.submit("w1")["submitted"][0]["jobId"]
+        self.broker.complete(job)
+        batch = self.rows("corpus_batches")[0]
+        with self.repo.connect(write=True) as connection:
+            connection.execute("CREATE TRIGGER injected BEFORE UPDATE OF cursor ON corpus_batches "
+                               "BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END")
+        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2):
+            with self.assertRaisesRegex(Exception, "injected cursor failure"):
+                self.executor.resume()
+        self.assertEqual(self.rows("model_receipts"), [])
+        self.assertEqual({self.states()[t] for t in tasks}, {("running", 1)})
+        with self.repo.connect(write=True) as connection:
+            connection.execute("DROP TRIGGER injected")
+        transactions, connect = self.write_statements()
+        reads, original_read = [], CorpusRepository.read_artifact
+
+        def counting_read(repo, digest):
+            reads.append(digest)
+            return original_read(repo, digest)
+
+        fresh = CorpusExecutor(self.repo, broker=self.broker, authorization=lambda *args: None)
+        with patch("ocsl_review.corpus_dispatch.RESULT_PAGE_RECORDS", 2), \
+                patch.object(CorpusRepository, "connect", connect), \
+                patch.object(CorpusRepository, "read_artifact", counting_read):
+            fresh.resume()
+        pages = [t for t in transactions if any("INSERT INTO model_receipts" in s for s in t)]
+        self.assertEqual(len(pages), 3)
+        self.assertTrue(all(any("UPDATE corpus_batches SET cursor" in s for s in t) for t in pages))
+        self.assertEqual(reads.count(batch["input_sha256"]), 1, "the batch request is parsed once")
+        self.assertEqual({self.states()[t] for t in tasks}, {("completed", 1)})
+        records = [r for r in self.broker.jobs[job]["records"] if r["state"] == "completed"]
+        before = {table: len(self.rows(table)) for table in ("model_receipts", "assessments", "assessment_evidence")}
+        self.executor.import_page(self.rows("corpus_batches")[0], records + records[:2])
+        self.assertEqual({table: len(self.rows(table)) for table in before}, before)
+        self.assertEqual(before["model_receipts"], 5)
+        self.repo.library.verify()
 
     def test_paused_job_is_not_resubmitted_until_new_approved_owner(self):
         task = self.add_tasks(1)[0]

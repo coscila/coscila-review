@@ -44,7 +44,8 @@ def add_commands(families, register):
             command.add_argument("--concurrency", type=int, default=60)
         if name in {"run", "execute"}:
             command.add_argument("--batch-size", type=int, default=1)
-            command.add_argument("--max-jobs", type=int, default=4)
+            command.add_argument("--max-jobs", type=int, default=3,
+                                 help="jobs of this analysis kept in flight (at most 3); each asks for the group limit")
         if name in {"execute", "calibrate"}:
             command.add_argument("--low-worker-config", required=True)
         if name in {"execute", "calibrate", "validate"}:
