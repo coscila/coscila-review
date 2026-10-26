@@ -129,6 +129,15 @@ it uses any of it, exactly as for its own retained evidence; a frozen study
 never depends on the mount. Retained review captures are found through the
 store's retained-source index by DOI.
 
+Census inputs read a store without adopting anything into a library
+(`store_client.EvidenceStore`, and `ProviderCache` for a provider response
+cache): both are ATTACHed `mode=ro&immutable=1` behind a SQLite authorizer that
+refuses any table outside the cache's allowlist (for a store, the projection's
+kept tables), and every byte is verified against its digest. Only the
+label-free projection is accepted as a census store. See
+[census instrument](census-instrument.md), "Inputs from byte caches and live
+routes".
+
 ## The label-free projection `literature-evidence@2`
 
 `ocsl-review store project --source SEALED_STORE --output NEW_DIR` (an
