@@ -298,7 +298,7 @@ def three_classes(connection: sqlite3.Connection, journal: str) -> dict[str, Any
 
 
 PANELS = {"year": "r.year", "stratum": "r.stratum", "topic": "r.topic", "country": "r.country",
-          "route": "r.route", "provenance": "r.provenance_class"}
+          "route": "r.route", "provenance": "r.provenance_class", "acquisition": "r.provenance"}
 
 
 def panel(connection: sqlite3.Connection, journal: str, by: str, *, b: int = DEFAULT_B, seed: int | str = 0) -> dict[str, Any]:
@@ -493,6 +493,10 @@ def decompose(connection: sqlite3.Connection, journal: str, *, year: int | None 
     return result
 
 
+def _has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(row[1] == column for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
 def report(connection: sqlite3.Connection, journals: Sequence[str], *, b: int = DEFAULT_B, seed: int | str = 0,
            ratio_pair: tuple[str, str] | None = None, panels: Sequence[str] = ("year", "stratum", "topic", "country"),
            trend_years: tuple[int, int] | None = None) -> dict[str, Any]:
@@ -506,7 +510,8 @@ def report(connection: sqlite3.Connection, journals: Sequence[str], *, b: int = 
             "trend": trend(connection, journal, b=b, seed=seed, years=trend_years),
             "ladder": sensitivity_ladder(connection, journal),
             "replicate": variant_agreement(connection, journal, "replicate"),
-            "coverage": {by: coverage(connection, journal, by) for by in ("year", "stratum", "route", "provenance")},
+            "coverage": {by: coverage(connection, journal, by) for by in ("year", "stratum", "route", "provenance")
+                         + (("acquisition",) if _has_column(connection, "reviews", "provenance") else ())},
         }
     if ratio_pair:
         out["ratio"] = ratio(connection, ratio_pair[0], ratio_pair[1], b=b, seed=seed)

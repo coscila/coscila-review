@@ -19,6 +19,7 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -33,11 +34,13 @@ from xml.etree import ElementTree as ET
 from . import citation_census as C
 from . import scores_db
 from .census_extraction import extract_review, resolve_identity
+from .census_inputs import CLASS_OF, FULL_TEXT, normal_doi, review_provenance, verify_item_claim
 from .errors import ConfidentialityError, ReviewError, ValidationError
 from .sanitize import SANITIZER_VERSION, sanitize_text
 
 IDENTITY_LADDER = "identity-ladder@1"
 RESOLVED = ("resolved", "resolved_unverified")
+PROVENANCE_MARKS = ",".join("?" * 17)
 
 
 def detected_rows(field: str, text: str | None, *, journal: str | None = None, doi: str | None = None,
@@ -55,6 +58,34 @@ def detected_rows(field: str, text: str | None, *, journal: str | None = None, d
                      removal.kind, removal.rule, removal.start, removal.length, removal.sha256, SANITIZER_VERSION,
                      utc_now()))
     return rows
+
+
+def review_item_id(journal: str, doi: str) -> str:
+    return "review-" + sha256_text(canonical([journal, doi]))[:32]
+
+
+def provenance_row(item_id: str, kind: str, label: str, detail: Mapping[str, Any] | None, *, journal: str | None = None,
+                   doi: str | None = None, work_key: str | None = None, evidence_id: str | None = None,
+                   source_sha256: str | None = None, verified: Any = None) -> tuple:
+    """One input_provenance row: where an item's bytes came from, with its acquisition record."""
+    if label not in scores_db.PROVENANCE:
+        raise ValidationError(f"unknown provenance: {label}")
+    detail = dict(detail or {})
+    return (item_id, kind, journal, doi, work_key, evidence_id, label, detail.get("cache"), detail.get("cacheVersion"),
+            source_sha256 or detail.get("sourceSha256"), detail.get("identity"), detail.get("provider"),
+            detail.get("sourceUrl"), detail.get("retrievedAt") or detail.get("capturedAt"),
+            None if verified is None else int(bool(verified)), canonical(detail) if detail else None, utc_now())
+
+
+def abstract_provenance(work: Mapping[str, Any], abstract: str) -> tuple[str, dict[str, Any]]:
+    """(label, detail) of the abstract a cited work carries: the lookup's record, unless the text changed since."""
+    recorded = work.get("abstractProvenance")
+    if isinstance(recorded, dict) and recorded.get("provenance") in scores_db.PROVENANCE:
+        if recorded.get("textSha256") != sha256_text(abstract or ""):
+            # A provenance record binds the text it vouches for; text changed (or never bound) since is supplied.
+            return "supplied", {"changedAfterLookup": dict(recorded)}
+        return str(recorded["provenance"]), dict(recorded)
+    return ("supplied" if abstract else "unavailable"), {}
 
 
 class TransportError(ReviewError):
@@ -254,6 +285,7 @@ class CensusRun:
         self.breaker = breaker or max(4, concurrency)
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
+        self.input_caches: Any = None
         self._writer = writer_lock(Path(database))
         try:
             self.connection = scores_db.connect(Path(database), create=True)
@@ -285,12 +317,57 @@ class CensusRun:
             connection.close()
         self._release()
 
+    # ------------------------------------------------------------------ input pins
+    def pin_inputs(self, caches: Any) -> dict[str, Any]:
+        """Pin the byte caches a study reads (store Merkle root, provider cache digest); a later change is refused.
+
+        Cited-work cache hits recorded while preparing are then checked against the pinned versions.
+        """
+        self.input_caches = caches
+        values = {}
+        if caches is not None and caches.store is not None:
+            values["inputStore"] = caches.store.version
+        if caches is not None and caches.provider_cache is not None:
+            values["inputProviderCache"] = caches.provider_cache.version
+        if values:
+            with self.lock, self.connection:
+                scores_db.set_meta(self.connection, values)
+        return values
+
+    def pin_enumeration(self, enumeration: Any) -> dict[str, Any]:
+        """Pin a verified fresh enumeration and record its population; one enumeration per study database."""
+        with self.lock, self.connection:
+            scores_db.set_meta(self.connection, {"enumerationSha256": enumeration.sha256,
+                                                 "enumerationReviews": str(len(enumeration.reviews))})
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO enumeration VALUES(?,?,?,?,?,?,?,?)",
+                [(journal, doi, item.get("stratum"), item.get("firstOnline"), item.get("year"), item.get("pmid"),
+                  item.get("pmcid"), enumeration.sha256) for (journal, doi), item in enumeration.reviews.items()])
+        return {"enumerationSha256": enumeration.sha256, "reviews": len(enumeration.reviews)}
+
     # ------------------------------------------------------------------ preparation
+    def _review_provenance(self, record: Mapping[str, Any], document_sha: str | None,
+                           provenance: tuple[str, Mapping[str, Any], Any] | None) -> tuple[str, dict[str, Any], Any]:
+        if provenance is not None:
+            label, detail, verified = provenance
+            return label, dict(detail or {}), verified
+        label, detail = review_provenance(record, document_sha)
+        return label, detail, None
+
+    def _provenance_class(self, record: Mapping[str, Any], label: str, document: bytes | None) -> str:
+        if label in CLASS_OF:
+            return CLASS_OF[label]
+        return "unavailable" if document is None else (record.get("provenanceClass") or "public")
+
     def prepare_review(self, record: Mapping[str, Any], document: bytes | None,
-                       table_pages: Sequence[tuple[int, bytes]] = ()) -> dict[str, Any]:
+                       table_pages: Sequence[tuple[int, bytes]] = (), *,
+                       provenance: tuple[str, Mapping[str, Any], Any] | None = None) -> dict[str, Any]:
         """Extract one review, resolve identities, record loci, works, abstracts and deterministic rows.
 
         ``table_pages`` are the separately rendered table pages of a publisher HTML review (``document.tables``).
+        ``provenance`` is (label, acquisition record, verified); by default it is read from the record's
+        ``acquisition`` block (``supplied`` for a document without one). A review acquired from a cache or a
+        live route must carry its own DOI.
         """
         journal, doi = record.get("journal"), (record.get("doi") or "").lower()
         if not journal or not doi:
@@ -304,27 +381,36 @@ class CensusRun:
             if existing[0] != document_sha:
                 raise ValidationError(f"{doi}: review already prepared from a different document")
             return {"doi": doi, "state": "already-prepared"}
+        label, acquisition, verified = self._review_provenance(record, document_sha, provenance)
         order = self.connection.execute("SELECT COALESCE(MAX(review_order), -1) + 1 FROM reviews").fetchone()[0]
         base = (journal, doi, record.get("paperKey"), record.get("title"), record.get("year"), record.get("firstOnline"),
                 record.get("stratum"), kind if document is not None else None,
-                "unavailable" if document is None else (record.get("provenanceClass") or "public"))
+                self._provenance_class(record, label, document))
+        review_item = provenance_row(review_item_id(journal, doi), "review", label, acquisition, journal=journal, doi=doi,
+                                     source_sha256=document_sha, verified=verified)
         if document is None:
             with self.lock, self.connection:
                 self.connection.execute(
                     "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, route, provenance_class,"
-                    " review_order, abstract_state, full_text_state) VALUES(?,?,?,?,?,?,?,?,?,?,'completed','completed')",
-                    (*base, order))
+                    " review_order, abstract_state, full_text_state, provenance)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,'completed','completed',?)", (*base, order, label))
+                self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", review_item)
             return {"doi": doi, "state": "unavailable"}
         if kind not in ("jats", "html"):
             raise ValidationError(f"{doi}: document kind must be jats or html")
         try:
             review = extract_review(document, html=kind == "html", table_pages=table_pages)
         except (ValidationError, ET.ParseError, UnicodeError) as error:
-            return self._record_unreadable(record, base, order, document_sha, kind, f"{type(error).__name__}: {error}")
+            return self._record_unreadable(record, base, order, document_sha, kind, f"{type(error).__name__}: {error}",
+                                           review_item=review_item, label=label)
+        declared = normal_doi(review["doi"])
+        if acquisition and label != "supplied" and declared and declared != normal_doi(doi):
+            raise ValidationError(f"{doi}: the acquired document declares a different DOI ({review['doi']})")
         works = {key: dict(value) for key, value in (record.get("works") or {}).items()}
         supplied = record.get("identities") or {}
         title = record.get("title") or review["title"] or ""
         rows, loci, identities, evidence, history, findings = [], [], [], {}, [], []
+        abstract_items: dict[str, tuple] = {}
         now = utc_now()
         for entry in review["entries"]:
             if entry.label in supplied:
@@ -357,6 +443,10 @@ class CensusRun:
                 evidence[abstract_id] = (abstract_id, key, version, "abstract", sha256_text(abstract),
                                          work.get("abstractSource"), work.get("abstractRoute"), "public",
                                          work.get("abstractRetrievedAt"), len(abstract), None, abstract)
+                abstract_label, abstract_detail = abstract_provenance(work, abstract)
+                abstract_items[abstract_id] = provenance_row(
+                    abstract_id, "abstract", abstract_label, abstract_detail, work_key=key, evidence_id=abstract_id,
+                    verified=verify_item_claim({"provenance": abstract_label, **abstract_detail}, self.input_caches))
                 cut, sent_chars = int(info["cut"]), info["sentCharacters"]
             ident_proof = {k: v for k, v in ident.items() if k not in ("workKey", "identity", "method", "titleAgrees")}
             identities.append((journal, doi, entry.label, key, identity_class, ident.get("method"),
@@ -388,13 +478,14 @@ class CensusRun:
         with self.lock, self.connection:
             self.connection.execute(
                 "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, route, provenance_class,"
-                " country, country_source, topic, topic_map, document_sha256, extraction_json, uncovered, review_order)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " country, country_source, topic, topic_map, document_sha256, extraction_json, uncovered, review_order,"
+                " provenance) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (journal, doi, record.get("paperKey"), title, record.get("year"), record.get("firstOnline"),
                  record.get("stratum"), kind, base[8], record.get("country") or review["country"]["country"],
                  "supplied" if record.get("country") else review["country"]["source"],
                  record.get("topic") or review["topic"], review["topicMap"], document_sha,
-                 canonical(review["diagnostics"]), uncovered, order))
+                 canonical(review["diagnostics"]), uncovered, order, label))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", review_item)
             for key, work in works.items():
                 version = work.get("identityVersion") or IDENTITY_LADDER
                 existing_work = self.connection.execute("SELECT identity_version FROM works WHERE work_key=?", (key,)).fetchone()
@@ -404,6 +495,8 @@ class CensusRun:
                     key, work.get("doi"), work.get("pmid"), work.get("pmcid"), work.get("title"), work.get("venue"),
                     None if work.get("year") is None else str(work.get("year")), int(bool(work.get("retracted"))), version))
             self.connection.executemany("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", list(evidence.values()))
+            self.connection.executemany(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})",
+                                        [abstract_items[evidence_id] for evidence_id in sorted(set(evidence) - known)])
             for row in rows:
                 self.connection.execute(
                     f"INSERT INTO citations({', '.join(row)}) VALUES({', '.join('?' * len(row))})", tuple(row.values()))
@@ -420,17 +513,18 @@ class CensusRun:
                 "judgeable": sum(1 for r in rows if "abs_class" not in r), "sanitizerFindings": len(findings)}
 
     def _record_unreadable(self, record: Mapping[str, Any], base: tuple, order: int, document_sha: str | None,
-                           kind: str | None, reason: str) -> dict[str, Any]:
+                           kind: str | None, reason: str, *, review_item: tuple, label: str) -> dict[str, Any]:
         """A review whose document cannot be extracted stays in coverage with its reason; nothing is judged."""
         journal, doi = base[0], base[1]
         diagnostics = {"extractionFailed": reason[:500]}
         with self.lock, self.connection:
             self.connection.execute(
                 "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, route, provenance_class,"
-                " document_sha256, extraction_json, review_order, abstract_state, full_text_state)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'completed','completed')",
+                " document_sha256, extraction_json, review_order, abstract_state, full_text_state, provenance)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'completed','completed',?)",
                 (journal, doi, record.get("paperKey"), record.get("title"), record.get("year"), record.get("firstOnline"),
-                 record.get("stratum"), kind, base[8], document_sha, canonical(diagnostics), order))
+                 record.get("stratum"), kind, base[8], document_sha, canonical(diagnostics), order, label))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", review_item)
         return {"doi": doi, "state": "extraction-failed", "reason": diagnostics["extractionFailed"]}
 
     def record_unavailable(self, record: Mapping[str, Any], reason: str) -> dict[str, Any]:
@@ -442,13 +536,17 @@ class CensusRun:
             if self.connection.execute("SELECT 1 FROM reviews WHERE journal=? AND doi=?", (journal, doi)).fetchone():
                 return {"doi": doi, "state": "already-prepared"}
             order = self.connection.execute("SELECT COALESCE(MAX(review_order), -1) + 1 FROM reviews").fetchone()[0]
+        claimed = record.get("acquisition") if isinstance(record.get("acquisition"), dict) else {}
+        item = provenance_row(review_item_id(journal, doi), "review", "unavailable",
+                              {"reason": reason[:500], **({"claimed": claimed} if claimed else {})}, journal=journal, doi=doi)
         with self.lock, self.connection:
             self.connection.execute(
                 "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, provenance_class,"
-                " extraction_json, review_order, abstract_state, full_text_state)"
-                " VALUES(?,?,?,?,?,?,?,'unavailable',?,?,'completed','completed')",
+                " extraction_json, review_order, abstract_state, full_text_state, provenance)"
+                " VALUES(?,?,?,?,?,?,?,'unavailable',?,?,'completed','completed','unavailable')",
                 (journal, doi, record.get("paperKey"), record.get("title"), record.get("year"), record.get("firstOnline"),
                  record.get("stratum"), canonical({"documentUnreadable": reason[:500]}), order))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
         return {"doi": doi, "state": "unavailable", "reason": reason[:500]}
 
     # ------------------------------------------------------------------ abstract tier
@@ -773,27 +871,49 @@ class CensusRun:
         return self._paused(totals, drift)
 
     # ------------------------------------------------------------------ full-text tier
-    def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled) -> tuple[str | None, str, str | None, str]:
-        """Full text of a cited work: (text, outcome, source, provenance class); cached per identity version."""
+    def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
+                  cache=None) -> tuple[str | None, str, str | None, str, str]:
+        """Full text of a cited work: (text, outcome, source, provenance class, provenance label), cached per identity
+        version.
+
+        A study's byte caches (``cache``) are asked first; their Europe PMC fullTextXML is accepted only with its
+        digest verified and its PMCID or DOI confirmed. Where the source came from is recorded once per source
+        (``input_provenance``, kind full-text) and returned as the label (cache-hit-public, live-public,
+        live-entitled; supplied for a source recorded before provenance existed).
+        """
         with self.lock:
             cached = self.connection.execute(
-                "SELECT text, provider, provenance_class FROM evidence WHERE work_key=? AND identity_version=? "
-                "AND unit='full-text' AND text IS NOT NULL AND route='source' ORDER BY evidence_id LIMIT 1",
+                "SELECT e.text, e.provider, e.provenance_class, p.provenance FROM evidence e LEFT JOIN input_provenance p "
+                "ON p.item_id=e.evidence_id WHERE e.work_key=? AND e.identity_version=? AND e.unit='full-text' "
+                "AND e.text IS NOT NULL AND e.route='source' ORDER BY e.evidence_id LIMIT 1",
                 (work["work_key"], work["identity_version"])).fetchone()
         if cached:
-            return cached["text"], "cache", cached["provider"], cached["provenance_class"]
+            return cached[0], "cache", cached[1], cached[2], cached[3] or "supplied"
         text = raw = source = None
-        provenance = "public"
-        if work.get("pmcid") and fetch_xml is not None:
+        provenance, label, detail, rejected = "public", "unavailable", {}, []
+        pmcid = None
+        if work.get("pmcid"):
             pmcid = work["pmcid"] if str(work["pmcid"]).upper().startswith("PMC") else "PMC%s" % work["pmcid"]
+        if pmcid and cache is not None:
+            hit, rejected = cache.full_text(work)
+            if hit is not None:
+                try:
+                    text, raw, source = C.jats_to_text(hit["body"]), hit["body"], "europe-pmc-fulltextxml"
+                    label, detail = "cache-hit-public", hit["provenance"]
+                except ValidationError:
+                    rejected.append({**hit["provenance"], "reason": "unreadable"})
+                    text = None
+        if text is None and pmcid and fetch_xml is not None:
             try:
                 fetched = fetch_xml(pmcid)
             except RetryableFetch:
                 # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
-                return None, "retry", None, provenance
+                return None, "retry", None, provenance, "unavailable"
             if fetched:
                 try:
                     text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
+                    label, detail = "live-public", {"provider": source, "sourceUrl": FULL_TEXT % pmcid,
+                                                    "retrievedAt": utc_now()}
                 except ValidationError:
                     text = None
         if text is None and entitled is not None:
@@ -802,32 +922,40 @@ class CensusRun:
                 raw, media = supplied
                 text = C.jats_to_text(raw) if "xml" in media else raw.decode("utf-8")
                 source, provenance = "entitled", "entitled"
+                label, detail = "live-entitled", {"provider": "entitled", "retrievedAt": utc_now()}
         if text is None:
-            return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, provenance
+            return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, provenance, "unavailable"
+        evidence_id = "src-" + sha256_text(canonical([work["work_key"], work["identity_version"], sha256_text(text)]))[:32]
+        raw_sha = hashlib.sha256(raw).hexdigest() if raw else None
+        item = provenance_row(evidence_id, "full-text", label, {**detail, **({"rejected": rejected} if rejected else {})},
+                              work_key=work["work_key"], evidence_id=evidence_id, source_sha256=raw_sha,
+                              verified=verify_item_claim(detail, cache))
         with self.lock, self.connection:
             self.connection.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-                "src-" + sha256_text(canonical([work["work_key"], work["identity_version"], sha256_text(text)]))[:32],
-                work["work_key"], work["identity_version"], "full-text", sha256_text(text), source, "source", provenance,
-                utc_now(), len(text), hashlib.sha256(raw).hexdigest() if raw else None, text))
-        return text, source, source, provenance
+                evidence_id, work["work_key"], work["identity_version"], "full-text", sha256_text(text), source, "source",
+                provenance, utc_now(), len(text), raw_sha, text))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
+        return text, source, source, provenance, label
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
-                       allow_entitled: bool) -> tuple[str, str, str, list[dict[str, Any]], int]:
+                       allow_entitled: bool, cache=None) -> tuple[str, str, str, list[dict[str, Any]], int]:
         """Retrieve every entry of one review's group, record definitive failures, build the windows."""
         journal, title = group[0]["journal"], group[0]["title"] or ""
         retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
-            text, outcome, source, provenance = self._retrieve(work, fetch_xml, entitled)
+            text, outcome, source, provenance, label = self._retrieve(work, fetch_xml, entitled, cache)
             if outcome == "retry":
                 retry += 1
                 continue
             if text is not None and provenance == "entitled" and not allow_entitled:
                 text, outcome = None, "entitled-blocked"
             if text is None:
+                # No window reaches the judge: the entry's full-text provenance is unavailable.
                 with self.lock, self.connection:
-                    self.connection.execute("UPDATE citations SET ft_retrieval=? WHERE journal=? AND doi=? AND label=?",
-                                            (outcome, journal, doi, row["label"]))
+                    self.connection.execute(
+                        "UPDATE citations SET ft_retrieval=?, ft_provenance='unavailable' WHERE journal=? AND doi=? AND label=?",
+                        (outcome, journal, doi, row["label"]))
                 continue
             with self.lock:
                 passages = [{"sentence": r["sentence"], "section": r["section"]}
@@ -842,7 +970,8 @@ class CensusRun:
             retrieved.append({"label": row["label"], "citing_passages": passages,
                               "cited_work": {"title": work["title"], "venue": work["venue"], "year": year},
                               "fulltext_window": window,
-                              "_entry": {"row": row, "outcome": outcome, "source": source, "provenance": provenance}})
+                              "_entry": {"row": row, "outcome": outcome, "source": source, "provenance": provenance,
+                                         "label": label}})
         return doi, journal, title, retrieved, retry
 
     def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]]):
@@ -871,7 +1000,7 @@ class CensusRun:
                   "AND c.identity IN ('resolved','resolved_unverified')")
 
     def _full_text_pass(self, fetch_xml, entitled, fetch_workers: int, totals: dict[str, int],
-                        touched: set[tuple[str, str]]) -> tuple[str | None, bool]:
+                        touched: set[tuple[str, str]], cache=None) -> tuple[str | None, bool]:
         """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped)."""
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
@@ -893,8 +1022,8 @@ class CensusRun:
         limit = 4 * self.concurrency
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as fetch_pool, \
                 concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as call_pool:
-            retrievals = [fetch_pool.submit(self._prepare_group, doi, group, works, fetch_xml, entitled, allow_entitled)
-                          for doi, group in groups]
+            retrievals = [fetch_pool.submit(self._prepare_group, doi, group, works, fetch_xml, entitled, allow_entitled,
+                                            cache) for doi, group in groups]
             calls: set[concurrent.futures.Future] = set()
 
             def collect(block: bool) -> None:
@@ -934,11 +1063,12 @@ class CensusRun:
     def run_full_text(self, *, fetch_xml: Callable[[str], bytes | None] | None = None,
                       entitled: Callable[[dict[str, Any]], tuple[bytes, str] | None] | None = None,
                       fetch_workers: int = 8, retry_failed: bool = False, transport_retries: int = 3,
-                      cooldown: float = 60.0) -> dict[str, Any]:
+                      cooldown: float = 60.0, cache: Any = None) -> dict[str, Any]:
         """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair.
 
         Entries whose fetch failed transiently or whose call got no response stay open and are retried in
         further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``.
+        ``cache`` (census_inputs.InputCaches) is asked before Europe PMC for each work's fullTextXML.
         """
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
@@ -958,7 +1088,7 @@ class CensusRun:
         touched: set[tuple[str, str]] = set()
         while True:
             totals["passes"] += 1
-            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched)
+            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched, cache)
             with self.lock:
                 still_open = self.connection.execute(
                     f"SELECT COUNT(*) FROM citations c WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL").fetchone()[0]
@@ -1006,10 +1136,11 @@ class CensusRun:
                 record = records.get(row["label"])
                 quote = C.quote_check(record, window) if record else {"quotePresent": None, "quoteInEvidence": None}
                 self.connection.execute(
-                    "UPDATE citations SET ft_retrieval=?, ft_source=?, ft_evidence_id=?, ft_window_characters=?, ft_call_id=?,"
-                    " ft_position=?, ft_category=?, ft_support_verdict=?, ft_class=?, ft_reason=?, ft_quote=?,"
+                    "UPDATE citations SET ft_retrieval=?, ft_source=?, ft_provenance=?, ft_evidence_id=?, ft_window_characters=?,"
+                    " ft_call_id=?, ft_position=?, ft_category=?, ft_support_verdict=?, ft_class=?, ft_reason=?, ft_quote=?,"
                     " ft_quote_present=?, ft_quote_in_evidence=? WHERE journal=? AND doi=? AND label=?",
-                    (entry["outcome"], entry["source"], evidence_id, len(window), call_id, position,
+                    (entry["outcome"], entry["source"], entry.get("label") or "supplied", evidence_id, len(window), call_id,
+                     position,
                      record["category"] if record else None, record["support_verdict"] if record else None,
                      C.full_text_class(record["category"]) if record else None,
                      record["reason"] if record else None, record["quote"] if record else None,
@@ -1163,23 +1294,138 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
     full_text = {r[0]: r[1] for r in c.execute("SELECT full_text_state, COUNT(*) FROM reviews GROUP BY full_text_state")}
     calls = abstract_calls[0] or 0
     pinned = meta.get("instrumentDigest")
-    return {"runId": meta.get("runId"), "instrumentDigest": pinned, "codeInstrumentDigest": code_instrument_digest,
-            "instrumentDigestMatches": None if code_instrument_digest is None or pinned is None
-            else pinned == code_instrument_digest,
-            "runState": meta.get("runState", "active"), "reviews": reviews, "fullTextReviews": full_text,
-            "openEntries": open_entries, "openFullTextEntries": open_full_text,
-            "judgeableEntries": judgeable, "invalidOutputs": invalid,
-            "invalidShare": invalid / judgeable if judgeable else None,
-            "abstractCalls": calls, "transportFailures": abstract_calls[1] or 0,
-            "transportFailureShare": (abstract_calls[1] or 0) / calls if calls else None,
-            "truncatedCalls": abstract_calls[2] or 0,
-            "receiptsWithResponse": responded[0] or 0, "receiptsWithFingerprint": responded[1] or 0,
-            "fingerprintOffered": bool(responded[1]),
-            "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
-            "duplicateJudgments": duplicates,
-            "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
-            "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
-                                                 "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
+    result = {"runId": meta.get("runId"), "instrumentDigest": pinned, "codeInstrumentDigest": code_instrument_digest,
+              "instrumentDigestMatches": None if code_instrument_digest is None or pinned is None
+              else pinned == code_instrument_digest,
+              "runState": meta.get("runState", "active"), "reviews": reviews, "fullTextReviews": full_text,
+              "openEntries": open_entries, "openFullTextEntries": open_full_text,
+              "judgeableEntries": judgeable, "invalidOutputs": invalid,
+              "invalidShare": invalid / judgeable if judgeable else None,
+              "abstractCalls": calls, "transportFailures": abstract_calls[1] or 0,
+              "transportFailureShare": (abstract_calls[1] or 0) / calls if calls else None,
+              "truncatedCalls": abstract_calls[2] or 0,
+              "receiptsWithResponse": responded[0] or 0, "receiptsWithFingerprint": responded[1] or 0,
+              "fingerprintOffered": bool(responded[1]),
+              "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
+              "duplicateJudgments": duplicates,
+              "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
+              "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
+                                                   "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
+    result.update(input_status(c, meta))
+    return result
+
+
+def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
+    """Provenance of the inputs: reviews per provenance class, items per kind and class, pinned caches, enumeration."""
+    out: dict[str, Any] = {"inputs": {key: json.loads(meta[key]) for key in ("inputStore", "inputProviderCache") if key in meta}}
+    if "provenance" in scores_db.table_columns(c, "reviews"):
+        out["reviewProvenance"] = {(row[0] or "unrecorded"): row[1] for row in c.execute(
+            "SELECT provenance, COUNT(*) FROM reviews GROUP BY provenance ORDER BY provenance")}
+        by_journal: dict[str, dict[str, int]] = {}
+        for journal, label, count in c.execute("SELECT journal, provenance, COUNT(*) FROM reviews "
+                                               "GROUP BY journal, provenance ORDER BY journal, provenance"):
+            by_journal.setdefault(journal, {})[label or "unrecorded"] = count
+        out["reviewProvenanceByJournal"] = by_journal
+    if scores_db.has_table(c, "input_provenance"):
+        items: dict[str, dict[str, int]] = {}
+        for kind, label, count in c.execute("SELECT kind, provenance, COUNT(*) FROM input_provenance "
+                                            "GROUP BY kind, provenance ORDER BY kind, provenance"):
+            items.setdefault(kind, {})[label] = count
+        out["itemProvenance"] = items
+        unverified = {kind: count for kind, count in c.execute(
+            "SELECT kind, COUNT(*) FROM input_provenance WHERE provenance LIKE 'cache-hit-%' AND COALESCE(verified, 0)!=1 "
+            "GROUP BY kind ORDER BY kind")}
+        # Abstract evidence no recorded lookup vouches for: the work was never looked up (no record; text carried
+        # over from an earlier manifest, or none), or its text changed after the lookup.
+        unlooked = c.execute("SELECT COUNT(*) FROM input_provenance WHERE kind='abstract' AND (detail_json IS NULL OR "
+                             "json_extract(detail_json, '$.changedAfterLookup') IS NOT NULL)").fetchone()[0]
+        out["inputChecks"] = {"unverifiedReviewCacheHits": unverified.get("review", 0),
+                              "unverifiedAbstractCacheHits": unverified.get("abstract", 0),
+                              "unverifiedFullTextCacheHits": unverified.get("full-text", 0),
+                              "abstractsWithoutLookup": unlooked}
+    if meta.get("enumerationSha256") and scores_db.has_table(c, "enumeration"):
+        enumerated = c.execute("SELECT COUNT(*) FROM enumeration").fetchone()[0]
+        studied = c.execute("SELECT COUNT(*) FROM enumeration e WHERE EXISTS (SELECT 1 FROM reviews r "
+                            "WHERE r.journal=e.journal AND r.doi=e.doi)").fetchone()[0]
+        outside = c.execute("SELECT COUNT(*) FROM reviews r WHERE NOT EXISTS (SELECT 1 FROM enumeration e "
+                            "WHERE e.journal=r.journal AND e.doi=r.doi)").fetchone()[0]
+        out["enumeration"] = {"sha256": meta["enumerationSha256"], "reviews": enumerated, "inStudy": studied,
+                              "notInStudy": enumerated - studied, "reviewsOutsideEnumeration": outside}
+    return out
+
+
+COMPARISON_LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
+
+
+def record_comparison(database: Path, stored: Path, output: Path, *, label: str = "stored",
+                      allow_incomplete: bool = False) -> dict[str, Any]:
+    """Compare the study's pinned fresh enumeration with a stored manifest; record counts, never import anything.
+
+    The comparison is a diagnostic, reported and never tuned: it runs only on a study pinned to a fresh
+    enumeration (``study prepare --require-fresh-enumeration``) whose census run is complete, unless
+    ``allow_incomplete``, which the comparison records. Only DOI, journal and stratum of the stored manifest are
+    read; the per-review lists go to the report file, the database keeps counts per journal and stratum.
+    """
+    from .census_inputs import COMPARISON_FORMAT, compare_manifests, load_stored_manifest
+    if not COMPARISON_LABEL.fullmatch(label or ""):
+        raise ValidationError("a comparison label is lower-case letters, digits and hyphens")
+    database, output = Path(database), Path(output)
+    if not database.is_file():
+        raise ValidationError(f"scores database is missing: {database}")
+    if output.exists():
+        raise ValidationError("comparison report already exists; write it to a new path")
+    writer = writer_lock(database)
+    temporary = None
+    try:
+        connection = scores_db.connect(database, create=True)
+        try:
+            meta = scores_db.meta(connection)
+            pinned = meta.get("enumerationSha256")
+            if not pinned:
+                raise ValidationError("compare a stored manifest only after study prepare --require-fresh-enumeration "
+                                      "has pinned the fresh enumeration")
+            state = scores_db.completeness(connection)
+            if not state["complete"] and not allow_incomplete:
+                raise ValidationError("compare a stored manifest after the census run is complete (a diagnostic, never "
+                                      "tuned): " + "; ".join(state["problems"]))
+            if connection.execute("SELECT 1 FROM manifest_comparisons WHERE label=?", (label,)).fetchone():
+                raise ValidationError(f"comparison {label!r} is already recorded; choose another label")
+            fresh = [{"journal": row[0], "doi": row[1], "stratum": row[2]} for row in connection.execute(
+                "SELECT journal, doi, stratum FROM enumeration WHERE receipt_sha256=? ORDER BY journal, doi", (pinned,))]
+            records, info = load_stored_manifest(Path(stored))
+            result = compare_manifests(fresh, records)
+            compared_at = utc_now()
+            report = {"format": COMPARISON_FORMAT, "label": label, "comparedAt": compared_at,
+                      "fresh": {"enumerationSha256": pinned, "reviews": len(fresh)}, "stored": info, **result,
+                      "runComplete": state["complete"], "runProblems": state["problems"], "imported": 0,
+                      "note": "comparison only: the stored manifest was read after the fresh enumeration was pinned and "
+                              "never entered the study"}
+            body = (json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+            report_sha = hashlib.sha256(body).hexdigest()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = output.with_name("." + output.name + ".incoming")
+            with temporary.open("xb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            with connection:
+                connection.executemany("INSERT INTO manifest_comparisons VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+                    (label, cell["journal"], cell["stratum"], cell["fresh"], cell["stored"], cell["inBoth"],
+                     cell["freshOnly"], cell["storedOnly"], info["sha256"], pinned, report_sha, int(state["complete"]),
+                     compared_at) for cell in result["cells"]])
+            os.replace(temporary, output)
+            temporary = None
+        finally:
+            connection.close()
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        fcntl.flock(writer, fcntl.LOCK_UN)
+        os.close(writer)
+    return {"label": label, "report": str(output), "reportSha256": report_sha, "runComplete": state["complete"],
+            "totals": result["totals"], "stored": info,
+            "byJournal": {journal: {k: v for k, v in cell.items() if k != "strata"}
+                          for journal, cell in result["byJournal"].items()}}
 
 
 def iter_records(path: Path) -> Iterator[dict[str, Any]]:
