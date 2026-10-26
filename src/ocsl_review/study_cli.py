@@ -2,11 +2,12 @@
 """``ocsl-review instruments`` and ``ocsl-review study``: instrument registry and census study commands.
 
 Controllers call these commands instead of writing drivers: enumerate the
-population live, acquire review documents and cited-work abstracts from the
-study's byte caches or live routes, prepare reviews from a manifest, run the
-abstract and full-text tiers, the predeclared no-truncation sensitivity, gates,
-freezing, exports, estimands and facts, and compare a stored manifest with the
-fresh enumeration afterwards.
+population live, acquire review documents, derive cited works from each
+review's own bibliography, look up cited-work abstracts and metadata from the
+study's byte caches or live routes, record protocol exclusions, prepare reviews
+from a manifest, run the abstract and full-text tiers, the predeclared
+no-truncation sensitivity, gates, freezing, exports, estimands and facts, and
+compare a stored manifest with the fresh enumeration afterwards.
 """
 from __future__ import annotations
 
@@ -38,11 +39,11 @@ def add_commands(families, register):
 
     study = families.add_parser("study", help="run a census study with a registered instrument")
     actions = study.add_subparsers(dest="study_command", required=True)
-    for name in ("enumerate", "acquire", "abstracts", "prepare", "judge", "full-text", "no-truncation", "replicate",
-                 "status", "gates", "freeze", "export", "estimands", "facts", "verify-facts", "cross-validate",
-                 "compare-manifest"):
+    for name in ("enumerate", "acquire", "works", "abstracts", "exclude", "prepare", "judge", "full-text",
+                 "no-truncation", "replicate", "status", "gates", "freeze", "export", "estimands", "facts", "verify-facts",
+                 "cross-validate", "compare-manifest"):
         command = actions.add_parser(name)
-        if name in ("prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze",
+        if name in ("exclude", "prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze",
                     "compare-manifest"):
             command.add_argument("--database", required=True, help="working census database")
         if name in ("prepare", "judge", "full-text", "no-truncation", "replicate"):
@@ -64,9 +65,18 @@ def add_commands(families, register):
                                  help="acquire documents the caches do not hold through the journal's live route")
             command.add_argument("--retry-unavailable", action="store_true",
                                  help="try again for reviews an earlier run recorded as unavailable")
+        if name == "works":
+            command.add_argument("--input", required=True, help="JSONL review records with documents (study acquire output)")
+            command.add_argument("--output", required=True,
+                                 help="JSONL review records with cited works derived from each review's bibliography "
+                                      "(keep it beside the input so document paths resolve)")
+        if name == "exclude":
+            command.add_argument("--input", required=True,
+                                 help="JSONL of enumerated reviews not in the study: journal, doi and the protocol reason")
         if name == "gates":
             command.add_argument("--require-fresh-enumeration", action="store_true",
-                                 help="also require that the study is pinned to a verified fresh enumeration")
+                                 help="also require that the study is pinned to a verified fresh enumeration and that "
+                                      "every enumerated review is in the study or excluded")
         if name == "prepare":
             command.add_argument("--input", required=True, help="JSONL review records; document paths are relative to it")
             command.add_argument("--require-fresh-enumeration", action="store_true",
@@ -99,7 +109,8 @@ def add_commands(families, register):
         if name == "judge":
             command.add_argument("--limit", type=int)
         if name == "full-text":
-            command.add_argument("--europe-pmc", action="store_true", help="fetch Europe PMC fullTextXML by PMCID")
+            command.add_argument("--europe-pmc", action="store_true",
+                                 help="fetch Europe PMC fullTextXML by PMCID (required with --store or --provider-cache)")
             command.add_argument("--fetch-workers", type=int, default=4)
             command.add_argument("--retry-failed", action="store_true",
                                  help="reopen entries an earlier run recorded as fetch-failed")
@@ -205,6 +216,7 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
 
 
 def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) -> dict[str, Any]:
+    from .census_inputs import QUERY_RULE
     responded = status["receiptsWithResponse"]
     checks = {
         "invalidOutputsAtMostOnePercent": status["invalidShare"] is not None and status["invalidShare"] <= 0.01,
@@ -237,9 +249,25 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
         checks["cacheHitsVerified"] = not any(inputs.get(name) for name in (
             "unverifiedReviewCacheHits", "unverifiedAbstractCacheHits", "unverifiedFullTextCacheHits"))
         checks["everyAbstractFromARecordedLookup"] = not inputs.get("abstractsWithoutLookup")
-        if enumeration["notInStudy"]:
-            notes.append(f"{enumeration['notInStudy']} enumerated reviews are not in the study (excluded by the protocol "
-                         "or not prepared yet)")
+        # Every input of the study derived in this run: no identity map, country or topic carried in a record, works
+        # derived from each review's bibliography with their metadata from a recorded lookup, cache hits only where
+        # the live route ran as well, and enumeration queries that select a population, never reviews one by one.
+        checks["noCarriedIdentityMapsOrCountries"] = not (inputs.get("suppliedIdentityMaps") or inputs.get("suppliedCountries"))
+        checks["everyWorkDerivedFromItsReview"] = not inputs.get("worksWithoutDerivation")
+        checks["everyWorkMetadataFromARecordedLookup"] = not inputs.get("worksWithoutRecordedMetadata")
+        checks["reviewsAcquiredThroughLiveRoutes"] = not inputs.get("reviewsAcquiredWithoutLiveRoute")
+        checks["fullTextCacheHitsBackedByLiveRetrieval"] = not inputs.get("fullTextCacheHitsWithoutLiveRetrieval")
+        checks["enumerationQueriesPopulationLevel"] = enumeration.get("queryRule") == QUERY_RULE
+        if require_fresh_enumeration:
+            checks["everyEnumeratedReviewInStudyOrExcluded"] = enumeration.get("unexplained", 1) == 0
+        if enumeration.get("excluded"):
+            notes.append(f"{enumeration['excluded']} enumerated reviews are excluded by the protocol, each with a recorded reason")
+        if enumeration.get("unexplained"):
+            notes.append(f"{enumeration['unexplained']} enumerated reviews are neither in the study nor excluded")
+        comparisons = status.get("comparisons") or []
+        if comparisons:
+            # A comparison froze the population: nothing may have been prepared or excluded after it.
+            checks["populationUnchangedSinceComparison"] = all(item["populationUnchanged"] for item in comparisons)
     return {"ok": all(checks.values()), "checks": checks, "notes": notes, "status": status}
 
 
@@ -298,10 +326,15 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
             "next": "run study abstracts again on the output for works whose lookup failed" if counts["lookupFailed"] else None}
 
 
-def _gate(record: dict[str, Any], enumeration: Any) -> dict[str, Any] | None:
+CARRIED = ("identities", "country", "topic", "documentSha256")
+
+
+def _gate(record: dict[str, Any], enumeration: Any, excluded: frozenset = frozenset()) -> dict[str, Any] | None:
     """Why a record is not prepared now (it stays out of the database and can be prepared later), or None."""
-    from .census_inputs import enumeration_mismatch
+    from .census_inputs import enumeration_mismatch, normal_doi
     from .census_runner import abstract_lookup_failed
+    if (record.get("journal"), normal_doi(record.get("doi"))) in excluded:
+        return {"doi": record.get("doi"), "state": "skipped-excluded", "reason": "excluded by the protocol"}
     failed = abstract_lookup_failed(record)
     if failed:
         return {"doi": record.get("doi"), "state": "skipped-abstract-lookup-failed", "works": failed[:20]}
@@ -316,9 +349,18 @@ def _gate(record: dict[str, Any], enumeration: Any) -> dict[str, Any] | None:
         if not isinstance(acquisition, dict) or not acquisition.get("provenance"):
             return {"doi": record.get("doi"), "state": "skipped-no-acquisition",
                     "reason": "a fresh-enumeration study takes documents only through study acquire"}
+        if acquisition.get("liveRoute") is not True:
+            return {"doi": record.get("doi"), "state": "skipped-cache-only-acquisition",
+                    "reason": "acquired without the journal's live route: a fresh-enumeration study acquires with --live "
+                              "and a --route for the journal, so the caches only stand in for its downloads"}
+        carried = [name for name in CARRIED if record.get(name) not in (None, "", {}, [])]
+        if carried:
+            return {"doi": record.get("doi"), "state": "skipped-carried-inputs",
+                    "reason": f"the record carries {', '.join(carried)}: a fresh-enumeration study derives identities, "
+                              "country and topic from the document and pins it by its acquisition"}
         if acquisition["provenance"] != "unavailable" and not isinstance(record.get("works"), dict):
             return {"doi": record.get("doi"), "state": "skipped-no-works",
-                    "reason": "the record carries no cited-work records (works); every entry would stay unresolved"}
+                    "reason": "the record carries no cited-work records (works); run study works on the acquired records"}
     return None
 
 
@@ -332,16 +374,21 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
     from . import scores_db
     from .census_inputs import review_provenance, verify_claim
     from .census_runner import iter_records, read_document, read_table_pages
+    from .census_works import works_mismatch
     if enumeration is None and scores_db.meta(run.connection).get("enumerationSha256"):
         raise ValidationError("this study is pinned to a fresh enumeration; prepare with --require-fresh-enumeration "
                               "and --enumeration naming its receipt (nothing is imported from other manifests)")
+    if run.connection.execute("SELECT 1 FROM manifest_comparisons LIMIT 1").fetchone():
+        raise ValidationError("a manifest comparison is recorded: the study population is frozen and no review is "
+                              "prepared after it")
     if enumeration is not None:
         run.pin_enumeration(enumeration)
     run.pin_inputs(caches)
+    excluded = frozenset((row[0], row[1]) for row in run.connection.execute("SELECT journal, doi FROM exclusions"))
     counts: dict[str, int] = {}
     problems = []
     for record in iter_records(source):
-        result = _gate(record, enumeration)
+        result = _gate(record, enumeration, excluded)
         if result is None:
             try:
                 document = read_document(source.parent, record)
@@ -351,8 +398,13 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
             else:
                 verified, reason = verify_claim(record, document, caches)
                 claimed = str((record.get("acquisition") or {}).get("provenance") or "").startswith("cache-hit-")
+                # A fresh study derives the works again from the document and takes only those (never carried over).
+                derived = lambda: (works_mismatch(record, document, (record.get("document") or {}).get("kind"), tables)
+                                   if enumeration is not None and document is not None else None)
                 if verified is False or (enumeration is not None and claimed and verified is not True):
                     result = {"doi": record.get("doi"), "state": "skipped-provenance-unverified", "reason": reason}
+                elif mismatch := derived():
+                    result = {"doi": record.get("doi"), "state": "skipped-works-not-derived", "reason": mismatch}
                 else:
                     try:
                         label, detail = review_provenance(record, None if document is None else
@@ -389,6 +441,12 @@ def command(args) -> Any:
             if caches is not None:
                 caches.close()
         return {**result, "inputs": caches.describe() if caches is not None else None}
+    if action == "works":
+        from .census_works import fill_works
+        return fill_works(Path(args.input), Path(args.output))
+    if action == "exclude":
+        from .census_runner import iter_records, record_exclusions
+        return record_exclusions(Path(args.database), iter_records(Path(args.input)))
     if action == "abstracts":
         from .census_abstracts import http_get
         caches = _caches(args)
@@ -427,6 +485,10 @@ def command(args) -> Any:
                 return run.run_abstract(limit=args.limit, **passes)
             if action == "full-text":
                 caches = _caches(args)
+                if caches is not None and not args.europe_pmc:
+                    caches.close()
+                    raise ValidationError("--store and --provider-cache stand in only for downloads the run makes: give "
+                                          "--europe-pmc with them, so every escalated work is retrieved live as well")
                 try:
                     run.pin_inputs(caches)
                     return run.run_full_text(fetch_xml=europe_pmc_fetcher() if args.europe_pmc else None,

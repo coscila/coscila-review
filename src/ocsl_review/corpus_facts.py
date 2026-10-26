@@ -211,6 +211,9 @@ def _provenance_facts(connection: sqlite3.Connection, journal: str) -> dict[str,
                     f"reviews of stratum {stratum} whose document provenance is {label}")
         facts["provenance.reviews.unrecorded"] = (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND provenance IS NULL",
                                                   "reviews prepared before document provenance was recorded")
+        facts["provenance.reviews_read.unrecorded"] = (
+            f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND provenance IS NULL AND {READ}",
+            "reviews with an extracted document prepared before document provenance was recorded")
     if scores_db.has_table(connection, "input_provenance"):
         for label in scores_db.PROVENANCE:
             # An IN list of the class's evidence units: one indexed pass, not one lookup per entry.
@@ -227,6 +230,9 @@ def _provenance_facts(connection: sqlite3.Connection, journal: str) -> dict[str,
             facts[f"provenance.full_text.{label}"] = (
                 f"SELECT COUNT(*) FROM citations WHERE journal={j} AND ft_provenance={_quote(label)}",
                 f"escalated entries whose full-text provenance is {label} (unavailable: no window was sent)")
+        facts["provenance.full_text.unrecorded"] = (
+            f"SELECT COUNT(*) FROM citations WHERE journal={j} AND ft_retrieval IS NOT NULL AND ft_provenance IS NULL",
+            "escalated entries with a full-text outcome recorded before full-text provenance existed")
     return facts
 
 
@@ -244,6 +250,14 @@ def _enumeration_facts(connection: sqlite3.Connection, journal: str) -> dict[str
         facts["enumeration.outside"] = (
             f"SELECT COUNT(*) FROM reviews r WHERE r.journal={j} AND NOT EXISTS (SELECT 1 FROM enumeration e "
             "WHERE e.journal=r.journal AND e.doi=r.doi)", "reviews in the study that the enumeration did not list (gate: 0)")
+        if scores_db.has_table(connection, "exclusions"):
+            excluded = "EXISTS (SELECT 1 FROM exclusions x WHERE x.journal=e.journal AND x.doi=e.doi)"
+            facts["enumeration.excluded"] = (
+                f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j} AND NOT {in_study} AND {excluded}",
+                "enumerated reviews excluded by the protocol, each with a recorded reason")
+            facts["enumeration.unexplained"] = (
+                f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j} AND NOT {in_study} AND NOT {excluded}",
+                "enumerated reviews neither in the study nor excluded (complete population: 0)")
         for (stratum,) in connection.execute("SELECT DISTINCT stratum FROM enumeration WHERE journal=? AND stratum IS NOT "
                                              "NULL ORDER BY stratum", (journal,)).fetchall():
             cell = f"e.journal={j} AND e.stratum={_quote(stratum)}"
@@ -256,6 +270,9 @@ def _enumeration_facts(connection: sqlite3.Connection, journal: str) -> dict[str
         fields = (("fresh", "reviews in the fresh enumeration"), ("stored", "reviews in the stored manifest"),
                   ("in_both", "reviews in both manifests"), ("fresh_only", "reviews only in the fresh enumeration"),
                   ("stored_only", "reviews only in the stored manifest (counted, never imported)"))
+        if "in_study" in scores_db.table_columns(connection, "manifest_comparisons"):
+            fields += (("in_study", "enumerated reviews in the study at comparison time"),
+                       ("excluded", "enumerated reviews excluded by the protocol at comparison time"))
         for label, stratum in connection.execute("SELECT label, stratum FROM manifest_comparisons WHERE journal=? "
                                                  "ORDER BY label, stratum", (journal,)).fetchall():
             cell = "all" if stratum == "*" else slug(stratum)
@@ -271,8 +288,11 @@ def _comparison_totals(connection: sqlite3.Connection) -> dict[str, tuple[str, s
     facts: dict[str, tuple[str, str]] = {}
     if not scores_db.has_table(connection, "manifest_comparisons"):
         return facts
+    names = ("fresh", "stored", "in_both", "fresh_only", "stored_only")
+    if "in_study" in scores_db.table_columns(connection, "manifest_comparisons"):
+        names += ("in_study", "excluded")
     for (label,) in connection.execute("SELECT DISTINCT label FROM manifest_comparisons ORDER BY label").fetchall():
-        for name in ("fresh", "stored", "in_both", "fresh_only", "stored_only"):
+        for name in names:
             facts[f"census.manifest_comparison.{label}.{name}"] = (
                 f"SELECT SUM({name}) FROM manifest_comparisons WHERE label={_quote(label)} AND stratum='*'",
                 f"comparison {label}, all journals: {name.replace('_', ' ')}")

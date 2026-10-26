@@ -456,7 +456,7 @@ class InputCaches:
                 return None
             if not raw.get("abstractText"):
                 return None
-            return {"abstract": raw["abstractText"], "outcome": outcome, "provenance": {
+            return {"abstract": raw["abstractText"], "outcome": outcome, "record": raw, "provenance": {
                 "provenance": "cache-hit-public", "cache": "provider-cache",
                 "cacheVersion": self.provider_cache.version["sha256"], "sourceSha256": response.sha256,
                 "requestKey": response.key, "pointer": pointer, "identity": method, "provider": "europe-pmc",
@@ -509,7 +509,7 @@ class InputCaches:
             if not raw.get("abstractText"):
                 continue
             provenance = candidate.get("provenance") if isinstance(candidate.get("provenance"), dict) else {}
-            return {"abstract": raw["abstractText"], "outcome": outcome, "provenance": {
+            return {"abstract": raw["abstractText"], "outcome": outcome, "record": raw, "provenance": {
                 "provenance": "cache-hit-public", "cache": "store", "cacheVersion": store.version["merkleRoot"],
                 "sourceSha256": document["artifact_sha256"], "documentId": document["document_id"], "identity": method,
                 "provider": "europe-pmc", "sourceUrl": provenance.get("sourceUrl"),
@@ -518,7 +518,13 @@ class InputCaches:
 
     # ----------------------------------------------------------------- full text
     def full_text(self, work: Mapping[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-        """Cached Europe PMC fullTextXML of a cited work (bytes verified, PMCID or DOI confirmed): (hit, rejected)."""
+        """Cached Europe PMC fullTextXML of a cited work (bytes verified, PMCID or DOI confirmed): (hit, rejected).
+
+        Only the provider cache's fullTextXML responses and the store's Europe PMC documents are candidates; the
+        source paths an earlier census selected for its own escalations (``legacy-original-source``) never are. A
+        census takes a cached full text only while it retrieves every escalated work live as well (the cache then
+        stands in for a download it makes anyway), so which works earlier runs fetched cannot decide coverage.
+        """
         from .store_client import ByteCacheError
         wanted = identifiers_of(work)
         rejected: list[dict[str, Any]] = []
@@ -544,17 +550,13 @@ class InputCaches:
                 rejected.append({"cache": "store", "reason": reason})
             for document in self.store.documents(work_id, "full-text") if work_id else []:
                 source_url = str(document["source_url"] or "")
-                europe_pmc = document["provider"] == "europe-pmc" or (
-                    document["provider"] == "legacy-original-source" and source_url.startswith(EUROPE_PMC)
-                    and source_url.endswith("/fullTextXML"))
-                if not europe_pmc:
+                if document["provider"] != "europe-pmc":
                     continue
                 try:
                     metadata = json.loads(document["metadata_json"] or "{}")
                 except ValueError:
                     metadata = {}
-                raw = (metadata.get("rawArtifactSha256") if isinstance(metadata, dict) else None) \
-                    if document["provider"] == "europe-pmc" else document["artifact_sha256"]
+                raw = metadata.get("rawArtifactSha256") if isinstance(metadata, dict) else None
                 artifact = self.store.artifact(str(raw or ""))
                 if artifact is None or KIND_OF_MEDIA.get(str(artifact["media_type"]).split(";")[0].strip().lower()) != "jats":
                     continue
@@ -813,6 +815,13 @@ class ReviewAcquirer:
         return pages, notes
 
     def acquire(self, record: Mapping[str, Any]) -> Acquisition:
+        result = self._acquire(record)
+        # Whether the journal's live route was on: with it, a cache hit only stands in for a download the
+        # acquisition would make anyway; a fresh-enumeration study takes only such acquisitions.
+        result.detail["liveRoute"] = bool(self.live is not None and self.routes.get(record.get("journal")) is not None)
+        return result
+
+    def _acquire(self, record: Mapping[str, Any]) -> Acquisition:
         from .census_runner import RetryableFetch
         journal, doi = record.get("journal"), normal_doi(record.get("doi"))
         if not journal or not doi:
@@ -1073,23 +1082,82 @@ def verify_claim(record: Mapping[str, Any], document: bytes | None, caches: Inpu
         if acquisition.get("cacheVersion") != caches.provider_cache.version["sha256"]:
             return False, "acquired from a different provider cache"
         from .store_client import ByteCacheError
+        key = str(acquisition.get("requestKey") or "")
+        if key not in review_request_keys(doi, record):
+            return False, "the cached response answers another request than this review's own"
         try:
-            response = caches.provider_cache.response(str(acquisition.get("requestKey") or ""))
+            response = caches.provider_cache.response(key)
         except ByteCacheError:
             response = None
         ok = response is not None and response.sha256 == digest
-        return ok, "provider cache holds these bytes" if ok else "provider cache holds no such response"
+        return ok, "provider cache holds these bytes for this review's request" if ok else "provider cache holds no such response"
     return False, "unknown cache"
 
 
+def review_request_keys(doi: str | None, record: Mapping[str, Any]) -> set[str]:
+    """The provider-cache request keys a review's acquisition may use: its publisher page through doi.org and, with
+    a PMCID, its Europe PMC fullTextXML (the requests ``provider_review_candidates`` makes)."""
+    from .corpus_acquisition import CorpusResponseCache
+    urls = []
+    if doi:
+        urls.append("https://doi.org/" + urllib.parse.quote(doi, safe="/()"))
+    pmcid = normal_pmcid(record.get("pmcid"))
+    if pmcid:
+        urls.append(FULL_TEXT % pmcid)
+    return {CorpusResponseCache.request_key(url, None, None, True)[0] for url in urls}
+
+
 def verify_item_claim(detail: Mapping[str, Any], caches: InputCaches | None) -> bool | None:
-    """Whether a cited-work cache hit names the cache version the study pinned (None without that cache)."""
+    """Whether a cited-work cache hit names the cache version the study pinned (None without that cache).
+
+    Only the version is compared; this suits a hit the run itself just read from the cache (a full text). An
+    abstract carried in an input record is checked by ``verify_abstract_claim``.
+    """
     if detail.get("provenance") not in ("cache-hit-public", "cache-hit-entitled"):
         return None
     pinned = caches.version_of(detail.get("cache")) if caches is not None else None
     if pinned is None:
         return None
     return detail.get("cacheVersion") == pinned
+
+
+def verify_abstract_claim(work: Mapping[str, Any], detail: Mapping[str, Any], text: str,
+                          caches: InputCaches | None) -> bool | None:
+    """Re-check an abstract's cache-hit claim by reading the cited cache entry again (None without that cache).
+
+    True when the pinned cache, asked the request the lookup makes for this work (its DOI, else its PMID), selects
+    the same entry (provider-cache request key and record pointer, or store document) with the same source digest,
+    and that record's abstract is exactly ``text``.
+    """
+    version = verify_item_claim(detail, caches)
+    if version is not True:
+        return version
+    wanted = identifiers_of(work)
+    scheme = "doi" if wanted.get("doi") else "pmid" if wanted.get("pmid") else None
+    if scheme is None:
+        return False
+    outcome = "europe-pmc-core" if scheme == "doi" else "europe-pmc-core-pmid"
+    rejected: list[dict[str, Any]] = []
+    hit = None
+    if detail.get("cache") == "provider-cache":
+        from .store_client import ByteCacheError
+        query = f'DOI:"{wanted["doi"]}"' if scheme == "doi" else f"EXT_ID:{wanted['pmid']} AND SRC:MED"
+        try:
+            response = caches.provider_cache.get(SEARCH, params={"query": query, "pageSize": 5, "resultType": "core",
+                                                                 "format": "json"})
+        except ByteCacheError:
+            response = None
+        if response is not None:
+            hit = caches._provider_abstract(response, wanted, scheme, outcome, rejected)
+        keys = ("requestKey", "pointer", "sourceSha256")
+    elif detail.get("cache") == "store":
+        hit = caches._store_abstract(wanted, scheme, outcome, rejected)
+        keys = ("documentId", "sourceSha256")
+    else:
+        return False
+    if hit is None or hit["abstract"] != text:
+        return False
+    return all(hit["provenance"].get(key) == detail.get(key) for key in keys)
 
 
 # ----------------------------------------------------------------------------- fresh enumeration
@@ -1122,6 +1190,51 @@ def search_pages(*, spacing: float = 0.4, attempts: int = 4, opener: Callable[..
     return get
 
 
+# Population-level search fields an enumeration query may use: the journal, the publication type and source, the
+# language and dates. Identifier fields (DOI, EXT_ID, PMCID, PMID, ...) and bare terms, which search every field
+# including identifiers, could list an earlier study's reviews one by one and replay its population as "fresh".
+QUERY_RULE = "population-fields@1"
+QUERY_FIELDS = frozenset({"ISSN", "JOURNAL", "PUB_TYPE", "SRC", "LANG", "PUB_YEAR", "FIRST_PDATE", "FIRST_IDATE",
+                          "P_PDATE", "E_PDATE"})
+DATE_FIELDS = frozenset({"PUB_YEAR", "FIRST_PDATE", "FIRST_IDATE", "P_PDATE", "E_PDATE"})
+_QUERY_TOKEN = re.compile(r'\s*(?:(?P<open>\()|(?P<close>\))|(?P<op>AND|OR|NOT)(?=[\s()]|$)'
+                          r'|(?P<field>[A-Za-z_][A-Za-z0-9_]*):(?P<value>"(?:[^"\\]|\\.)*"|\[[^\]]*\]|[^\s()"]+)'
+                          r'|(?P<bare>"(?:[^"\\]|\\.)*"|[^\s()]+))')
+
+
+def query_problems(query: str) -> list[str]:
+    """Why an enumeration query could select reviews one by one (empty when it selects a population only)."""
+    problems, depth, position, terms = [], 0, 0, 0
+    text = str(query)
+    while position < len(text):
+        if not text[position:].strip():
+            break
+        match = _QUERY_TOKEN.match(text, position)
+        if not match or match.end() == position:
+            problems.append(f"unreadable query text at {position}")
+            break
+        position = match.end()
+        if match.group("open"):
+            depth += 1
+        elif match.group("close"):
+            depth -= 1
+            if depth < 0:
+                problems.append("unbalanced parentheses")
+                break
+        elif match.group("field"):
+            terms += 1
+            if match.group("field").upper() not in QUERY_FIELDS:
+                problems.append(f"field {match.group('field')} is not a population-level field "
+                                f"({', '.join(sorted(QUERY_FIELDS))})")
+        elif match.group("bare"):
+            problems.append(f"bare term {match.group('bare')[:40]!r} searches every field, identifiers included")
+    if depth > 0:
+        problems.append("unbalanced parentheses")
+    if not terms and not problems:
+        problems.append("the query names no field")
+    return list(dict.fromkeys(problems))
+
+
 def _spec(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, dict) or not isinstance(value.get("groups"), list) or not value["groups"]:
         raise ValidationError("an enumeration spec lists groups: [{journal, query, stratum or strata}]")
@@ -1132,11 +1245,15 @@ def _spec(value: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(window, dict) or not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(window.get(k, "")))
                                                     for k in ("from", "until")):
             raise ValidationError("the enumeration window needs from and until dates (YYYY-MM-DD)")
-        if not re.fullmatch(r"[A-Z_]{1,40}", str(window.get("field", "FIRST_PDATE"))):
-            raise ValidationError("invalid enumeration window field")
+        if str(window.get("field", "FIRST_PDATE")) not in DATE_FIELDS:
+            raise ValidationError(f"the enumeration window field is one of {', '.join(sorted(DATE_FIELDS))}")
     for group in value["groups"]:
         if not isinstance(group, dict) or not str(group.get("journal", "")).strip() or not str(group.get("query", "")).strip():
             raise ValidationError("every enumeration group needs a journal and a query")
+        problems = query_problems(str(group["query"]))
+        if problems:
+            raise ValidationError(f"enumeration query of {str(group['journal']).strip()!r} is not population-level "
+                                  f"({QUERY_RULE}): " + "; ".join(problems))
         if "strata" in group and not isinstance(group["strata"], dict):
             raise ValidationError("group strata map publication types to stratum labels")
     if value.get("resultType", "core") not in ("core", "lite"):
@@ -1257,7 +1374,7 @@ def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable
     os.replace(temporary, output)
     reviews = [[record["journal"], record["doi"]] for record in manifest]
     receipt = {"format": ENUMERATION_FORMAT, "provider": "europe-pmc", "endpoint": SEARCH, "enumeratedAt": utc_now(),
-               "codeRevision": code_revision, "spec": spec, "groups": groups, "reviews": reviews,
+               "codeRevision": code_revision, "spec": spec, "queryRule": QUERY_RULE, "groups": groups, "reviews": reviews,
                "reviewsSha256": hashlib.sha256(canonical(reviews).encode()).hexdigest(),
                "manifest": {"path": output.name, "sha256": sha256_bytes(output.read_bytes()), "records": len(manifest)},
                "pages": pages_dir.name}
@@ -1405,11 +1522,16 @@ def compare_manifests(fresh: Sequence[Mapping[str, Any]], stored: Sequence[Mappi
 
     def bump(journal: str, stratum: str | None, field_name: str) -> None:
         for key in ((journal, "*"), (journal, stratum or "(none)")):
-            cell = cells.setdefault(key, {"fresh": 0, "stored": 0, "inBoth": 0, "freshOnly": 0, "storedOnly": 0})
+            cell = cells.setdefault(key, {"fresh": 0, "stored": 0, "inBoth": 0, "freshOnly": 0, "storedOnly": 0,
+                                          "inStudy": 0, "excluded": 0})
             cell[field_name] += 1
     for doi, item in fresh_by_doi.items():
         bump(item["journal"], item.get("stratum"), "fresh")
         bump(item["journal"], item.get("stratum"), "inBoth" if doi in stored_by_doi else "freshOnly")
+        if item.get("inStudy"):
+            bump(item["journal"], item.get("stratum"), "inStudy")
+        elif item.get("excluded"):
+            bump(item["journal"], item.get("stratum"), "excluded")
     for doi, item in stored_by_doi.items():
         if doi in fresh_by_doi:
             journal, stratum = fresh_by_doi[doi]["journal"], fresh_by_doi[doi].get("stratum")
