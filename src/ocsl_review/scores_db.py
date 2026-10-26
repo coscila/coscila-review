@@ -23,8 +23,8 @@ from .errors import ValidationError
 
 SCHEMA_VERSION = 1
 TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "history",
-          "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "manifest_comparisons",
-          "data_dictionary")
+          "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "exclusions",
+          "manifest_comparisons", "data_dictionary")
 PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
 
 DDL = """
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS loci(
   sent INTEGER NOT NULL, PRIMARY KEY(journal, doi, label, seq));
 CREATE TABLE IF NOT EXISTS works(
   work_key TEXT PRIMARY KEY, doi TEXT, pmid TEXT, pmcid TEXT, title TEXT, venue TEXT, year TEXT, retracted INTEGER,
-  identity_version TEXT NOT NULL);
+  identity_version TEXT NOT NULL, derivation TEXT, metadata_provenance TEXT);
 CREATE TABLE IF NOT EXISTS identity(
   journal TEXT NOT NULL, doi TEXT NOT NULL, label TEXT NOT NULL, work_key TEXT, identity TEXT NOT NULL, method TEXT,
   title_agrees INTEGER, ladder TEXT NOT NULL, proof_json TEXT, PRIMARY KEY(journal, doi, label));
@@ -105,11 +105,15 @@ CREATE TABLE IF NOT EXISTS input_provenance(
 CREATE TABLE IF NOT EXISTS enumeration(
   journal TEXT NOT NULL, doi TEXT NOT NULL, stratum TEXT, first_online TEXT, year INTEGER, pmid TEXT, pmcid TEXT,
   receipt_sha256 TEXT NOT NULL, PRIMARY KEY(journal, doi));
+CREATE TABLE IF NOT EXISTS exclusions(
+  journal TEXT NOT NULL, doi TEXT NOT NULL, reason TEXT NOT NULL, enumeration_sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL, PRIMARY KEY(journal, doi));
 CREATE TABLE IF NOT EXISTS manifest_comparisons(
   label TEXT NOT NULL, journal TEXT NOT NULL, stratum TEXT NOT NULL, fresh INTEGER NOT NULL, stored INTEGER NOT NULL,
   in_both INTEGER NOT NULL, fresh_only INTEGER NOT NULL, stored_only INTEGER NOT NULL, stored_sha256 TEXT NOT NULL,
   enumeration_sha256 TEXT NOT NULL, report_sha256 TEXT NOT NULL, run_complete INTEGER NOT NULL,
-  compared_at TEXT NOT NULL, PRIMARY KEY(label, journal, stratum));
+  compared_at TEXT NOT NULL, in_study INTEGER, excluded INTEGER, population_sha256 TEXT,
+  PRIMARY KEY(label, journal, stratum));
 CREATE TABLE IF NOT EXISTS data_dictionary(
   table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
   PRIMARY KEY(table_name, column_name));
@@ -190,7 +194,12 @@ DICTIONARY: dict[str, dict[str, str]] = {
              "sent": "1 when the sentence was among the citing sentences sent"},
     "works": {"work_key": "cited work key", "doi": "DOI", "pmid": "PMID", "pmcid": "PMCID", "title": "title",
               "venue": "venue", "year": "year", "retracted": "retraction flag sent to the judge",
-              "identity_version": "identity ladder version; a change invalidates downstream evidence and verdicts"},
+              "identity_version": "identity ladder version; a change invalidates downstream evidence and verdicts",
+              "derivation": "how the work record was derived (bibliography-identifiers@1: from identifiers in the citing "
+                            "review's own bibliography); NULL for a work record an input supplied",
+              "metadata_provenance": "where the title, venue, year, PMCID and retraction flag came from: the provenance "
+                                     "class of the recorded lookup (cache-hit-public, live-public, unavailable), or "
+                                     "supplied; NULL when not recorded"},
     "identity": {"journal": "journal", "doi": "citing review DOI", "label": "bibliography label", "work_key": "resolved work",
                  "identity": "identity class", "method": "ladder step", "title_agrees": "printed entry contains the work title",
                  "ladder": "identity ladder version", "proof_json": "identifiers and comparisons used"},
@@ -247,22 +256,32 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "identity_check": "identifiers that agreed between the request and the document (doi, pmcid, pmid)",
         "provider": "provider of the bytes", "source_url": "provider address the bytes came from",
         "retrieved_at": "original retrieval or capture time",
-        "verified": "1 when a cache hit was re-checked at preparation against the pinned cache, 0 when it was not, "
-                    "NULL when there is nothing to re-check",
+        "verified": "1 when a cache hit was re-checked against the pinned cache (the cited entry read again: its bytes, "
+                    "its request or document, and for an abstract its record and text; a full text read from the cache "
+                    "in this run), 0 when the check failed or could not be made, NULL when there is nothing to re-check",
         "detail_json": "acquisition record: rejected cache candidates with their reasons, table pages, live attempts",
         "recorded_at": "time the item was recorded"},
     "enumeration": {"journal": "journal (enumeration group)", "doi": "review DOI, lower case",
                     "stratum": "stratum assigned by the enumeration spec", "first_online": "first publication date",
                     "year": "first-online year", "pmid": "PMID", "pmcid": "PMCID",
                     "receipt_sha256": "sha256 of the enumeration receipt (kept provider pages and their digests)"},
+    "exclusions": {"journal": "journal (enumeration group)", "doi": "enumerated review DOI, lower case",
+                   "reason": "protocol reason the enumerated review is not in the study",
+                   "enumeration_sha256": "sha256 of the enumeration receipt the review belongs to",
+                   "recorded_at": "time the exclusion was recorded (before any manifest comparison)"},
     "manifest_comparisons": {
         "label": "comparison label", "journal": "journal ((unattributed) for stored-only reviews of other journals)",
         "stratum": "stratum, * for the journal total", "fresh": "reviews in the fresh enumeration",
         "stored": "reviews in the stored manifest", "in_both": "reviews in both", "fresh_only": "only in the fresh enumeration",
         "stored_only": "only in the stored manifest (counted, never imported)", "stored_sha256": "sha256 of the stored manifest",
         "enumeration_sha256": "sha256 of the enumeration receipt", "report_sha256": "sha256 of the comparison report",
-        "run_complete": "1 when the census run was complete at comparison time (the default requirement), else 0",
-        "compared_at": "comparison time"},
+        "run_complete": "1 when the census run was complete at comparison time (the default requirement: every "
+                        "enumerated review in the study or excluded, and no review pending), else 0",
+        "compared_at": "comparison time",
+        "in_study": "enumerated reviews of the cell in the study at comparison time",
+        "excluded": "enumerated reviews of the cell excluded by the protocol at comparison time",
+        "population_sha256": "sha256 of the study population at comparison time (reviews with their provenance and the "
+                             "exclusions); the gates check that it is unchanged"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }
 
@@ -290,11 +309,14 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    """Additive changes for working databases created before them: the review and full-text provenance columns."""
-    if "provenance" not in table_columns(connection, "reviews"):
-        connection.execute("ALTER TABLE reviews ADD COLUMN provenance TEXT")
-    if "ft_provenance" not in table_columns(connection, "citations"):
-        connection.execute("ALTER TABLE citations ADD COLUMN ft_provenance TEXT")
+    """Additive changes for working databases created before them: provenance, work derivation and comparison columns."""
+    for table, column in (("reviews", "provenance"), ("citations", "ft_provenance"), ("works", "derivation"),
+                          ("works", "metadata_provenance"), ("manifest_comparisons", "population_sha256")):
+        if column not in table_columns(connection, table):
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+    for column in ("in_study", "excluded"):
+        if column not in table_columns(connection, "manifest_comparisons"):
+            connection.execute(f"ALTER TABLE manifest_comparisons ADD COLUMN {column} INTEGER")
 
 
 def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
@@ -389,8 +411,33 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def population(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """The study population of a fresh enumeration: enumerated reviews in the study, excluded, and neither; plus the
+    digest of the population (every review with its provenance, every exclusion with its reason). None when the
+    study is not pinned to an enumeration."""
+    pinned = connection.execute("SELECT value FROM meta WHERE key='enumerationSha256'").fetchone()
+    if not pinned or not has_table(connection, "enumeration"):
+        return None
+    excluded_table = has_table(connection, "exclusions")
+    in_study = "EXISTS (SELECT 1 FROM reviews r WHERE r.journal=e.journal AND r.doi=e.doi)"
+    excluded = ("EXISTS (SELECT 1 FROM exclusions x WHERE x.journal=e.journal AND x.doi=e.doi)" if excluded_table
+                else "0")
+    enumerated, studied, dropped, unexplained = connection.execute(
+        f"SELECT COUNT(*), SUM({in_study}), SUM(NOT ({in_study}) AND {excluded}), SUM(NOT ({in_study}) AND NOT ({excluded})) "
+        "FROM enumeration e").fetchone()
+    digest = hashlib.sha256()
+    for row in connection.execute("SELECT journal, doi, provenance FROM reviews ORDER BY journal, doi"):
+        digest.update(json.dumps(["review", *row], ensure_ascii=False).encode("utf-8") + b"\n")
+    if excluded_table:
+        for row in connection.execute("SELECT journal, doi, reason FROM exclusions ORDER BY journal, doi"):
+            digest.update(json.dumps(["excluded", *row], ensure_ascii=False).encode("utf-8") + b"\n")
+    return {"enumerationSha256": pinned[0], "enumerated": enumerated or 0, "inStudy": studied or 0,
+            "excluded": dropped or 0, "unexplained": unexplained or 0, "sha256": digest.hexdigest()}
+
+
 def completeness(connection: sqlite3.Connection) -> dict[str, Any]:
-    """Whether a run is finished: not paused, no review pending in either tier, no open entry."""
+    """Whether a run is finished: not paused, no review pending in either tier, no open entry, and in a study pinned
+    to a fresh enumeration every enumerated review in the study or excluded with a recorded reason."""
     state = (connection.execute("SELECT value FROM meta WHERE key='runState'").fetchone() or ["active"])[0]
     abstract = connection.execute("SELECT COUNT(*) FROM reviews WHERE abstract_state!='completed'").fetchone()[0]
     full_text = connection.execute("SELECT COUNT(*) FROM reviews WHERE full_text_state!='completed'").fetchone()[0]
@@ -401,8 +448,12 @@ def completeness(connection: sqlite3.Connection) -> dict[str, Any]:
         problems.append(f"{abstract} reviews pending in the abstract tier")
     if full_text:
         problems.append(f"{full_text} reviews pending in the full-text tier")
+    enumerated = population(connection)
+    if enumerated and enumerated["unexplained"]:
+        problems.append(f"{enumerated['unexplained']} enumerated reviews are neither in the study nor excluded with a "
+                        "recorded reason")
     return {"complete": not problems, "runState": state, "abstractPending": abstract, "fullTextPending": full_text,
-            "problems": problems}
+            "population": enumerated, "problems": problems}
 
 
 ENTITLED_REVIEWS = "(SELECT journal, doi FROM reviews WHERE provenance_class='entitled')"

@@ -12,16 +12,18 @@ import sqlite3
 import tempfile
 import unittest
 import urllib.parse
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from ocsl_review import census_inputs, corpus_facts, scores_db
-from ocsl_review.census_inputs import (FULL_TEXT, SEARCH, InputCaches, LiveSources, ReviewAcquirer, acquire_records,
-                                       acquired_record, compare_manifests, enumerate_reviews, load_enumeration,
-                                       parse_routes, verify_claim)
+from ocsl_review import census_abstracts, census_inputs, corpus_facts, scores_db
+from ocsl_review.census_inputs import (FULL_TEXT, QUERY_RULE, SEARCH, InputCaches, LiveSources, ReviewAcquirer,
+                                       acquire_records, acquired_record, compare_manifests, enumerate_reviews,
+                                       load_enumeration, parse_routes, verify_claim)
 from ocsl_review.census_abstracts import fill_record
-from ocsl_review.census_runner import CensusRun, RetryableFetch, census_status, record_comparison
+from ocsl_review.census_runner import (CensusRun, HttpChatTransport, RetryableFetch, census_status, record_comparison,
+                                       record_exclusions)
+from ocsl_review.census_works import WORKS_DERIVATION, derive_works, fill_works, metadata_label
 from ocsl_review.cli import main
 from ocsl_review.corpus_acquisition import CorpusResponseCache
 from ocsl_review.corpus_library import now
@@ -32,7 +34,7 @@ from ocsl_review.evidence import abstract_candidate
 from ocsl_review.scholarly import RawResponse, normalize_europe_pmc
 from ocsl_review.store_client import (ByteCacheError, EvidenceStore, GuardedReader, ProviderCache, TableAllowlistError)
 from ocsl_review.store_projection import KEPT_TABLES, build_projection
-from ocsl_review.study_cli import gates, prepare
+from ocsl_review.study_cli import fill_abstracts, gates, prepare
 
 from test_census_runner import FIXTURES, JOURNAL, RunnerTestCase, record
 
@@ -95,9 +97,14 @@ def build_caches(root: Path) -> dict:
         # A legacy normalised abstract column: never an abstract of record.
         db.execute("INSERT INTO works VALUES(?,?,?,?,?,?,NULL,NULL,NULL)",
                    ("doi:10.5555/w6", "10.5555/w6", "Fictional cohort six", 2019, "Legacy normalised text.", "europepmc"))
+        # A full text the earlier census selected for one of its own escalations (legacy-original-source).
+        db.execute("INSERT INTO works VALUES(?,?,?,?,NULL,NULL,?,?,?)",
+                   ("doi:10.5555/w9", "10.5555/w9", "Range member nine and box source", 2016, "work/corpus/w9.xml",
+                    FULL_TEXT % "PMC900009", "jats"))
         db.execute("INSERT INTO papers VALUES(?,?,?,?)", (JATS_REVIEW, "Synthetic review", 2021, "work/corpus/review.xml"))
         db.execute("INSERT INTO bib_refs VALUES(?,?,?,?)", (JATS_REVIEW, "1", "Printed reference", "doi:10.5555/w1"))
     (legacy / "work/corpus/review.xml").write_bytes((FIXTURES / "review.xml").read_bytes())
+    (legacy / "work/corpus/w9.xml").write_bytes(cited_jats("PMC900009", "10.5555/w9", "Selected full text of work nine."))
     import_legacy_evidence(seed, database, source_root=legacy)
     with seed.connect(write=True) as connection:
         method = connection.execute("SELECT sha256 FROM source_artifacts LIMIT 1").fetchone()[0]
@@ -421,12 +428,76 @@ class CitedWorkTests(CacheTestCase):
                           "14": ("unavailable", "no-pmcid")}, provenance)
         items = {r["work_key"]: r for r in self.rows("SELECT * FROM input_provenance WHERE kind='full-text'")}
         self.assertEqual(("provider-cache", 1), (items["work-5"]["cache"], items["work-5"]["verified"]))
+        self.assertTrue(all(json.loads(item["detail_json"])["liveRetrieval"] for item in items.values()))
         self.assertEqual(("store", "doi+pmcid"), (items["work-7"]["cache"], items["work-7"]["identity_check"]))
         self.assertEqual("identity-mismatch", json.loads(items["work-15"]["detail_json"])["rejected"][0]["reason"])
         with closing(scores_db.open_readonly(self.database)) as connection:
             status = census_status(connection)
         self.assertEqual({"cache-hit-public": 2, "live-public": 1}, status["itemProvenance"]["full-text"])
         self.assertEqual(caches.store.version["merkleRoot"], status["inputs"]["inputStore"]["merkleRoot"])
+
+
+    def test_full_text_caches_stand_in_only_for_live_downloads_and_never_offer_earlier_selections(self):
+        caches = self.caches()
+        # The store holds a full text an earlier census selected for its own escalation; it is never a candidate.
+        store = caches.store
+        work_id, _ = store.find_work({"doi": "10.5555/w9"})
+        self.assertIn("legacy-original-source", {document["provider"] for document in store.documents(work_id, "full-text")})
+        self.assertEqual((None, []), caches.full_text({"doi": "10.5555/w9", "pmcid": "PMC900009"}))
+        self.assertIsNotNone(caches.full_text({"doi": "10.5555/w7", "pmcid": "PMC900007"})[0])   # a Europe PMC document
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        run.pin_inputs(caches)
+        with self.assertRaisesRegex(ValidationError, "stand in only for downloads"):
+            run.run_full_text(cache=caches)
+        self.assertEqual([], self.rows("SELECT * FROM input_provenance WHERE kind='full-text'"))
+        run.close()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            code = main(["study", "full-text", "--database", str(self.database), "--seed", "1234", "--base-url", self.base,
+                         "--store", str(self.paths["projection"])])
+        self.assertNotEqual(0, code)
+        self.assertIn("--europe-pmc", buffer.getvalue())
+        # A full text taken from the cache while retrieving live is a stand-in; one without (an older run) fails the gate.
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        self.assertEqual(0, status["inputChecks"]["fullTextCacheHitsWithoutLiveRetrieval"])
+
+    def test_works_derived_from_the_bibliography_take_their_metadata_from_the_abstract_lookup(self):
+        document = (FIXTURES / "review.xml").read_bytes()
+        works, counts = derive_works(document, "jats")
+        self.assertEqual({"entries": 17, "withoutIdentifier": 1, "works": 16}, counts)
+        self.assertEqual({"doi": "10.5555/w2", "pmid": "100002"}, works["doi:10.5555/w2"])
+        self.assertEqual({"pmid": "100003"}, works["pmid:100003"])
+        self.assertIn("doi:10.5555/s0140-6736(14)00012-5", works)          # a DOI printed in the entry
+        folder = self.root / "derive"
+        folder.mkdir()
+        (folder / "review.xml").write_bytes(document)
+        base = {"journal": JOURNAL, "doi": JATS_REVIEW, "document": {"path": "review.xml", "kind": "jats"}}
+        (folder / "in.jsonl").write_text(json.dumps(base) + "\n")
+        result = fill_works(folder / "in.jsonl", folder / "works.jsonl")
+        self.assertEqual((1, 16, 1), (result["derived"], result["works"], result["entriesWithoutIdentifier"]))
+        row = json.loads((folder / "works.jsonl").read_text())
+        provenance = row["works"]["doi:10.5555/w1"]["workProvenance"]
+        self.assertEqual((WORKS_DERIVATION, census_inputs.sha256_bytes(document)),
+                         (provenance["derivation"], provenance["documentSha256"]))
+        (folder / "carried.jsonl").write_text(json.dumps({**base, "works": record()["works"]}) + "\n")
+        with self.assertRaisesRegex(ValidationError, "already carries works"):
+            fill_works(folder / "carried.jsonl", folder / "refused.jsonl")
+        filled = fill_record(row, lookups, cache=self.caches())["works"]
+        one, three, seven = filled["doi:10.5555/w1"], filled["pmid:100003"], filled["doi:10.5555/w7"]
+        self.assertEqual(("cache-hit-public", "A cited work", 2020), (one["metadataProvenance"]["provenance"], one["title"],
+                                                                      one["year"]))
+        self.assertEqual(("live-public", "PMC900007"), (seven["metadataProvenance"]["provenance"], seven["pmcid"]))
+        self.assertEqual("live-public", three["metadataProvenance"]["provenance"])
+        self.assertEqual("cache-hit-public", metadata_label(one))
+        self.assertEqual("supplied", metadata_label({**one, "title": "Changed after the lookup"}))
+        self.assertIsNone(metadata_label({"doi": "10.5555/x", "title": "A supplied work"}))
+        # Works an input supplied keep their metadata: only derived works take it from the lookup.
+        supplied = fill_record({"journal": JOURNAL, "doi": JATS_REVIEW, "works": {"w1": {"doi": "10.5555/w1", "title": "Kept"}}},
+                               lookups, cache=self.caches())["works"]["w1"]
+        self.assertEqual(("Kept", None), (supplied["title"], supplied.get("metadataProvenance")))
 
 
 class PreparationProvenanceTests(CacheTestCase):
@@ -487,6 +558,64 @@ class PreparationProvenanceTests(CacheTestCase):
         with self.assertRaisesRegex(ValidationError, "inputStore is pinned"):
             again.pin_inputs(other)
 
+    def test_abstract_cache_claims_are_read_again_at_preparation(self):
+        caches = self.caches()
+        works = {"w1": {"doi": "10.5555/w1", "title": "One"}, "w5": {"doi": "10.5555/w5", "title": "Five"},
+                 "w6": {"doi": "10.5555/w6", "title": "Six"}}
+        filled = fill_record({"journal": JOURNAL, "doi": "x", "works": works}, lookups, cache=caches)["works"]
+        self.assertEqual(("provider-cache", "store"), (filled["w1"]["abstractProvenance"]["cache"],
+                                                       filled["w5"]["abstractProvenance"]["cache"]))
+        claim = lambda work: {"provenance": "cache-hit-public", **work["abstractProvenance"]}
+        verify = census_inputs.verify_abstract_claim
+        self.assertTrue(verify(filled["w1"], claim(filled["w1"]), filled["w1"]["abstract"], caches))
+        self.assertTrue(verify(filled["w5"], claim(filled["w5"]), filled["w5"]["abstract"], caches))
+        # Replaced text with its digest recomputed: the cache record says otherwise.
+        self.assertFalse(verify(filled["w1"], claim(filled["w1"]), "A replaced abstract.", caches))
+        # A pointer to another record, or a claim for another work, is refuted; without the cache nothing is shown.
+        self.assertFalse(verify(filled["w1"], {**claim(filled["w1"]), "pointer": "/resultList/result/3"},
+                                filled["w1"]["abstract"], caches))
+        self.assertFalse(verify(filled["w6"], claim(filled["w1"]), filled["w1"]["abstract"], caches))
+        self.assertIsNone(verify(filled["w1"], claim(filled["w1"]), filled["w1"]["abstract"], None))
+        # At preparation: the tampered abstract is recorded as an unverified cache hit.
+        tampered = {**filled["w1"], "abstract": "A replaced abstract."}
+        tampered["abstractProvenance"] = {**filled["w1"]["abstractProvenance"],
+                                          "textSha256": census_inputs.sha256_bytes(b"A replaced abstract.")}
+        data = record()
+        data["works"] = {**data["works"], "work-1": {**data["works"]["work-1"], **{k: tampered[k] for k in (
+            "abstract", "abstractSource", "abstractProvenance", "europePmcOutcome")}},
+                         "work-5": {**data["works"]["work-5"], **{k: filled["w5"][k] for k in (
+                             "abstract", "abstractSource", "abstractProvenance", "europePmcOutcome")}}}
+        run = self.run_census()
+        run.pin_inputs(caches)
+        run.prepare_review(data, (FIXTURES / "review.xml").read_bytes())
+        verified = {r["work_key"]: r["verified"] for r in self.rows("SELECT work_key, verified FROM input_provenance "
+                                                                    "WHERE kind='abstract' AND provenance='cache-hit-public'")}
+        self.assertEqual({"work-1": 0, "work-5": 1}, verified)
+
+    def test_review_claims_name_this_reviews_own_request_and_document(self):
+        caches = self.caches()
+        body = html_review(CACHED_REVIEW)
+        acquired = ReviewAcquirer(caches, routes=parse_routes([f"{SECOND}=entitled"])).acquire(
+            {"journal": SECOND, "doi": CACHED_REVIEW})
+        claim = {"journal": SECOND, "doi": CACHED_REVIEW, "acquisition": {"provenance": "cache-hit-entitled", **acquired.detail}}
+        self.assertEqual((True, "provider cache holds these bytes for this review's request"),
+                         verify_claim(claim, body, caches))
+        other = {**claim, "doi": "10.5555/another.review"}
+        self.assertEqual((False, "the cached response answers another request than this review's own"),
+                         verify_claim(other, body, caches))
+        # A JATS document that declares only a PMCID must declare this review's PMCID when prepared.
+        document = (FIXTURES / "review.xml").read_bytes().replace(
+            b'<article-id pub-id-type="doi">10.5555/synthetic.review.1</article-id>',
+            b'<article-id pub-id-type="pmcid">PMC111</article-id>')
+        acquisition = {"provenance": "live-public", "sourceSha256": census_inputs.sha256_bytes(document),
+                       "retrievedAt": "2026-01-01T00:00:00Z"}
+        run = self.run_census()
+        wrong = {**record(doi="10.5555/pmcid.review"), "pmcid": "PMC222", "acquisition": acquisition}
+        with self.assertRaisesRegex(ValidationError, "do not confirm this review"):
+            run.prepare_review(wrong, document)
+        right = {**record(doi="10.5555/pmcid.review"), "pmcid": "PMC111", "acquisition": acquisition}
+        self.assertEqual("prepared", run.prepare_review(right, document)["state"])
+
     def test_verify_claim_refutes_changed_bytes_and_other_versions(self):
         caches = self.caches()
         body = (FIXTURES / "review.xml").read_bytes()
@@ -514,6 +643,27 @@ def enumerated(doi, kind, first="2021-03-01", pmcid=None):
             "firstPublicationDate": first, "pubYear": first[:4], "pubTypeList": {"pubType": [kind]}}
 
 
+def refuse_live(*args):
+    raise AssertionError("the caches hold every review: nothing is fetched live")
+
+
+# The journals' live routes are on (as a fresh study requires); every review is in the caches, so none is used.
+LIVE = LiveSources(europe_pmc=refuse_live, publisher=refuse_live)
+LIVE_PMCIDS = {"10.5555/w7": "PMC900007"}
+
+
+def lookups(params):
+    """Europe PMC search answers for the abstract and metadata lookups (a record with an abstract for every DOI)."""
+    results = []
+    for part in params["query"].split(" OR "):
+        if '"' in part:
+            doi = part.split('"')[1]
+            results.append(epmc(doi=doi, abstract="Live abstract.", title="Live title " + doi, pmcid=LIVE_PMCIDS.get(doi)))
+    if params["query"].startswith("EXT_ID:"):
+        results.append(epmc(pmid=params["query"].split(":")[1].split()[0], abstract="Live abstract by PMID."))
+    return {"resultList": {"result": results}}
+
+
 class FreshEnumerationTests(CacheTestCase):
     SPEC = {"window": {"from": "2020-01-01", "until": "2022-12-31"}, "pageSize": 2,
             "groups": [{"journal": JOURNAL, "query": 'ISSN:"0000-0001"', "stratum": "Review",
@@ -539,6 +689,26 @@ class FreshEnumerationTests(CacheTestCase):
         result = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
         return manifest, result, requests
 
+    def fresh_inputs(self):
+        """Enumerate, acquire with the live routes on, derive the works, look up abstracts and metadata."""
+        manifest, result, _ = self.enumerate()
+        enumeration = load_enumeration(Path(result["receipt"]))
+        caches = self.caches()
+        acquirer = ReviewAcquirer(caches, routes=parse_routes([f"{JOURNAL}=public", f"{SECOND}=entitled"]), live=LIVE)
+        acquired = manifest.parent / "acquired.jsonl"
+        acquire_records(manifest, acquired, acquirer)
+        derived = manifest.parent / "works.jsonl"
+        fill_works(acquired, derived)
+        looked_up = manifest.parent / "abstracts.jsonl"
+        fill_abstracts(derived, looked_up, lookups, cache=caches)
+        return manifest, enumeration, caches, [json.loads(line) for line in looked_up.read_text().splitlines()]
+
+    def census(self, database: Path, **kwargs) -> CensusRun:
+        transport = HttpChatTransport(self.base, on_premises=kwargs.pop("on_premises", False))
+        run = CensusRun(database, seed=1234, transport=transport, concurrency=4, sleep=lambda s: None, **kwargs)
+        self.addCleanup(run.close)
+        return run
+
     def test_enumeration_keeps_its_pages_and_verifies_them(self):
         manifest, result, requests = self.enumerate()
         self.assertEqual(3, result["records"])
@@ -551,6 +721,7 @@ class FreshEnumerationTests(CacheTestCase):
         enumeration = load_enumeration(receipt)
         self.assertEqual(3, len(enumeration.reviews))
         self.assertEqual(1, json.loads(receipt.read_text())["groups"][0]["withoutDoi"])
+        self.assertEqual(QUERY_RULE, json.loads(receipt.read_text())["queryRule"])
         with self.assertRaisesRegex(ValidationError, "already exists"):
             enumerate_reviews(self.SPEC, manifest, self.provider()[0])
         page = next(Path(str(manifest) + ".pages").iterdir())
@@ -574,37 +745,62 @@ class FreshEnumerationTests(CacheTestCase):
         with self.assertRaises(ValidationError):
             enumerate_reviews({"groups": []}, self.root / "c.jsonl", short)
 
-    def test_fresh_study_prepares_only_enumerated_acquired_reviews_and_compares_afterwards(self):
+    def test_enumeration_queries_select_a_population_never_single_reviews(self):
+        for query in ('DOI:"10.5555/a" OR DOI:"10.5555/b"', '"10.5555/a" OR "10.5555/b"', "EXT_ID:1 AND SRC:MED",
+                      'ISSN:"1" or ISSN:"2"', "pmcid:PMC1", 'ISSN:"1" AND (PUB_TYPE:"review"'):
+            spec = {**self.SPEC, "groups": [{"journal": JOURNAL, "query": query, "stratum": "Review"}]}
+            with self.subTest(query=query), self.assertRaisesRegex(ValidationError, "not population-level"):
+                enumerate_reviews(spec, self.root / "refused.jsonl", self.provider()[0])
+        self.assertEqual([], census_inputs.query_problems(
+            '(ISSN:"0000-0001" OR JOURNAL:"Synthetic Journal") AND PUB_TYPE:"review" AND NOT PUB_TYPE:"erratum"'))
+        with self.assertRaisesRegex(ValidationError, "window field"):
+            enumerate_reviews({**self.SPEC, "window": {"from": "2020-01-01", "until": "2021-01-01", "field": "DOI"}},
+                              self.root / "window.jsonl", self.provider()[0])
+        self.assertFalse((self.root / "refused.jsonl").exists())
         manifest, result, _ = self.enumerate()
-        receipt = Path(result["receipt"])
-        enumeration = load_enumeration(receipt)
-        caches = self.caches()
-        acquirer = ReviewAcquirer(caches, routes=parse_routes([f"{JOURNAL}=public", f"{SECOND}=entitled"]))
-        acquired = manifest.parent / "acquired.jsonl"
-        acquire_records(manifest, acquired, acquirer)
-        rows = [json.loads(line) for line in acquired.read_text().splitlines()]
+        # A receipt whose spec lists reviews one by one is refused when a study would pin it.
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        receipt["spec"]["groups"][0]["query"] = 'DOI:"%s"' % JATS_REVIEW
+        forged = manifest.parent / "forged.receipt.json"
+        forged.write_text(json.dumps(receipt))
+        with self.assertRaisesRegex(ValidationError, "not population-level"):
+            load_enumeration(forged)
+        # The rule is pinned with the enumeration and checked by the gates.
+        run = self.run_census()
+        empty = manifest.parent / "empty.jsonl"
+        empty.write_text("")
+        prepare(run, empty, enumeration=load_enumeration(Path(result["receipt"])))
+        run.close()
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        self.assertEqual(QUERY_RULE, status["enumeration"]["queryRule"])
+        self.assertTrue(gates(status)["checks"]["enumerationQueriesPopulationLevel"])
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DELETE FROM meta WHERE key='enumerationQueryRule'")
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            self.assertFalse(gates(census_status(connection))["checks"]["enumerationQueriesPopulationLevel"])
+
+    def test_fresh_study_prepares_only_enumerated_acquired_reviews_and_compares_afterwards(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
         self.assertEqual(["cache-hit-public", "cache-hit-public", "cache-hit-entitled"],
                          [row["acquisition"]["provenance"] for row in rows])
-        # The study's own cited-work records (identifiers and metadata, no abstracts yet), then the abstract lookups:
-        # the caches first, Europe PMC (mocked here) for the rest.
-        works = {key: {k: v for k, v in work.items() if k not in ("abstract", "abstractSource")}
-                 for key, work in record()["works"].items()}
-
-        def get(params):
-            results = [epmc(doi=part.split('"')[1], abstract="Live abstract.") for part in params["query"].split(" OR ")
-                       if '"' in part]
-            if params["query"].startswith("EXT_ID:"):
-                results.append(epmc(pmid=params["query"].split(":")[1].split()[0], abstract="Live abstract by PMID."))
-            return {"resultList": {"result": results}}
-        withworks = [fill_record({**row, "works": works}, get, cache=caches) for row in rows]
-        labels = {work["abstractProvenance"]["provenance"] for work in withworks[0]["works"].values()}
+        self.assertTrue(all(row["acquisition"]["liveRoute"] for row in rows))
+        # Works derived from the review's own bibliography, metadata and abstracts from recorded lookups.
+        self.assertEqual((WORKS_DERIVATION, "derived", 17, 1),
+                         tuple(rows[0]["worksDerivation"][k] for k in ("derivation", "state", "entries", "withoutIdentifier")))
+        one, seven = rows[0]["works"]["doi:10.5555/w1"], rows[0]["works"]["doi:10.5555/w7"]
+        self.assertEqual(("cache-hit-public", "provider-cache", "A cited work"),
+                         (one["metadataProvenance"]["provenance"], one["metadataProvenance"]["cache"], one["title"]))
+        self.assertEqual(("live-public", "Live title 10.5555/w7", "PMC900007"),
+                         (seven["metadataProvenance"]["provenance"], seven["title"], seven["pmcid"]))
+        labels = {work["abstractProvenance"]["provenance"] for work in rows[0]["works"].values()}
         self.assertEqual({"cache-hit-public", "live-public"}, labels)
-        extra = [{**withworks[0], "doi": "10.5555/not.enumerated"},
-                 {**withworks[0], "stratum": "Mini Review"},
-                 {key: value for key, value in withworks[1].items() if key != "works"},
-                 {key: value for key, value in withworks[2].items() if key != "enumeration"}]
+        extra = [{**rows[0], "doi": "10.5555/not.enumerated"},
+                 {**rows[0], "stratum": "Mini Review"},
+                 {key: value for key, value in rows[1].items() if key != "works"},
+                 {key: value for key, value in rows[2].items() if key != "enumeration"}]
         source = manifest.parent / "prepared-input.jsonl"
-        source.write_text("".join(json.dumps(row) + "\n" for row in withworks + extra))
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows + extra))
         run = self.run_census()
         # Cache-hit claims that cannot be re-checked (no caches given) are refused in a fresh-enumeration study.
         blind = prepare(run, source, enumeration=enumeration)
@@ -621,12 +817,16 @@ class FreshEnumerationTests(CacheTestCase):
         with closing(scores_db.open_readonly(self.database)) as connection:
             status = census_status(connection)
         verdict = gates(status, require_fresh_enumeration=True)["checks"]
-        self.assertTrue(all(verdict[name] for name in ("freshEnumerationPinned", "reviewsComeFromTheEnumeration",
-                                                        "everyReviewHasAcquisitionProvenance", "cacheHitsVerified",
-                                                        "everyAbstractFromARecordedLookup")), verdict)
+        for name in ("freshEnumerationPinned", "reviewsComeFromTheEnumeration", "everyReviewHasAcquisitionProvenance",
+                     "cacheHitsVerified", "everyAbstractFromARecordedLookup", "noCarriedIdentityMapsOrCountries",
+                     "everyWorkDerivedFromItsReview", "everyWorkMetadataFromARecordedLookup",
+                     "reviewsAcquiredThroughLiveRoutes", "fullTextCacheHitsBackedByLiveRetrieval",
+                     "enumerationQueriesPopulationLevel", "everyEnumeratedReviewInStudyOrExcluded"):
+            self.assertTrue(verdict[name], name)
         self.assertEqual(0, status["inputChecks"]["abstractsWithoutLookup"])
-        self.assertEqual({"sha256": enumeration.sha256, "reviews": 3, "inStudy": 3, "notInStudy": 0,
-                          "reviewsOutsideEnumeration": 0}, status["enumeration"])
+        self.assertEqual({"sha256": enumeration.sha256, "reviews": 3, "inStudy": 3, "notInStudy": 0, "excluded": 0,
+                          "unexplained": 0, "reviewsOutsideEnumeration": 0, "queryRule": QUERY_RULE},
+                         {k: v for k, v in status["enumeration"].items() if k != "populationSha256"})
         stored = manifest.parent / "stored.csv"
         with stored.open("w", newline="") as handle:
             writer = csv.writer(handle)
@@ -639,23 +839,41 @@ class FreshEnumerationTests(CacheTestCase):
         early = record_comparison(self.database, stored, manifest.parent / "early.json", label="early", allow_incomplete=True)
         self.assertEqual({"fresh": 3, "stored": 3, "inBoth": 1, "freshOnly": 2, "storedOnly": 2}, early["totals"])
         self.assertFalse(early["runComplete"])
-        self.assertEqual({"fresh": 2, "stored": 2, "inBoth": 1, "freshOnly": 1, "storedOnly": 1}, early["byJournal"][JOURNAL])
+        self.assertEqual({"fresh": 2, "stored": 2, "inBoth": 1, "freshOnly": 1, "storedOnly": 1, "inStudy": 2, "excluded": 0},
+                         early["byJournal"][JOURNAL])
         self.assertEqual(1, early["byJournal"]["(unattributed)"]["storedOnly"])
         report = json.loads((manifest.parent / "early.json").read_text())
         self.assertEqual((["10.5555/elsewhere", "10.5555/stored.only"], 0, 1), (report["storedOnly"], report["imported"],
                                                                                 report["stored"]["invalid"]))
+        self.assertEqual((3, 0, 0), (report["population"]["inStudy"], report["population"]["excluded"],
+                                     report["population"]["unexplained"]))
         reviews = {row["doi"] for row in self.rows("SELECT doi FROM reviews")}
         self.assertEqual({JATS_REVIEW, HTML_REVIEW, CACHED_REVIEW}, reviews, "nothing of the stored manifest is imported")
         with self.assertRaisesRegex(ValidationError, "already recorded"):
             record_comparison(self.database, stored, manifest.parent / "again.json", label="early", allow_incomplete=True)
+        # The first comparison froze the population: nothing is prepared or excluded after it.
+        run = self.run_census()
+        with self.assertRaisesRegex(ValidationError, "population is frozen"):
+            prepare(run, source, caches=caches, enumeration=enumeration)
+        run.close()
+        with self.assertRaisesRegex(ValidationError, "population is frozen"):
+            record_exclusions(self.database, [{"journal": JOURNAL, "doi": HTML_REVIEW, "reason": "late"}])
         # Finish the run (the entitled review needs an on-premises judge), then compare, freeze and export facts.
         run = self.run_census(on_premises=True)
         self.assertEqual("completed", run.run_abstract()["state"])
         run.pin_inputs(caches)
+        with self.assertRaisesRegex(ValidationError, "stand in only for downloads"):
+            run.run_full_text(cache=caches)
         self.assertEqual("completed", run.run_full_text(fetch_xml=lambda pmcid: None, cache=caches)["state"])
         run.close()
         final = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
         self.assertTrue(final["runComplete"])
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        checks = gates(status, require_fresh_enumeration=True)["checks"]
+        self.assertTrue(checks["populationUnchangedSinceComparison"])
+        self.assertTrue(checks["fullTextCacheHitsBackedByLiveRetrieval"])
+        self.assertEqual(1, status["itemProvenance"]["full-text"]["cache-hit-public"])
         frozen = self.root / "frozen.sqlite3"
         scores_db.freeze(self.database, frozen)
         export = corpus_facts.export_facts(frozen, self.root / "facts", [JOURNAL, SECOND], b=50, seed=3,
@@ -677,19 +895,146 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual((0, 0, 0), (value(f"{j}.provenance.abstracts.supplied"),
                                      value(f"{j}.provenance.abstracts.cache-hit-entitled"),
                                      value(f"{j}.provenance.abstracts.unrecorded")))
+        # Work seven's cached full text (retrieved live as well) gave a window to its escalated entries in both reviews.
+        self.assertEqual(self.rows("SELECT COUNT(*) AS n FROM citations WHERE journal=? AND ft_provenance='cache-hit-public' "
+                                   "AND cited_work_key='doi:10.5555/w7'", JOURNAL)[0]["n"],
+                         value(f"{j}.provenance.full_text.cache-hit-public"))
+        self.assertGreaterEqual(value(f"{j}.provenance.full_text.cache-hit-public"), 1)
         self.assertGreater(value(f"{j}.provenance.full_text.unavailable"), 0)
-        self.assertEqual((2, 2, 0), (value(f"{j}.enumeration.reviews"), value(f"{j}.enumeration.in_study"),
-                                     value(f"{j}.enumeration.outside")))
+        self.assertEqual((0, 0), (value(f"{j}.provenance.full_text.unrecorded"),
+                                  value(f"{j}.provenance.reviews_read.unrecorded")))
+        self.assertEqual((2, 2, 0, 0, 0), (value(f"{j}.enumeration.reviews"), value(f"{j}.enumeration.in_study"),
+                                           value(f"{j}.enumeration.outside"), value(f"{j}.enumeration.excluded"),
+                                           value(f"{j}.enumeration.unexplained")))
         self.assertEqual(1, value(f"{j}.enumeration.stratum.systematic-review.reviews"))
-        self.assertEqual((2, 1, 1), (value(f"{j}.manifest_comparison.final.all.stored"),
-                                     value(f"{j}.manifest_comparison.final.all.in_both"),
-                                     value(f"{j}.manifest_comparison.final.review.stored_only")))
-        self.assertEqual((3, 2), (value("census.manifest_comparison.final.stored"),
-                                  value("census.manifest_comparison.final.stored_only")))
+        self.assertEqual((2, 1, 1, 2), (value(f"{j}.manifest_comparison.final.all.stored"),
+                                        value(f"{j}.manifest_comparison.final.all.in_both"),
+                                        value(f"{j}.manifest_comparison.final.review.stored_only"),
+                                        value(f"{j}.manifest_comparison.final.all.in_study")))
+        self.assertEqual((3, 2, 3), (value("census.manifest_comparison.final.stored"),
+                                     value("census.manifest_comparison.final.stored_only"),
+                                     value("census.manifest_comparison.final.in_study")))
         inputs = facts[f"{j}.provenance.reviews.cache-hit-public"]["inputs"]
         self.assertEqual((caches.store.version["merkleRoot"], enumeration.sha256),
                          (inputs["inputStoreMerkleRoot"], inputs["enumerationSha256"]))
         self.assertEqual({"ok": True, "facts": export["count"]}, corpus_facts.verify_export(self.root / "facts" / "facts.json"))
+
+    def test_a_trimmed_or_empty_population_never_counts_as_complete(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        stored = manifest.parent / "stored.txt"
+        stored.write_text(f"{JATS_REVIEW}\n")
+        empty = manifest.parent / "empty.jsonl"
+        empty.write_text("")
+        run = self.run_census()
+        prepare(run, empty, caches=caches, enumeration=enumeration)       # pins the enumeration, prepares nothing
+        run.close()
+        with self.assertRaisesRegex(ValidationError, "3 enumerated reviews are neither in the study nor excluded"):
+            record_comparison(self.database, stored, manifest.parent / "empty.json")
+        # Only the review the stored manifest also lists, judged to the end: still a trimmed population.
+        only = manifest.parent / "only.jsonl"
+        only.write_text(json.dumps(rows[0]) + "\n")
+        run = self.run_census()
+        self.assertEqual(1, prepare(run, only, caches=caches, enumeration=enumeration)["prepared"])
+        self.assertEqual("completed", run.run_abstract()["state"])
+        run.pin_inputs(caches)
+        self.assertEqual("completed", run.run_full_text(fetch_xml=lambda pmcid: None, cache=caches)["state"])
+        run.close()
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        checks = gates(status, require_fresh_enumeration=True)
+        self.assertFalse(checks["checks"]["everyEnumeratedReviewInStudyOrExcluded"])
+        self.assertFalse(checks["ok"])
+        self.assertIn("2 enumerated reviews are neither in the study nor excluded", checks["notes"])
+        with self.assertRaisesRegex(ValidationError, "2 enumerated reviews are neither in the study nor excluded"):
+            record_comparison(self.database, stored, manifest.parent / "trimmed.json")
+        with self.assertRaisesRegex(ValidationError, "incomplete"):
+            scores_db.freeze(self.database, self.root / "refused.sqlite3")
+        # Protocol exclusions, each with its reason, complete the population and are counted.
+        for bad, message in (({"journal": JOURNAL, "doi": JATS_REVIEW, "reason": "x"}, "already in the study"),
+                             ({"journal": JOURNAL, "doi": "10.5555/stranger", "reason": "x"}, "not a review of the pinned"),
+                             ({"journal": JOURNAL, "doi": HTML_REVIEW, "reason": " "}, "needs journal, doi and a reason")):
+            with self.subTest(message=message), self.assertRaisesRegex(ValidationError, message):
+                record_exclusions(self.database, [bad])
+        exclusions = manifest.parent / "exclusions.jsonl"
+        exclusions.write_text(json.dumps({"journal": JOURNAL, "doi": HTML_REVIEW, "reason": "stratum outside the protocol"})
+                              + "\n" + json.dumps({"journal": SECOND, "doi": CACHED_REVIEW, "reason": "journal outside "
+                                                   "the protocol"}) + "\n")
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(0, main(["study", "exclude", "--database", str(self.database), "--input", str(exclusions)]))
+        result = json.loads(buffer.getvalue())
+        self.assertEqual((2, 0, 2, 0), (result["excluded"], result["already"], result["population"]["excluded"],
+                                        result["population"]["unexplained"]))
+        again = record_exclusions(self.database, [{"journal": SECOND, "doi": CACHED_REVIEW, "reason": "journal outside the protocol"}])
+        self.assertEqual((0, 1), (again["excluded"], again["already"]))
+        with self.assertRaisesRegex(ValidationError, "another reason"):
+            record_exclusions(self.database, [{"journal": SECOND, "doi": CACHED_REVIEW, "reason": "changed my mind"}])
+        final = record_comparison(self.database, stored, manifest.parent / "final.json")
+        self.assertTrue(final["runComplete"])
+        self.assertEqual((1, 2, 0), (final["population"]["inStudy"], final["population"]["excluded"],
+                                     final["population"]["unexplained"]))
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        checks = gates(status, require_fresh_enumeration=True)["checks"]
+        self.assertTrue(checks["everyEnumeratedReviewInStudyOrExcluded"] and checks["populationUnchangedSinceComparison"])
+        frozen = self.root / "frozen.sqlite3"
+        scores_db.freeze(self.database, frozen)
+        corpus_facts.export_facts(frozen, self.root / "facts", [JOURNAL], b=20, seed=3, code_revision="test")
+        facts = json.loads((self.root / "facts" / "facts.json").read_text())["facts"]
+        j = "census.synthetic-journal-of-examples"
+        self.assertEqual((1, 1, 0), (facts[f"{j}.enumeration.in_study"]["value"], facts[f"{j}.enumeration.excluded"]["value"],
+                                     facts[f"{j}.enumeration.unexplained"]["value"]))
+        self.assertEqual(1, facts[f"{j}.manifest_comparison.stored.all.excluded"]["value"])
+        # Changing the population after the comparison fails the gates.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DELETE FROM exclusions WHERE doi=?", (CACHED_REVIEW,))
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            checks = gates(census_status(connection), require_fresh_enumeration=True)["checks"]
+        self.assertFalse(checks["populationUnchangedSinceComparison"])
+        self.assertFalse(checks["everyEnumeratedReviewInStudyOrExcluded"])
+
+    def test_fresh_inputs_are_derived_in_the_run_never_carried(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        jats = rows[0]
+        one = jats["works"]["doi:10.5555/w1"]
+        cache_only = ReviewAcquirer(caches, routes=parse_routes([f"{JOURNAL}=public", f"{SECOND}=entitled"]))
+        acquire_records(manifest, manifest.parent / "cache-only.jsonl", cache_only)
+        cached = json.loads((manifest.parent / "cache-only.jsonl").read_text().splitlines()[0])
+        self.assertFalse(cached["acquisition"]["liveRoute"])
+        variants = {
+            "skipped-carried-inputs": {**jats, "identities": {"1": {"workKey": "doi:10.5555/w1", "identity": "resolved"}},
+                                       "country": "Carried Over"},
+            "skipped-works-not-derived": {**jats, "works": record()["works"]},
+            "skipped-cache-only-acquisition": {**cached, "works": jats["works"]},
+        }
+        changed = {**jats, "works": {**jats["works"], "doi:10.5555/w1": {**one, "pmid": "999999"}}}
+        for index, (state, row) in enumerate([*variants.items(), ("skipped-works-not-derived", changed)]):
+            source = manifest.parent / f"variant-{index}.jsonl"
+            source.write_text(json.dumps(row) + "\n")
+            run = self.census(self.root / f"variant-{index}.sqlite3")
+            with self.subTest(state=state, index=index):
+                result = prepare(run, source, caches=caches, enumeration=enumeration)
+                self.assertEqual({state: 1}, result["states"])
+                if index == 0:
+                    self.assertIn("identities, country", result["problems"][0]["reason"])
+                if index == 3:
+                    self.assertIn("changed its pmid", result["problems"][0]["reason"])
+            run.close()
+        # Metadata edited after its lookup counts as supplied, which the gates refuse in a fresh study.
+        edited = {**jats, "works": {**jats["works"], "doi:10.5555/w1": {**one, "title": "Copied from elsewhere"}}}
+        source = manifest.parent / "edited.jsonl"
+        source.write_text(json.dumps(edited) + "\n")
+        run = self.census(self.root / "edited.sqlite3")
+        self.assertEqual(1, prepare(run, source, caches=caches, enumeration=enumeration)["prepared"])
+        self.assertEqual("supplied", run.connection.execute(
+            "SELECT metadata_provenance FROM works WHERE work_key='doi:10.5555/w1'").fetchone()[0])
+        status = census_status(run.connection)
+        run.close()
+        checks = gates(status)["checks"]
+        self.assertFalse(checks["everyWorkMetadataFromARecordedLookup"])
+        self.assertTrue(checks["everyWorkDerivedFromItsReview"] and checks["noCarriedIdentityMapsOrCountries"])
+        status["inputChecks"]["suppliedIdentityMaps"] = 17      # a database prepared around these rules
+        self.assertFalse(gates(status)["checks"]["noCarriedIdentityMapsOrCountries"])
 
     def test_stored_manifests_are_read_for_identities_only(self):
         folder = self.root / "stored"
@@ -711,13 +1056,15 @@ class FreshEnumerationTests(CacheTestCase):
             record_comparison(self.database, folder / "m.tsv", folder / "out.json", label="Not A Label")
 
     def test_compare_manifests_counts_by_journal_and_stratum(self):
-        fresh = [{"journal": "A", "doi": "1", "stratum": "x"}, {"journal": "A", "doi": "2", "stratum": "y"}]
+        fresh = [{"journal": "A", "doi": "1", "stratum": "x", "inStudy": True},
+                 {"journal": "A", "doi": "2", "stratum": "y", "excluded": True}]
         stored = [{"journal": "a", "doi": "2", "stratum": "y"}, {"journal": "A ", "doi": "3", "stratum": "x"},
                   {"journal": None, "doi": "4", "stratum": None}]
         result = compare_manifests(fresh, stored)
         self.assertEqual({"fresh": 2, "stored": 3, "inBoth": 1, "freshOnly": 1, "storedOnly": 2}, result["totals"])
-        self.assertEqual({"fresh": 1, "stored": 1, "inBoth": 0, "freshOnly": 1, "storedOnly": 1},
+        self.assertEqual({"fresh": 1, "stored": 1, "inBoth": 0, "freshOnly": 1, "storedOnly": 1, "inStudy": 1, "excluded": 0},
                          result["byJournal"]["A"]["strata"]["x"])
+        self.assertEqual((1, 1), (result["byJournal"]["A"]["inStudy"], result["byJournal"]["A"]["excluded"]))
         self.assertEqual(1, result["byJournal"]["(unattributed)"]["storedOnly"])
 
 
@@ -806,30 +1153,43 @@ class CommandLineInputTests(CacheTestCase):
         self.assertEqual(3, enumerated_result["records"])
         acquired = manifest.parent / "acquired.jsonl"
         caches = ["--store", str(self.paths["projection"]), "--provider-cache", str(self.paths["provider"])]
-        result = self.run_cli(["study", "acquire", "--input", str(manifest), "--output", str(acquired), *caches,
-                               "--route", f"{JOURNAL}=public", "--route", f"{SECOND}=entitled"])
+        with mock.patch.object(census_inputs.LiveSources, "default", return_value=LIVE):
+            result = self.run_cli(["study", "acquire", "--input", str(manifest), "--output", str(acquired), *caches,
+                                   "--route", f"{JOURNAL}=public", "--route", f"{SECOND}=entitled", "--live"])
         self.assertEqual({"cache-hit-entitled": 1, "cache-hit-public": 2}, result["provenance"])
         self.assertEqual("literature-evidence@2", result["inputs"]["store"]["id"])
-        rows = [{**json.loads(line), "works": record()["works"]} for line in acquired.read_text().splitlines()]
-        filled = manifest.parent / "with-works.jsonl"
-        filled.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        derived = manifest.parent / "works.jsonl"
+        works = self.run_cli(["study", "works", "--input", str(acquired), "--output", str(derived)])
+        self.assertEqual((3, 3, 0), (works["records"], works["derived"], works["extractionFailed"]))
+        filled = manifest.parent / "abstracts.jsonl"
+        with mock.patch.object(census_abstracts, "http_get", return_value=lookups):
+            self.run_cli(["study", "abstracts", "--input", str(derived), "--output", str(filled), *caches])
         prepared = self.run_cli(["study", "prepare", "--database", str(self.database), "--seed", "1234", "--input",
                                  str(filled), *caches, "--require-fresh-enumeration", "--enumeration",
                                  enumerated_result["receipt"]])
         self.assertEqual(3, prepared["prepared"])
         checks = self.run_cli(["study", "gates", "--database", str(self.database), "--require-fresh-enumeration"])["checks"]
-        self.assertTrue(checks["freshEnumerationPinned"] and checks["reviewsComeFromTheEnumeration"])
-        # The fixture works carry abstracts that no recorded lookup vouches for.
-        self.assertFalse(checks["everyAbstractFromARecordedLookup"])
+        for name in ("freshEnumerationPinned", "reviewsComeFromTheEnumeration", "everyAbstractFromARecordedLookup",
+                     "everyWorkDerivedFromItsReview", "everyWorkMetadataFromARecordedLookup",
+                     "reviewsAcquiredThroughLiveRoutes", "everyEnumeratedReviewInStudyOrExcluded"):
+            self.assertTrue(checks[name], name)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            self.assertNotEqual(0, main(["study", "full-text", "--database", str(self.database), "--seed", "1234",
+                                         "--base-url", self.base, *caches]))
         stored = self.root / "stored.txt"
         stored.write_text(f"# one DOI per line\n{JATS_REVIEW}\n10.5555/stored.only\n")
         compared = self.run_cli(["study", "compare-manifest", "--database", str(self.database), "--stored", str(stored),
                                  "--output", str(self.root / "comparison.json"), "--allow-incomplete"])
         self.assertEqual({"fresh": 3, "stored": 2, "inBoth": 1, "freshOnly": 2, "storedOnly": 1}, compared["totals"])
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        with redirect_stdout(buffer), redirect_stderr(buffer):
             self.assertNotEqual(0, main(["study", "prepare", "--database", str(self.database), "--seed", "1234",
                                          "--input", str(filled), "--require-fresh-enumeration"]))
+            self.assertNotEqual(0, main(["study", "prepare", "--database", str(self.database), "--seed", "1234",
+                                         "--input", str(filled), *caches, "--require-fresh-enumeration", "--enumeration",
+                                         enumerated_result["receipt"]]))
+        self.assertIn("population is frozen", buffer.getvalue())
         unpinned = self.root / "unpinned.sqlite3"
         self.run_cli(["study", "prepare", "--database", str(unpinned), "--seed", "1234", "--input", str(filled)])
         checks = self.run_cli(["study", "gates", "--database", str(unpinned), "--require-fresh-enumeration"])["checks"]

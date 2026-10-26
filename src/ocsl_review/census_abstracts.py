@@ -53,7 +53,10 @@ def _now() -> str:
 
 def fetch_abstracts(works: Mapping[str, Mapping[str, Any]], get: Callable[[dict[str, Any]], dict[str, Any] | None]
                     ) -> dict[str, dict[str, Any]]:
-    """Return {work key: {"abstract", "abstractSource", "abstractRetrievedAt"}} for every work."""
+    """Return {work key: {"abstract", "abstractSource", "abstractRetrievedAt", "record"}} for every work.
+
+    ``record`` is the Europe PMC record the lookup selected (None without a hit).
+    """
     out: dict[str, dict[str, Any]] = {}
     with_doi = [(key, str(work["doi"]).lower()) for key, work in works.items() if work.get("doi")]
     for start in range(0, len(with_doi), DOIS_PER_QUERY):
@@ -73,19 +76,21 @@ def fetch_abstracts(works: Mapping[str, Mapping[str, Any]], get: Callable[[dict[
                 source = "europe-pmc-no-hit"
             else:
                 source = "europe-pmc-core" if hit.get("abstractText") else "europe-pmc-no-abstract"
-            out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": source, "abstractRetrievedAt": _now()}
+            out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": source, "abstractRetrievedAt": _now(),
+                        "record": hit}
     for key, work in works.items():
         if key in out:
             continue
         if not work.get("pmid"):
-            out[key] = {"abstract": None, "abstractSource": "no-identifier", "abstractRetrievedAt": _now()}
+            out[key] = {"abstract": None, "abstractSource": "no-identifier", "abstractRetrievedAt": _now(), "record": None}
             continue
         response = get({"query": "EXT_ID:%s AND SRC:MED" % work["pmid"], "format": "json", "resultType": "core"})
         results = ((response or {}).get("resultList") or {}).get("result") or []
         hit = results[0] if results else None
         source = ("europe-pmc-failed" if response is None else "europe-pmc-no-hit" if hit is None
                   else "europe-pmc-core-pmid" if hit.get("abstractText") else "europe-pmc-no-abstract")
-        out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": source, "abstractRetrievedAt": _now()}
+        out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": source, "abstractRetrievedAt": _now(),
+                    "record": hit}
     return out
 
 
@@ -109,8 +114,11 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
     carried; where Europe PMC definitively has none, an abstract supplied from another provider is kept as a
     recorded fallback (``abstractSource`` = ``fallback:<provider>``). A failed lookup changes nothing but
     ``europePmcOutcome`` and is retried on the next run. ``abstractProvenance`` records cache-hit-public,
-    live-public, supplied (a fallback) or unavailable, with the digest of the text it vouches for.
+    live-public, supplied (a fallback) or unavailable, with the digest of the text it vouches for. A work derived
+    from the review's bibliography (``study works``) also takes its title, venue, year, PMCID and retraction flag
+    from the same record (``metadataProvenance``, bound to the digest of those fields).
     """
+    from .census_works import apply_metadata
     works = {key: dict(work) for key, work in (record.get("works") or {}).items()}
     wanted = {key: work for key, work in works.items() if overwrite or not looked_up(work)}
     rejected: dict[str, list] = {}
@@ -127,6 +135,8 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
             work["abstract"], work["abstractSource"] = hit["abstract"], hit["outcome"]
             work["abstractProvenance"] = {**hit["provenance"], "textSha256": _text_sha256(hit["abstract"]),
                                           **({"rejected": refused} if refused else {})}
+            if derived(work):
+                apply_metadata(work, hit.get("record"), hit["provenance"])
             del wanted[key]
     for key, found in fetch_abstracts(wanted, get).items():
         work, outcome = works[key], found["abstractSource"]
@@ -134,6 +144,10 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
         if outcome == "europe-pmc-failed":
             continue
         work["abstractRetrievedAt"] = found["abstractRetrievedAt"]
+        if derived(work):
+            apply_metadata(work, found.get("record"), {
+                "provenance": "live-public" if found.get("record") is not None else "unavailable",
+                "provider": "europe-pmc", "outcome": outcome, "retrievedAt": found["abstractRetrievedAt"]})
         if found["abstract"]:
             work["abstract"], work["abstractSource"] = found["abstract"], outcome
             provenance = {"provenance": "live-public", "provider": "europe-pmc", "retrievedAt": found["abstractRetrievedAt"]}
@@ -148,3 +162,8 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
         work["abstractProvenance"] = {**provenance, "textSha256": _text_sha256(work.get("abstract")),
                                       **({"rejected": rejected[key]} if key in rejected else {})}
     return {**record, "works": works}
+
+
+def derived(work: Mapping[str, Any]) -> bool:
+    """A work ``study works`` derived from the review's bibliography (its metadata comes from the lookup too)."""
+    return isinstance(work.get("workProvenance"), dict)
