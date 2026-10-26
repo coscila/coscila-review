@@ -23,7 +23,9 @@ from .errors import ValidationError
 
 SCHEMA_VERSION = 1
 TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "history",
-          "review_scores", "work_scores", "sanitizer_findings", "data_dictionary")
+          "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "manifest_comparisons",
+          "data_dictionary")
+PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -35,7 +37,7 @@ CREATE TABLE IF NOT EXISTS reviews(
   n_printed INTEGER, n_cited_inbody INTEGER, n_judged INTEGER, n_not_cited INTEGER,
   abs_sure_supported INTEGER, abs_unsure INTEGER, abs_sure_not_supported INTEGER,
   ft_read INTEGER, ft_sure_supported INTEGER, ft_unsure INTEGER, ft_sure_not_supported INTEGER,
-  abs_not_supported_share REAL, ft_not_supported_share REAL,
+  abs_not_supported_share REAL, ft_not_supported_share REAL, provenance TEXT,
   PRIMARY KEY(journal, doi));
 CREATE TABLE IF NOT EXISTS citations(
   journal TEXT NOT NULL, doi TEXT NOT NULL, label TEXT NOT NULL, ordinal INTEGER NOT NULL, target_id TEXT, printed TEXT,
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS citations(
   abs_evidence_id TEXT, abs_cut INTEGER, abs_sent_characters INTEGER,
   ft_category TEXT, ft_support_verdict TEXT, ft_class TEXT, ft_source TEXT, ft_retrieval TEXT, ft_reason TEXT,
   ft_quote TEXT, ft_quote_present INTEGER, ft_quote_in_evidence INTEGER, ft_call_id TEXT, ft_position INTEGER,
-  ft_evidence_id TEXT, ft_window_characters INTEGER,
+  ft_evidence_id TEXT, ft_window_characters INTEGER, ft_provenance TEXT,
   PRIMARY KEY(journal, doi, label),
   FOREIGN KEY(journal, doi) REFERENCES reviews(journal, doi));
 CREATE TABLE IF NOT EXISTS loci(
@@ -92,12 +94,31 @@ CREATE TABLE IF NOT EXISTS sanitizer_findings(
   journal TEXT, doi TEXT, label TEXT, seq INTEGER, evidence_id TEXT, field TEXT NOT NULL, kind TEXT NOT NULL,
   rule TEXT NOT NULL, start INTEGER NOT NULL, length INTEGER NOT NULL, sha256 TEXT NOT NULL, sanitizer TEXT NOT NULL,
   created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS input_provenance(
+  item_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('review', 'abstract', 'full-text')),
+  journal TEXT, doi TEXT, work_key TEXT, evidence_id TEXT,
+  provenance TEXT NOT NULL CHECK(provenance IN ('cache-hit-public', 'cache-hit-entitled', 'live-public', 'live-entitled',
+                                                'unavailable', 'supplied')),
+  cache TEXT CHECK(cache IS NULL OR cache IN ('store', 'provider-cache')), cache_version TEXT, source_sha256 TEXT,
+  identity_check TEXT, provider TEXT, source_url TEXT, retrieved_at TEXT, verified INTEGER, detail_json TEXT,
+  recorded_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS enumeration(
+  journal TEXT NOT NULL, doi TEXT NOT NULL, stratum TEXT, first_online TEXT, year INTEGER, pmid TEXT, pmcid TEXT,
+  receipt_sha256 TEXT NOT NULL, PRIMARY KEY(journal, doi));
+CREATE TABLE IF NOT EXISTS manifest_comparisons(
+  label TEXT NOT NULL, journal TEXT NOT NULL, stratum TEXT NOT NULL, fresh INTEGER NOT NULL, stored INTEGER NOT NULL,
+  in_both INTEGER NOT NULL, fresh_only INTEGER NOT NULL, stored_only INTEGER NOT NULL, stored_sha256 TEXT NOT NULL,
+  enumeration_sha256 TEXT NOT NULL, report_sha256 TEXT NOT NULL, run_complete INTEGER NOT NULL,
+  compared_at TEXT NOT NULL, PRIMARY KEY(label, journal, stratum));
 CREATE TABLE IF NOT EXISTS data_dictionary(
   table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
   PRIMARY KEY(table_name, column_name));
 CREATE INDEX IF NOT EXISTS ix_citations_class ON citations(journal, abs_class);
 CREATE INDEX IF NOT EXISTS ix_calls_review ON calls(journal, doi, tier);
 CREATE INDEX IF NOT EXISTS ix_history_entry ON history(journal, doi, label);
+CREATE INDEX IF NOT EXISTS ix_input_provenance_kind ON input_provenance(kind, provenance);
+CREATE INDEX IF NOT EXISTS ix_input_provenance_work ON input_provenance(work_key, kind);
+CREATE INDEX IF NOT EXISTS ix_input_provenance_review ON input_provenance(journal, doi);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_history_primary_verdict ON history(journal, doi, label, tier)
   WHERE variant='primary' AND outcome='accepted';
 CREATE TRIGGER IF NOT EXISTS history_no_update BEFORE UPDATE ON history
@@ -109,8 +130,8 @@ CREATE TRIGGER IF NOT EXISTS calls_no_update BEFORE UPDATE ON calls
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
-    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state; when frozen: completeness "
-                    "and the entitled-text redaction)",
+    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state, pinned input caches and "
+                    "fresh enumeration; when frozen: completeness and the entitled-text redaction)",
              "value": "metadata value"},
     "reviews": {
         "journal": "journal of the review (study input)", "doi": "review DOI, lower case", "paper_key": "local review key",
@@ -128,7 +149,9 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "abs_sure_not_supported": "abstract tier: F and not escalated", "ft_read": "entries with a full-text verdict",
         "ft_sure_supported": "full-text tier: T", "ft_unsure": "full-text tier: N or U", "ft_sure_not_supported": "full-text tier: F",
         "abs_not_supported_share": "abs_sure_not_supported / (abs_sure_supported + abs_sure_not_supported)",
-        "ft_not_supported_share": "ft_sure_not_supported / (ft_sure_supported + ft_sure_not_supported)"},
+        "ft_not_supported_share": "ft_sure_not_supported / (ft_sure_supported + ft_sure_not_supported)",
+        "provenance": "where the review document came from: cache-hit-public, cache-hit-entitled, live-public, live-entitled, "
+                      "unavailable, or supplied (an input document without an acquisition record)"},
     "citations": {
         "journal": "journal of the citing review", "doi": "citing review DOI", "label": "printed bibliography label (alphanumeric)",
         "ordinal": "position in the printed bibliography (document order)", "target_id": "bibliography target id in the markup",
@@ -152,6 +175,8 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "abs_cut": "1 when the abstract sent was cut", "abs_sent_characters": "abstract characters sent",
         "ft_category": "full-text tier category", "ft_support_verdict": "full-text tier support type", "ft_class": "full-text class",
         "ft_source": "full-text source (europe-pmc-fulltextxml, entitled, cache)",
+        "ft_provenance": "where the full text behind the window came from: cache-hit-public, live-public, live-entitled, "
+                         "supplied (a source recorded before provenance), or unavailable when no window was sent",
         "ft_retrieval": "retrieval outcome (cache, europe-pmc-fulltextxml, entitled, fetch-failed, no-pmcid)",
         "ft_reason": "full-text rationale", "ft_quote": "full-text quote", "ft_quote_present": "for F: quote returned",
         "ft_quote_in_evidence": "for F: quote occurs in the window sent", "ft_call_id": "call receipt of the full-text verdict",
@@ -210,6 +235,34 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "length": "matched characters", "sha256": "sha256 of the matched text; the text itself is not copied",
         "sanitizer": "sanitizer version (detect mode: the text sent to the judge is unchanged)",
         "created_at": "detection time"},
+    "input_provenance": {
+        "item_id": "item id (review-<digest> for a review document, the evidence unit id for an abstract or a full text)",
+        "kind": "review, abstract or full-text",
+        "journal": "journal of the review (review items)", "doi": "review DOI (review items)",
+        "work_key": "cited work (abstract and full-text items)", "evidence_id": "evidence unit the item supplied",
+        "provenance": "cache-hit-public, cache-hit-entitled, live-public, live-entitled, unavailable or supplied",
+        "cache": "store (literature-evidence@2 projection) or provider-cache for cache hits",
+        "cache_version": "store Merkle root or provider cache database sha256",
+        "source_sha256": "sha256 of the bytes accepted (for a store abstract: of the provider record artifact)",
+        "identity_check": "identifiers that agreed between the request and the document (doi, pmcid, pmid)",
+        "provider": "provider of the bytes", "source_url": "provider address the bytes came from",
+        "retrieved_at": "original retrieval or capture time",
+        "verified": "1 when a cache hit was re-checked at preparation against the pinned cache, 0 when it was not, "
+                    "NULL when there is nothing to re-check",
+        "detail_json": "acquisition record: rejected cache candidates with their reasons, table pages, live attempts",
+        "recorded_at": "time the item was recorded"},
+    "enumeration": {"journal": "journal (enumeration group)", "doi": "review DOI, lower case",
+                    "stratum": "stratum assigned by the enumeration spec", "first_online": "first publication date",
+                    "year": "first-online year", "pmid": "PMID", "pmcid": "PMCID",
+                    "receipt_sha256": "sha256 of the enumeration receipt (kept provider pages and their digests)"},
+    "manifest_comparisons": {
+        "label": "comparison label", "journal": "journal ((unattributed) for stored-only reviews of other journals)",
+        "stratum": "stratum, * for the journal total", "fresh": "reviews in the fresh enumeration",
+        "stored": "reviews in the stored manifest", "in_both": "reviews in both", "fresh_only": "only in the fresh enumeration",
+        "stored_only": "only in the stored manifest (counted, never imported)", "stored_sha256": "sha256 of the stored manifest",
+        "enumeration_sha256": "sha256 of the enumeration receipt", "report_sha256": "sha256 of the comparison report",
+        "run_complete": "1 when the census run was complete at comparison time (the default requirement), else 0",
+        "compared_at": "comparison time"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }
 
@@ -225,6 +278,7 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys=ON")
     if create:
         connection.executescript(DDL)
+        migrate(connection)
         write_dictionary(connection)
         connection.execute("INSERT OR IGNORE INTO meta VALUES('schemaVersion', ?)", (str(SCHEMA_VERSION),))
         connection.commit()
@@ -233,6 +287,22 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
         connection.close()
         raise ValidationError("unsupported scores database schema version")
     return connection
+
+
+def migrate(connection: sqlite3.Connection) -> None:
+    """Additive changes for working databases created before them: the review and full-text provenance columns."""
+    if "provenance" not in table_columns(connection, "reviews"):
+        connection.execute("ALTER TABLE reviews ADD COLUMN provenance TEXT")
+    if "ft_provenance" not in table_columns(connection, "citations"):
+        connection.execute("ALTER TABLE citations ADD COLUMN ft_provenance TEXT")
+
+
+def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def has_table(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
 
 def write_dictionary(connection: sqlite3.Connection) -> None:
@@ -469,6 +539,8 @@ def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet:
         parquet = False
     with closing(open_frozen(path)) as connection:
         for table in tables:
+            if not has_table(connection, table):
+                continue            # a database frozen before the table existed
             order = "ORDER BY key" if table == "meta" else "ORDER BY rowid"
             cursor = connection.execute(f"SELECT * FROM {table} {order}")
             columns = [d[0] for d in cursor.description]
@@ -502,21 +574,3 @@ def export(path: Path, output: Path, *, tables: Iterable[str] = TABLES, parquet:
                 "parquet": parquet_state, "files": files}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest
-def open_readonly(path: Path) -> sqlite3.Connection:
-    """A read-only connection to a working or frozen scores database: no DDL, no metadata pins, no writes."""
-    path = Path(path)
-    if not path.is_file():
-        raise ValidationError(f"scores database is missing: {path}")
-    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=60)
-    connection.row_factory = sqlite3.Row
-    try:
-        version = connection.execute("SELECT value FROM meta WHERE key='schemaVersion'").fetchone()
-    except sqlite3.DatabaseError as error:
-        connection.close()
-        raise ValidationError("not a census scores database") from error
-    if not version or int(version[0]) != SCHEMA_VERSION:
-        connection.close()
-        raise ValidationError("unsupported scores database schema version")
-    return connection
-
-
