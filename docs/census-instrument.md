@@ -504,8 +504,11 @@ executor; `--api-key-env` is refused with the broker transport.
    with `onPremBrokerProviders: [{"provider": "<id>", "models": [...]}]`.
 
 Before any call, each command reads the principal's catalog again and refuses
-unless the worker requests the census model and every bundle the pending
-reviews need is installed and granted; the error names the missing digests.
+unless the daemon offers verbatim instrument mode (`instrumentVerbatim: 1`),
+the worker requests the census model, and every bundle the pending reviews
+need is installed and granted and is listed with `transport.messages:
+verbatim` (a policy-wrapped install would put the broker's worker policy in
+front of the prompt); the error names the digests at fault.
 
 **Calls.** Each paper-batch call (first, repair or full-text call) is one bulk
 job with one item whose input is the chat-completions request the instrument

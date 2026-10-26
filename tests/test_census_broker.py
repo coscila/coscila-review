@@ -125,13 +125,14 @@ class MockBroker:
 
     def catalog(self) -> dict:
         installed = [{"digest": digest, "instrumentId": bundle["instrumentId"], "version": bundle["version"],
-                      "itemsPerCall": bundle["itemsPerCall"]} for digest, bundle in self.instruments.items()
-                     if digest in self.granted]
+                      "itemsPerCall": bundle["itemsPerCall"],
+                      "transport": {"messages": (bundle.get("transport") or {}).get("messages", "policy-wrapped")}}
+                     for digest, bundle in self.instruments.items() if digest in self.granted]
         value = {"version": 1, "revision": 3,
                  "authorization": {"principalId": self.principal, "kind": "run", "runId": self.run_id,
                                    "attemptId": self.principal, "state": "active", "publicLiteratureAllowed": True,
                                    "instruments": sorted(self.granted)},
-                 "instrumentMode": 1, "instruments": installed,
+                 "instrumentMode": 1, "instrumentVerbatim": 1, "instruments": installed,
                  "workers": [{"id": self.worker, "providerId": self.worker, "model": self.model,
                               "bulkConcurrencyLimit": 60, "bulkAvailable": True}]}
         for key, patch in self.catalog_patch.items():
@@ -879,6 +880,21 @@ class BrokerPreflightTests(BrokerTestCase):
         run.close()
         run = self.run_census(transport=transport)
         with self.assertRaisesRegex(ValidationError, "pass --model to match"):
+            run.run_abstract()
+        self.assertEqual(0, self.broker.calls_to_route("POST", "/bulk/submit"))
+
+    def test_a_broker_without_verbatim_mode_or_a_policy_wrapped_install_is_refused_before_any_job(self):
+        self.broker.install_census(tiers=("full-text",))
+        exported = broker_bundle("citation-census@1", tier="abstract", parameters={"journal": JOURNAL})
+        # The daemon stores a policy-wrapped bundle without transport and lists it as policy-wrapped.
+        self.broker.install(exported["digest"], {k: v for k, v in exported["bundle"].items() if k != "transport"})
+        self.broker.granted.add(exported["digest"])
+        run = self.run_census()
+        self.prepare(run)
+        with self.assertRaisesRegex(ValidationError, rf"without transport.messages verbatim: abstract tier, .*{exported['digest']}"):
+            run.run_abstract()
+        self.broker.catalog_patch = {"instrumentVerbatim": None}
+        with self.assertRaisesRegex(ValidationError, r"verbatim instrument mode \(instrumentVerbatim\)"):
             run.run_abstract()
         self.assertEqual(0, self.broker.calls_to_route("POST", "/bulk/submit"))
 
