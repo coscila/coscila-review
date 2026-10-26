@@ -26,6 +26,10 @@ TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence
           "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "exclusions",
           "manifest_comparisons", "data_dictionary")
 PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
+# Receipt columns of a call made through the run principal's broker socket (NULL for direct calls).
+BROKER_CALL_COLUMNS = ("broker_principal_id", "broker_job_id", "broker_item_id", "broker_instrument_digest",
+                       "broker_settings_sha256", "broker_request_sha256", "broker_error_code")
+CALL_COLUMNS_ADDED = ("transport", "study_bundle_sha256", "request_sha256") + BROKER_CALL_COLUMNS
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -77,7 +81,10 @@ CREATE TABLE IF NOT EXISTS calls(
   system_sha256 TEXT NOT NULL, user_sha256 TEXT NOT NULL, messages_sha256 TEXT NOT NULL, body_sha256 TEXT NOT NULL,
   max_tokens INTEGER NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
   cached_tokens INTEGER, finish_reason TEXT, truncated INTEGER, attempts INTEGER NOT NULL, seconds REAL,
-  error TEXT, n_parsed INTEGER, n_missing INTEGER, n_problems INTEGER, created_at TEXT NOT NULL);
+  error TEXT, n_parsed INTEGER, n_missing INTEGER, n_problems INTEGER, created_at TEXT NOT NULL,
+  transport TEXT, study_bundle_sha256 TEXT, request_sha256 TEXT, broker_principal_id TEXT, broker_job_id TEXT,
+  broker_item_id TEXT, broker_instrument_digest TEXT, broker_settings_sha256 TEXT, broker_request_sha256 TEXT,
+  broker_error_code TEXT);
 CREATE TABLE IF NOT EXISTS history(
   history_id INTEGER PRIMARY KEY AUTOINCREMENT, journal TEXT NOT NULL, doi TEXT NOT NULL, label TEXT NOT NULL,
   tier TEXT NOT NULL, variant TEXT NOT NULL DEFAULT 'primary', call_id TEXT, position INTEGER, outcome TEXT NOT NULL,
@@ -134,8 +141,9 @@ CREATE TRIGGER IF NOT EXISTS calls_no_update BEFORE UPDATE ON calls
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
-    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state, pinned input caches and "
-                    "fresh enumeration; when frozen: completeness and the entitled-text redaction)",
+    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state and pause detail, pinned "
+                    "input caches, fresh enumeration and study bundle; when frozen: completeness and the entitled-text "
+                    "redaction)",
              "value": "metadata value"},
     "reviews": {
         "journal": "journal of the review (study input)", "doi": "review DOI, lower case", "paper_key": "local review key",
@@ -212,15 +220,35 @@ DICTIONARY: dict[str, dict[str, str]] = {
               "variant": "primary or a predeclared sensitivity", "batch": "batch or call index within the review",
               "kind": "first, repair or full-text", "n_items": "items in the call", "labels_json": "labels in call order",
               "instrument_id": "instrument id", "instrument_digest": "instrument bundle digest", "code_revision": "code tag",
-              "request_model": "model name requested", "served_model": "model reported by the server", "fingerprint": "server fingerprint when offered",
+              "request_model": "model name requested",
+              "served_model": "model reported by the server (NULL when no response arrived)",
+              "fingerprint": "server fingerprint: the response's system_fingerprint when offered (direct transport), or "
+                             "the broker receipt's serverFingerprint (system_fingerprint when offered, else the served "
+                             "model and a digest of the server identity headers)",
               "settings_sha256": "digest of the request settings without messages", "system_sha256": "sha256 of the system prompt",
               "user_sha256": "sha256 of the user message", "messages_sha256": "sha256 of the JSON message list",
-              "body_sha256": "sha256 of the bytes sent", "max_tokens": "output token limit", "prompt_tokens": "provider prompt tokens",
+              "body_sha256": "sha256 of the bytes sent (direct transport) or of the same body as the executor built it "
+                             "(broker transport, where request_sha256 and broker_request_sha256 attest what was sent)",
+              "max_tokens": "output token limit", "prompt_tokens": "provider prompt tokens",
               "completion_tokens": "provider completion tokens", "total_tokens": "provider total tokens",
               "cached_tokens": "provider cached prompt tokens", "finish_reason": "provider finish reason",
               "truncated": "1 when the finish reason is length", "attempts": "transport attempts", "seconds": "latency of the last attempt",
-              "error": "transport, model_drift or other failure", "n_parsed": "labels parsed", "n_missing": "labels missing",
-              "n_problems": "parser problems", "created_at": "receipt time"},
+              "error": "transport, model_drift, request_mismatch (the broker's request digest differs: the call is "
+                       "invalid and its output was discarded) or other failure",
+              "n_parsed": "labels parsed", "n_missing": "labels missing",
+              "n_problems": "parser problems", "created_at": "receipt time",
+              "transport": "direct (chat completions to the judge) or broker (a bulk job over the run principal's socket)",
+              "study_bundle_sha256": "sha256 of the study bundle pinned on the run (study prepare --study-bundle)",
+              "request_sha256": "sha256 of the canonical JSON (keys sorted, no whitespace, numbers as JSON.stringify "
+                                "writes them) of the request body the executor built",
+              "broker_principal_id": "run principal of the broker socket the call went through",
+              "broker_job_id": "broker job that settled the call (after any resume of a paused job)",
+              "broker_item_id": "broker item id (the call id)",
+              "broker_instrument_digest": "broker allow-list digest of the instrument bundle the job named "
+                                          "(ocsl-review instruments export)",
+              "broker_settings_sha256": "settingsSha256 of the broker receipt (effective settings of the call as sent)",
+              "broker_request_sha256": "requestSha256 of the broker receipt; must equal request_sha256",
+              "broker_error_code": "closed failure code of the broker item, when it failed or paused"},
     "history": {"history_id": "append-only row id", "journal": "journal", "doi": "review DOI", "label": "label", "tier": "tier",
                 "variant": "primary or sensitivity", "call_id": "receipt", "position": "position in call",
                 "outcome": "accepted, superseded, missing, deterministic or invalid", "category": "category", "support_verdict": "support type",
@@ -309,7 +337,8 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    """Additive changes for working databases created before them: provenance, work derivation and comparison columns."""
+    """Additive changes for working databases created before them: provenance, work derivation, comparison, transport,
+    study-bundle and broker receipt columns."""
     for table, column in (("reviews", "provenance"), ("citations", "ft_provenance"), ("works", "derivation"),
                           ("works", "metadata_provenance"), ("manifest_comparisons", "population_sha256")):
         if column not in table_columns(connection, table):
@@ -317,6 +346,10 @@ def migrate(connection: sqlite3.Connection) -> None:
     for column in ("in_study", "excluded"):
         if column not in table_columns(connection, "manifest_comparisons"):
             connection.execute(f"ALTER TABLE manifest_comparisons ADD COLUMN {column} INTEGER")
+    calls = table_columns(connection, "calls")
+    for column in CALL_COLUMNS_ADDED:
+        if column not in calls:
+            connection.execute(f"ALTER TABLE calls ADD COLUMN {column} TEXT")
 
 
 def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:

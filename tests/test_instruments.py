@@ -63,6 +63,7 @@ FORBIDDEN = {
 LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/instrument.schema.json",
               "src/ocsl_review/instruments.py", "src/ocsl_review/citation_census.py",
               "src/ocsl_review/census_extraction.py", "src/ocsl_review/census_runner.py",
+              "src/ocsl_review/census_broker.py",
               "src/ocsl_review/scores_db.py", "src/ocsl_review/estimands.py", "src/ocsl_review/corpus_facts.py",
               "src/ocsl_review/study_cli.py", "src/ocsl_review/census_abstracts.py"]
 

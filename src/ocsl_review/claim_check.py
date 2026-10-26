@@ -197,13 +197,17 @@ class ConfidentialPolicy:
     On-prem judges are named explicitly: ``on_prem_endpoints`` lists each endpoint (scheme, host, port
     and path, a path ending in ``/`` covering what lies below it), optionally with the served models it
     may answer with. An address alone never makes a judge on-prem: a loopback or private-network
-    relay can forward to a hosted service. The list is empty by default.
+    relay can forward to a hosted service. The list is empty by default. A judge reached through the
+    run principal's broker socket has no endpoint the executor sees: ``on_prem_broker_providers`` names
+    the broker providers (ids of the daemon's provider configuration) the operator vouches are on
+    premises, optionally with the models they may request.
     """
 
     mode: str = "confidential-manuscript"
     on_prem_endpoints: tuple[tuple[tuple[str, str, int, str], frozenset[str]], ...] = ()
     provider_hosts: frozenset[str] = frozenset({"doi.org", "api.crossref.org", "www.ebi.ac.uk",
                                                  "eutils.ncbi.nlm.nih.gov"})
+    on_prem_broker_providers: tuple[tuple[str, frozenset[str]], ...] = ()
 
     MODES = ("confidential-manuscript", "public-literature")
 
@@ -216,21 +220,25 @@ class ConfidentialPolicy:
         return self.mode == "confidential-manuscript"
 
     def record(self) -> dict[str, Any]:
-        return {"policy": "claim-check-egress", "version": 2, "mode": self.mode,
-                "onPremEndpoints": [{"url": endpoint_text(endpoint), "models": sorted(models)}
-                                    for endpoint, models in self.on_prem_endpoints],
-                "providerHosts": sorted(self.provider_hosts)}
+        record = {"policy": "claim-check-egress", "version": 2, "mode": self.mode,
+                  "onPremEndpoints": [{"url": endpoint_text(endpoint), "models": sorted(models)}
+                                      for endpoint, models in self.on_prem_endpoints],
+                  "providerHosts": sorted(self.provider_hosts)}
+        if self.on_prem_broker_providers:   # absent when empty, so earlier policies keep their digest
+            record["onPremBrokerProviders"] = [{"provider": provider, "models": sorted(models)}
+                                               for provider, models in self.on_prem_broker_providers]
+        return record
 
     @property
     def digest(self) -> str:
         return sha256_text(canonical(self.record()))
 
     def with_mode(self, mode: str) -> ConfidentialPolicy:
-        return ConfidentialPolicy(mode, self.on_prem_endpoints, self.provider_hosts)
+        return ConfidentialPolicy(mode, self.on_prem_endpoints, self.provider_hosts, self.on_prem_broker_providers)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> ConfidentialPolicy:
-        known = {"policy", "version", "mode", "onPremEndpoints", "providerHosts"}
+        known = {"policy", "version", "mode", "onPremEndpoints", "providerHosts", "onPremBrokerProviders"}
         if value.get("version") == 1 or "onPremHosts" in value or "allowPrivateNetworks" in value:
             raise ValidationError("policy version 1 inferred on-prem judges from their address; list every on-prem "
                                   "judge endpoint in onPremEndpoints (version 2)")
@@ -247,8 +255,19 @@ class ConfidentialPolicy:
             if not isinstance(models, list) or not all(isinstance(model, str) and model for model in models):
                 raise ValidationError("onPremEndpoints models must be a list of model names")
             endpoints.append((normalize_endpoint(url), frozenset(models)))
+        brokers: dict[str, frozenset[str]] = {}
+        for item in value.get("onPremBrokerProviders", []):
+            provider, models = (item, []) if isinstance(item, str) else (
+                (item.get("provider"), item.get("models", [])) if isinstance(item, dict) else (None, []))
+            if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", provider):
+                raise ValidationError("onPremBrokerProviders names broker provider ids (1-128 of A-Za-z0-9._:-)")
+            if not isinstance(models, list) or not all(isinstance(model, str) and model for model in models):
+                raise ValidationError("onPremBrokerProviders models must be a list of model names")
+            if provider in brokers:
+                raise ValidationError(f"onPremBrokerProviders lists {provider} twice")
+            brokers[provider] = frozenset(models)
         return cls(str(value.get("mode", "confidential-manuscript")), tuple(sorted(endpoints, key=lambda e: e[0])),
-                   frozenset(h.lower() for h in providers))
+                   frozenset(h.lower() for h in providers), tuple(sorted(brokers.items())))
 
     @classmethod
     def load(cls, path: Path | None) -> ConfidentialPolicy:
@@ -284,6 +303,13 @@ class ConfidentialPolicy:
 
     def endpoint_on_prem(self, url: str) -> bool:
         return self.endpoint_entry(url) is not None
+
+    def broker_provider_on_prem(self, provider: str | None, model: str | None = None) -> bool:
+        """Whether the operator lists this broker provider as on premises (and, when models are listed, ``model``)."""
+        for name, models in self.on_prem_broker_providers:
+            if name == provider:
+                return not models or model in models
+        return False
 
     def _on_prem(self, judge: Any) -> bool:
         if getattr(judge, "location", "") != "on-prem":
