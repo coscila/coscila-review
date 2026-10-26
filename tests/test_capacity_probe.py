@@ -910,7 +910,7 @@ class SharedServerTests(ProbeCase):
 
     def test_tokens_of_unanswered_calls_are_allowed_for_in_the_counters(self):
         # Server errors that still generated on the server must not look like another client's tokens.
-        self.judge.latency, self.judge.fail_every, self.judge.generation_on_failure = 0.05, 10, 2500
+        self.judge.latency, self.judge.fail_every, self.judge.generation_on_failure = 0.1, 4, 2500
         report = self.probe("3x1", abort_failure_share=1.0)
         cell = report["cells"][0]
         counters = cell["server"]["counters"]
@@ -986,9 +986,10 @@ class SharedServerTests(ProbeCase):
         unmeasured = self.probe("2x1,4x1", metrics=False, allowed_streams=2)
         self.assertEqual("skipped", unmeasured["cells"][1]["state"])
         self.assertIn("no --metrics-url", unmeasured["cells"][1]["reason"])
-        self.judge.foreign = 0
+        # Unshared, with server time dominating each call so the metrics demonstrably cover our calls.
+        self.judge.foreign, self.judge.latency = 0, 0.1
         free = self.probe("2x1,4x1", allowed_streams=2)
-        self.assertEqual(["completed", "completed"], [c["state"] for c in free["cells"]])
+        self.assertEqual(["completed", "completed"], [c["state"] for c in free["cells"]], free["cells"][-1].get("reason"))
 
     def test_server_prefix_cache_counters_give_the_cached_share_when_usage_has_none(self):
         self.judge.cached = None
