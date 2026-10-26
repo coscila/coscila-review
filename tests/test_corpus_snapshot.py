@@ -258,6 +258,147 @@ class BranchTests(unittest.TestCase):
             CorpusRepository(self.root, "work/branch")
 
 
+class BranchClashTests(unittest.TestCase):
+    """A branch write that clashes with a parent row ends as it would on a full copy, or raises; it is never dropped."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        # The source library stays writable after the snapshot: it is the full copy the branch must behave like.
+        self.copy = CorpusRepository.create(self.root, "work/literature", "Fixture question", "first", {"v": 1})
+        self.works = populate(self.copy)
+        self.reviews = [self.copy.review({"doi": f"10.1234/review-{n}", "title": f"Review {n}"}) for n in range(2)]
+        self.copy.library.snapshot("results/snapshot")
+        self.parent = Library(self.copy.workspace, "results/snapshot")
+        self.parent_db = library.digest_file(self.parent.db)
+        self.parent.branch("work/branch", "Branch question", "second", {"v": 2})
+        self.branch = CorpusRepository(self.root, "work/branch")
+        with self.copy.connect() as connection:
+            self.review_rows = {r["review_id"]: dict(r) for r in connection.execute("SELECT * FROM reviews")}
+
+    def tearDown(self):
+        self.branch.library.verify()
+        self.assertEqual(library.digest_file(self.parent.db), self.parent_db)
+
+    @staticmethod
+    def commit(repo, statement, parameters=()):
+        with repo.connect(write=True) as connection:
+            connection.execute(statement, parameters)
+
+    @staticmethod
+    def outcome(repo, statement, parameters, table, key):
+        """The IntegrityError message (None if the statement succeeds) and the rows of ``table`` it leaves; rolled back."""
+        with repo.connect(write=True) as connection:
+            try:
+                connection.execute(statement, parameters)
+                error = None
+            except sqlite3.IntegrityError as caught:
+                error = str(caught)
+            rows = [dict(r) for r in connection.execute(f"SELECT * FROM {table} ORDER BY {key}")]
+            connection.rollback()
+        return error, rows
+
+    @staticmethod
+    def rows(repo, table, key):
+        with repo.connect() as connection:
+            return [dict(r) for r in connection.execute(f"SELECT * FROM {table} ORDER BY {key}")]
+
+    def delta(self, table):
+        with contextlib.closing(sqlite3.connect(self.branch.db.as_uri() + "?mode=ro", uri=True)) as raw:
+            return raw.execute(f"SELECT count(*) FROM ocsl_delta_{table}").fetchone()[0]
+
+    def assertSameOutcome(self, statement, parameters, table, key, branch_message):
+        """The statement raises (with ``branch_message`` in the branch) or succeeds in both, leaving the same rows."""
+        copied, copy_rows = self.outcome(self.copy, statement, parameters, table, key)
+        branched, branch_rows = self.outcome(self.branch, statement, parameters, table, key)
+        self.assertEqual(copied is None, branched is None, (copied, branched))
+        if branched is not None:
+            self.assertIn("constraint failed", copied)
+            self.assertIn(branch_message, branched)
+        self.assertEqual(branch_rows, copy_rows)
+        return branch_rows
+
+    def test_inserting_a_parent_key_raises_or_is_skipped_as_on_a_full_copy(self):
+        row = (self.works[0], "Shadow title", 2020, "{}")
+        for clause in ("", "OR ABORT", "OR FAIL", "OR ROLLBACK", "OR IGNORE"):
+            with self.subTest(clause=clause):
+                self.assertSameOutcome(f"INSERT {clause} INTO works VALUES (?,?,?,?)", row, "works", "work_id",
+                                       "CHECK constraint failed: works.work_id exists in the parent snapshot")
+        # Replacing would delete the parent row, which a branch cannot do, so it raises instead of dropping the write.
+        self.assertIn("works.work_id exists in the parent snapshot",
+                      self.outcome(self.branch, "INSERT OR REPLACE INTO works VALUES (?,?,?,?)", row, "works", "work_id")[0])
+        self.assertEqual(self.delta("works"), 0)
+        # The rows a statement wrote before the clashing one stay in the transaction, as on a full copy.
+        with self.branch.connect(write=True) as connection:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "works.work_id exists in the parent snapshot"):
+                connection.executemany("INSERT INTO works VALUES (?,?,?,?)",
+                                       [("w-new-1", "New", None, "{}"), row, ("w-new-2", "New", None, "{}")])
+        self.assertEqual([r["work_id"] for r in self.rows(self.branch, "works", "work_id") if r["work_id"].startswith("w-new")],
+                         ["w-new-1"])
+
+    def test_unique_columns_of_a_parent_row_clash_like_its_key(self):
+        parent_review = self.review_rows[self.reviews[0]]
+        row = ("review-other", parent_review["corpus_id"], parent_review["work_id"], "included", "{}", "fixture")
+        for clause in ("", "OR IGNORE"):
+            with self.subTest(clause=clause):
+                self.assertSameOutcome(f"INSERT {clause} INTO reviews VALUES (?,?,?,?,?,?)", row, "reviews", "review_id",
+                                       "reviews.corpus_id, reviews.work_id exists in the parent snapshot")
+        self.assertIn("reviews.corpus_id, reviews.work_id exists in the parent snapshot", self.outcome(
+            self.branch, "INSERT OR REPLACE INTO reviews VALUES (?,?,?,?,?,?)", row, "reviews", "review_id")[0])
+        self.assertEqual(self.delta("reviews"), 0)
+
+    def test_a_row_the_branch_overrides_clashes_as_that_row(self):
+        for repo in (self.copy, self.branch):
+            repo.work({"doi": "10.1234/w0", "title": "Corrected title"})  # copy-on-write in the branch
+        row = (self.works[0], "Inserted again", None, "{}")
+        for clause, message in (("", "UNIQUE constraint failed: ocsl_delta_works.work_id"), ("OR IGNORE", None)):
+            with self.subTest(clause=clause):
+                self.assertSameOutcome(f"INSERT {clause} INTO works VALUES (?,?,?,?)", row, "works", "work_id", message)
+        shown = self.assertSameOutcome("INSERT OR REPLACE INTO works VALUES (?,?,?,?)", row, "works", "work_id", None)
+        self.assertEqual([r["title"] for r in shown if r["work_id"] == self.works[0]], ["Inserted again"])
+        # Unique values that an override moved away from are free again, as on a full copy.
+        first = self.review_rows[self.reviews[0]]
+        for repo in (self.copy, self.branch):
+            self.commit(repo, "UPDATE reviews SET work_id=? WHERE review_id=?", (self.works[2], self.reviews[0]))
+        self.assertSameOutcome("INSERT INTO reviews VALUES (?,?,?,?,?,?)",
+                               ("review-reuse", first["corpus_id"], first["work_id"], "included", "{}", "fixture"),
+                               "reviews", "review_id", None)
+
+    def test_replace_never_deletes_an_override_or_shows_its_parent_row_again(self):
+        first = self.review_rows[self.reviews[0]]
+        self.commit(self.branch, "UPDATE reviews SET selection_reason='branch' WHERE review_id=?", (self.reviews[0],))
+        row = ("review-other", first["corpus_id"], first["work_id"], "included", "{}", "fixture")
+        for clause in ("", "OR REPLACE"):
+            with self.subTest(clause=clause):
+                self.assertIn("reviews.corpus_id, reviews.work_id exists in a parent snapshot row that the branch overrides",
+                              self.outcome(self.branch, f"INSERT {clause} INTO reviews VALUES (?,?,?,?,?,?)", row, "reviews",
+                                           "review_id")[0])
+        error, rows = self.outcome(self.branch, "INSERT OR IGNORE INTO reviews VALUES (?,?,?,?,?,?)", row, "reviews",
+                                   "review_id")
+        shown = {r["review_id"]: r["selection_reason"] for r in rows}
+        self.assertEqual((error, shown[self.reviews[0]], "review-other" in shown), (None, "branch", False))
+        # The branch's own rows are replaced as on a full copy.
+        own = ("review-own", first["corpus_id"], self.works[2], "included", "{}", "first")
+        self.commit(self.branch, "INSERT INTO reviews VALUES (?,?,?,?,?,?)", own)
+        error, rows = self.outcome(self.branch, "INSERT OR REPLACE INTO reviews VALUES (?,?,?,?,?,?)",
+                                   own[:-1] + ("replaced",), "reviews", "review_id")
+        self.assertEqual((error, {r["review_id"]: r["selection_reason"] for r in rows}["review-own"]), (None, "replaced"))
+
+    def test_an_update_cannot_repeat_the_unique_values_of_another_parent_row(self):
+        taken = (self.review_rows[self.reviews[1]]["work_id"], self.reviews[0])
+        for clause in ("", "OR IGNORE"):
+            with self.subTest(clause=clause):
+                self.assertSameOutcome(f"UPDATE {clause} reviews SET work_id=? WHERE review_id=?", taken, "reviews",
+                                       "review_id", "reviews.corpus_id, reviews.work_id exists in the parent snapshot")
+        self.assertIn("reviews.corpus_id, reviews.work_id exists in the parent snapshot", self.outcome(
+            self.branch, "UPDATE OR REPLACE reviews SET work_id=? WHERE review_id=?", taken, "reviews", "review_id")[0])
+        # The refused updates copied nothing, and status still counts each review once.
+        self.commit(self.branch, "UPDATE OR IGNORE reviews SET work_id=? WHERE review_id=?", taken)
+        self.assertEqual(self.delta("reviews"), 0)
+        self.assertEqual(self.branch.status()["counts"]["reviews"], 2)
+
+
 class RootTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
