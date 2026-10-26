@@ -98,6 +98,7 @@ class MockBroker:
         self.release.set()
         self.latency = 0.0                      # simulated upstream seconds per call, outside the lock
         self.inject_policy = self.omit_request_digest = self.refuse_items = False
+        self.refuse_code = "INSTRUMENT_MESSAGE_MISMATCH"
         self.fail_next: list[str] = []
         self.refuse_next = self.rate_limit_next = 0
         self.resume_after = self.provider_paused = None
@@ -320,11 +321,18 @@ class MockBroker:
             return
         data = item["input"]
         messages = data.get("messages") if isinstance(data, dict) else None
-        if (self.refuse_items or not isinstance(messages, list) or not messages or set(data) - {"messages", "itemCount"}
+        if self.refuse_items:
+            # A refusal before any provider call, with the code the daemon would record (no attempt, no receipt).
+            self.settle(job, result, state="failed", errorCode=self.refuse_code,
+                        error=f"Refused before any provider call ({self.refuse_code}).")
+            return
+        if (not isinstance(messages, list) or not messages or set(data) - {"messages", "itemCount"}
                 or messages[0].get("role") != "system" or messages[0].get("content") != bundle["systemPrompt"]
                 or data.get("itemCount", 1) > bundle["itemsPerCall"]):
-            self.settle(job, result, state="failed", errorCode="INVALID_REQUEST",
-                        error="Verbatim instrument calls carry the installed system prompt.")
+            # The daemon refuses every verbatim item that is not the installed instrument's request this way.
+            self.settle(job, result, state="failed", errorCode="INSTRUMENT_MESSAGE_MISMATCH",
+                        error="Verbatim instrument call refused: the system message differs from the installed "
+                              "instrument prompt.")
             return
         count = data.get("itemCount", bundle["itemsPerCall"])
         system = (POLICY_PREFIX + "\n\n" if self.inject_policy else "") + messages[0]["content"]
@@ -630,15 +638,52 @@ class BrokerAbstractTierTests(BrokerTestCase):
         self.assertEqual("request_mismatch", self.rows("SELECT error FROM calls")[0]["error"])
 
     def test_a_broker_that_refuses_verbatim_calls_stops_the_run(self):
+        # Every refusal before a provider call stops the run: nothing reached a judge and the same request would be
+        # refused again, so no repair call follows and no entry becomes an invalid output.
         self.broker.install_census()
         self.broker.refuse_items = True
+        for seed, code in enumerate(("INSTRUMENT_MESSAGE_MISMATCH", "PRINCIPAL_REQUIRED", "INVALID_REQUEST"), 1):
+            with self.subTest(code=code):
+                self.broker.refuse_code = code
+                database = self.root / f"refused-{code}.sqlite3"
+                # Another seed is another run (other call ids), so no call meets a job of an earlier subtest.
+                run = CensusRun(database, seed=seed, transport=self.transport(), concurrency=4, sleep=lambda s: None)
+                self.addCleanup(run.close)
+                self.prepare(run, record(), record(doi="10.5555/second"))
+                result = run.run_abstract()
+                self.assertEqual(("paused", 0, 0), (result["state"], result["accepted"], result["invalid"]))
+                self.assertTrue(result["reason"].startswith(f"fidelity: call call-"), result["reason"])
+                self.assertIn(code, result["reason"])
+                with closing(sqlite3.connect(database)) as c:
+                    calls = c.execute("SELECT kind, error, attempts, served_model, n_parsed FROM calls").fetchall()
+                    state = c.execute("SELECT value FROM meta WHERE key='runState'").fetchone()[0]
+                self.assertEqual("paused:fidelity", state)
+                self.assertTrue(calls and all(kind == "first" and error.startswith(f"broker refused the instrument call: {code}")
+                                              and (attempts, served, parsed) == (0, None, 0)
+                                              for kind, error, attempts, served, parsed in calls), calls)
+        self.assertEqual([], self.broker.upstream)
+
+    def test_a_bundle_installed_wrongly_under_the_census_digest_stops_the_run_before_any_call(self):
+        digests = self.broker.install_census()
+        installed = self.broker.instruments[digests["abstract"]]
+        installed["systemPrompt"] += "\nAlso consider the review's tone."
         run = self.run_census()
-        self.prepare(run)
+        self.prepare(run, record(), record(doi="10.5555/second"))
         result = run.run_abstract()
         self.assertEqual(("paused", 0, 0), (result["state"], result["accepted"], result["invalid"]))
-        self.assertIn("verbatim mode", result["reason"])
-        self.assertEqual([], self.broker.upstream)
-        self.assertEqual("broker refused the instrument call: INVALID_REQUEST", self.rows("SELECT error FROM calls")[0]["error"])
+        self.assertIn("INSTRUMENT_MESSAGE_MISMATCH", result["reason"])
+        self.assertIn(f"the bundle installed under {digests['abstract']}", result["reason"])
+        self.assertIn("ocsl-review instruments export", result["reason"])
+        self.assertEqual([], self.broker.upstream, "the broker refused every item before a provider call")
+        status = self.status()
+        self.assertEqual(("paused:fidelity", len(self.rows("SELECT call_id FROM calls")), 0),
+                         (status["runState"], status["brokerRefusals"], status["brokerRequestMismatches"]))
+        self.assertTrue(any("refused before any provider call" in note for note in gates(status)["notes"]))
+        self.assertEqual({"first"}, {c["kind"] for c in self.rows("SELECT kind FROM calls")}, "no repair call")
+        self.assertLessEqual(len(self.rows("SELECT call_id FROM calls")), 2, "the run stops at the first refusal")
+        installed["systemPrompt"] = C.system_prompt(JOURNAL)
+        resumed = run.run_abstract()
+        self.assertEqual(("completed", 30, 0), (resumed["state"], resumed["accepted"], self.status()["duplicateJudgments"]))
 
     def test_repair_failures_and_refusals_follow_the_direct_semantics(self):
         self.broker.install_census()

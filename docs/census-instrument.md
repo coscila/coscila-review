@@ -527,10 +527,14 @@ has no whitespace and writes strings and numbers as `JSON.stringify` does (an
 integral float such as 0.0 is written 0). A missing or different digest makes
 the call invalid: it is recorded with error `request_mismatch`, its output is
 never parsed, its entries stay open (never invalid outputs) and the run pauses
-as `paused:fidelity`. An item the broker refuses before any provider call
-(`INVALID_REQUEST`, no attempt: the daemon does not run the instrument
-verbatim) stops the run the same way. The next invocation tries again, so fix
-the daemon first.
+as `paused:fidelity`. An item the broker refuses before any provider call (no
+attempt) stops the run the same way, with the broker's reason in the call's
+error: `INSTRUMENT_MESSAGE_MISMATCH` (the messages or settings differ from the
+bundle installed under the digest, or from the worker's model),
+`PRINCIPAL_REQUIRED` (no run principal authority) or `INVALID_REQUEST` (the
+daemon cannot run the instrument verbatim). No repair call follows, since the
+same request would be refused again. The next invocation tries again, so fix
+the daemon or the installed bundle first.
 
 **Receipts.** Each settled broker call is a `calls` row with `transport =
 broker`, `broker_principal_id`, `broker_job_id` (the job that settled it, after
