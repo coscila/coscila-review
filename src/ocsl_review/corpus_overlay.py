@@ -11,6 +11,15 @@ name them unqualified, which every SQLite version accepts); updating a parent
 row first copies it into the branch (copy-on-write) so the branch's own
 triggers still enforce append-only tables, and parent rows cannot be deleted.
 
+A branch never drops a write silently. When a written row's key or unique
+columns match a parent row that the branch shows, the trigger first inserts into
+a TEMP probe table whose CHECK constraint, named after the clashing columns,
+always fails. SQLite resolves that failure with the conflict clause of the
+statement that fired the trigger, so a plain INSERT or UPDATE (and OR ABORT,
+OR FAIL, OR ROLLBACK) raises IntegrityError and OR IGNORE skips the row, as on
+a full copy of the parent; OR REPLACE raises as well, because replacing would
+delete a parent row.
+
 SQLite cannot enforce foreign keys across databases, so branch connections
 disable them and TEMP triggers check every declared reference of an inserted
 or updated row against the union instead; verification repeats that check for
@@ -34,8 +43,12 @@ SHARED = (
     "assessment_evidence", "work_observations", "work_observation_evidence", "facts", "corpus_reviews",
     "corpus_documents", "corpus_imports", "retained_sources", "store_meta",
 )
-# Identities that must stay unique across parent and branch (a clash raises).
+# Identities that must stay unique across parent and branch (a clash raises, even with OR IGNORE).
 STRICT = ("corpora", "runs", "analyses")
+# TEMP table whose CHECK constraints report writes that clash with parent rows (it never holds a row).
+CLASH_TABLE = "ocsl_parent_clash"
+CLASH = "exists in the parent snapshot"
+OVERRIDDEN = "exists in a parent snapshot row that the branch overrides"
 # Tables whose row totals status reports; a branch counts the parent rows it copies (copy-on-write) so that
 # status can take them out of the union without scanning the branch tables.
 COUNTED = ("reviews", "bibliography_entries", "works", "claim_loci", "source_artifacts", "source_sections")
@@ -83,6 +96,11 @@ def _match(columns, left: str, right: str) -> str:
     return " AND ".join(f"{left}.{quote(c)}={right}.{quote(c)}" for c in columns)
 
 
+def _named(name: str, columns) -> str:
+    """Columns as SQLite names them in a UNIQUE constraint message."""
+    return ", ".join(f"{name}.{c}" for c in columns)
+
+
 def prefix_shared_tables(connection: sqlite3.Connection) -> list[str]:
     """Rename the shared tables of a new branch database (references and triggers follow)."""
     present = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -128,7 +146,11 @@ class Overlay:
         if self.parent_version != self.version:
             raise ValueError("branch schema version differs from its parent snapshot")
         self.shared = [name for name, table in self.tables.items() if table.shared]
-        self.script = "\n".join(self._statements())
+        self.clash_columns: dict[str, str] = {}
+        statements = list(self._statements())
+        probe = ", ".join(f"{column} INTEGER CONSTRAINT {quote(message)} CHECK ({column} IS NULL)"
+                          for message, column in self.clash_columns.items())
+        self.script = "\n".join(([f"CREATE TEMP TABLE {CLASH_TABLE}({probe});"] if probe else []) + statements)
 
     def physical(self, name: str) -> str:
         table = self.tables.get(name)
@@ -162,6 +184,42 @@ class Overlay:
                               f"(SELECT 1 FROM {quote(target)} AS r WHERE {matched});")
         return " ".join(statements)
 
+    def _probe(self, message: str, condition: str) -> str:
+        """A trigger step that fails a CHECK constraint named ``message`` when ``condition`` holds.
+
+        SQLite resolves the failure with the conflict clause of the statement that fired the
+        trigger: OR IGNORE skips the step (the guarded write after it then skips the row), and
+        every other clause, OR REPLACE included, raises IntegrityError with the message.
+        """
+        column = self.clash_columns.setdefault(message, f"c{len(self.clash_columns)}")
+        return f"INSERT INTO {CLASH_TABLE}({column}) SELECT 1 WHERE {condition}; "
+
+    @staticmethod
+    def _parent_clash(table: Table, group, new: dict, other_than: dict | None = None) -> str:
+        """A parent row the branch shows (no branch row overrides it) has ``new``'s values in ``group``.
+
+        ``new`` and ``other_than`` map columns to the SQL expressions of the written row and,
+        for an update, of the row's own key (which the check skips).
+        """
+        conditions = [" AND ".join(f"cp.{quote(c)}={new[c]}" for c in group)]
+        if other_than:
+            conditions.append("NOT (" + " AND ".join(f"cp.{quote(c)} IS {other_than[c]}" for c in table.key) + ")")
+        if table.key:
+            conditions.append(f"NOT EXISTS (SELECT 1 FROM main.{quote(table.physical)} AS cd "
+                              f"WHERE {_match(table.key, 'cd', 'cp')})")
+        return f"EXISTS (SELECT 1 FROM {PARENT}.{quote(table.name)} AS cp WHERE {' AND '.join(conditions)})"
+
+    @staticmethod
+    def _override_clash(table: Table, group, new: dict, other_than: dict) -> str:
+        """A branch row that overrides a parent row under another key has ``new``'s values in ``group``.
+
+        Replacing that row would delete the override and show the parent row again.
+        """
+        matched = " AND ".join(f"cd.{quote(c)}={new[c]}" for c in group)
+        own = " AND ".join(f"cd.{quote(c)} IS {other_than[c]}" for c in table.key)
+        return (f"EXISTS (SELECT 1 FROM main.{quote(table.physical)} AS cd WHERE {matched} AND NOT ({own}) AND EXISTS "
+                f"(SELECT 1 FROM {PARENT}.{quote(table.name)} AS cp WHERE {_match(table.key, 'cp', 'cd')}))")
+
     def _statements(self):
         for name, table in self.tables.items():
             if table.shared:
@@ -187,11 +245,18 @@ class Overlay:
                 yield (f"CREATE TEMP VIEW {quote(ORDERED_PREFIX + name)} AS "
                        f"SELECT 0 AS ocsl_source, rowid AS ocsl_rowid, {columns} FROM main.{d} UNION ALL "
                        f"SELECT 1, p.rowid, {parent_columns} FROM {PARENT}.{t} AS p{hidden};")
-            values = ", ".join(f"coalesce(NEW.{quote(c)}, {table.defaults[c]})" if c in table.defaults
-                               else f"NEW.{quote(c)}" for c in table.columns)
-            clashes = [f"NOT EXISTS (SELECT 1 FROM {PARENT}.{t} AS p WHERE {_match(group, 'p', 'NEW')})"
-                       for group in ((table.key,) if table.key else ()) + table.uniques]
-            guard = " WHERE " + " AND ".join(clashes) if clashes else ""
+            inserted = {c: f"coalesce(NEW.{quote(c)}, {table.defaults[c]})" if c in table.defaults else f"NEW.{quote(c)}"
+                        for c in table.columns}
+            values = ", ".join(inserted[c] for c in table.columns)
+            # Unique groups a row with another key can clash on (a group holding the key clashes with the key).
+            others = tuple(group for group in table.uniques if not (table.key and set(table.key) <= set(group)))
+            groups = ((table.key,) if table.key and name not in STRICT else ()) + others
+            clashes = [self._parent_clash(table, group, inserted) for group in groups]
+            probes = "".join(self._probe(f"{_named(name, group)} {CLASH}", clash) for group, clash in zip(groups, clashes))
+            if table.key:
+                probes += "".join(self._probe(f"{_named(name, group)} {OVERRIDDEN}",
+                                              self._override_clash(table, group, inserted, inserted)) for group in others)
+            guard = " WHERE " + " AND ".join(f"NOT {clash}" for clash in clashes) if clashes else ""
             strict = ""
             if name in STRICT and table.key:
                 strict = (f"SELECT RAISE(ABORT, 'UNIQUE constraint failed: {name} exists in the parent snapshot') "
@@ -199,7 +264,7 @@ class Overlay:
             checks = self._checks(name)
             # Trigger bodies name the branch table unqualified (older SQLite rejects schema-qualified targets).
             yield (f"CREATE TEMP TRIGGER {quote('ocsl_insert_' + name)} INSTEAD OF INSERT ON {t} BEGIN {strict}"
-                   f"{checks} INSERT INTO {d}({columns}) SELECT {values}{guard}; END;")
+                   f"{checks} {probes}INSERT INTO {d}({columns}) SELECT {values}{guard}; END;")
             if table.key:
                 assignments = ", ".join(f"{quote(c)}=NEW.{quote(c)}" for c in table.columns)
                 old = " AND ".join(f"{quote(c)}=OLD.{quote(c)}" for c in table.key)
@@ -209,8 +274,18 @@ class Overlay:
                 # A changed key would leave the parent's row visible again under the old key.
                 key_guard = (f"SELECT RAISE(ABORT, '{name}: keys of shared rows cannot change in a branch') "
                              f"WHERE NOT ({same_key}); ")
+                # New unique values must not repeat those of another row the union shows or the branch overrides.
+                new = {c: f"NEW.{quote(c)}" for c in table.columns}
+                own = {c: f"OLD.{quote(c)}" for c in table.key}
+                taken = [self._parent_clash(table, group, new, own) for group in others]
+                overridden = [self._override_clash(table, group, new, own) for group in others]
+                update_probes = "".join(self._probe(f"{_named(name, group)} {CLASH}", clash)
+                                        for group, clash in zip(others, taken))
+                update_probes += "".join(self._probe(f"{_named(name, group)} {OVERRIDDEN}", clash)
+                                         for group, clash in zip(others, overridden))
+                unblocked = "".join(f" AND NOT {clash}" for clash in taken + overridden)
                 copied = (f"FROM {PARENT}.{t} AS p WHERE {parent_old} "
-                          f"AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old})")
+                          f"AND NOT EXISTS (SELECT 1 FROM main.{d} AS d WHERE {delta_old}){unblocked}")
                 counting = ""
                 if name in COUNTED:
                     counting = (f"INSERT INTO progress_counters SELECT 'overrides','','{name}','',1 {copied} "
@@ -221,8 +296,8 @@ class Overlay:
                 if counting and "progress_counters" not in self.tables:
                     counting = ""
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_update_' + name)} INSTEAD OF UPDATE ON {t} BEGIN {key_guard}"
-                       f"{checks} {counting}INSERT INTO {d}({columns}) SELECT {parent_columns} {copied}; "
-                       f"UPDATE {d} SET {assignments} WHERE {old}; END;")
+                       f"{checks} {update_probes}{counting}INSERT INTO {d}({columns}) SELECT {parent_columns} {copied}; "
+                       f"UPDATE {d} SET {assignments} WHERE {old}{unblocked}; END;")
                 yield (f"CREATE TEMP TRIGGER {quote('ocsl_delete_' + name)} INSTEAD OF DELETE ON {t} BEGIN "
                        f"SELECT RAISE(ABORT, '{name}: rows of the parent snapshot are immutable') "
                        f"WHERE EXISTS (SELECT 1 FROM {PARENT}.{t} AS p WHERE {parent_old}); "
