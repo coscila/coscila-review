@@ -508,12 +508,17 @@ unless the worker requests the census model and every bundle the pending
 reviews need is installed and granted; the error names the missing digests.
 
 **Calls.** Each paper-batch call (first, repair or full-text call) is one bulk
-job with one item whose input is `{messages, itemCount}`: the instrument's
-system and user messages, unchanged, and the number of entries. The job names
-the bundle digest; the daemon sends the messages upstream without a worker
-policy or assignment text, with model, temperature, seed, reasoning and
-`max_tokens` from the provider and the bundle. The item id is the call id, and
-the job's idempotency key is derived from the call id and the request digest.
+job with one item whose input is the chat-completions request the instrument
+built plus its entry count: `{messages, model, max_tokens, temperature,
+stream, reasoning_effort, itemCount}`, the system and user messages unchanged.
+The job names the bundle digest. The daemon checks the item against the bundle
+installed under it and the worker's model (the system message is the installed
+prompt; model, `max_tokens`, temperature, seed, reasoning and `stream` are the
+values it sends) and refuses any difference before a provider call with
+`INSTRUMENT_MESSAGE_MISMATCH`; otherwise it sends exactly that request upstream,
+without a worker policy or assignment text, as canonical JSON. The item id is
+the call id, and the job's idempotency key is derived from the call id and the
+request digest.
 The executor follows the principal's changed-job feed (`GET /jobs?view=summary`)
 and reads each settled job's result page.
 

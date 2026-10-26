@@ -313,6 +313,8 @@ def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, requir
                    digest: str, items: int) -> CallResult:
     """One logical call as a one-item broker job (``census_broker.BrokerTransport``); returns the receipt fields.
 
+    The item carries ``payload`` whole: its messages unchanged and its settings, which the broker checks against the
+    installed bundle and the worker's model before any provider call; a refusal stops the run (``BROKER_REFUSALS``).
     The broker retries transport failures itself. A completed item counts only when it reports the digest of
     the request it sent upstream and that digest equals the canonical digest of ``payload``; otherwise the call
     is invalid, its output is never parsed and the run stops (``stop="fidelity"``). A call that never settled
@@ -328,7 +330,7 @@ def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, requir
                "broker_principal_id": getattr(transport, "principal_id", None), "broker_item_id": call_id,
                "broker_instrument_digest": digest}
     outcome = transport.call(item_id=call_id, messages=payload["messages"], item_count=items, digest=digest,
-                             key=census_broker.idempotency_key(call_id, expected))
+                             key=census_broker.idempotency_key(call_id, expected), settings=settings)
     receipt["seconds"] = outcome.seconds
     if outcome.job:
         receipt["broker_job_id"] = outcome.job.get("jobId")

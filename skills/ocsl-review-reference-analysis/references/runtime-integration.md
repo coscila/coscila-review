@@ -52,9 +52,11 @@ judge provider to the principal; `study prepare --study-bundle` pins the study
 bundle that every call receipt records. Entitled reviews reach only a broker
 provider that the operator policy lists in `onPremBrokerProviders`.
 
-Each call is a one-item bulk job carrying the instrument's messages unchanged;
-a receipt whose request digest differs from the request the instrument built
-makes the call invalid and pauses the run as `paused:fidelity`. A broker pause
+Each call is a one-item bulk job carrying the request the instrument built (its
+messages unchanged and its settings, which the broker checks against the
+installed bundle before any provider call); a refusal, or a receipt whose
+request digest differs from the request the instrument built, makes the call
+invalid and pauses the run as `paused:fidelity`. A broker pause
 (provider limit, budget, expiry, withdrawn grant) pauses the run as
 `paused:transport` with the broker's reason and `resumeAfter`; running the same
 command again resumes the same broker jobs and never judges an entry twice.
