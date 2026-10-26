@@ -9,6 +9,12 @@ module digest, so a changed prompt, schema, builder or validator is a
 different instrument. Execution code (transport, retries, storage) is
 deliberately outside the digest: capacity and reliability fixes never force a
 new analysis.
+
+An instrument that declares ``transport.messages: verbatim`` exports one broker
+bundle per tier and parameter set (``ocsl-review instruments export``): the
+body the execution daemon installs with ``PUT /v2/instruments/{digest}``, under
+a digest derived from the registry digest, the tier, the parameters and the
+bundle itself.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ PACKAGE = Path(__file__).resolve().parent
 SCHEMA_PATH = HOME / "schemas/instrument.schema.json"
 ID_PATTERN = re.compile(r"^([a-z][a-z0-9-]*)@([1-9][0-9]*)$")
 DIGEST_FORMAT = "ocsl-instrument-digest-v1"
+BROKER_FORMAT = "ocsl-broker-instrument-v1"
 
 
 def canonical(value: Any) -> str:
@@ -217,6 +224,84 @@ def study_bundle_digest(*, protocol: Any, study_prompt: str | bytes, instruments
               "instruments": dict(sorted(instruments.items())), "datasetVersions": dict(sorted(dataset_versions.items())),
               "packageTags": dict(sorted(package_tags.items()))}
     return {**record, "sha256": sha256_bytes(canonical(record).encode("utf-8"))}
+
+
+def _parameter_value(instrument: Instrument, name: str, value: Any, token: str | None) -> str:
+    if not isinstance(value, str) or not value.strip() or "\n" in value or (token and token in value):
+        raise ValidationError(f"{instrument.id}: parameter {name} must be one non-empty line")
+    return value
+
+
+def broker_bundle(instrument_id: str, *, tier: str | None = None,
+                  parameters: dict[str, str] | None = None) -> dict[str, Any]:
+    """The bundle the execution daemon installs for one tier of a verbatim instrument, with its broker digest.
+
+    ``bundle`` is the exact ``PUT /v2/instruments/{digest}`` body: the system prompt with the parameters
+    substituted (byte for byte what the builder sends), no response schema (the label parser validates),
+    the output-token rule, sampling, reasoning, geometry, the required served model (when a mismatch
+    pauses) and ``transport.messages: verbatim``. ``digest`` is the sha256 of the canonical JSON of the
+    registry digest, tier, parameters and bundle digest, so a different body never reuses a digest.
+    """
+    from .census_broker import canonical_sha256
+    instrument = load(instrument_id)
+    manifest = instrument.manifest
+    if (manifest.get("transport") or {}).get("messages") != "verbatim":
+        raise ValidationError(f"{instrument.id} declares no verbatim message transport; only instruments that do export "
+                              "a broker bundle")
+    tiers = sorted(manifest["tiers"])
+    if tier is None:
+        if len(tiers) != 1:
+            raise ValidationError(f"{instrument.id} has the tiers {', '.join(tiers)}: choose one with --tier")
+        tier = tiers[0]
+    spec = instrument.tier(tier)
+    declared = manifest.get("parameters") or {}
+    values = dict(parameters or {})
+    unknown = sorted(set(values) - set(declared))
+    if unknown:
+        raise ValidationError(f"{instrument.id} has no parameter {', '.join(unknown)}")
+    prompt = instrument.text("systemPrompt")
+    for name, declaration in sorted(declared.items()):
+        token = declaration.get("token")
+        if name not in values:
+            if declaration.get("required"):
+                raise ValidationError(f"{instrument.id} needs --param {name}=VALUE")
+            continue
+        value = _parameter_value(instrument, name, values[name], token)
+        if token:
+            if prompt.count(token) != 1:
+                raise ValidationError(f"{instrument.id}: parameter {name} token must occur once in the system prompt")
+            prompt = prompt.replace(token, value)
+    request = spec["request"]
+    rule = request["maxOutputTokens"]
+    required = manifest.get("requiredModel") or {}
+    bundle = {"instrumentId": instrument.id, "version": instrument.version, "systemPrompt": prompt,
+              "responseSchema": None,
+              "maxOutputTokens": {"perItem": int(rule["perItem"]), "minimum": int(rule["floor"])},
+              "temperature": request["temperature"], "seed": request.get("seed"),
+              "reasoning": request.get("reasoningEffort") or "none",
+              "itemsPerCall": int(spec["geometry"]["itemsPerCall"]),
+              "requiredModelFingerprint": required.get("served") if required.get("onMismatch") == "pause" else None,
+              "transport": {"messages": "verbatim"}}
+    registry = instrument.digest
+    bundle_sha = canonical_sha256(bundle)
+    digest = canonical_sha256({"format": BROKER_FORMAT, "instrument": instrument.id, "registryDigest": registry,
+                               "tier": tier, "parameters": values, "bundleSha256": bundle_sha})
+    return {"format": BROKER_FORMAT, "instrumentId": instrument.id, "registryDigest": registry, "tier": tier,
+            "parameters": values, "digest": digest, "bundleSha256": bundle_sha,
+            "install": f"PUT /v2/instruments/{digest}", "bundle": bundle}
+
+
+def cmd_export(args: Any) -> dict[str, Any]:
+    parameters: dict[str, str] = {}
+    for item in getattr(args, "param", None) or []:
+        name, separator, value = item.partition("=")
+        if not separator or not name:
+            raise ValidationError("--param takes NAME=VALUE")
+        if name in parameters:
+            raise ValidationError(f"--param {name} is given twice")
+        parameters[name] = value
+    exported = broker_bundle(args.instrument, tier=getattr(args, "tier", None), parameters=parameters)
+    return exported["bundle"] if getattr(args, "body", False) else exported
 
 
 def cmd_list(args: Any) -> dict[str, Any]:

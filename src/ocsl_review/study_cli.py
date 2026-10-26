@@ -5,14 +5,17 @@ Controllers call these commands instead of writing drivers: enumerate the
 population live, acquire review documents, derive cited works from each
 review's own bibliography, look up cited-work abstracts and metadata from the
 study's byte caches or live routes, record protocol exclusions, prepare reviews
-from a manifest, run the abstract and full-text tiers, the predeclared
+from a manifest (pinning the study bundle), run the abstract and full-text
+tiers directly or through the run principal's broker socket, the predeclared
 no-truncation sensitivity, gates, freezing, exports, estimands and facts, and
 compare a stored manifest with the fresh enumeration afterwards.
+``instruments export`` prints the broker bundle of a verbatim instrument.
 """
 from __future__ import annotations
 
 import hashlib
 import http.client
+import os
 import threading
 import time
 import urllib.error
@@ -27,14 +30,20 @@ EUROPE_PMC_FULL_TEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/%s/full
 
 
 def add_commands(families, register):
-    instruments = families.add_parser("instruments", help="list, show and verify measurement instruments")
+    instruments = families.add_parser("instruments", help="list, show, verify and export measurement instruments")
     commands = instruments.add_subparsers(dest="instrument_command", required=True)
-    for name in ("list", "show", "verify"):
+    for name in ("list", "show", "verify", "export"):
         command = commands.add_parser(name)
-        if name == "show":
+        if name in ("show", "export"):
             command.add_argument("instrument")
         if name == "verify":
             command.add_argument("instrument", nargs="?")
+        if name == "export":
+            command.add_argument("--tier", help="instrument tier (required when the instrument has several)")
+            command.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                                 help="instrument parameter, for example journal=NAME (the reviews' journal)")
+            command.add_argument("--body", action="store_true",
+                                 help="print only the bundle: the exact body of PUT /v2/instruments/{digest}")
         register(command, "instruments", f"cmd_{name}", "read-only", state_required=False)
 
     study = families.add_parser("study", help="run a census study with a registered instrument")
@@ -79,6 +88,9 @@ def add_commands(families, register):
                                       "every enumerated review is in the study or excluded")
         if name == "prepare":
             command.add_argument("--input", required=True, help="JSONL review records; document paths are relative to it")
+            command.add_argument("--study-bundle",
+                                 help="study bundle file (ocsl-study-bundle-v1) or its sha256, pinned before the first "
+                                      "call and recorded in every call receipt")
             command.add_argument("--require-fresh-enumeration", action="store_true",
                                  help="prepare only reviews of a verified live enumeration, acquired with provenance")
             command.add_argument("--enumeration", help="enumeration receipt (<manifest>.receipt.json) of study enumerate")
@@ -95,13 +107,19 @@ def add_commands(families, register):
             command.add_argument("--allow-incomplete", action="store_true",
                                  help="compare before the census run is complete (recorded with the comparison)")
         if name in ("judge", "full-text", "no-truncation", "replicate"):
-            command.add_argument("--base-url", required=True, help="chat-completions base URL of the judge")
-            command.add_argument("--api-key-env", help="environment variable holding the judge key")
+            command.add_argument("--base-url", help="chat-completions base URL of a judge called directly")
+            command.add_argument("--api-key-env", help="environment variable holding the direct judge's key")
+            command.add_argument("--broker-socket",
+                                 help="the run principal's broker socket (default: OCSL_BROKER_SOCKET when no --base-url "
+                                      "is given); the broker holds every credential")
+            command.add_argument("--broker-worker", help="bulk worker of the run principal (needed when it offers several)")
             command.add_argument("--model", help="model name to request (defaults to the required served model)")
-            command.add_argument("--concurrency", type=int, default=60)
+            command.add_argument("--concurrency", type=int, default=60, help="calls in flight")
             command.add_argument("--on-premises", action="store_true",
-                                 help="the judge runs on premises (entitled text allowed); needs --policy naming its endpoint")
-            command.add_argument("--policy", help="operator egress policy (JSON, version 2) whose onPremEndpoints lists the judge")
+                                 help="the judge runs on premises (entitled text allowed); needs --policy naming its "
+                                      "endpoint, or for the broker its provider")
+            command.add_argument("--policy", help="operator egress policy (JSON, version 2) whose onPremEndpoints lists the "
+                                                  "judge, or whose onPremBrokerProviders lists the broker provider")
             command.add_argument("--transport-retries", type=int, default=3,
                                  help="further passes over entries left open by an outage before the run pauses")
             command.add_argument("--transport-cooldown", type=float, default=60.0,
@@ -151,17 +169,43 @@ def add_commands(families, register):
 
 
 def _transport(args):
-    from .census_runner import HttpChatTransport
-    if args.on_premises:
-        # Entitled text goes only to an endpoint the operator's policy lists, never on a self-declared flag.
-        from .claim_check import ConfidentialPolicy
-        from .errors import ConfidentialityError
-        if not args.policy:
-            raise ConfidentialityError("--on-premises needs --policy with the judge endpoint in onPremEndpoints")
-        endpoint = args.base_url.rstrip("/") + "/chat/completions"
-        if not ConfidentialPolicy.load(Path(args.policy)).endpoint_on_prem(endpoint):
-            raise ConfidentialityError(f"{endpoint} is not an on-prem endpoint of the policy")
-    return HttpChatTransport(args.base_url, api_key_env=args.api_key_env, on_premises=args.on_premises)
+    """The direct chat-completions transport (``--base-url``) or the broker transport (``--broker-socket`` or
+    ``OCSL_BROKER_SOCKET``); entitled text reaches only a judge the operator's policy names as on premises."""
+    from .census_broker import SOCKET_ENV
+    from .claim_check import ConfidentialPolicy
+    from .errors import ConfidentialityError
+    base_url, socket_path = getattr(args, "base_url", None), getattr(args, "broker_socket", None)
+    if base_url and socket_path:
+        raise ValidationError("give either --base-url (a judge called directly) or --broker-socket (the run principal's "
+                              "broker), not both")
+    on_premises, policy = bool(getattr(args, "on_premises", False)), getattr(args, "policy", None)
+    if base_url:
+        from .census_runner import HttpChatTransport
+        if on_premises:
+            # Entitled text goes only to an endpoint the operator's policy lists, never on a self-declared flag.
+            if not policy:
+                raise ConfidentialityError("--on-premises needs --policy with the judge endpoint in onPremEndpoints")
+            endpoint = base_url.rstrip("/") + "/chat/completions"
+            if not ConfidentialPolicy.load(Path(policy)).endpoint_on_prem(endpoint):
+                raise ConfidentialityError(f"{endpoint} is not an on-prem endpoint of the policy")
+        return HttpChatTransport(base_url, api_key_env=getattr(args, "api_key_env", None), on_premises=on_premises)
+    socket_path = socket_path or os.environ.get(SOCKET_ENV) or None
+    if not socket_path:
+        raise ValidationError(f"give --base-url for a judge called directly, or --broker-socket (or {SOCKET_ENV}) for the "
+                              "run principal's broker socket")
+    if getattr(args, "api_key_env", None):
+        raise ValidationError("the broker transport holds no provider credential: the broker injects it; drop --api-key-env")
+    from .census_broker import BrokerTransport
+    transport = BrokerTransport(socket_path, worker=getattr(args, "broker_worker", None))
+    transport.open()
+    if on_premises:
+        if not policy:
+            raise ConfidentialityError("--on-premises needs --policy with the broker provider in onPremBrokerProviders")
+        if not ConfidentialPolicy.load(Path(policy)).broker_provider_on_prem(transport.provider_id, transport.worker_model):
+            raise ConfidentialityError(f"broker provider {transport.provider_id} is not an on-prem broker provider of the "
+                                       "policy")
+        transport.on_premises = True
+    return transport
 
 
 def _run(args, transport=None):
@@ -230,6 +274,14 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
         "fullTextTierComplete": status["openFullTextEntries"] == 0 and not status["fullTextReviews"].get("pending"),
     }
     notes = []
+    if status.get("brokerCalls"):
+        # A verdict counts only from a broker call whose receipt attests the request the instrument built.
+        checks["everyBrokerVerdictFromAVerifiedRequest"] = status.get("brokerVerdictsFromUnverifiedRequests") == 0
+    if status.get("brokerRequestMismatches"):
+        notes.append(f"{status['brokerRequestMismatches']} broker calls reported another request than the instrument "
+                     "built; they are invalid and their outputs were discarded")
+    if status.get("studyBundleSha256"):
+        checks["everyReceiptCarriesTheStudyBundle"] = status.get("receiptsWithoutStudyBundle") == 0
     if responded and not status["fingerprintOffered"]:
         notes.append("the judge server offered no system_fingerprint on any response, so the fingerprint gate cannot "
                      "pass with this server")
@@ -467,7 +519,10 @@ def command(args) -> Any:
         try:
             run = _run(args)
             try:
-                return prepare(run, Path(args.input), caches=caches, enumeration=enumeration)
+                bundle = run.pin_study_bundle(args.study_bundle) if args.study_bundle else None
+                result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration)
+                return {**result, "studyBundle": bundle or ({"studyBundleSha256": run.study_bundle}
+                                                            if run.study_bundle else None)}
             finally:
                 run.close()
         finally:
