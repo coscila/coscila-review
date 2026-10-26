@@ -117,7 +117,12 @@ neighbouring abstracts in their call are no longer cut.
 Records written by `study acquire` also carry an `acquisition` block (where the
 document came from, see below) and records of a fresh enumeration an
 `enumeration` block (the group and the digest of the provider page that listed
-the review); a record may pin its document by `documentSha256`.
+the review); a record may pin its document by `documentSha256`. A supplied
+document without `provenanceClass` counts as entitled, as a journal without a
+route does in acquisition, so it reaches only on-premises judges. Supplied
+`identities`, `country` and `topic` are taken as given (recorded as
+`supplied`); a fresh-enumeration study refuses records that carry them and
+derives its cited works with `study works` (see [fresh enumeration](#fresh-enumeration)).
 
 `study abstracts --input reviews.jsonl --output reviews.abstracts.jsonl` gives
 every cited work the abstract of one provider, Europe PMC `resultType=core`, 40
@@ -232,9 +237,11 @@ Every review records its provenance class: `cache-hit-public`,
 record). Europe PMC copies are public; retained captures and publisher pages
 take the class of the journal's route, and entitled when the journal has none.
 The record's `acquisition` block names the cache and its version, the source
-digest, the identifiers that agreed, the table pages and every rejected
-candidate with its reason; `provenanceClass` follows from the label, and
-entitled reviews reach only on-premises judges.
+digest, the identifiers that agreed, the table pages, every rejected
+candidate with its reason, and `liveRoute`: whether the journal's live route
+was on, so that a cache hit only stood in for a download the acquisition would
+have made anyway; `provenanceClass` follows from the label, and entitled
+reviews reach only on-premises judges.
 
 **Cited-work abstracts.** `study abstracts --store DIR --provider-cache FILE`
 asks the caches before Europe PMC. From the provider cache it takes the
@@ -248,22 +255,38 @@ the work is refused; a cached record without an abstract is no hit, and the
 live lookup decides. Each work records `abstractProvenance` (`cache-hit-public`
 with the cache, its version and the source digest, `live-public`, `supplied`
 for a recorded fallback, or `unavailable`) bound to the digest of its text; text
-changed after the lookup counts as supplied.
+changed after the lookup counts as supplied. A work that `study works` derived
+from the review's bibliography also takes its title, venue, year, PMCID and
+retraction flag from the same record (`metadataProvenance`, bound to the digest
+of those fields; `unavailable` without a record); metadata edited afterwards
+counts as supplied. Works an input supplied keep their metadata.
 
-**Cited-work full texts.** `study full-text --store DIR --provider-cache FILE`
-reads cached Europe PMC fullTextXML first (the provider cache by the PMCID's
-fullTextXML address, the store's Europe PMC documents) and accepts it when its
-PMCID or DOI agrees with the work; otherwise Europe PMC live
-(`--europe-pmc`), then entitled text. Each escalated entry records
-`ft_provenance`: the class of the source behind its window, or `unavailable`
-when no window was sent.
+**Cited-work full texts.** `study full-text --store DIR --provider-cache FILE
+--europe-pmc` reads cached Europe PMC fullTextXML first (the provider cache by
+the PMCID's fullTextXML address, the store's Europe PMC documents) and accepts
+it when its PMCID or DOI agrees with the work; otherwise Europe PMC live, then
+entitled text. The caches are given only together with `--europe-pmc`: earlier
+runs fetched full texts only for their own escalations, so a cache-only tier
+would limit full-text coverage to their selection, while with live retrieval a
+cache hit only stands in for a download the run makes for every escalated work
+(`liveRetrieval` in the source's provenance record). The source paths an
+earlier census selected (`legacy-original-source` documents in the store) are
+never candidates. Each escalated entry records `ft_provenance`: the class of
+the source behind its window, or `unavailable` when no window was sent.
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
 re-checks every review cache hit: the claimed cache version must be the pinned
-one and it must hold exactly these bytes for this review, otherwise the record
-is skipped as `skipped-provenance-unverified`. An acquired document that
-declares a different DOI is refused. Provenance lands in `reviews.provenance`
+one and it must hold exactly these bytes for this review (a provider-cache hit
+must answer this review's own request, its doi.org page or its PMCID's
+fullTextXML), otherwise the record is skipped as `skipped-provenance-unverified`.
+An acquired document is checked for identity again, as acquisition does: every
+identifier it declares about itself (DOI, PMCID, PMID) must agree with the
+record and one must be shared, otherwise it is refused. Every abstract cache
+hit is read again from the pinned cache: the request the lookup makes for the
+work must select the same entry (request key and record pointer, or store
+document) with the same digest, and that record's abstract must be exactly the
+text prepared; otherwise it is recorded unverified. Provenance lands in `reviews.provenance`
 and in `input_provenance`, one row per review document, abstract evidence unit
 and full-text source (cache, cache version, source digest, identity check,
 provider, address, retrieval time, whether the cache hit was re-checked against
@@ -280,9 +303,13 @@ the stored manifest only afterwards:
 ocsl-review study enumerate --spec protocol/enumeration.json --output study/enumeration.jsonl
 ocsl-review study acquire --input study/enumeration.jsonl --output study/reviews.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
+ocsl-review study works --input study/reviews.jsonl --output study/reviews.works.jsonl
+ocsl-review study abstracts --input study/reviews.works.jsonl --output study/reviews.works.abstracts.jsonl \
+  --store "$STORE" --provider-cache "$PROVIDER_CACHE"
 ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" \
   --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json
+ocsl-review study exclude --database work/census.sqlite3 --input protocol/exclusions.jsonl   # if the protocol excludes any
 ocsl-review study gates --database work/census.sqlite3 --require-fresh-enumeration
 ocsl-review study compare-manifest --database work/census.sqlite3 --stored old/manifest.csv \
   --output results/manifest-comparison.json --label stored
@@ -290,40 +317,80 @@ ocsl-review study compare-manifest --database work/census.sqlite3 --stored old/m
 
 The enumeration spec lists groups, each with a journal label, a Europe PMC
 query, a default `stratum` and optionally `strata` mapping publication types to
-stratum labels, plus a `window` (`from`, `until`, field `FIRST_PDATE` by
-default), `pageSize` and `resultType`. `study enumerate` pages through Europe
-PMC search with cursors, keeps every raw page content-addressed in
-`<output>.pages/` and writes the manifest and, last, the receipt
-`<output>.receipt.json` (spec, effective queries, hit counts, page digests and
-the population digest). A population that is not exhausted or whose hit count
-changes while paging is refused; a review listed twice is kept once and records
-without a DOI are listed by provider id. Requests carry identifiers only.
+stratum labels, plus a `window` (`from`, `until`, a date field, `FIRST_PDATE` by
+default), `pageSize` and `resultType`. A query selects a population, never
+reviews one by one (rule `population-fields@1`): every term is `FIELD:value`
+with a population-level field (`ISSN`, `JOURNAL`, `PUB_TYPE`, `SRC`, `LANG` and
+the date fields `PUB_YEAR`, `FIRST_PDATE`, `FIRST_IDATE`, `P_PDATE`, `E_PDATE`),
+joined by `AND`, `OR`, `NOT` and parentheses. Identifier fields (`DOI`,
+`EXT_ID`, `PMCID`, `PMID`, ...) and bare terms, which search every field
+including identifiers, are refused, so an earlier manifest cannot be replayed
+as a fresh population. `study enumerate` pages through Europe PMC search with
+cursors, keeps every raw page content-addressed in `<output>.pages/` and writes
+the manifest and, last, the receipt `<output>.receipt.json` (spec, query rule,
+effective queries, hit counts, page digests and the population digest). A
+population that is not exhausted or whose hit count changes while paging is
+refused; a review listed twice is kept once and records without a DOI are
+listed by provider id. Requests carry identifiers only.
+
+`study acquire` for a fresh study runs with `--live` and a `--route` for every
+journal: its byte caches then only stand in for downloads, so which reviews an
+earlier study happened to keep cannot decide which reviews are read. `study
+works` derives each review's cited works from its own bibliography: a DOI or
+PMID in the bibliography markup, else a DOI printed in the entry, one work per
+cited work keyed `doi:<doi>` (else `pmid:<pmid>`), bound to the digest of the
+document (`workProvenance`, derivation `bibliography-identifiers@1`); entries
+without an identifier get no work and stay unresolved. It refuses records that
+already carry works. `study abstracts` then fills each derived work's abstract
+and metadata from the same Europe PMC record, with their provenance.
 
 `study prepare --require-fresh-enumeration --enumeration RECEIPT` verifies the
 receipt (every kept page against its digest, the population re-derived from
-the pages), pins it (`enumerationSha256` in the run metadata and the
-`enumeration` table) and prepares only records that descend from it: an
-enumerated journal and DOI, a kept page of this enumeration, the stratum, year
-and first-online date the enumeration gave, a document taken through `study
-acquire` with its provenance, and cited-work records (`works`). Cache-hit claims
-that cannot be re-checked because a cache was not given are refused. Once a
-study is pinned to an enumeration, every later `study prepare` must name it.
+the pages, the queries against the rule), pins it (`enumerationSha256` and the
+query rule in the run metadata, and the `enumeration` table) and prepares only
+records that descend from it: an enumerated journal and DOI, a kept page of
+this enumeration, the stratum, year and first-online date the enumeration gave,
+a document taken through `study acquire` with the journal's live route on, no
+carried `identities`, `country`, `topic` or `documentSha256`, and cited works
+exactly as `study works` derives them from the document (derived again and
+compared). Cache-hit claims that cannot be re-checked because a cache was not
+given are refused, and so are excluded reviews. Once a study is pinned to an
+enumeration, every later `study prepare` must name it.
+
+**Exclusions and a complete population.** A study pinned to a fresh enumeration
+is complete only when every enumerated review is in the study (prepared,
+unavailable or unreadable, each in coverage) or excluded by the protocol with a
+recorded reason: `study exclude --input FILE` reads JSON lines of `journal`,
+`doi` and `reason` for enumerated reviews not in the study and keeps them in
+`exclusions`. Freezing, facts export and the manifest comparison treat a
+population with reviews neither in the study nor excluded as incomplete (a
+study with no reviews, or only a pilot, is no completed run).
+
 `study gates --require-fresh-enumeration` adds checks that the enumeration is
-pinned, that no review lies outside it, that every review has acquisition
-provenance, that every cache hit (review, abstract, full text) names the pinned
-cache version, and that every abstract comes from a recorded lookup (a cache
-hit, a live lookup, a recorded fallback or a definitive absence), not from text
-an earlier manifest carried.
+pinned with its query rule, that no review lies outside it and every enumerated
+review is in the study or excluded, that every review has acquisition
+provenance and was acquired with its journal's live route, that every cache hit
+(review, abstract, full text) was re-checked against the pinned caches, that
+cached full texts were taken only while retrieving live, that every abstract
+comes from a recorded lookup (a cache hit, a live lookup, a recorded fallback
+or a definitive absence), not from text an earlier manifest carried, that no
+identity map or country was supplied, and that every work was derived from its
+review with its metadata from a recorded lookup. Once a manifest comparison is
+recorded, a further check requires the population to be unchanged since.
 
 `study compare-manifest` reads only the DOI, journal and stratum of a stored
 manifest (JSON lines, JSON, CSV or TSV with a `doi` column, or one DOI per
 line) and counts reviews in both, only in the fresh enumeration and only in the
 stored manifest, per journal and stratum (stored-only reviews of journals
-outside the enumeration are unattributed). It is a diagnostic, reported and
-never tuned: it runs only on a study pinned to a fresh enumeration whose census
-run is complete, unless `--allow-incomplete`, which the comparison records. The
-counts go to `manifest_comparisons`, the per-review lists to the report, and
-nothing of the stored manifest enters the study.
+outside the enumeration are unattributed), together with the enumerated
+reviews in the study and excluded, and the digest of the study population
+(every review with its provenance and every exclusion with its reason). It is a
+diagnostic, reported and never tuned: it runs only on a study pinned to a fresh
+enumeration whose census run and population are complete, unless
+`--allow-incomplete`, which the comparison records. The first comparison
+freezes the population: `study prepare` and `study exclude` refuse to run after
+it. The counts go to `manifest_comparisons`, the per-review lists to the
+report, and nothing of the stored manifest enters the study.
 
 ## Running a study
 
@@ -390,17 +457,21 @@ digests, tokens, finish reason, attempts), `history` (append-only),
 `review_scores` and `work_scores` (beta-binomial excess and Benjamini-Hochberg
 q-values), `sanitizer_findings`, `input_provenance` (where each review document,
 abstract evidence unit and full-text source came from), `enumeration` (a pinned
-fresh enumeration), `manifest_comparisons` (counts of a stored manifest compared
-afterwards) and `data_dictionary`; `reviews.provenance` and
-`citations.ft_provenance` carry the provenance class of the review document and
-of the full text behind each window. A working database created before these
-columns gains them when a study command opens it. Citing sentences that are
+fresh enumeration), `exclusions` (enumerated reviews the protocol excluded, with
+their reasons), `manifest_comparisons` (counts of a stored manifest compared
+afterwards, with the population in the study and its digest) and
+`data_dictionary`; `reviews.provenance` and `citations.ft_provenance` carry the
+provenance class of the review document and of the full text behind each
+window, and `works.derivation` and `works.metadata_provenance` how a work record
+was derived and where its metadata came from. A working database created before
+these columns gains them when a study command opens it. Citing sentences that are
 sent, every abstract (once per database) and every full-text window pass the
 sanitizer in detect mode: hidden characters and prompt-injection sentences are
 recorded by offset, rule and digest, and the text the judge receives stays the
 instrument's, byte for byte. `study freeze` writes the closed, read-only
 copy (rollback journal, evidence text removed unless `--keep-text`). It refuses
-a paused run or one with pending reviews unless `--allow-incomplete`, which is
+a paused run, one with pending reviews, or a fresh-enumeration study whose
+population is incomplete, unless `--allow-incomplete`, which is
 recorded (`complete` = 0) so that `study facts` refuses it too unless told
 otherwise. Without `--keep-text` the frozen copy also replaces the entitled
 reviews' citing sentences by `sha256:` digests and removes their printed
@@ -443,13 +514,17 @@ revision; interval bounds are separate facts, and a `derivation` block records
 estimand, seed and B. Input provenance is exported as facts too: per journal,
 reviews by acquisition class (`census.<journal>.provenance.reviews.<class>`,
 `.reviews_read.<class>`, and per stratum `.provenance.stratum.<stratum>.reviews.<class>`,
-every class including zero), entries by the class of their abstract
+every class including zero, and `.unrecorded` for reviews prepared before
+provenance existed), entries by the class of their abstract
 (`.provenance.abstracts.<class>`) and of their full-text window
-(`.provenance.full_text.<class>`), coverage cells by acquisition class
+(`.provenance.full_text.<class>`, with `.unrecorded` for full-text outcomes
+recorded before provenance), coverage cells by acquisition class
 (`.coverage.acquisition.<class>.*`), the fresh enumeration
-(`.enumeration.reviews`, `.in_study`, `.outside`, per stratum) and each
-recorded manifest comparison (`.manifest_comparison.<label>.<stratum|all>.<count>`
-and `census.manifest_comparison.<label>.<count>` over all journals). The pinned
+(`.enumeration.reviews`, `.in_study`, `.outside`, `.excluded`, `.unexplained`,
+per stratum) and each recorded manifest comparison
+(`.manifest_comparison.<label>.<stratum|all>.<count>` and
+`census.manifest_comparison.<label>.<count>` over all journals, including the
+enumerated reviews in the study and excluded at comparison time). The pinned
 store root, provider cache digest and enumeration digest are recorded with the
 input hashes. The export passes `ocsl-writing facts verify` unchanged;
 `ocsl-writing facts lint` then requires every numeral in a manuscript template
@@ -476,12 +551,14 @@ from that journal's own recorded calls.
   broker bulk jobs need a verbatim instrument mode before they can carry this
   instrument unchanged. Its calls are receipted in the scores database
   (`calls`), not in the workspace egress ledger.
-- Cited-work records are not derived by these commands: a fresh-enumeration
-  manifest needs `works` per review (identifiers and bibliographic metadata of
-  the cited works) before `study abstracts` and `study prepare`, and `study
-  prepare --require-fresh-enumeration` skips records without them.
-- Cached full texts of cited works are read only as Europe PMC fullTextXML;
-  entitled full text of cited works is acquired live, never from a cache.
+- `study works` derives cited works from identifiers only (a DOI or PMID in the
+  bibliography markup, or a DOI printed in the entry); entries without one stay
+  unresolved, and there is no title search. Derived works take their metadata
+  from Europe PMC only; a work Europe PMC does not hold has no title, venue or
+  year.
+- Cached full texts of cited works are read only as Europe PMC fullTextXML and
+  only while retrieving live; entitled full text of cited works is acquired
+  live, never from a cache.
 - The provider cache is read as a quiescent copy (`mode=ro&immutable=1`); a
   cache that another process still writes must be copied first.
 - Fresh-enumeration strata come from the provider's publication types through
