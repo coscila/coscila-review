@@ -7,6 +7,7 @@ import http.server
 import io
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -22,6 +23,8 @@ from ocsl_review import capacity_probe as P
 from ocsl_review import citation_census as C
 from ocsl_review.cli import main
 from ocsl_review.errors import ValidationError
+
+from test_census_runner import RunnerTestCase
 
 MODEL = C.instrument().manifest["requiredModel"]["served"]
 FAST = dict(cell_seconds=0.6, warmup_seconds=0.15, ramp_seconds=0.05, drain_seconds=3.0, pause_seconds=0.02,
@@ -42,8 +45,11 @@ class MockJudge:
         self.visible, self.preempt_per_fetch, self.preemptions = 1.0, 0, 0
         self.fail_message, self.generation_on_failure = "mock failure", 0
         self.close_connections, self.echo_authorization, self.models_status = False, False, 200
+        self.metrics_fail_after, self.metrics_body = None, None
+        self.tenant = None          # {"after": fetches, "running": n, "generation": tokens, "success": requests} per fetch
         self.requests = self.connections = self.metrics_requests = self.inflight = 0
-        self.generation_total = self.prompt_total = 0
+        self.generation_total = self.prompt_total = self.success_total = 0
+        self.prefix_queries = self.prefix_hits = 0
         self.dropped = self.garbage = self.empty = self.failed = self.truncated = self.resets = 0
         self.chat_connections, self.chat_authorization, self.other_authorization = set(), set(), []
         self.bodies: list[str] = []
@@ -65,21 +71,34 @@ class MockJudge:
                  for label in labels]
         return "\n".join(lines), finish
 
-    def metrics(self) -> bytes:
+    def metrics(self) -> tuple[int, bytes]:
         with self.lock:
             self.metrics_requests += 1
+            if self.metrics_fail_after is not None and self.metrics_requests > self.metrics_fail_after:
+                return 500, b"metrics unavailable"
+            if self.metrics_body is not None:
+                return 200, self.metrics_body.encode()
             self.generation_total += self.extra_generation
             self.preemptions += self.preempt_per_fetch
-            # ``visible`` < 1: metrics of one replica behind a balancer, which sees only part of our calls and tokens
-            values = {"vllm:num_requests_running": round(self.inflight * self.visible) + self.foreign,
+            tenant_running = 0
+            if self.tenant and self.metrics_requests > self.tenant["after"]:
+                tenant_running = self.tenant.get("running", 0)
+                self.generation_total += self.tenant.get("generation", 0)
+                self.success_total += self.tenant.get("success", 0)
+            # ``visible`` < 1: metrics of one replica behind a balancer, which sees only part of our calls and counters
+            values = {"vllm:num_requests_running": round(self.inflight * self.visible) + self.foreign + tenant_running,
                       "vllm:num_requests_waiting": self.waiting, "vllm:kv_cache_usage_perc": self.kv,
-                      "vllm:num_preemptions_total": self.preemptions, "vllm:prompt_tokens_total": self.prompt_total,
-                      "vllm:generation_tokens_total": round(self.generation_total * self.visible)}
+                      "vllm:num_preemptions_total": self.preemptions,
+                      "vllm:prompt_tokens_total": round(self.prompt_total * self.visible),
+                      "vllm:generation_tokens_total": round(self.generation_total * self.visible),
+                      "vllm:request_success_total": round(self.success_total * self.visible),
+                      "vllm:prefix_cache_queries_total": self.prefix_queries,
+                      "vllm:prefix_cache_hits_total": self.prefix_hits}
         lines = ["# HELP vllm:num_requests_running Number of requests in model execution batches.",
                  "# TYPE vllm:num_requests_running gauge"]
         lines += ['%s{engine="0",model_name="%s"} %s' % (name, MODEL, float(value)) for name, value in values.items()]
         lines.append('vllm:generation_tokens_created{engine="0",model_name="%s"} 1.7e+09' % MODEL)
-        return ("\n".join(lines) + "\n").encode()
+        return 200, ("\n".join(lines) + "\n").encode()
 
 
 def start(judge: MockJudge):
@@ -110,7 +129,8 @@ def start(judge: MockJudge):
             with judge.lock:
                 judge.other_authorization.append((self.path, self.headers.get("Authorization")))
             if self.path == "/metrics":
-                self.send(200, judge.metrics(), "text/plain; version=0.0.4")
+                status, body = judge.metrics()
+                self.send(status, body, "text/plain; version=0.0.4")
             elif self.path == "/v1/models":
                 body = json.dumps({"object": "list", "data": [{"id": judge.model, "object": "model"}]}).encode()
                 self.send(judge.models_status, body if judge.models_status == 200 else b'{"error": "no"}')
@@ -161,6 +181,9 @@ def start(judge: MockJudge):
                 prompt, completion = len(body) // 4, len(content) // 4 + 1
                 judge.prompt_total += prompt
                 judge.generation_total += completion
+                judge.success_total += 1
+                judge.prefix_queries += prompt
+                judge.prefix_hits += min(prompt, 64)
             usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
             if judge.cached is not None:
                 usage["prompt_tokens_details"] = {"cached_tokens": judge.cached}
@@ -211,6 +234,59 @@ class ProbeCase(unittest.TestCase):
         return [json.loads(line) for line in (self.output / P.CALLS_NAME).read_text().splitlines()]
 
 
+def decision_cell(name, rate, *, state="completed", invalid=0.001, model=MODEL, measured=240.0, p95=60.0,
+                  completed=None, output=30.0, prompt=500.0, tail=True, reason=None, rule=None):
+    """A cell summary as the probe writes it, for the decision rules."""
+    streams, items = map(int, name.split("x"))
+    return {"cell": name, "streams": streams, "itemsPerCall": items, "state": state, "reason": reason,
+            "role": P.cell_role(streams, items, P.ProbeSettings()),
+            "abort": {"rule": rule or {"saturated": "saturation", "metrics-lost": "metrics-unavailable",
+                                       "aborted": "transport-failures"}.get(state)} if state != "completed" else None,
+            "entries": {"perSecond": rate, "perSecondCompleted": rate if completed is None else completed},
+            "invalidOutputShare": invalid, "transportFailureShare": 0.0, "latencySeconds": {"p95": p95},
+            "timing": {"cellSeconds": 300.0, "warmupSeconds": 30.0, "measuredSeconds": measured, "tailComplete": tail},
+            "tokens": {"promptPerEntry": prompt, "completionPerEntry": output},
+            "served": {"models": {model: 10}, "requiredModel": MODEL, "matchesInstrument": model == MODEL}}
+
+
+def simulate_processor_sharing(*, streams=20, capacity=8.0, ramp=5.0, window=(10.0, 150.0), tail=True, seed=1,
+                               spread=0.5, items=10):
+    """Calls of ``streams`` closed-loop streams on a processor-sharing server of ``capacity`` entries per second.
+
+    Streams start staggered over ``ramp`` and keep sending until the window ends, and with ``tail`` until every
+    call that overlaps the window's end has finished.
+    """
+    rng = random.Random(seed)
+    pending = sorted((i * ramp / streams, i) for i in range(streams))
+    active: dict[int, list] = {}
+    records, t, edge = [], 0.0, None
+
+    def call(i, now):
+        size = max(1, round(items * rng.uniform(1 - spread, 1 + spread)))
+        active[i] = [now, float(size), size]
+    while pending or active:
+        n = len(active)
+        done = min(((w[1] * n / capacity) + t, i) for i, w in active.items()) if active else (float("inf"), None)
+        begin = pending[0] if pending else (float("inf"), None)
+        step = min(done[0], begin[0]) - t
+        for w in active.values():
+            w[1] -= step * capacity / n
+        t += step
+        if begin[0] <= done[0]:
+            pending.pop(0)
+            call(begin[1], t)
+            continue
+        w = active.pop(done[1])
+        records.append({"start": w[0], "end": t, "valid": w[2]})
+        if edge is None and t >= window[1]:
+            edge = {j for j, c in active.items() if c[0] < window[1]}
+        if edge is not None:
+            edge.discard(done[1])
+        if t < window[1] or (tail and edge):
+            call(done[1], t)
+    return records
+
+
 class RequestTests(ProbeCase):
     def test_requests_are_the_instruments_first_calls_over_synthetic_entries(self):
         report = self.probe("2x1,2x5")
@@ -238,6 +314,7 @@ class RequestTests(ProbeCase):
             self.assertEqual(len(labels), record["items"])
         self.assertEqual(report["instrument"]["digest"], C.instrument().digest)
         self.assertEqual({"1": 3000, "5": 3500}, report["request"]["maxTokens"])
+        self.assertEqual(P.FORMAT, report["format"])
 
     def test_synthetic_entries_are_deterministic_bounded_and_grouped_by_review(self):
         first, again, other = P.SyntheticCorpus(7, "60x40"), P.SyntheticCorpus(7, "60x40"), P.SyntheticCorpus(7, "60x10")
@@ -247,6 +324,7 @@ class RequestTests(ProbeCase):
         self.assertEqual(a, b)
         self.assertFalse(set(a) & set(c))
         cut, sentences, missing, cut_count, total = C.abstract_cut(), set(), 0, 0, 0
+        restated, passages = 0, 0
         for batch, _ in zip(first.batches(40), range(25)):
             numbers = [int(item["label"]) for item in batch.items]
             self.assertEqual(list(range(numbers[0], numbers[0] + len(numbers))), numbers)   # bibliography order
@@ -260,21 +338,35 @@ class RequestTests(ProbeCase):
                 self.assertLessEqual(evidence["sentCharacters"], cut)
                 missing += not item["abstract"]
                 cut_count += evidence["cut"]
+                if item["abstract"]:
+                    words = set(item["abstract"].lower().replace(".", " ").replace(":", " ").split())
+                    for passage in item["citing_passages"]:
+                        passages += 1
+                        text = passage["sentence"].rsplit(" ⟨", 1)[0].lower().replace(".", " ").replace(":", " ")
+                        restated += set(text.split()) <= words
         self.assertEqual({1, 2, 3}, sentences)
         self.assertTrue(0 < missing < total * 0.15)
         self.assertTrue(0.05 < cut_count / total < 0.4)
+        # Most citing sentences restate a span of the entry's own abstract (the profile's citingFromAbstract share).
+        self.assertAlmostEqual(P.PROFILE["citingFromAbstract"]["share"], restated / passages, delta=0.06)
 
     def test_grid_order_cells_and_limits(self):
         settings = P.ProbeSettings(max_streams=60)
         grid = P.ordered_grid(settings)
         self.assertEqual(16, len(grid))
-        # Cells within the allowed concurrency (60) first, each group by ascending load (streams x items, streams).
-        self.assertEqual(["30x1", "60x1", "30x5", "30x10", "60x5", "60x10", "30x40", "60x40", "90x1", "120x1"],
+        # The instrument's geometry within the allowed concurrency first (the deciding cell before any exploratory
+        # geometry), then the other cells within it, then the cells above it, each group by ascending load.
+        self.assertEqual(["30x40", "60x40", "30x1", "60x1", "30x5", "30x10", "60x5", "60x10", "90x1", "120x1"],
                          [g["cell"] for g in grid[:10]])
+        roles = {g["cell"]: (g["role"], g["aboveAllowed"]) for g in grid}
+        self.assertEqual(("decisive", False), roles["60x40"])
+        self.assertEqual(("instrument", False), roles["30x40"])
+        self.assertEqual(("exploratory", False), roles["60x10"])
+        self.assertEqual(("instrument", True), roles["90x40"])
         self.assertEqual("120x40", grid[-1]["cell"])
         self.assertEqual("above --max-streams 60", grid[-1]["skip"])
         self.assertEqual(8, sum(1 for g in grid if g["skip"]))
-        self.assertEqual(["30x1", "60x1", "90x1", "120x1", "30x5"],
+        self.assertEqual(["30x40", "60x40", "90x40", "120x40", "30x1"],
                          [g["cell"] for g in P.ordered_grid(P.ProbeSettings(allowed_streams=120))[:5]])
         by_items = P.ordered_grid(P.ProbeSettings(order="items"))
         self.assertEqual(["30x1", "60x1", "90x1", "120x1", "30x5"], [g["cell"] for g in by_items[:5]])
@@ -288,13 +380,30 @@ class RequestTests(ProbeCase):
         for bad in (dict(cells=((60, 41),)), dict(cells=((0, 5),)), dict(order="as-given"), dict(warmup_seconds=400),
                     dict(ramp_seconds=40), dict(abort_failure_share=0), dict(journal="two\nlines"),
                     dict(api_key_env="NOT A NAME"), dict(max_streams=20), dict(abort_min_failures=0),
-                    dict(drain_seconds=float("nan")), dict(cell_seconds=float("inf")), dict(shared_tolerance=-1.0)):
+                    dict(drain_seconds=float("nan")), dict(cell_seconds=float("inf")), dict(shared_tolerance=-1.0),
+                    dict(expect_output_tokens=0.0), dict(expect_tolerance=0.0), dict(profile={"reviewEntries": {"median": 0}})):
             with self.subTest(bad=bad), self.assertRaises(ValidationError):
                 P.ProbeSettings(**bad).validate(live=False)
         with self.assertRaises(ValidationError):
             P.parse_cells(["60by40"])
         with self.assertRaises(ValidationError):
             P.ProbeSettings().validate(live=True)            # no --base-url
+        self.assertEqual(0.0, P.ProbeSettings().shared_tolerance)
+
+    def test_profiles_are_validated_and_replace_the_built_in_sizes(self):
+        merged = P.validate_profile({"reviewEntries": {"median": 60, "sigma": 0.5, "min": 4, "max": 300},
+                                     "citingSentences": {"weights": [0.7, 0.2, 0.1]}})
+        self.assertEqual(60, merged["reviewEntries"]["median"])
+        self.assertEqual(P.PROFILE["sentenceCharacters"], merged["sentenceCharacters"])
+        for bad in ({"unknown": 1}, {"reviewEntries": {"median": 10, "sigma": 0.2, "min": 9, "max": 3}},
+                    {"citingSentences": {"weights": [0, 0]}}, {"citingFromAbstract": {"share": 2}},
+                    {"abstractCharacters": {"missingShare": 1.5}}, {"titleWords": {"min": 0, "max": 3}}):
+            with self.subTest(bad=bad), self.assertRaises(ValidationError):
+                P.validate_profile(bad)
+        small = P.SyntheticCorpus(1, "4x40", merged)
+        sizes = [small.review_size(r) for r in range(200)]
+        self.assertLess(sum(sizes) / len(sizes), 90)
+        self.assertTrue(all(4 <= size <= 300 for size in sizes))
 
 
 class PoolTests(ProbeCase):
@@ -341,7 +450,7 @@ class RateTests(ProbeCase):
         cell = report["cells"][0]
         expected = 4 * cell["calls"]["meanItems"] / 0.1      # streams x items per call / latency
         rate = cell["entries"]["perSecond"]
-        self.assertGreater(rate, 0.7 * expected)
+        self.assertGreater(rate, 0.75 * expected)
         self.assertLess(rate, 1.02 * expected)
         self.assertGreater(cell["entries"]["meanConcurrency"], 3.5)
         self.assertFalse(cell["entries"]["clientLimited"])
@@ -349,9 +458,20 @@ class RateTests(ProbeCase):
         self.assertGreaterEqual(cell["latencySeconds"]["p50"], 0.1)
         self.assertLessEqual(cell["latencySeconds"]["p50"], cell["latencySeconds"]["p95"])
         self.assertLessEqual(cell["latencySeconds"]["p95"], cell["latencySeconds"]["p99"])
+        self.assertEqual("calls started inside the measured window", cell["latencySeconds"]["scope"])
         self.assertEqual(cell["tokens"]["prompt"], sum(r["promptTokens"] for r in self.calls()))
         self.assertAlmostEqual(cell["tokens"]["cachedShare"],
                                64 * cell["calls"]["answered"] / cell["tokens"]["prompt"], places=3)
+        self.assertEqual("usage", cell["tokens"]["cachedShareSource"])
+        # The tail: the streams kept sending past the window until its last calls had finished, so the window was
+        # not truncated, and calls were sent after it.
+        timing = cell["timing"]
+        self.assertTrue(timing["tailComplete"])
+        self.assertEqual(4, timing["edgeCalls"])
+        self.assertEqual(timing["windowLimitSeconds"], timing["windowEndSeconds"])
+        self.assertEqual(0.0, timing["truncatedSeconds"])
+        self.assertTrue(any(r["start"] >= timing["windowEndSeconds"] for r in self.calls()))
+        self.assertGreaterEqual(timing["windowStartSeconds"], 0.4)
 
     def test_time_weighted_rate_does_not_depend_on_where_the_window_cuts_calls(self):
         # Two synchronised streams, 3 s per call of 10 entries: 20/3 entries per second in steady state.
@@ -369,6 +489,27 @@ class RateTests(ProbeCase):
         self.assertAlmostEqual(3.97, P.percentile([1, 2, 3, 4], 0.99))
         self.assertIsNone(P.percentile([], 0.5))
 
+    def test_the_steady_state_window_removes_the_edge_bias_on_a_processor_sharing_server(self):
+        valid = lambda r: r["valid"]
+        naive, steady, truncated = [], [], []
+        for seed in range(6):
+            # Sending stops at the window's end, which starts after the warm-up only: the edges read high.
+            records = simulate_processor_sharing(tail=False, seed=seed)
+            naive.append(P.time_weighted_rate(records, 10.0, 150.0, valid))
+            # The probe's window: after the ramp's calls, with the tail.
+            records = simulate_processor_sharing(tail=True, seed=seed)
+            start = max(10.0, max(r["end"] for r in records if r["start"] < 5.0))
+            steady.append(P.time_weighted_rate(records, start, 150.0, valid))
+            # A stop rule: sending stops at once; the window ends at the earliest start of the calls still open.
+            records = simulate_processor_sharing(tail=False, window=(10.0, 200.0), seed=seed)
+            start = max(10.0, max(r["end"] for r in records if r["start"] < 5.0))
+            end = min([200.0] + [r["start"] for r in records if r["start"] < 200.0 < r["end"]])
+            truncated.append(P.time_weighted_rate(records, start, end, valid))
+        mean = lambda values: sum(values) / len(values)
+        self.assertGreater(mean(naive), 8.0 * 1.01)
+        self.assertAlmostEqual(8.0, mean(steady), delta=0.02)
+        self.assertAlmostEqual(8.0, mean(truncated), delta=0.02)
+
 
 class AbortTests(ProbeCase):
     def test_transport_failures_above_the_share_stop_the_cell_and_the_grid(self):
@@ -385,7 +526,7 @@ class AbortTests(ProbeCase):
         self.assertEqual("grid stopped at 2x1 (transport-failures)", second["reason"])
         self.assertEqual("2x1", report["abort"]["cell"])
         self.assertIn("Remaining cells: `--cells 4x1`", (self.output / P.MARKDOWN_NAME).read_text())
-        self.assertIsNone(report["exitCriterion"]["passes"])             # an aborted cell is never the best cell
+        self.assertIsNone(report["exitCriterion"]["passes"])
         self.assertTrue(any('"event": "abort"' in event for event in self.events))
 
     def test_failures_below_the_share_are_classified_without_aborting(self):
@@ -399,9 +540,9 @@ class AbortTests(ProbeCase):
         self.assertAlmostEqual(cell["transportFailureShare"], (self.judge.failed + self.judge.resets) / self.judge.requests,
                                places=4)
 
-    def test_server_saturation_stops_the_grid_and_keeps_the_cells_measurement(self):
+    def test_server_saturation_stops_the_grid_and_keeps_a_truncated_steady_window(self):
         self.judge.waiting = 3
-        report = self.probe("2x1,2x5", cell_seconds=2.0)
+        report = self.probe("2x40,2x5", cell_seconds=2.0, allowed_streams=2)
         first = report["cells"][0]
         self.assertEqual("saturated", first["state"])
         self.assertEqual("saturation", first["abort"]["rule"])
@@ -412,12 +553,16 @@ class AbortTests(ProbeCase):
         self.assertEqual(0, first["calls"]["abandoned"])                  # calls in flight finished, none cut off
         self.assertGreater(first["entries"]["perSecond"], 0)
         self.assertGreater(first["server"]["saturatedSamples"], 2)
+        timing = first["timing"]
+        self.assertFalse(timing["tailComplete"])
+        self.assertLessEqual(timing["windowEndSeconds"], timing["windowLimitSeconds"])   # ends at the cut calls' start
         self.assertEqual("skipped", report["cells"][1]["state"])
-        self.assertEqual("grid stopped at 2x1 (saturation)", report["cells"][1]["reason"])
+        self.assertEqual("grid stopped at 2x40 (saturation)", report["cells"][1]["reason"])
         self.assertEqual("aborted", report["state"])
-        self.assertEqual(("2x1", "saturated"), (report["exitCriterion"]["bestCell"]["cell"],
-                                                report["exitCriterion"]["bestCell"]["state"]))
-        self.assertIn("stopped by the saturation rule", report["exitCriterion"]["line"])
+        verdict = report["exitCriterion"]
+        self.assertEqual(("2x40", "saturated", True), (verdict["cell"], verdict["assessment"]["state"],
+                                                       verdict["assessment"]["eligible"]))
+        self.assertIn("stopped by the saturation rule", verdict["line"])
 
     def test_http_429_responses_count_as_saturation_without_metrics(self):
         self.judge.fail_every, self.judge.fail_status, self.judge.fail_message = 1, 429, "rate limited"
@@ -435,6 +580,7 @@ class AbortTests(ProbeCase):
         self.assertEqual("saturated", cell["state"])
         self.assertEqual(["preemptions"], cell["abort"]["signals"])
         self.assertGreater(cell["server"]["counters"]["preemptions"], 0)
+        self.assertFalse(cell["server"]["counters"]["tokensComparable"])   # recomputed prefills may count twice
 
     def test_failures_at_a_slow_call_rate_stop_once_enough_failures_accumulate(self):
         self.judge.latency, self.judge.fail_every = 0.05, 2
@@ -442,7 +588,7 @@ class AbortTests(ProbeCase):
         cell = report["cells"][0]
         self.assertEqual("aborted", cell["state"])
         self.assertEqual((6, 3), (cell["abort"]["calls"], cell["abort"]["failures"]))
-        self.assertIsNone(report["exitCriterion"]["bestCell"])
+        self.assertIsNone(report["exitCriterion"]["assessment"])
 
     def test_abort_monitor_rules(self):
         settings = P.ProbeSettings(abort_window_seconds=60.0, abort_min_calls=20, abort_min_failures=3,
@@ -466,14 +612,27 @@ class AbortTests(ProbeCase):
         self.assertEqual((21, 2), (fired[0]["calls"], fired[0]["failures"]))
         fired.clear()
         monitor = P.AbortMonitor(settings, fired.append)
-        for t, saturated in ((30, True), (60, True), (85, None), (90, True), (140, True), (150, False), (155, True),
-                             (200, True)):
+        for t, saturated in ((30, True), (60, True), (85, None), (89, True), (95, False), (155, True), (200, True)):
             monitor.sample(float(t), saturated, ["waiting"])
-        self.assertEqual([], fired)                                  # every streak was broken within 60 s
+        self.assertEqual([], fired)                                  # only an unsaturated sample breaks a streak
         monitor.sample(216.0, True, ["waiting"])
         self.assertEqual(("saturation", 155.0, 61.0), (fired[0]["rule"], fired[0]["since"], fired[0]["seconds"]))
         monitor.sample(300.0, True, ["waiting"])
         self.assertEqual(1, len(fired))                              # a rule fires once
+        fired.clear()
+        monitor = P.AbortMonitor(settings, fired.append)
+        for t, saturated in ((30, True), (85, None), (91, True)):     # a sample without metrics is neutral
+            monitor.sample(float(t), saturated, ["waiting"])
+        self.assertEqual(("saturation", 30.0), (fired[0]["rule"], fired[0]["since"]))
+        fired.clear()
+        monitor = P.AbortMonitor(settings, fired.append)
+        for t in (30, 60, 90):
+            monitor.sample(float(t), None, [], in_flight=0)          # no calls in flight: nothing to watch
+        for t in (100, 130, 160):
+            monitor.sample(float(t), None, [], in_flight=5)
+        self.assertEqual([], fired)
+        monitor.sample(161.0, None, [], in_flight=5)                 # metrics missing for more than 60 s
+        self.assertEqual(("metrics-unavailable", 100.0), (fired[0]["rule"], fired[0]["since"]))
 
     def test_calls_cut_off_at_the_drain_are_abandoned_not_failed(self):
         self.judge.latency = 1.5
@@ -485,7 +644,30 @@ class AbortTests(ProbeCase):
         self.assertEqual(2, cell["calls"]["abandonedInFlight"])
         self.assertEqual({}, cell["failures"])
         self.assertIsNone(cell["transportFailureShare"])
+        self.assertFalse(cell["timing"]["tailComplete"])            # the window's calls outlasted the tail
         self.assertLess(cell["timing"]["wallSeconds"], 1.4)
+
+    def test_metrics_that_fail_during_a_cell_stop_it_and_keep_its_window(self):
+        # The readability check, two baseline samples and the cell's idle sample succeed; the run samples fail.
+        self.judge.metrics_fail_after = 4
+        report = self.probe("2x1", cell_seconds=2.0)
+        cell = report["cells"][0]
+        self.assertEqual("metrics-lost", cell["state"])
+        self.assertEqual("metrics-unavailable", cell["abort"]["rule"])
+        self.assertEqual(0, cell["calls"]["abandoned"])
+        self.assertLess(cell["abort"]["at"], 2.0)
+        self.assertEqual("aborted", report["state"])
+
+    def test_unreadable_or_unrecognised_metrics_are_refused_before_any_cell(self):
+        self.judge.metrics_fail_after = 0
+        with self.assertRaisesRegex(ValidationError, "cannot be read"):
+            self.probe("2x1")
+        self.assertEqual(0, self.judge.requests)
+        self.assertFalse(self.output.exists())
+        self.judge.metrics_fail_after, self.judge.metrics_body = None, "sglang:num_running_reqs 4\n"
+        with self.assertRaisesRegex(ValidationError, "no vLLM request gauge"):
+            self.probe("2x1")
+        self.assertEqual(0, self.judge.requests)
 
 
 class OutputTests(ProbeCase):
@@ -545,22 +727,30 @@ class OutputTests(ProbeCase):
             with self.subTest(body=body):
                 self.assertEqual({"outcome": "failed", "failure": failure, "detail": detail},
                                  P.classify_response(status, body, labels))
+        scrubbed = P.classify_response(200, completion("", model="echo-K3Y"), labels, scrub=lambda s: s.replace("K3Y", "#"))
+        self.assertEqual("echo-#", scrubbed["model"])
         import http.client
         self.assertEqual("timeout", P.failure_class(socket.timeout()))
         self.assertEqual("reset", P.failure_class(http.client.RemoteDisconnected("x")))
         self.assertEqual("reset", P.failure_class(http.client.IncompleteRead(b"")))
         self.assertEqual("refused", P.failure_class(ConnectionRefusedError()))
         self.assertEqual("protocol", P.failure_class(http.client.BadStatusLine("x")))
+        self.assertFalse(P.may_have_run({"outcome": "failed", "failure": "http-413"}))
+        self.assertFalse(P.may_have_run({"outcome": "failed", "failure": "refused"}))
+        self.assertTrue(P.may_have_run({"outcome": "failed", "failure": "http-502"}))
+        self.assertTrue(P.may_have_run({"outcome": "abandoned", "failure": "reset"}))
 
     def test_report_shape_markdown_and_exit_line(self):
-        self.judge.latency = 0.02
-        report = self.probe("2x1,3x5", allowed_streams=2, target_rate=10.0)
+        self.judge.latency = 0.1         # server time dominates, so the metrics cover our calls (an unshared verdict)
+        report = self.probe("2x40,2x1,3x40", allowed_streams=2, target_rate=10.0, cell_seconds=0.8)
         for key in ("format", "state", "startedAt", "finishedAt", "code", "client", "instrument", "request", "endpoint",
-                    "synthetic", "grid", "abortRules", "preflight", "baseline", "cells", "server", "exitCriterion",
-                    "allowedConcurrency", "files"):
+                    "synthetic", "expectation", "grid", "abortRules", "decision", "preflight", "baseline", "cells",
+                    "server", "exitCriterion", "allowedConcurrency", "files"):
             self.assertIn(key, report)
         self.assertEqual(P.FORMAT, report["format"])
         self.assertEqual([MODEL], report["preflight"]["models"])
+        self.assertEqual(["2x40", "2x1", "3x40"], [c["cell"] for c in report["cells"]])
+        self.assertEqual(["decisive", "exploratory", "instrument"], [c["role"] for c in report["cells"]])
         cell = report["cells"][0]
         for key in ("calls", "entries", "tokens", "latencySeconds", "invalidOutputShare", "failures", "server", "client",
                     "served", "timing", "transportFailureShare"):
@@ -568,56 +758,107 @@ class OutputTests(ProbeCase):
         self.assertEqual({"fp-mock-1": cell["calls"]["answered"]}, cell["served"]["fingerprints"])
         self.assertTrue(cell["served"]["matchesInstrument"])
         self.assertIsNotNone(cell["client"]["rssMaxMB"])
+        self.assertIsNotNone(cell["tokens"]["promptPerEntry"])
         self.assertGreater(len(cell["server"]["samples"]), 3)
-        best = report["exitCriterion"]["bestCell"]
-        self.assertEqual("2x1", best["cell"])                     # 3x5 is above the allowed concurrency of 2 streams
-        self.assertTrue(report["exitCriterion"]["passes"])
-        self.assertTrue(report["exitCriterion"]["line"].startswith(
-            "Exit criterion (≥ 10 entries/s at the allowed concurrency of 2 streams): PASS - best cell at ≤ 2 "
-            "streams: 2 streams x 1 items per call"))
+        verdict = report["exitCriterion"]
+        self.assertEqual("2x40", verdict["cell"])
+        self.assertTrue(verdict["passes"])
+        self.assertTrue(verdict["line"].startswith(
+            "Exit criterion (≥ 10 entries/s with the instrument's 40 items per call at the allowed concurrency of 2 "
+            "streams): PASS - 2x40: "))
+        self.assertIn("Exploratory geometries at ≤ 2 streams (not the instrument's, never deciding): best 2x1",
+                      verdict["line"])
+        self.assertIn("(no expectation predeclared: --expect-output-tokens or --profile)", verdict["line"])
+        self.assertIn(f"served model `{MODEL}`", verdict["line"])
+        self.assertTrue(report["allowedConcurrency"]["mayExceed"])
+        self.assertIn("Best cell above 2 streams with the instrument's 40 items per call: 3x40",
+                      report["allowedConcurrency"]["line"])
         markdown = (self.output / P.MARKDOWN_NAME).read_text()
-        self.assertIn(report["exitCriterion"]["line"], markdown)
+        self.assertIn(verdict["line"], markdown)
         self.assertIn(report["allowedConcurrency"]["line"], markdown)
-        self.assertIn("| Cell | State | Calls answered | Items/call | Entries/s |", markdown)
-        self.assertEqual(2, len(re.findall(r"^\| (2x1|3x5) \| completed \|", markdown, flags=re.M)))
+        self.assertIn("| Cell | Role | State | Calls answered | Items/call | Window s | Entries/s |", markdown)
+        self.assertEqual(3, len(re.findall(r"^\| (2x40|2x1|3x40) \| \w+ \| completed \|", markdown, flags=re.M)))
         on_disk = json.loads((self.output / P.REPORT_NAME).read_text())
         self.assertEqual(report["cells"][1]["entries"], on_disk["cells"][1]["entries"])
         self.assertEqual(sum(c["calls"]["sent"] for c in report["cells"]), len(self.calls()))
 
-    def test_exit_criterion_and_allowed_concurrency_rules(self):
-        def cell(name, rate, state="completed", invalid=0.001):
-            streams, items = map(int, name.split("x"))
-            return {"cell": name, "streams": streams, "itemsPerCall": items, "state": state,
-                    "entries": {"perSecond": rate}, "invalidOutputShare": invalid, "transportFailureShare": 0.0,
-                    "latencySeconds": {"p95": 1.0}, "timing": {"measuredSeconds": 270.0}}
+    def test_only_the_instruments_geometry_at_the_allowed_concurrency_decides(self):
         settings = P.ProbeSettings(metrics_url="http://127.0.0.1:9/metrics")
-        report = {"cells": [cell("30x40", 31.0), cell("60x40", 44.5), cell("60x10", 52.0, state="aborted"),
-                            cell("90x40", 61.0)], "server": {"shared": True}}
-        verdict = P.exit_criterion(report, settings)
-        self.assertEqual("60x40", verdict["bestCell"]["cell"])
-        self.assertTrue(verdict["passes"])
-        self.assertIn("PASS - best cell at ≤ 60 streams: 60 streams x 40 items per call, 44.5 entries/s", verdict["line"])
-        report["cells"][1]["entries"]["perSecond"] = 39.0
-        failing = P.exit_criterion(report, settings)
-        self.assertFalse(failing["passes"])
-        self.assertTrue(failing["line"].endswith("the author decides."))
-        shared = P.allowed_concurrency(report, settings)
+        line = lambda report, s=settings: P.exit_criterion(report, s)
+        # A faster exploratory geometry never passes the criterion for the instrument's 40 items per call.
+        verdict = line({"cells": [decision_cell("60x40", 31.0), decision_cell("60x10", 45.0)]})
+        self.assertFalse(verdict["passes"])
+        self.assertIn("FAIL - 60x40: 31.0 entries/s over a 240 s steady-state window", verdict["line"])
+        self.assertIn("best 60x10 at 45.0 entries/s", verdict["line"])
+        self.assertTrue(verdict["line"].endswith("never deciding): best 60x10 at 45.0 entries/s."))
+        self.assertIn("the author decides.", verdict["line"])
+        passing = line({"cells": [decision_cell("30x40", 30.0), decision_cell("60x40", 44.5)]})
+        self.assertTrue(passing["passes"])
+        self.assertIn("PASS - 60x40: 44.5 entries/s", passing["line"])
+        # The deciding cell skipped (the grid stopped earlier): not assessed, whatever an exploratory cell reached.
+        skipped = {"cell": "60x40", "streams": 60, "itemsPerCall": 40, "state": "skipped",
+                   "reason": "grid stopped at 30x40 (transport-failures)"}
+        verdict = line({"cells": [skipped, decision_cell("30x1", 41.0)]})
+        self.assertIsNone(verdict["passes"])
+        self.assertIn("not assessed - 60x40: skipped (grid stopped at 30x40 (transport-failures))", verdict["line"])
+        self.assertIn("not assessed - the grid has no 60x40 cell", line({"cells": [decision_cell("30x40", 50.0)]})["line"])
+        aborted = line({"cells": [decision_cell("60x40", 50.0, state="aborted")]})
+        self.assertIn("stopped by the transport-failures rule with its calls cut off", aborted["line"])
+        # Answers from another model: the census would pause on model drift.
+        drift = line({"cells": [decision_cell("60x40", 462.8, model="some-other-model")]})
+        self.assertIsNone(drift["passes"])
+        self.assertIn("answered as `some-other-model`, not the instrument's required model", drift["line"])
+        self.assertIn("model drift", drift["line"])
+        # A saturated cell whose steady-state window is shorter than two p95 call latencies does not decide.
+        short = line({"cells": [decision_cell("60x40", 40.4, state="saturated", measured=35.0, p95=52.0)]})
+        self.assertIsNone(short["passes"])
+        self.assertIn("a steady-state window of 35 s, less than the 104 s needed", short["line"])
+        self.assertIn("indicative 40.4 entries/s", short["line"])
+        self.assertIn("--cells 60x40 --cell-seconds 900 and a larger --saturation-seconds", short["line"])
+        long_enough = line({"cells": [decision_cell("60x40", 41.5, state="saturated", measured=200.0, p95=52.0,
+                                                    completed=39.0)]})
+        self.assertTrue(long_enough["passes"])
+        self.assertIn("41.5 entries/s over a 200 s steady-state window (stopped by the saturation rule", long_enough["line"])
+        self.assertIn("completed calls 39.0 entries/s", long_enough["line"])
+        # A completed cell needs at least its planned window or two p95 latencies.
+        self.assertIsNone(line({"cells": [decision_cell("60x40", 45.0, measured=150.0, p95=100.0)]})["passes"])
+
+    def test_predeclared_tokens_per_entry_warn_and_normalise_the_rate(self):
+        settings = P.ProbeSettings(expect_output_tokens=40.0, expect_prompt_tokens=520.0)
+        within = P.exit_criterion({"cells": [decision_cell("60x40", 44.5, output=36.0)]}, settings)
+        self.assertTrue(within["passes"])
+        self.assertIn("tokens per entry: prompt 500.0, output 36.0 against the expected prompt 520 (-4 %), output 40 "
+                      "(-10 %)", within["line"])
+        self.assertNotIn("WARNING", within["line"])
+        departing = P.exit_criterion({"cells": [decision_cell("60x40", 44.5, output=30.0)]}, settings)
+        self.assertFalse(departing["passes"])
+        self.assertEqual(33.38, departing["assessment"]["normalisedRate"])
+        self.assertIn("WARNING: output tokens per entry depart from the expectation by more than 20 %, token-normalised "
+                      "rate 33.4 entries/s", departing["line"])
+        self.assertIn("FAIL - 60x40: 33.4 entries/s", departing["line"])
+        # Synthetic entries with longer answers than real ones: the lower measured rate decides.
+        longer = P.exit_criterion({"cells": [decision_cell("60x40", 38.0, output=60.0)]}, settings)
+        self.assertFalse(longer["passes"])
+        self.assertEqual(57.0, longer["assessment"]["normalisedRate"])
+        profiled = P.ProbeSettings(profile_expected={"outputTokensPerEntry": 30.0})
+        self.assertEqual({"outputTokensPerEntry": 30.0, "tolerance": 0.2, "source": {"outputTokensPerEntry": "profile"}},
+                         profiled.expectation())
+
+    def test_allowed_concurrency_names_the_instruments_geometry_above_the_limit(self):
+        settings = P.ProbeSettings(metrics_url="http://127.0.0.1:9/metrics")
+        cells = [decision_cell("60x40", 44.5), decision_cell("90x40", 61.0), decision_cell("120x10", 70.0)]
+        shared = P.allowed_concurrency({"cells": cells, "server": {"shared": True}}, settings)
         self.assertEqual((60, False), (shared["streams"], shared["mayExceed"]))
         self.assertIn("shared server", shared["line"])
-        report["server"]["shared"] = False
-        free = P.allowed_concurrency(report, settings)
+        free = P.allowed_concurrency({"cells": cells, "server": {"shared": False}}, settings)
         self.assertTrue(free["mayExceed"])
-        self.assertIn("Best cell above 60 streams: 90 streams x 40 items per call, 61.0 entries/s.", free["line"])
-        report["server"]["shared"] = None
-        self.assertIn("cannot show that the server is not shared", P.allowed_concurrency(report, settings)["line"])
-        self.assertIn("no metrics endpoint", P.allowed_concurrency(report, P.ProbeSettings())["line"])
-        self.assertIsNone(P.exit_criterion({"cells": [cell("90x40", 61.0)]}, settings)["passes"])
-        # A cell stopped by the saturation rule measured the server at capacity: it is eligible, and the line says so.
-        saturated = P.exit_criterion({"cells": [cell("30x40", 31.0), cell("60x40", 41.5, state="saturated")]}, settings)
-        self.assertEqual(("60x40", "saturated"), (saturated["bestCell"]["cell"], saturated["bestCell"]["state"]))
-        self.assertIn("41.5 entries/s (stopped by the saturation rule after 270 s of measurement)", saturated["line"])
-        aborted = P.exit_criterion({"cells": [cell("30x40", 31.0), cell("60x40", 41.5, state="aborted")]}, settings)
-        self.assertEqual("30x40", aborted["bestCell"]["cell"])
+        self.assertIn("Best cell above 60 streams with the instrument's 40 items per call: 90x40, 61.0 entries/s.",
+                      free["line"])
+        self.assertIn("Exploratory geometries above 60 streams: best 120x10 at 70.0 entries/s.", free["line"])
+        self.assertEqual("90x40", free["bestAbove"]["cell"])
+        unknown = P.allowed_concurrency({"cells": cells, "server": {"shared": None}}, settings)
+        self.assertIn("cannot show that the server is not shared", unknown["line"])
+        self.assertIn("no metrics endpoint", P.allowed_concurrency({"cells": cells, "server": {}}, P.ProbeSettings())["line"])
 
 
 class SharedServerTests(ProbeCase):
@@ -637,14 +878,17 @@ class SharedServerTests(ProbeCase):
         self.judge.latency = 0.1
         report = self.probe("3x1,2x5")
         for cell in report["cells"]:
+            counters = cell["server"]["counters"]
             self.assertEqual(0, cell["server"]["foreignSamples"], cell["server"])
-            self.assertTrue(cell["server"]["counters"]["comparable"])
-            self.assertEqual(0, cell["server"]["counters"]["generationExcess"])
+            self.assertTrue(counters["comparable"])
+            self.assertEqual((0, 0, 0), (counters["generationExcess"], counters["promptExcess"], counters["requestExcess"]))
+            self.assertEqual([], counters["foreignBy"])
             self.assertTrue(cell["server"]["coverage"]["covered"], cell["server"]["coverage"])
             self.assertEqual(1.0, cell["server"]["coverage"]["tokens"])
             self.assertIs(False, cell["server"]["shared"])
             self.assertGreater(cell["server"]["running"]["max"], 0)
-        self.assertEqual({"promptTokens": 0, "generationTokens": 0}, report["baseline"]["countersAdvanced"])
+        self.assertEqual({"promptTokens": 0, "generationTokens": 0, "requestSuccess": 0},
+                         report["baseline"]["countersAdvanced"])
         self.assertIs(False, report["server"]["shared"])
         self.assertEqual([], report["server"]["gaps"])
         self.assertTrue(report["allowedConcurrency"]["mayExceed"])
@@ -665,7 +909,7 @@ class SharedServerTests(ProbeCase):
                       (self.output / P.MARKDOWN_NAME).read_text())
 
     def test_tokens_of_unanswered_calls_are_allowed_for_in_the_counters(self):
-        # Failed calls that still generated on the server must not look like another client's tokens.
+        # Server errors that still generated on the server must not look like another client's tokens.
         self.judge.latency, self.judge.fail_every, self.judge.generation_on_failure = 0.05, 10, 2500
         report = self.probe("3x1", abort_failure_share=1.0)
         cell = report["cells"][0]
@@ -674,8 +918,41 @@ class SharedServerTests(ProbeCase):
         self.assertEqual(2500 * self.judge.failed, counters["generationExcess"])
         self.assertGreater(counters["generationExcess"], counters["margin"])
         self.assertEqual(3000 * cell["calls"]["failed"], counters["unansweredTokenBound"])
+        self.assertEqual(cell["calls"]["failed"], counters["requestBound"])
         self.assertFalse(counters["foreign"])
         self.assertIs(False, cell["server"]["shared"])
+
+    def test_refusals_get_no_allowance_so_tokens_beside_them_show_another_client(self):
+        # HTTP 400 refusals generate nothing; tokens generated beside them can only be another client's.
+        self.judge.latency, self.judge.fail_every, self.judge.fail_status = 0.05, 10, 400
+        self.judge.generation_on_failure = 2500
+        report = self.probe("3x1", abort_failure_share=1.0)
+        counters = report["cells"][0]["server"]["counters"]
+        self.assertGreater(report["cells"][0]["calls"]["failed"], 2)
+        self.assertEqual((0, 0), (counters["unansweredMayHaveRun"], counters["unansweredTokenBound"]))
+        self.assertEqual(["generation"], counters["foreignBy"])
+        self.assertTrue(report["server"]["shared"])
+
+    def test_a_tenant_keeping_one_request_running_is_caught(self):
+        # Idle while the baseline is taken; then one request runs throughout the cell and generates tokens.
+        self.judge.tenant = {"after": 4, "running": 1, "generation": 60}
+        report = self.probe("2x1")
+        cell = report["cells"][0]
+        self.assertFalse(report["baseline"]["foreign"])
+        self.assertGreaterEqual(cell["server"]["foreignSamples"], 2)
+        self.assertEqual(1, cell["server"]["maxExcess"])
+        self.assertIn("generation", cell["server"]["counters"]["foreignBy"])
+        self.assertTrue(report["server"]["shared"])
+        self.assertFalse(report["allowedConcurrency"]["mayExceed"])
+
+    def test_requests_another_client_finished_are_caught_by_the_request_counter(self):
+        self.judge.tenant = {"after": 4, "success": 1}
+        report = self.probe("2x1")
+        counters = report["cells"][0]["server"]["counters"]
+        self.assertGreater(counters["requestExcess"], 0)
+        self.assertEqual(["requests"], counters["foreignBy"])
+        self.assertTrue(report["server"]["shared"])
+        self.assertTrue(any("more requests than we had answered" in item for item in report["server"]["evidence"]))
 
     def test_foreign_generation_between_samples_is_caught_by_the_token_counters(self):
         self.judge.extra_generation = 5000
@@ -696,13 +973,41 @@ class SharedServerTests(ProbeCase):
         self.assertEqual(60, report["allowedConcurrency"]["streams"])
         self.assertFalse(report["allowedConcurrency"]["mayExceed"])
 
+    def test_cells_above_the_allowed_concurrency_wait_for_an_unshared_server(self):
+        self.judge.foreign = 5
+        report = self.probe("2x1,4x1", allowed_streams=2)
+        self.assertEqual(["completed", "skipped"], [c["state"] for c in report["cells"]])
+        self.assertIn("the server showed other clients", report["cells"][1]["reason"])
+        self.assertIn("--run-above-allowed", report["cells"][1]["reason"])
+        self.assertEqual({"2x1"}, {record["cell"] for record in self.calls()})
+        self.assertEqual("completed", report["state"])
+        forced = self.probe("2x1,4x1", allowed_streams=2, run_above_allowed=True)
+        self.assertEqual(["completed", "completed"], [c["state"] for c in forced["cells"]])
+        unmeasured = self.probe("2x1,4x1", metrics=False, allowed_streams=2)
+        self.assertEqual("skipped", unmeasured["cells"][1]["state"])
+        self.assertIn("no --metrics-url", unmeasured["cells"][1]["reason"])
+        self.judge.foreign = 0
+        free = self.probe("2x1,4x1", allowed_streams=2)
+        self.assertEqual(["completed", "completed"], [c["state"] for c in free["cells"]])
+
+    def test_server_prefix_cache_counters_give_the_cached_share_when_usage_has_none(self):
+        self.judge.cached = None
+        report = self.probe("2x5")
+        tokens = report["cells"][0]["tokens"]
+        counters = report["cells"][0]["server"]["counters"]
+        self.assertEqual("server-prefix-cache", tokens["cachedShareSource"])
+        self.assertEqual(counters["prefixCacheHitShare"], tokens["cachedShare"])
+        self.assertAlmostEqual(counters["prefixCacheHits"] / counters["prefixCacheQueries"], tokens["cachedShare"], places=3)
+        self.assertIn(" (server) |", (self.output / P.MARKDOWN_NAME).read_text())
+
     def test_abandoned_calls_are_allowed_for_within_the_grace_period(self):
         probe = P.CapacityProbe(P.ProbeSettings())
         now = time.monotonic()
         for ago, tokens in ((100.0, 3000), (5.0, 28000), (1.0, 3500)):
-            probe.abandoned(now - ago, tokens)
+            probe.abandoned(now - ago, tokens, tokens // 10)
         self.assertEqual(2, probe.abandoned_recently(30.0))
         self.assertEqual(31500, probe.abandoned_tokens(30.0))
+        self.assertEqual({"calls": 2, "tokens": 31500, "prompt": 3150}, probe.carried(30.0))
         self.assertEqual(0, probe.abandoned_tokens(0.5))
 
     def test_metrics_parsing(self):
@@ -711,10 +1016,12 @@ class SharedServerTests(ProbeCase):
                 'vllm:num_requests_running{engine="1",model_name="a{b}"} 2.0 1700000000000\n'
                 'vllm:num_requests_waiting{engine="0"} NaN\n'
                 'vllm:gpu_cache_usage_perc{engine="0"} 0.5\nvllm:gpu_cache_usage_perc{engine="1"} 0.75\n'
+                'vllm:request_success_total{finished_reason="stop"} 10\n'
+                'vllm:request_success_total{finished_reason="length"} 2\n'
                 'vllm:generation_tokens_total 120\nvllm:generation_tokens_created 1.7e9\nnot a sample line\n')
         load = P.server_load(P.parse_prometheus(text))
-        self.assertEqual((5.0, None, 0.75, 120.0), (load["running"], load["waiting"], load["kvCacheUsage"],
-                                                  load["generationTokens"]))
+        self.assertEqual((5.0, None, 0.75, 120.0, 12.0), (load["running"], load["waiting"], load["kvCacheUsage"],
+                                                        load["generationTokens"], load["requestSuccess"]))
         self.assertTrue(load["recognized"])
         self.assertFalse(P.server_load(P.parse_prometheus("sglang:num_running_reqs 4\n"))["recognized"])
         both = P.server_load(P.parse_prometheus("vllm:kv_cache_usage_perc 0.2\nvllm:gpu_cache_usage_perc 0.9\n"))
@@ -722,6 +1029,9 @@ class SharedServerTests(ProbeCase):
 
 
 class SecretTests(ProbeCase):
+    def fragments(self, key: str) -> list[str]:
+        return [key[i:i + P.KEY_FRAGMENT] for i in range(len(key) - P.KEY_FRAGMENT + 1)]
+
     def test_the_key_reaches_only_the_judge_and_never_the_report_or_logs(self):
         key = "probe-key-" + secrets.token_hex(16)
         self.judge.fail_every, self.judge.echo_authorization = 9, True
@@ -746,13 +1056,36 @@ class SecretTests(ProbeCase):
         for name, text in texts.items():
             with self.subTest(output=name):
                 self.assertTrue(text)
-                self.assertNotIn(key, text)
-                self.assertNotIn(key[10:], text)
+                for fragment in self.fragments(key):
+                    self.assertNotIn(fragment, text)
         report = json.loads(texts[P.REPORT_NAME])
         self.assertEqual("PROBE_JUDGE_KEY", report["endpoint"]["apiKeyEnv"])
         self.assertTrue(report["endpoint"]["keySent"])
         self.assertEqual({"fp-[redacted]"}, set(report["cells"][0]["served"]["fingerprints"]))
         self.assertEqual("rejected Bearer [redacted]", report["cells"][0]["failureExamples"]["http-500"][0]["detail"])
+
+    def test_a_key_echoed_across_the_cut_of_a_server_message_never_survives_in_part(self):
+        key = "pk|" + secrets.token_hex(20)                          # a pipe, which the markdown escapes
+        self.judge.fail_every, self.judge.fail_status = 2, 401
+        self.judge.fail_message = "e" * 182 + " Bearer " + key + " was refused"
+        out, err = io.StringIO(), io.StringIO()
+        output = self.root / "cut-run"
+        argv = ["capacity", "probe", "--base-url", self.url + "/v1", "--api-key-env", "PROBE_JUDGE_KEY", "--cells", "2x1",
+                "--output", str(output), "--cell-seconds", "0.6", "--warmup-seconds", "0.15", "--ramp-seconds", "0.05",
+                "--drain-seconds", "3", "--pause-seconds", "0.02", "--sample-seconds", "0.1",
+                "--abort-failure-share", "1.0"]
+        with mock.patch.dict(os.environ, {"PROBE_JUDGE_KEY": key}), redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(0, main(argv))
+        texts = {"stdout": out.getvalue(), "stderr": err.getvalue(),
+                 **{path.name: path.read_text() for path in output.iterdir()}}
+        for name, text in texts.items():
+            for fragment in self.fragments(key) + [key.replace("|", "\\|")]:
+                with self.subTest(output=name, fragment=fragment):
+                    self.assertNotIn(fragment, text)
+        detail = json.loads(texts[P.REPORT_NAME])["cells"][0]["failureExamples"]["http-401"][0]["detail"]
+        self.assertEqual(("e" * 182 + " Bearer [redacted]")[:P.DETAIL_CHARACTERS], detail)
+        self.assertEqual("ab[redacted]", P.redact_key("ab" + key[5:17], key))
+        self.assertEqual("ab" + key[5:12] + "z", P.redact_key("ab" + key[5:12] + "z", key))   # 7 characters stay
 
     def test_refusals_never_echo_the_key(self):
         key = "probe-key-" + secrets.token_hex(16)
@@ -789,6 +1122,10 @@ class DryRunTests(ProbeCase):
         self.assertIn("(not contacted)", text)
         self.assertEqual(16, len(re.findall(r"^\| \d+ \| \d+x\d+ \|", text, flags=re.M)))
         self.assertEqual(4, text.count("skipped: above --max-streams 90"))
+        self.assertEqual(4, text.count("runs if the server can be shown unshared"))
+        self.assertIn("exit criterion: cell 60x40 only", text)
+        self.assertIn("| 1 | 30x40 | instrument | runs |", text)
+        self.assertIn("| 2 | 60x40 | decisive | runs |", text)
         self.assertIn("| 40 | ", text)
         self.assertIn("estimated duration:", text)
         out = io.StringIO()
@@ -797,12 +1134,52 @@ class DryRunTests(ProbeCase):
                                       "--base-url", self.url + "/v1"]))
         plan = json.loads(out.getvalue())
         self.assertTrue(plan["dryRun"])
-        self.assertEqual(["30x1", "60x40"], [row["cell"] for row in plan["load"]])
+        self.assertEqual(["60x40", "30x1"], [row["cell"] for row in plan["load"]])
+        self.assertEqual("60x40", plan["decision"]["cell"])
         sizes = {size["itemsPerCall"]: size for size in plan["requestSizes"]}
         self.assertEqual(28000, sizes[40]["maxTokens"])
         self.assertGreater(sizes[40]["bodyBytes"]["p50"], sizes[1]["bodyBytes"]["p50"] * 10)
-        self.assertEqual(round(60 * sizes[40]["meanItems"] / 40, 2), plan["load"][1]["latencyBudgetSeconds"])
+        self.assertEqual(round(60 * sizes[40]["meanItems"] / 40, 2), plan["load"][0]["latencyBudgetSeconds"])
         self.assertEqual((0, 0), (self.judge.connections, self.judge.requests))
+
+
+class ProfileTests(RunnerTestCase):
+    def test_a_profile_from_a_census_database_feeds_the_probe(self):
+        run = self.run_census()
+        self.prepare(run)
+        self.assertEqual("completed", run.run_abstract()["state"])
+        run.close()
+        profile = P.profile_from_database(self.database)
+        self.assertEqual(P.PROFILE_FORMAT, profile["format"])
+        self.assertEqual(1, profile["source"]["publicReviews"])
+        self.assertEqual(15, profile["source"]["entries"])
+        # The runner's mock judge reports 20 completion and 100 prompt tokens per call.
+        calls = self.rows("SELECT COUNT(*) AS n, SUM(n_items) AS items FROM calls WHERE kind='first' AND error IS NULL")[0]
+        self.assertEqual(round(20 * calls["n"] / calls["items"], 1), profile["expected"]["outputTokensPerEntry"])
+        self.assertEqual(round(100 * calls["n"] / calls["items"], 1), profile["expected"]["promptTokensPerEntry"])
+        self.assertAlmostEqual(1.0, sum(profile["profile"]["citingSentences"]["weights"]), places=3)
+        self.assertNotIn("text", json.dumps(profile["profile"]).lower().replace("context", ""))
+        path = self.root / "profile.json"
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(0, main(["capacity", "profile", "--database", str(self.database), "--output", str(path)]))
+        loaded, expected, source = P.load_profile(path)
+        self.assertEqual(profile["expected"]["outputTokensPerEntry"], expected["outputTokensPerEntry"])
+        self.assertEqual("profile.json", source["path"])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertNotEqual(0, main(["capacity", "profile", "--database", str(self.database), "--output", str(path)]))
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(0, main(["--json", "capacity", "probe", "--dry-run", "--cells", "60x40", "--profile", str(path)]))
+        plan = json.loads(out.getvalue())
+        self.assertEqual(expected["outputTokensPerEntry"], plan["expectation"]["outputTokensPerEntry"])
+        self.assertEqual({"outputTokensPerEntry": "profile", "promptTokensPerEntry": "profile"},
+                         plan["expectation"]["source"])
+        self.assertEqual("profile.json", plan["synthetic"]["profileSource"]["path"])
+        self.assertEqual(loaded["reviewEntries"], plan["synthetic"]["profile"]["reviewEntries"])
+        (self.root / "bad.json").write_text(json.dumps({"format": "other"}))
+        with self.assertRaisesRegex(ValidationError, "not a capacity profile"):
+            P.load_profile(self.root / "bad.json")
 
 
 if __name__ == "__main__":

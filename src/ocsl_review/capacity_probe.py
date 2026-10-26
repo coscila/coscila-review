@@ -6,17 +6,26 @@ instrument's own abstract-tier requests: the system prompt and per-batch user
 content from ``citation_census``, temperature 0, reasoning none,
 ``max_tokens = max(3000, 700 * n)`` and streaming off, built over synthetic
 entries generated deterministically from a seed (no corpus data, no entitled
-text). A grid of cells (streams x items per call) runs for a fixed time each,
-over a keep-alive connection pool sized to the stream count. Every cell records
-valid entries per second, tokens, the cached-token share, latency percentiles,
-invalid outputs under the instrument's validator, failure classes, server load
-from the vLLM Prometheus endpoint (with a shared-server check), the client's
-RSS and the served model and fingerprint. Abort rules stop the cell and the
-grid when transport failures exceed a share of calls in a trailing window
-(the calls in flight are cut off) or the server reports saturation for too
-long (the calls in flight finish, and the cell keeps its measurement of the
-server at capacity). The report is JSON plus a markdown table with the exit
-criterion line.
+text; sizes from a built-in profile or from a profile measured on a study's own
+public inputs). A grid of cells (streams x items per call) runs for a fixed time
+each, over a keep-alive connection pool sized to the stream count. The measured
+window is a steady state: it starts once the calls of the ramp have finished
+and the streams keep sending past its end until the calls that overlap it have
+finished. Every cell records valid entries per second, tokens, the cached-token
+share, latency percentiles, invalid outputs under the instrument's validator,
+failure classes, server load from the vLLM Prometheus endpoint (with a
+shared-server check over request gauges and token and request counters), the
+client's RSS and the served model and fingerprint. Abort rules stop the cell and
+the grid when transport failures exceed a share of calls in a trailing window
+(the calls in flight are cut off), or when the server reports saturation, or its
+metrics stay unreadable, for too long (the calls in flight finish).
+
+The exit criterion is assessed on one cell, the instrument's own geometry (its
+items per call) at the allowed concurrency, and only when that cell was answered
+by the instrument's required model and measured long enough; the other
+geometries are exploratory. Cells above the allowed concurrency run only while
+the server can still be shown not to be shared. The report is JSON plus a
+markdown table with the exit criterion line.
 
 The probe only measures: it is not part of any instrument digest, sends only
 first calls (no repair pass) and never writes a scores database.
@@ -25,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import itertools
 import json
 import math
 import os
@@ -39,6 +49,7 @@ import threading
 import time
 import urllib.parse
 from collections import Counter, deque
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +59,8 @@ from . import citation_census as C
 from .errors import ValidationError
 from .util import atomic_write
 
-FORMAT = "ocsl-capacity-probe@1"
+FORMAT = "ocsl-capacity-probe@2"
+PROFILE_FORMAT = "ocsl-capacity-profile@1"
 TIER = "abstract"
 DEFAULT_STREAMS = (30, 60, 90, 120)
 DEFAULT_ITEMS = (1, 5, 10, 40)
@@ -60,15 +72,23 @@ TOKEN_CHARACTERS = 4          # characters per token, for the dry-run estimates 
 SATURATION_STATUS = frozenset({429, 503})
 CONNECT_TIMEOUT = 10.0        # seconds to open a connection; reads then wait up to --request-timeout
 COVERAGE_MIN = 0.8            # server load must account for this share of our own calls before "not shared" holds
-COUNTER_MARGIN = (1000, 0.02)  # generation tokens beyond ours (absolute, share) before the counters show other clients
+COUNTER_MARGIN = (16, 1)      # tokens beyond ours the counters tolerate: absolute, and per call that may have run
+PROMPT_OVERHEAD = 64          # prompt tokens a chat template may add to a request beyond its body bytes
+DECISION_CYCLES = 2           # a cell decides only after this many p95 call latencies of steady state (or its full window)
 DETAIL_CHARACTERS = 200       # length of a failure example's text (server error messages; the key is redacted)
+KEY_FRAGMENT = 8              # a run of this many characters of the key in server text is redacted too
 REPORT_NAME, MARKDOWN_NAME, CALLS_NAME = "capacity-probe.json", "capacity-probe.md", "calls.jsonl"
+MEASURED_STATES = ("completed", "saturated", "metrics-lost")   # cells whose window measured the server
+STOP_RULES = {"saturation": "saturated", "metrics-unavailable": "metrics-lost"}   # rules that let calls in flight finish
 
-# Size distributions of the synthetic entries; recorded in every report.
+# Size distributions of the synthetic entries; recorded in every report. ``--profile`` replaces them with the sizes of
+# a study's own public inputs (``capacity profile``).
 PROFILE: dict[str, Any] = {
     "reviewEntries": {"distribution": "lognormal", "median": 110, "sigma": 0.6, "min": 8, "max": 600},
     "citingSentences": {"weights": [0.55, 0.25, 0.2], "note": "1, 2 or 3 sentences (never more than the instrument sends)"},
     "sentenceCharacters": {"distribution": "lognormal", "median": 170, "sigma": 0.4, "min": 60, "max": 480},
+    "citingFromAbstract": {"share": 0.8, "note": "citing sentences built from a span of the entry's own abstract, so the "
+                                                 "judge can support most entries; the rest are unrelated text"},
     "abstractCharacters": {"distribution": "lognormal", "median": 1500, "sigma": 0.45, "min": 200, "max": 4000,
                            "missingShare": 0.05, "structuredShare": 0.3,
                            "note": "the instrument's builder applies its abstract cut"},
@@ -77,6 +97,7 @@ PROFILE: dict[str, Any] = {
     "years": {"min": 1985, "max": 2025},
     "printedReference": "authors, title, venue, year, volume, pages and a synthetic DOI; recorded, never sent",
 }
+_LOGNORMAL_KEYS = ("reviewEntries", "sentenceCharacters", "abstractCharacters")
 
 _FUNCTION = ("the", "of", "in", "and", "with", "was", "were", "for", "to", "by", "a", "that", "on", "from", "as", "is",
              "are", "than", "after", "between", "among", "within", "not", "both", "only", "these")
@@ -110,10 +131,149 @@ _SURNAMES = ("Abel", "Brandt", "Costa", "Dahl", "Eriksen", "Fischer", "Garcia", 
              "Laurent", "Moreau", "Novak", "Okafor", "Petrov", "Quinn", "Rossi", "Sato", "Tanaka", "Ueda", "Varga",
              "Weber", "Xu", "Yilmaz", "Zhang")
 _ABSTRACT_HEADINGS = (("Background", 0.2), ("Methods", 0.25), ("Results", 0.35), ("Conclusions", 0.2))
+_STRUCTURED = re.compile(r"\b(?:Background|Methods|Results|Conclusions?|Objectives?|Purpose|Findings)\s*:")
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----------------------------------------------------------------------------- profiles
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def validate_profile(profile: Any) -> dict[str, Any]:
+    """A complete synthetic size profile: the built-in one with the given keys replaced, each checked."""
+    if not isinstance(profile, dict):
+        raise ValidationError("a capacity profile is a JSON object")
+    unknown = set(profile) - set(PROFILE)
+    if unknown:
+        raise ValidationError(f"unknown capacity profile keys: {', '.join(sorted(unknown))}")
+    merged = json.loads(json.dumps(PROFILE))
+    for key, value in profile.items():
+        if key == "printedReference":
+            continue
+        if key in _LOGNORMAL_KEYS:
+            if not isinstance(value, dict) or value.get("distribution", "lognormal") != "lognormal":
+                raise ValidationError(f"profile {key} is a lognormal distribution")
+            spec = {**merged[key], **value}
+            if not (all(_number(spec.get(k)) for k in ("median", "sigma", "min", "max")) and spec["median"] > 0
+                    and spec["sigma"] >= 0 and 1 <= spec["min"] <= spec["max"]):
+                raise ValidationError(f"profile {key} needs median > 0, sigma >= 0 and 1 <= min <= max")
+            for share in ("missingShare", "structuredShare"):
+                if share in spec and not (_number(spec[share]) and 0 <= spec[share] <= 1):
+                    raise ValidationError(f"profile {key}.{share} is a share in [0, 1]")
+            merged[key] = spec
+        elif key == "citingSentences":
+            weights = value.get("weights") if isinstance(value, dict) else None
+            if (not isinstance(weights, list) or not 1 <= len(weights) <= 3 or not all(_number(w) and w >= 0 for w in weights)
+                    or not sum(weights) > 0):
+                raise ValidationError("profile citingSentences.weights lists one to three non-negative weights")
+            merged[key] = {**merged[key], **value}
+        elif key == "citingFromAbstract":
+            share = value.get("share") if isinstance(value, dict) else None
+            if not (_number(share) and 0 <= share <= 1):
+                raise ValidationError("profile citingFromAbstract.share is a share in [0, 1]")
+            merged[key] = {**merged[key], **value}
+        elif key in ("titleWords", "years"):
+            if not isinstance(value, dict) or not all(isinstance(value.get(k), int) for k in ("min", "max")) \
+                    or not 1 <= value["min"] <= value["max"]:
+                raise ValidationError(f"profile {key} needs integer min and max with 1 <= min <= max")
+            merged[key] = {**merged[key], **value}
+        elif key == "retractedShare":
+            if not (_number(value) and 0 <= value <= 1):
+                raise ValidationError("profile retractedShare is a share in [0, 1]")
+            merged[key] = value
+    return merged
+
+
+def load_profile(path: Path) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """(profile, expected tokens per entry or None, source record) from a ``capacity profile`` file."""
+    raw = Path(path).read_bytes()
+    try:
+        value = json.loads(raw)
+    except ValueError as error:
+        raise ValidationError("the capacity profile is not JSON") from error
+    if not isinstance(value, dict) or value.get("format") != PROFILE_FORMAT:
+        raise ValidationError(f"not a capacity profile ({PROFILE_FORMAT})")
+    profile = validate_profile(value.get("profile") or {})
+    expected = value.get("expected")
+    if expected is not None:
+        if not isinstance(expected, dict):
+            raise ValidationError("the profile's expected tokens are an object")
+        expected = {k: expected[k] for k in ("promptTokensPerEntry", "outputTokensPerEntry")
+                    if _number(expected.get(k)) and expected[k] > 0} or None
+    source = {"path": Path(path).name, "sha256": hashlib.sha256(raw).hexdigest(), "source": value.get("source")}
+    return profile, expected, source
+
+
+def _fit(values: Sequence[float], fallback: dict[str, Any]) -> dict[str, Any]:
+    """Lognormal parameters (median and sigma of the logs) with the observed range; the fallback when too few."""
+    positive = sorted(float(v) for v in values if v and v > 0)
+    if len(positive) < 2:
+        return {k: v for k, v in fallback.items() if k != "note"}
+    logs = [math.log(v) for v in positive]
+    mean = sum(logs) / len(logs)
+    sigma = math.sqrt(sum((x - mean) ** 2 for x in logs) / (len(logs) - 1))
+    return {"distribution": "lognormal", "median": round(math.exp(mean), 1), "sigma": round(sigma, 3),
+            "min": max(1, int(positive[0])), "max": max(1, int(math.ceil(positive[-1]))), "n": len(positive)}
+
+
+def profile_from_database(path: Path) -> dict[str, Any]:
+    """Size profile and expected tokens per entry from the public reviews of a census scores database (read-only).
+
+    Only sizes and token counts are read (entries per review, citing sentences per entry and their length, abstract
+    length, title words, the tokens of answered first calls); no text leaves the database and no verdict is read.
+    """
+    from . import scores_db
+    judged = ("c.cited_inbody=1 AND c.identity IN ('resolved','resolved_unverified') AND (c.journal, c.doi) IN "
+              "(SELECT journal, doi FROM reviews WHERE provenance_class='public' AND document_sha256 IS NOT NULL)")
+    with closing(scores_db.open_readonly(Path(path))) as connection:
+        reviews = [row[0] for row in connection.execute(
+            f"SELECT COUNT(*) FROM citations c WHERE {judged} GROUP BY c.journal, c.doi")]
+        sentences = Counter(min(3, row[0]) for row in connection.execute(
+            f"SELECT COUNT(*) FROM loci l JOIN citations c ON c.journal=l.journal AND c.doi=l.doi AND c.label=l.label "
+            f"WHERE l.sent=1 AND {judged} GROUP BY l.journal, l.doi, l.label"))
+        lengths = [row[0] for row in connection.execute(
+            f"SELECT length(l.sentence) FROM loci l JOIN citations c ON c.journal=l.journal AND c.doi=l.doi AND "
+            f"c.label=l.label WHERE l.sent=1 AND l.sentence NOT LIKE 'sha256:%' AND {judged}")]
+        abstracts = connection.execute(
+            f"SELECT e.characters, e.text FROM citations c LEFT JOIN evidence e ON e.evidence_id=c.abs_evidence_id "
+            f"WHERE {judged}").fetchall()
+        titles = [len(str(row[0]).split()) for row in connection.execute(
+            f"SELECT w.title FROM citations c JOIN works w ON w.work_key=c.cited_work_key WHERE {judged} "
+            "AND w.title IS NOT NULL AND w.title != ''")]
+        calls = connection.execute(
+            "SELECT COUNT(*), SUM(n_items), SUM(prompt_tokens), SUM(completion_tokens) FROM calls WHERE tier='abstract' "
+            "AND variant='primary' AND kind='first' AND error IS NULL AND prompt_tokens IS NOT NULL AND "
+            "completion_tokens IS NOT NULL AND (journal, doi) IN (SELECT journal, doi FROM reviews WHERE "
+            "provenance_class='public')").fetchone()
+    if not reviews:
+        raise ValidationError("the database holds no prepared public review with judged entries")
+    present = [row[0] for row in abstracts if row[0]]
+    texts = [row[1] for row in abstracts if row[0] and row[1]]
+    abstract = {**_fit(present, PROFILE["abstractCharacters"]),
+                "missingShare": round(1 - len(present) / len(abstracts), 4) if abstracts else 0.0,
+                "structuredShare": (round(sum(1 for t in texts if len(_STRUCTURED.findall(t)) >= 2) / len(texts), 4)
+                                    if texts else PROFILE["abstractCharacters"]["structuredShare"])}
+    total = sum(sentences.values())
+    profile = {"reviewEntries": _fit(reviews, PROFILE["reviewEntries"]),
+               "citingSentences": {"weights": [round(sentences.get(k, 0) / total, 4) for k in (1, 2, 3)]
+                                   if total else PROFILE["citingSentences"]["weights"]},
+               "sentenceCharacters": _fit(lengths, PROFILE["sentenceCharacters"]),
+               "abstractCharacters": abstract}
+    if len(titles) >= 2:
+        ordered = sorted(titles)
+        profile["titleWords"] = {"min": max(1, ordered[len(ordered) // 100]), "max": max(1, ordered[-1 - len(ordered) // 100])}
+    validate_profile(profile)
+    count, items, prompt, completion = calls
+    expected = ({"promptTokensPerEntry": round(prompt / items, 1), "outputTokensPerEntry": round(completion / items, 1),
+                 "calls": count, "entries": items} if count and items else None)
+    return {"format": PROFILE_FORMAT, "createdAt": utc_now(), "profile": profile, "expected": expected,
+            "source": {"database": Path(path).name, "publicReviews": len(reviews), "entries": sum(reviews),
+                       "citingSentences": len(lengths), "abstracts": len(abstracts), "firstCalls": count or 0,
+                       "note": "sizes and token counts of public reviews only; no text and no verdict"}}
 
 
 # ----------------------------------------------------------------------------- settings and grid
@@ -131,6 +291,7 @@ class ProbeSettings:
     cells: tuple[tuple[int, int], ...] = ()
     order: str = "load"
     max_streams: int | None = None
+    run_above_allowed: bool = False
     cell_seconds: float = 300.0
     warmup_seconds: float = 30.0
     ramp_seconds: float = 10.0
@@ -146,11 +307,17 @@ class ProbeSettings:
     saturation_seconds: float = 60.0
     saturation_waiting: float = 1.0
     saturation_kv: float | None = None
-    shared_tolerance: float = 1.0
+    shared_tolerance: float = 0.0
     shared_min_samples: int = 2
     abandon_grace_seconds: float = 30.0
     allowed_streams: int = 60
     target_rate: float = 40.0
+    expect_output_tokens: float | None = None
+    expect_prompt_tokens: float | None = None
+    expect_tolerance: float = 0.2
+    profile: dict[str, Any] | None = None
+    profile_expected: dict[str, Any] | None = None
+    profile_source: dict[str, Any] | None = None
     seed: int = 1
     journal: str = DEFAULT_JOURNAL
     heartbeat_seconds: float = 30.0
@@ -193,6 +360,14 @@ class ProbeSettings:
             raise ValidationError("--saturation-waiting must be positive")
         if self.allowed_streams < 1 or self.target_rate <= 0:
             raise ValidationError("--allowed-streams and --target-rate must be positive")
+        for name in ("expect_output_tokens", "expect_prompt_tokens"):
+            value = getattr(self, name)
+            if value is not None and not (_number(value) and value > 0):
+                raise ValidationError(f"--{name.replace('_', '-')} must be positive")
+        if not 0 < self.expect_tolerance <= 1:
+            raise ValidationError("--expect-tolerance is a share in (0, 1]")
+        if self.profile is not None:
+            validate_profile(self.profile)
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValidationError("--seed must be an integer")
         C.system_prompt(self.journal)                 # a one-line journal parameter, as the instrument requires
@@ -216,6 +391,27 @@ class ProbeSettings:
 
     def requested_model(self) -> str:
         return self.model or C.instrument().manifest["requiredModel"]["served"]
+
+    def synthetic_profile(self) -> dict[str, Any]:
+        return self.profile or PROFILE
+
+    def expectation(self) -> dict[str, Any] | None:
+        """Predeclared tokens per entry the census's real entries carry: the options, else the profile's."""
+        expected = dict(self.profile_expected or {})
+        source = {k: "profile" for k in expected}
+        for key, value in (("outputTokensPerEntry", self.expect_output_tokens),
+                           ("promptTokensPerEntry", self.expect_prompt_tokens)):
+            if value is not None:
+                expected[key], source[key] = float(value), "option"
+        expected = {k: v for k, v in expected.items() if k in ("outputTokensPerEntry", "promptTokensPerEntry")}
+        if not expected:
+            return None
+        return {**expected, "tolerance": self.expect_tolerance, "source": source}
+
+
+def instrument_items() -> int:
+    """The instrument's items per call: the only geometry a census sends."""
+    return C.items_per_call(TIER)
 
 
 def parse_cells(values: Sequence[str] | None) -> tuple[tuple[int, int], ...]:
@@ -250,16 +446,28 @@ def label(streams: int, items: int) -> str:
     return f"{streams}x{items}"
 
 
-def ordered_grid(settings: ProbeSettings) -> list[dict[str, Any]]:
-    """The cells in run order, each with the reason it is skipped (``None`` when it runs).
+def cell_role(streams: int, items: int, settings: ProbeSettings) -> str:
+    """``decisive`` (the instrument's geometry at the allowed concurrency), ``instrument`` (its geometry at other
+    stream counts), or ``exploratory`` (other items per call, which a census never sends)."""
+    if items != instrument_items():
+        return "exploratory"
+    return "decisive" if streams == settings.allowed_streams else "instrument"
 
-    ``load`` (the default) runs the cells within the allowed concurrency first, each group by ascending load
-    (streams x items, then streams): an abort rule that fires above the allowed concurrency then never costs the
-    cells the exit criterion is assessed on.
+
+def ordered_grid(settings: ProbeSettings) -> list[dict[str, Any]]:
+    """The cells in run order, each with its role and the reason it is skipped (``None`` when it runs).
+
+    ``load`` (the default) runs the instrument's geometry within the allowed concurrency first (by ascending
+    streams, so the cell the exit criterion is assessed on runs before any exploratory geometry), then the other
+    cells within the allowed concurrency, then the cells above it, each group by ascending load (streams x items,
+    then streams): an abort rule that fires later never costs the cells the exit criterion is assessed on.
     """
     cells = settings.grid_cells()
     if settings.order == "load":
-        cells.sort(key=lambda cell: (cell[0] > settings.allowed_streams, cell[0] * cell[1], cell[0], cell[1]))
+        native = instrument_items()
+        cells.sort(key=lambda cell: (cell[0] > settings.allowed_streams,
+                                     not (cell[1] == native and cell[0] <= settings.allowed_streams),
+                                     cell[0] * cell[1], cell[0], cell[1]))
     elif settings.order == "streams":
         cells.sort()
     elif settings.order == "items":
@@ -272,6 +480,7 @@ def ordered_grid(settings: ProbeSettings) -> list[dict[str, Any]]:
         if settings.max_streams is not None and streams > settings.max_streams:
             skip = f"above --max-streams {settings.max_streams}"
         grid.append({"position": position, "cell": label(streams, items), "streams": streams, "itemsPerCall": items,
+                     "role": cell_role(streams, items, settings), "aboveAllowed": streams > settings.allowed_streams,
                      "skip": skip})
     return grid
 
@@ -331,13 +540,16 @@ def _text(rng: random.Random, characters: int) -> str:
 class SyntheticCorpus:
     """Deterministic synthetic reviews: entries with citing sentences, cited-work metadata, abstracts and printed references.
 
-    Every value depends only on (seed, scope, review, position), so a cell's call sequence is reproducible and two
-    cells (different scopes) never send the same prompt. Batches follow the instrument's geometry
-    (``citation_census.paper_batches``): one review's entries in bibliography order, cut into calls of ``n``.
+    Every value depends only on (seed, scope, review, position) and the size profile, so a cell's call sequence is
+    reproducible and two cells (different scopes) never send the same prompt. Batches follow the instrument's geometry
+    (``citation_census.paper_batches``): one review's entries in bibliography order, cut into calls of ``n``. Most
+    citing sentences restate a span of the entry's own abstract (``citingFromAbstract``), so the verdict mix, and with
+    it the length of the judge's lines, resembles real entries more than unrelated text would.
     """
 
-    def __init__(self, seed: int, scope: str):
+    def __init__(self, seed: int, scope: str, profile: dict[str, Any] | None = None):
         self.seed, self.scope = seed, scope
+        self.profile = profile or PROFILE
         self.max_sentences = C.max_citing_sentences()
 
     def _rng(self, *parts: Any) -> random.Random:
@@ -345,7 +557,7 @@ class SyntheticCorpus:
         return random.Random(int.from_bytes(hashlib.sha256(material).digest()[:16], "big"))
 
     def review_size(self, review: int) -> int:
-        return _draw(self._rng("size", review), PROFILE["reviewEntries"])
+        return _draw(self._rng("size", review), self.profile["reviewEntries"])
 
     def review_title(self, review: int) -> str:
         rng = self._rng("title", review)
@@ -353,21 +565,28 @@ class SyntheticCorpus:
             rng.choice(_ADJECTIVES).capitalize(), rng.choice(_TERMS), rng.choice(_TERMS), rng.choice(_TERMS))
 
     def _title(self, rng: random.Random) -> str:
-        spec = PROFILE["titleWords"]
+        spec = self.profile["titleWords"]
         words = [rng.choice(_TERMS if i % 2 else _ADJECTIVES + _TERMS) for i in range(rng.randint(spec["min"], spec["max"]))]
         text = " ".join(words)
         return text[0].upper() + text[1:]
 
-    def _citing_sentence(self, rng: random.Random, label_text: str) -> str:
-        characters = _draw(rng, PROFILE["sentenceCharacters"])
-        sentence = _sentence(rng, max(6, round(characters / 7)))[:-1]
+    def _citing_sentence(self, rng: random.Random, label_text: str, abstract: str) -> str:
+        characters = _draw(rng, self.profile["sentenceCharacters"])
+        words = max(6, round(characters / 7))
+        source = abstract.split()
+        if len(source) >= 6 and rng.random() < self.profile["citingFromAbstract"]["share"]:
+            start = rng.randrange(max(1, len(source) - words + 1))
+            sentence = " ".join(source[start:start + words]).rstrip(" ,;:.")
+            sentence = sentence[0].upper() + sentence[1:]
+        else:
+            sentence = _sentence(rng, words)[:-1]
         if len(sentence) > characters:
             cut = sentence.rfind(" ", 0, characters)
-            sentence = sentence[:cut if cut > 0 else characters].rstrip(" ,;")
+            sentence = sentence[:cut if cut > 0 else characters].rstrip(" ,;:")
         return "%s ⟨B%s⟩." % (sentence, label_text)
 
     def _abstract(self, rng: random.Random) -> str:
-        spec = PROFILE["abstractCharacters"]
+        spec = self.profile["abstractCharacters"]
         characters = _draw(rng, spec)
         if rng.random() >= spec["structuredShare"]:
             return _text(rng, characters)
@@ -378,16 +597,16 @@ class SyntheticCorpus:
         """Entry ``position`` (0-based) of a review; ``printed`` is recorded but never sent, as the instrument requires."""
         rng = self._rng("item", review, position)
         number = str(position + 1)
-        weights = PROFILE["citingSentences"]["weights"][:self.max_sentences]
+        abstract = "" if rng.random() < self.profile["abstractCharacters"]["missingShare"] else self._abstract(rng)
+        weights = self.profile["citingSentences"]["weights"][:self.max_sentences]
         count = rng.choices(range(1, len(weights) + 1), weights=weights)[0]
-        passages = [{"sentence": self._citing_sentence(rng, number), "section": rng.choice(_SECTIONS)}
+        passages = [{"sentence": self._citing_sentence(rng, number, abstract), "section": rng.choice(_SECTIONS)}
                     for _ in range(count)]
-        years = PROFILE["years"]
+        years = self.profile["years"]
         year = max(years["min"], years["max"] - int(rng.expovariate(1 / 8)))
         title = self._title(rng)
         venue = "%s %s" % (rng.choice(_VENUE_FORMS), rng.choice(_VENUE_FIELDS))
-        retracted = rng.random() < PROFILE["retractedShare"]
-        abstract = "" if rng.random() < PROFILE["abstractCharacters"]["missingShare"] else self._abstract(rng)
+        retracted = rng.random() < self.profile["retractedShare"]
         authors = ", ".join("%s %s" % (rng.choice(_SURNAMES), "".join(rng.choice("ABCDEFGHJKLMNPRST")
                                                                        for _ in range(rng.randint(1, 2))))
                             for _ in range(rng.randint(1, 6)))
@@ -420,7 +639,7 @@ class SyntheticCorpus:
 
 
 def cell_corpus(settings: ProbeSettings, streams: int, items: int) -> SyntheticCorpus:
-    return SyntheticCorpus(settings.seed, label(streams, items))
+    return SyntheticCorpus(settings.seed, label(streams, items), settings.synthetic_profile())
 
 
 def build_request(batch: Batch, *, journal: str, model: str) -> tuple[dict[str, Any], bytes, list[str]]:
@@ -630,12 +849,31 @@ def failure_class(error: BaseException) -> str:
     return "error:" + type(error).__name__
 
 
+def may_have_run(record: dict[str, Any]) -> bool:
+    """Whether a call without an answer may still have run on the model server (and used its tokens).
+
+    A refusal with a 4xx status (bad request, context length, authentication, rate limit) and a connection that was
+    refused or never resolved reached no model; every other unanswered call may have, up to its ``max_tokens``.
+    """
+    if record.get("outcome") == "answered":
+        return False
+    failure = str(record.get("failure") or "")
+    return not (failure.startswith("http-4") or failure in ("refused", "dns"))
+
+
 def _integer(value: Any) -> int | None:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
 
 
-def _detail(body: bytes) -> str:
-    """A short, single-line description of a refused or malformed response, for the cell's failure examples."""
+def _same(text: str) -> str:
+    return text
+
+
+def _detail(body: bytes, scrub: Callable[[str], str] = _same) -> str:
+    """A short, single-line description of a refused or malformed response, for the cell's failure examples.
+
+    ``scrub`` runs over the whole message before it is cut, so a key the server echoed cannot survive in part.
+    """
     text = body.decode("utf-8", "replace")
     try:
         payload = json.loads(text)
@@ -647,25 +885,26 @@ def _detail(body: bytes) -> str:
             or payload.get("detail")
         if isinstance(message, str) and message.strip():
             text = message
-    return re.sub(r"\s+", " ", text).strip()[:DETAIL_CHARACTERS]
+    return re.sub(r"\s+", " ", scrub(text)).strip()[:DETAIL_CHARACTERS]
 
 
-def classify_response(status: int, body: bytes, labels: Sequence[str]) -> dict[str, Any]:
+def classify_response(status: int, body: bytes, labels: Sequence[str],
+                      scrub: Callable[[str], str] = _same) -> dict[str, Any]:
     """One HTTP response: a transport failure, or an answered call validated by the instrument's own label parser.
 
     Transport failures are a non-2xx status (``http-<status>``), a body that is not a JSON object (``invalid-json``)
     and a JSON object that is no chat completion (``invalid-response``); each carries a short ``detail`` from the
     body. An answered call counts its entries with a valid line; an empty completion is an answer whose entries
-    are all invalid outputs.
+    are all invalid outputs. ``scrub`` cleans every string the server supplied (detail, model, fingerprint).
     """
     if not 200 <= status < 300:
-        return {"outcome": "failed", "failure": f"http-{status}", "detail": _detail(body)}
+        return {"outcome": "failed", "failure": f"http-{status}", "detail": _detail(body, scrub)}
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
-        return {"outcome": "failed", "failure": "invalid-json", "detail": _detail(body)}
+        return {"outcome": "failed", "failure": "invalid-json", "detail": _detail(body, scrub)}
     if not isinstance(payload, dict):
-        return {"outcome": "failed", "failure": "invalid-json", "detail": _detail(body)}
+        return {"outcome": "failed", "failure": "invalid-json", "detail": _detail(body, scrub)}
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return {"outcome": "failed", "failure": "invalid-response", "detail": "no choices"}
@@ -677,14 +916,32 @@ def classify_response(status: int, body: bytes, labels: Sequence[str]) -> dict[s
     details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
     records, problems, missing = C.parse_labels(content or "", list(labels), stage=TIER)
     model, fingerprint = payload.get("model"), payload.get("system_fingerprint")
+    finish = choices[0].get("finish_reason")
     return {"outcome": "answered", "failure": None, "valid": len(records), "missing": len(missing),
-            "problems": len(problems), "empty": not content, "finishReason": choices[0].get("finish_reason"),
-            "model": model if isinstance(model, str) else None,
-            "fingerprint": fingerprint if isinstance(fingerprint, str) else None,
+            "problems": len(problems), "empty": not content,
+            "finishReason": scrub(finish)[:40] if isinstance(finish, str) else None,
+            "model": scrub(model) if isinstance(model, str) else None,
+            "fingerprint": scrub(fingerprint) if isinstance(fingerprint, str) else None,
             "promptTokens": _integer(usage.get("prompt_tokens")),
             "completionTokens": _integer(usage.get("completion_tokens")),
             "cachedTokens": _integer(details.get("cached_tokens")),
             "examples": {"missing": missing[:5], "problems": problems[:3]} if missing or problems else None}
+
+
+def redact_key(text: str, key: str | None, *, fragment: int = KEY_FRAGMENT) -> str:
+    """``text`` without the key: its whole forms, then any run of ``fragment`` or more of its characters."""
+    if not key or not text:
+        return text
+    for form in sorted({key, json.dumps(key)[1:-1], json.dumps(key, ensure_ascii=False)[1:-1]}, key=len, reverse=True):
+        if form:
+            text = text.replace(form, "[redacted]")
+    size = len(key)
+    for length in range(size - 1, fragment - 1, -1):
+        for start in range(size - length + 1):
+            piece = key[start:start + length]
+            if piece in text:
+                text = text.replace(piece, "[redacted]")
+    return text
 
 
 # ----------------------------------------------------------------------------- server metrics and client memory
@@ -719,7 +976,7 @@ def _first(series: dict[str, list[float]], names: Sequence[str], combine: Callab
 
 
 def server_load(series: dict[str, list[float]]) -> dict[str, Any]:
-    """vLLM load gauges and counters, summed over engines (the KV cache usage is the fullest engine's)."""
+    """vLLM load gauges and counters, summed over engines and label values (KV cache usage: the fullest engine's)."""
     load = {
         "running": _first(series, ("vllm:num_requests_running",), sum),
         "waiting": _first(series, ("vllm:num_requests_waiting",), sum),
@@ -727,11 +984,15 @@ def server_load(series: dict[str, list[float]]) -> dict[str, Any]:
         "preemptions": _first(series, ("vllm:num_preemptions_total", "vllm:num_preemptions"), sum),
         "promptTokens": _first(series, ("vllm:prompt_tokens_total",), sum),
         "generationTokens": _first(series, ("vllm:generation_tokens_total",), sum),
+        "requestSuccess": _first(series, ("vllm:request_success_total",), sum),
         "prefixCacheQueries": _first(series, ("vllm:prefix_cache_queries_total", "vllm:gpu_prefix_cache_queries_total"), sum),
         "prefixCacheHits": _first(series, ("vllm:prefix_cache_hits_total", "vllm:gpu_prefix_cache_hits_total"), sum),
     }
     load["recognized"] = load["running"] is not None
     return load
+
+
+COUNTERS = ("preemptions", "promptTokens", "generationTokens", "requestSuccess", "prefixCacheQueries", "prefixCacheHits")
 
 
 class MetricsClient:
@@ -787,10 +1048,13 @@ def rss_mb(pid: int | str = "self") -> float | None:
 
 # ----------------------------------------------------------------------------- abort rules
 class AbortMonitor:
-    """A cell's abort rules: the transport-failure share over a trailing window, and sustained saturation.
+    """A cell's abort rules: the transport-failure share over a trailing window, sustained saturation, and metrics
+    that stay unreadable while our calls are in flight.
 
     The failure share counts once the window holds ``abort_min_calls`` calls or ``abort_min_failures`` failures, so
-    neither one early failure nor a slow cell whose window never fills decides alone.
+    neither one early failure nor a slow cell whose window never fills decides alone. A sample without metrics
+    neither extends nor breaks a saturation streak; metrics missing for longer than ``saturation_seconds`` while our
+    calls are in flight stop the cell, since saturation can no longer be watched.
     """
 
     def __init__(self, settings: ProbeSettings, on_abort: Callable[[dict[str, Any]], None]):
@@ -801,6 +1065,7 @@ class AbortMonitor:
         self._calls: deque = deque()
         self._failures = 0
         self._saturated_since: float | None = None
+        self._missing_since: float | None = None
         self._lock = threading.Lock()
         self.fired: dict[str, Any] | None = None
 
@@ -826,8 +1091,18 @@ class AbortMonitor:
                             "calls": calls, "failures": self._failures, "share": round(self._failures / calls, 4),
                             "limit": self.share})
 
-    def sample(self, t: float, saturated: bool | None, signals: Sequence[str]) -> None:
+    def sample(self, t: float, saturated: bool | None, signals: Sequence[str], in_flight: int = 1) -> None:
         with self._lock:
+            if saturated is None:
+                if in_flight <= 0:
+                    self._missing_since = None
+                elif self._missing_since is None:
+                    self._missing_since = t
+                elif t - self._missing_since > self.saturation_seconds:
+                    self._fire({"rule": "metrics-unavailable", "at": round(t, 3), "since": round(self._missing_since, 3),
+                                "seconds": round(t - self._missing_since, 3), "limitSeconds": self.saturation_seconds})
+                return
+            self._missing_since = None
             if not saturated:
                 self._saturated_since = None
                 return
@@ -859,7 +1134,9 @@ def time_weighted_rate(records: Sequence[dict[str, Any]], start: float, end: flo
     """Per second over [start, end]: each call's value spread evenly over its own duration, counted where it overlaps.
 
     In steady state this equals the completion rate and does not depend on where the window cuts the calls, so a
-    window shorter than a few call latencies (long calls at 40 items) is not biased by synchronised completions.
+    window shorter than a few call latencies (long calls at 40 items) is not biased by synchronised completions. The
+    calls a window cuts must run under the same load throughout, which the cell ensures: the window starts once the
+    ramp's calls have finished, and the streams keep sending past its end until the calls that overlap it finish.
     """
     if end <= start:
         return None
@@ -939,7 +1216,7 @@ class _CellRun:
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.aborted = threading.Event()        # an abort rule fired: no new calls
-        self.abandon_now = threading.Event()    # ... and the calls in flight are cut off (all rules but saturation)
+        self.abandon_now = threading.Event()    # ... and the calls in flight are cut off (transport failures, defects)
         self.abandoning = threading.Event()
         self.gauge = _Inflight()
         self.monitor = AbortMonitor(self.settings, self._on_abort)
@@ -948,22 +1225,27 @@ class _CellRun:
         self.invalid_examples: list[dict[str, Any]] = []
         self.failure_examples: dict[str, list[dict[str, Any]]] = {}
         self.last_preemptions: float | None = None
-        self.carried_tokens = 0         # max_tokens of earlier cells' abandoned calls the server may still run
+        self.carried = {"calls": 0, "tokens": 0, "prompt": 0}   # earlier cells' abandoned calls the server may still run
+        self._open_calls: dict[int, float] = {}   # calls in flight: id -> start (seconds after t0)
+        self._call_ids = itertools.count()
         self.t0 = 0.0
 
     def _on_abort(self, detail: dict[str, Any]) -> None:
-        """Saturation stops new calls and lets those in flight finish (they measure the saturated server);
-        failures and probe errors also cut off the calls in flight."""
+        """Saturation and unreadable metrics stop new calls and let those in flight finish (they measure the server);
+        transport failures and probe errors also cut off the calls in flight."""
         self.aborted.set()
-        if detail.get("rule") != "saturation":
+        if detail.get("rule") not in STOP_RULES:
             self.abandon_now.set()
 
     # -------------------------------------------------------------- calls
     def _call(self, pool: ConnectionPool, body: bytes, labels: list[str]) -> dict[str, Any]:
         connection, reused = pool.acquire()
         status, data, failure, server_closed = None, b"", None, False
+        call_id = next(self._call_ids)
         self.gauge.up()
         started = time.monotonic()
+        with self.lock:
+            self._open_calls[call_id] = started - self.t0
         try:
             connection.request("POST", self.probe.chat_path, body=body, headers=self.probe.headers)
             response = connection.getresponse()
@@ -974,22 +1256,24 @@ class _CellRun:
         finally:
             ended = time.monotonic()
             self.gauge.down()
+            with self.lock:
+                self._open_calls.pop(call_id, None)
             pool.release(connection, broken=failure is not None, server_closed=server_closed)
         if failure is not None:
             result = {"outcome": "abandoned" if self.abandoning.is_set() else "failed", "failure": failure}
         else:
-            result = classify_response(status, data, labels)
+            result = classify_response(status, data, labels, scrub=self.probe.scrub_server)
         return {**result, "status": status, "reused": reused, "start": round(started - self.t0, 4),
                 "end": round(ended - self.t0, 4), "seconds": round(ended - started, 4)}
 
-    def _worker(self, index: int, pool: ConnectionPool, source: _BatchSource, end_at: float) -> None:
+    def _worker(self, index: int, pool: ConnectionPool, source: _BatchSource) -> None:
         if self.stop.wait(max(0.0, self.t0 + index * self.settings.ramp_seconds / self.streams - time.monotonic())):
             return
         seq = 0
         try:
-            while not self.stop.is_set() and time.monotonic() < end_at:
+            while not self.stop.is_set() and not self.aborted.is_set():
                 batch, body, labels = source.next()
-                if self.stop.is_set():
+                if self.stop.is_set() or self.aborted.is_set():
                     break
                 try:
                     outcome = self._call(pool, body, labels)
@@ -1018,7 +1302,8 @@ class _CellRun:
                 if len(kept) < 3:
                     kept.append({"batch": record["batch"], "status": record.get("status"), "detail": detail})
         if record["outcome"] == "abandoned" or record.get("failure") == "timeout":
-            self.probe.abandoned(self.t0 + record["end"], C.max_tokens(record["items"], TIER))
+            self.probe.abandoned(self.t0 + record["end"], C.max_tokens(record["items"], TIER),
+                                 record["bodyBytes"] + PROMPT_OVERHEAD)
         if record["outcome"] != "abandoned":
             self.monitor.call_finished(record["end"], record["outcome"] == "failed")
 
@@ -1037,12 +1322,13 @@ class _CellRun:
         recognized = bool(load and load.get("ok") and load.get("recognized"))
         if load is not None:
             sample.update({"ok": bool(load.get("ok")), "recognized": recognized, "error": load.get("error")})
-            for key in ("running", "waiting", "kvCacheUsage", "preemptions", "promptTokens", "generationTokens",
-                        "prefixCacheQueries", "prefixCacheHits"):
+            for key in ("running", "waiting", "kvCacheUsage", *COUNTERS):
                 sample[key] = load.get(key)
         signals = []
         if recognized:
             server = (sample["running"] or 0) + (sample["waiting"] or 0)
+            # Our own count is an upper bound of our requests on the server: a call counts from before it is sent
+            # until its whole response is read, and the sample takes the peak since its mark.
             sample["excess"] = round(server - ours - allowance, 3)
             sample["foreign"] = sample["excess"] > settings.shared_tolerance
             # The share of our own calls in flight that the server's load accounts for (below 1 when the metrics
@@ -1065,7 +1351,7 @@ class _CellRun:
         with self.lock:
             self.samples.append(sample)
         if phase == "run" and t >= settings.warmup_seconds:
-            self.monitor.sample(t, sample["saturated"], signals)   # the ramp's queue is no saturation
+            self.monitor.sample(t, sample["saturated"], signals, ours)   # the ramp's queue is no saturation
         return sample
 
     def _sampler(self, until: threading.Event) -> None:
@@ -1090,34 +1376,54 @@ class _CellRun:
         pool = ConnectionPool(probe.endpoint, self.streams, settings.request_timeout)
         started_at = utc_now()
         self.t0 = time.monotonic()
-        self.carried_tokens = probe.abandoned_tokens(settings.abandon_grace_seconds)
-        self._sample("before")      # idle: our requests in flight are 0; the token counters start here
+        self.carried = probe.carried(settings.abandon_grace_seconds)
+        self._sample("before")      # idle: our requests in flight are 0; the token and request counters start here
         self.t0 = time.monotonic()
         end_at = self.t0 + settings.cell_seconds
         sampler_stop = threading.Event()
         sampler = threading.Thread(target=self._sampler, args=(sampler_stop,), name=f"probe-{self.label}-sampler",
                                    daemon=True)
-        workers = [threading.Thread(target=self._worker, args=(k, pool, source, end_at), name=f"probe-{self.label}-{k}",
+        workers = [threading.Thread(target=self._worker, args=(k, pool, source), name=f"probe-{self.label}-{k}",
                                     daemon=True) for k in range(self.streams)]
         sampler.start()
         for worker in workers:
             worker.start()
         abandoned_in_flight, interrupted = 0, False
-        window_end = settings.cell_seconds
+        window_end, tail = settings.cell_seconds, {"seconds": 0.0, "complete": False, "edgeCalls": 0}
+        cut: list[float] = []
         try:
             while not self.aborted.is_set() and time.monotonic() < end_at:
                 self.aborted.wait(max(0.0, min(1.0, end_at - time.monotonic())))
             stopped = min(time.monotonic(), end_at)
             window_end = stopped - self.t0
+            if not self.aborted.is_set():
+                # The tail: the streams keep sending until every call that overlaps the window's end has finished,
+                # so those calls run under full load (a server emptying behind them would make the window read high).
+                with self.lock:
+                    edge = set(self._open_calls)
+                tail["edgeCalls"] = len(edge)
+                deadline = stopped + settings.drain_seconds
+                while edge and not self.aborted.is_set() and time.monotonic() < deadline:
+                    self.aborted.wait(0.02)
+                    with self.lock:
+                        edge &= set(self._open_calls)
+                tail["complete"] = not edge and not self.aborted.is_set()
+                tail["seconds"] = round(max(0.0, time.monotonic() - stopped), 3)
+            # Sending stops here. The calls still in flight finish on an emptying server (or are cut off), so the
+            # steady-state window ends no later than the earliest start among them.
+            with self.lock:
+                cut = list(self._open_calls.values())
             self.stop.set()
-            # Calls in flight finish (and count where they overlap the window) unless an abort cuts them off.
-            deadline = stopped + settings.drain_seconds
+            # Calls still in flight finish (outside the window) unless an abort cuts them off.
+            deadline = time.monotonic() + settings.drain_seconds
             while (not self.abandon_now.is_set() and time.monotonic() < deadline
                    and any(worker.is_alive() for worker in workers)):
                 self.abandon_now.wait(max(0.0, min(0.05, deadline - time.monotonic())))
         except KeyboardInterrupt:
             interrupted = True          # the calls so far are kept; the probe reports and re-raises
             window_end = min(time.monotonic(), end_at) - self.t0
+            with self.lock:
+                cut = list(self._open_calls.values())
         finally:
             self.stop.set()
             abandoned_in_flight = self._abandon(pool, workers)
@@ -1132,9 +1438,9 @@ class _CellRun:
                 self._sample("after")
             except KeyboardInterrupt:
                 interrupted = True
-        summary = self.summarize(started_at=started_at, window_end=window_end, drained=drained_at - self.t0,
-                                 abandoned_in_flight=abandoned_in_flight, pool=pool.stats(),
-                                 unjoined=sum(worker.is_alive() for worker in workers))
+        summary = self.summarize(started_at=started_at, window_end=window_end, tail=tail, cut=cut,
+                                 drained=drained_at - self.t0, abandoned_in_flight=abandoned_in_flight,
+                                 pool=pool.stats(), unjoined=sum(worker.is_alive() for worker in workers))
         if interrupted:
             summary["state"] = "interrupted"
         return summary
@@ -1152,22 +1458,29 @@ class _CellRun:
         return abandoned
 
     # -------------------------------------------------------------- summary
-    def summarize(self, *, started_at: str, window_end: float, drained: float, abandoned_in_flight: int,
-                  pool: dict[str, int], unjoined: int) -> dict[str, Any]:
+    def summarize(self, *, started_at: str, window_end: float, tail: dict[str, Any], cut: Sequence[float],
+                  drained: float, abandoned_in_flight: int, pool: dict[str, int], unjoined: int) -> dict[str, Any]:
         settings, records = self.settings, list(self.records)
         abort = self.monitor.fired
-        window_start = settings.warmup_seconds
-        measured = window_end - window_start if window_end > window_start else 0.0
         answered = [r for r in records if r["outcome"] == "answered"]
         failed = [r for r in records if r["outcome"] == "failed"]
         abandoned = [r for r in records if r["outcome"] == "abandoned"]
+        # The steady-state window: it starts after the warm-up and once every call started during the ramp has
+        # finished (those calls began on a server with fewer of our calls), and it ends at the cell's end, or earlier
+        # at the earliest start of the calls still in flight when sending stopped (a stop rule fired, or the tail ran
+        # out): calls finishing on an emptying server would read high if spread into the window.
+        planned_end = window_end
+        ramp_ends = [r["end"] for r in answered if r["start"] < settings.ramp_seconds]
+        window_start = max(settings.warmup_seconds, max(ramp_ends, default=0.0))
+        window_end = min([planned_end, *cut])
+        measured = window_end - window_start if window_end > window_start else 0.0
         valid = lambda r: r.get("valid") or 0
         rate = time_weighted_rate(records, window_start, window_end, valid) if measured else None
         answered_items = sum(r["items"] for r in answered)
         missing = sum(r.get("missing") or 0 for r in answered)
-        late = [r for r in answered if r["start"] >= window_start]
-        latency_scope = "calls started after the warm-up" if late else "all answered calls"
-        latencies = [r["seconds"] for r in (late or answered)]
+        in_window = [r for r in answered if window_start <= r["start"] < window_end]
+        latency_scope = "calls started inside the measured window" if in_window else "all answered calls"
+        latencies = [r["seconds"] for r in (in_window or answered)]
         cached_calls = [r for r in answered if r.get("cachedTokens") is not None and r.get("promptTokens")]
         prompt = sum(r.get("promptTokens") or 0 for r in answered)
         completion = sum(r.get("completionTokens") or 0 for r in answered)
@@ -1175,14 +1488,28 @@ class _CellRun:
         served_models = Counter(r.get("model") or "(none)" for r in answered)
         fingerprints = Counter(r.get("fingerprint") for r in answered if r.get("fingerprint"))
         required = C.instrument().manifest["requiredModel"]["served"]
-        # A saturated cell stopped dispatching and let its calls finish: its window measured the server at capacity.
-        state = "completed" if abort is None else ("saturated" if abort["rule"] == "saturation" else "aborted")
+        # A cell stopped by saturation or lost metrics stopped dispatching and let its calls finish: its window
+        # measured the server, though without the tail.
+        state = "completed" if abort is None else STOP_RULES.get(abort["rule"], "aborted")
+        server = self._server_summary(records, failed, abandoned, window_end)
+        cached_share, cached_source = None, None
+        if cached_calls:
+            cached_share = _round(sum(r["cachedTokens"] for r in cached_calls) / sum(r["promptTokens"] for r in cached_calls), 4)
+            cached_source = "usage"
+        elif (server.get("counters") or {}).get("prefixCacheHitShare") is not None:
+            cached_share, cached_source = server["counters"]["prefixCacheHitShare"], "server-prefix-cache"
         summary = {
             "position": self.entry["position"], "cell": self.label, "streams": self.streams, "itemsPerCall": self.items,
+            "role": self.entry.get("role") or cell_role(self.streams, self.items, settings),
             "state": state, "startedAt": started_at, "abort": abort,
-            "timing": {"cellSeconds": settings.cell_seconds, "warmupSeconds": window_start,
-                       "rampSeconds": settings.ramp_seconds, "measuredSeconds": round(measured, 3),
-                       "drainSeconds": round(max(0.0, drained - window_end), 3), "wallSeconds": round(drained, 3)},
+            "timing": {"cellSeconds": settings.cell_seconds, "warmupSeconds": settings.warmup_seconds,
+                       "rampSeconds": settings.ramp_seconds, "windowStartSeconds": round(window_start, 3),
+                       "windowEndSeconds": round(window_end, 3), "windowLimitSeconds": round(planned_end, 3),
+                       "truncatedSeconds": round(max(0.0, planned_end - window_end), 3),
+                       "measuredSeconds": round(measured, 3),
+                       "tailSeconds": tail["seconds"], "tailComplete": tail["complete"], "edgeCalls": tail["edgeCalls"],
+                       "drainSeconds": round(max(0.0, drained - planned_end - tail["seconds"]), 3),
+                       "wallSeconds": round(drained, 3)},
             "calls": {"sent": len(records), "answered": len(answered), "failed": len(failed),
                       "abandoned": len(abandoned), "abandonedInFlight": abandoned_in_flight,
                       "meanItems": _round(sum(r["items"] for r in records) / len(records), 2) if records else None},
@@ -1195,10 +1522,10 @@ class _CellRun:
                         "clientLimited": bool(concurrency is not None and concurrency < 0.9 * self.streams)},
             "tokens": {"prompt": prompt, "completion": completion,
                        "cached": sum(r["cachedTokens"] for r in cached_calls),
-                       "cachedReportedCalls": len(cached_calls),
-                       "cachedShare": _round(sum(r["cachedTokens"] for r in cached_calls)
-                                             / sum(r["promptTokens"] for r in cached_calls), 4) if cached_calls else None,
+                       "cachedReportedCalls": len(cached_calls), "cachedShare": cached_share,
+                       "cachedShareSource": cached_source,
                        "promptPerCall": _round(prompt / len(answered), 1) if answered else None,
+                       "promptPerEntry": _round(prompt / answered_items, 1) if answered_items else None,
                        "completionPerEntry": _round(completion / answered_items, 1) if answered_items else None,
                        "promptPerSecond": _round(time_weighted_rate(
                            records, window_start, window_end, lambda r: r.get("promptTokens") or 0), 1) if measured else None,
@@ -1220,8 +1547,9 @@ class _CellRun:
             "failureExamples": {k: list(v) for k, v in sorted(self.failure_examples.items())},
             "served": {"models": dict(served_models), "fingerprints": dict(fingerprints),
                        "withoutFingerprint": sum(1 for r in answered if not r.get("fingerprint")),
+                       "requiredModel": required,
                        "matchesInstrument": bool(answered) and set(served_models) == {required}},
-            "server": self._server_summary(records, failed, abandoned, window_end),
+            "server": server,
             "client": {**pool, "rssMaxMB": _stats([s.get("clientRssMB") for s in self.samples], 1)["max"],
                        "rssEndMB": self.samples[-1].get("clientRssMB") if self.samples else None},
             "proxies": self._proxy_summary(),
@@ -1239,16 +1567,63 @@ class _CellRun:
                                 "rssEndMB": values[-1] if values else None}
         return result
 
+    def _counters(self, records: list[dict[str, Any]], before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+        """Token and request counters between the idle samples before and after the cell, against our own calls.
+
+        Without other clients, the server's prompt and generation tokens equal what our answers carried plus what
+        our unanswered calls that may have run could have used (their body bytes and ``max_tokens``), and its
+        finished requests equal our answered calls plus those; earlier cells' abandoned calls are allowed for too.
+        A refusal with a 4xx status gets no allowance. Preemptions make the token counters incomparable.
+        """
+        delta = lambda key: (after[key] - before[key]) if after.get(key) is not None and before.get(key) is not None else None
+        answered = [r for r in records if r["outcome"] == "answered"]
+        ran = [r for r in records if may_have_run(r)]
+        carried = self.carried
+        our_completion = sum(r.get("completionTokens") or 0 for r in answered)
+        our_prompt = sum(r.get("promptTokens") or 0 for r in answered)
+        generation_bound = sum(C.max_tokens(r["items"], TIER) for r in ran) + carried["tokens"]
+        prompt_bound = sum(r["bodyBytes"] + PROMPT_OVERHEAD for r in ran) + carried["prompt"]
+        request_bound = len(ran) + carried["calls"]
+        margin = COUNTER_MARGIN[0] + COUNTER_MARGIN[1] * (len(answered) + request_bound)
+        generation, prompt, successes = delta("generationTokens"), delta("promptTokens"), delta("requestSuccess")
+        preemptions = delta("preemptions")
+        tokens_comparable = not preemptions
+        generation_excess = generation - our_completion if generation is not None else None
+        prompt_excess = prompt - our_prompt if prompt is not None else None
+        request_excess = successes - len(answered) if successes is not None else None
+        foreign = {
+            "generation": bool(tokens_comparable and generation_excess is not None
+                               and generation_excess > generation_bound + margin),
+            "prompt": bool(tokens_comparable and prompt_excess is not None and prompt_excess > prompt_bound + margin),
+            "requests": bool(request_excess is not None and request_excess > request_bound),
+        }
+        queries, hits = delta("prefixCacheQueries"), delta("prefixCacheHits")
+        return {"generationTokens": generation, "promptTokens": prompt, "requestSuccess": successes,
+                "preemptions": preemptions, "prefixCacheQueries": queries, "prefixCacheHits": hits,
+                "prefixCacheHitShare": round(hits / queries, 4) if queries and hits is not None else None,
+                "ourCompletionTokens": our_completion, "ourPromptTokens": our_prompt, "ourAnsweredCalls": len(answered),
+                "unansweredMayHaveRun": len(ran), "carried": dict(carried),
+                "generationExcess": generation_excess, "unansweredTokenBound": generation_bound,
+                "promptExcess": prompt_excess, "promptBound": prompt_bound,
+                "requestExcess": request_excess, "requestBound": request_bound,
+                "carriedTokenBound": carried["tokens"], "margin": margin,
+                "comparable": generation is not None and tokens_comparable,
+                "tokensComparable": tokens_comparable,
+                "coverage": round(generation / our_completion, 3) if generation is not None and our_completion
+                and tokens_comparable else None,
+                "foreignBy": sorted(k for k, v in foreign.items() if v), "foreign": any(foreign.values())}
+
     def _server_summary(self, records: list[dict[str, Any]], failed: list, abandoned: list,
                         window_end: float) -> dict[str, Any]:
         """Server load over the cell, and whether it shows other clients (``shared``).
 
         ``shared`` is True on evidence of other clients: at least ``shared_min_samples`` samples with more requests
-        on the server than ours (beyond the tolerance), or more generated tokens between the idle samples before and
-        after the cell than our answers carried plus what our unanswered calls could have generated. It is False
-        only when there is no such evidence and the metrics demonstrably cover our own calls (in-flight load and
-        generated tokens both at least ``COVERAGE_MIN`` of ours): metrics of one replica behind a balancer, or a
-        proxy that queues our calls, cannot show that a server is not shared. Otherwise it is None.
+        on the server than ours (beyond the tolerance), or more generated or prompt tokens, or more finished
+        requests, between the idle samples before and after the cell than our calls account for (see
+        ``_counters``). It is False only when there is no such evidence and the metrics demonstrably cover our own
+        calls (in-flight load and generated tokens both at least ``COVERAGE_MIN`` of ours): metrics of one replica
+        behind a balancer, or a proxy that queues our calls, cannot show that a server is not shared. Otherwise it
+        is None.
         """
         settings = self.settings
         samples = list(self.samples)
@@ -1266,24 +1641,7 @@ class _CellRun:
                   if settings.warmup_seconds <= s["t"] <= window_end and s.get("coverage") is not None]
         before = next((s for s in samples if s["phase"] == "before" and s.get("recognized")), None)
         after = next((s for s in samples if s["phase"] == "after" and s.get("recognized")), None)
-        counters = None
-        if before and after:
-            delta = lambda key: (after[key] - before[key]) if after.get(key) is not None and before.get(key) is not None else None
-            ours = sum(r.get("completionTokens") or 0 for r in records if r["outcome"] == "answered")
-            generation = delta("generationTokens")
-            # A call without an answer may still have generated up to its max_tokens on the server, as may an
-            # earlier cell's abandoned call that was still running when this cell began.
-            unanswered = sum(C.max_tokens(r["items"], TIER) for r in (*failed, *abandoned)) + self.carried_tokens
-            margin = max(COUNTER_MARGIN[0], COUNTER_MARGIN[1] * ours)
-            excess = generation - ours if generation is not None else None
-            counters = {"generationTokens": generation, "promptTokens": delta("promptTokens"),
-                        "preemptions": delta("preemptions"), "prefixCacheQueries": delta("prefixCacheQueries"),
-                        "prefixCacheHits": delta("prefixCacheHits"), "ourCompletionTokens": ours,
-                        "generationExcess": excess, "unansweredTokenBound": unanswered,
-                        "carriedTokenBound": self.carried_tokens, "margin": round(margin),
-                        "comparable": generation is not None,
-                        "coverage": round(generation / ours, 3) if generation is not None and ours else None,
-                        "foreign": bool(excess is not None and excess > unanswered + margin)}
+        counters = self._counters(records, before, after) if before and after else None
         coverage = {"inFlight": _round(percentile(window, 0.5)), "inFlightSamples": len(window),
                     "tokens": (counters or {}).get("coverage")}
         measured = [value for value in (coverage["inFlight"], coverage["tokens"]) if value is not None]
@@ -1315,16 +1673,16 @@ class CapacityProbe:
         self.model = settings.requested_model()
         self.chat_path = ""
         self.headers: dict[str, str] = {}
-        self._abandoned: list[tuple[float, int]] = []
+        self._abandoned: list[tuple[float, int, int]] = []
         self._abandoned_lock = threading.Lock()
 
-    def abandoned(self, at: float, max_tokens: int) -> None:
+    def abandoned(self, at: float, max_tokens: int, prompt_tokens: int = 0) -> None:
         """Record a call that was abandoned or timed out (monotonic seconds): the server may still be running it,
-        so later samples allow for it and later token counters for up to its ``max_tokens``."""
+        so later samples allow for it and later counters for up to its ``max_tokens`` and prompt bound."""
         with self._abandoned_lock:
-            self._abandoned.append((at, max_tokens))
+            self._abandoned.append((at, max_tokens, prompt_tokens))
 
-    def _recent(self, grace: float) -> list[tuple[float, int]]:
+    def _recent(self, grace: float) -> list[tuple[float, int, int]]:
         horizon = time.monotonic() - grace
         with self._abandoned_lock:
             self._abandoned = [entry for entry in self._abandoned if entry[0] >= horizon]
@@ -1334,7 +1692,12 @@ class CapacityProbe:
         return len(self._recent(grace))
 
     def abandoned_tokens(self, grace: float) -> int:
-        return sum(tokens for _, tokens in self._recent(grace))
+        return sum(entry[1] for entry in self._recent(grace))
+
+    def carried(self, grace: float) -> dict[str, int]:
+        recent = self._recent(grace)
+        return {"calls": len(recent), "tokens": sum(entry[1] for entry in recent),
+                "prompt": sum(entry[2] for entry in recent)}
 
     # -------------------------------------------------------------- secrets
     def scrub(self, text: str) -> str:
@@ -1345,6 +1708,10 @@ class CapacityProbe:
             if form:
                 text = text.replace(form, "[redacted]")
         return text
+
+    def scrub_server(self, text: str) -> str:
+        """A string the server supplied, without the key or any run of ``KEY_FRAGMENT`` of its characters."""
+        return redact_key(text, self._key)
 
     def emit(self, event: dict[str, Any]) -> None:
         if self.progress:
@@ -1397,6 +1764,7 @@ class CapacityProbe:
                             "bodyBytes": {"p50": percentile(body, 0.5), "max": max(body)},
                             "promptTokensEstimate": {"p50": round(percentile(tokens, 0.5)),
                                                      "p95": round(percentile(tokens, 0.95)), "max": round(max(tokens))},
+                            "promptTokensPerEntryEstimate": round(sum(tokens) / sum(counts), 1),
                             "maxTokens": C.max_tokens(items, TIER),
                             "cutAbstractShare": round(cut / sum(counts), 3)}
         measured = settings.cell_seconds - settings.warmup_seconds
@@ -1417,18 +1785,20 @@ class CapacityProbe:
         minimum = len(runnable) * per_cell + settings.baseline_samples * settings.sample_seconds
         return {"format": FORMAT, "dryRun": True, "instrument": self._instrument_record(),
                 "request": self._request_record(), "synthetic": self._synthetic_record(),
+                "expectation": settings.expectation(),
                 "endpoint": {"baseUrl": self._safe_url(settings.base_url, "base URL"),
                              "metricsUrl": self._safe_url(settings.metrics_url, "metrics URL"), "contacted": False},
                 "grid": self._grid_record(grid), "requestSizes": [sizes[k] for k in sorted(sizes)], "load": load,
-                "abortRules": self._abort_record(),
-                "estimatedSeconds": {"min": round(minimum), "max": round(minimum + len(runnable) * settings.drain_seconds)}}
+                "abortRules": self._abort_record(), "decision": self._decision_record(),
+                "estimatedSeconds": {"min": round(minimum),
+                                     "max": round(minimum + len(runnable) * 2 * settings.drain_seconds)}}
 
     def _safe_url(self, url: str | None, what: str) -> str | None:
         return Endpoint.parse(url, what).url() if url else None
 
     def _instrument_record(self) -> dict[str, Any]:
         instrument = C.instrument()
-        return {"id": instrument.id, "digest": instrument.digest, "tier": TIER,
+        return {"id": instrument.id, "digest": instrument.digest, "tier": TIER, "itemsPerCall": instrument_items(),
                 "requiredModel": instrument.manifest["requiredModel"]["served"],
                 "validator": instrument.manifest["validator"]["id"],
                 "systemPromptSha256": hashlib.sha256(C.system_prompt(self.settings.journal).encode("utf-8")).hexdigest()}
@@ -1446,11 +1816,14 @@ class CapacityProbe:
 
     def _synthetic_record(self) -> dict[str, Any]:
         return {"seed": self.settings.seed, "scope": "one call sequence per cell (seed and cell label)",
-                "profile": PROFILE, "source": "generated from a fixed vocabulary; no corpus data or entitled text"}
+                "profile": self.settings.synthetic_profile(),
+                "profileSource": self.settings.profile_source or {"source": "built-in"},
+                "source": "generated from a fixed vocabulary; no corpus data or entitled text"}
 
     def _grid_record(self, grid: list[dict[str, Any]]) -> dict[str, Any]:
         settings = self.settings
         return {"order": settings.order, "cells": grid, "maxStreams": settings.max_streams,
+                "allowedStreams": settings.allowed_streams, "runAboveAllowed": settings.run_above_allowed,
                 "cellSeconds": settings.cell_seconds, "warmupSeconds": settings.warmup_seconds,
                 "rampSeconds": settings.ramp_seconds, "drainSeconds": settings.drain_seconds,
                 "pauseSeconds": settings.pause_seconds, "sampleSeconds": settings.sample_seconds}
@@ -1462,9 +1835,20 @@ class CapacityProbe:
                 "saturationSeconds": settings.saturation_seconds,
                 "saturationSignals": {"waitingAtLeast": settings.saturation_waiting, "preemptions": "any increase",
                                       "kvCacheUsageAtLeast": settings.saturation_kv, "httpStatus": sorted(SATURATION_STATUS)},
-                "saturationClock": "samples after the warm-up",
-                "scope": "either rule stops the cell and the grid; transport failures cut off the calls in flight, "
-                         "saturation lets them finish and keeps the cell's measurement"}
+                "saturationClock": "samples after the warm-up; a sample without metrics neither extends nor breaks it",
+                "metricsUnavailable": "metrics unreadable for longer than the saturation clock while our calls are in flight",
+                "scope": "every rule stops the cell and the grid; transport failures cut off the calls in flight, "
+                         "saturation and unreadable metrics let them finish and keep the cell's measurement"}
+
+    def _decision_record(self) -> dict[str, Any]:
+        settings = self.settings
+        return {"cell": label(settings.allowed_streams, instrument_items()), "targetEntriesPerSecond": settings.target_rate,
+                "allowedStreams": settings.allowed_streams, "itemsPerCall": instrument_items(),
+                "requires": ["answered by the instrument's required model",
+                             f"measured for at least {DECISION_CYCLES} p95 call latencies or the planned window",
+                             "a cell stopped early decides with the lower of its time-weighted and completed-call rates"],
+                "aboveAllowed": "cells above the allowed concurrency run only while the server can be shown unshared"
+                                + (" (overridden: --run-above-allowed)" if settings.run_above_allowed else "")}
 
     # -------------------------------------------------------------- run
     def _preflight(self) -> dict[str, Any]:
@@ -1484,18 +1868,28 @@ class CapacityProbe:
         if response.status == 200:
             try:
                 listed = [m.get("id") for m in json.loads(data).get("data", []) if isinstance(m, dict)]
-                record["models"] = [m for m in listed if isinstance(m, str)][:20]
+                record["models"] = [self.scrub_server(m) for m in listed if isinstance(m, str)][:20]
                 record["requestedModelListed"] = self.model in record["models"]
             except (ValueError, AttributeError, TypeError):
                 pass
         return record
 
+    def _check_metrics(self) -> None:
+        """The metrics URL must answer with vLLM's request gauges before any load is sent: saturation and the
+        shared-server checks depend on them."""
+        load = self.metrics.fetch()
+        if not load.get("ok"):
+            raise ValidationError(f"the metrics URL cannot be read ({load.get('error')}); fix --metrics-url or leave it out")
+        if not load.get("recognized"):
+            raise ValidationError("the metrics URL shows no vLLM request gauge (vllm:num_requests_running); give the "
+                                  "vLLM server's own /metrics or leave --metrics-url out")
+
     def _baseline(self) -> dict[str, Any]:
         """Server load before the first cell, while none of our calls exist.
 
         Other clients show as requests on the server (beyond the tolerance, in ``shared_min_samples`` samples) or as
-        token counters that advance between the samples, which also catches short requests that start and finish
-        between two samples.
+        token or request counters that advance between the samples, which also catches short requests that start
+        and finish between two samples.
         """
         settings = self.settings
         samples = []
@@ -1506,7 +1900,7 @@ class CapacityProbe:
                 time.sleep(settings.sample_seconds)
             load = self.metrics.fetch()
             sample = {k: load.get(k) for k in ("ok", "recognized", "running", "waiting", "kvCacheUsage",
-                                               "promptTokens", "generationTokens", "error")}
+                                               "promptTokens", "generationTokens", "requestSuccess", "error")}
             if load.get("ok") and load.get("recognized"):
                 sample["excess"] = (load.get("running") or 0) + (load.get("waiting") or 0)
                 sample["foreign"] = sample["excess"] > settings.shared_tolerance
@@ -1514,7 +1908,7 @@ class CapacityProbe:
         known = [s for s in samples if s.get("recognized")]
         foreign = sum(1 for s in known if s.get("foreign"))
         advanced = {}
-        for key in ("promptTokens", "generationTokens"):
+        for key in ("promptTokens", "generationTokens", "requestSuccess"):
             values = [s[key] for s in known if s.get(key) is not None]
             advanced[key] = values[-1] - values[0] if len(values) > 1 else None
         active = any(value for value in advanced.values())
@@ -1540,10 +1934,18 @@ class CapacityProbe:
                          "metricsUrl": self._safe_url(settings.metrics_url, "metrics URL"),
                          "apiKeyEnv": settings.api_key_env, "keySent": bool(self._key),
                          "connection": "direct HTTP/1.1 keep-alive; proxies from the environment are not used"},
-            "synthetic": self._synthetic_record(), "grid": self._grid_record(grid), "abortRules": self._abort_record(),
+            "synthetic": self._synthetic_record(), "expectation": settings.expectation(),
+            "grid": self._grid_record(grid), "abortRules": self._abort_record(), "decision": self._decision_record(),
             "preflight": None, "baseline": None, "cells": [], "abort": None,
         }
-        report["preflight"] = self._preflight()
+        try:
+            report["preflight"] = self._preflight()
+            if self.metrics:
+                self._check_metrics()
+        except BaseException:
+            if self.metrics:
+                self.metrics.close()
+            raise
         output.mkdir(parents=True, exist_ok=True)
         files = {"json": output / REPORT_NAME, "markdown": output / MARKDOWN_NAME, "calls": output / CALLS_NAME}
         report["files"] = {k: str(v) for k, v in files.items()}
@@ -1560,6 +1962,11 @@ class CapacityProbe:
                 if report["abort"]:
                     report["cells"].append({**self._skipped(entry), "reason": "grid stopped at %s (%s)" % (
                         report["abort"]["cell"], report["abort"]["rule"])})
+                    continue
+                blocked = above_allowed_reason(report, settings) if entry["aboveAllowed"] else None
+                if blocked:
+                    report["cells"].append({**self._skipped(entry), "reason": blocked})
+                    self.emit({"event": "cell-skipped", "cell": entry["cell"], "reason": blocked})
                     continue
                 self.emit({"event": "cell-start", "cell": entry["cell"], "position": entry["position"],
                            "of": len(runnable)})
@@ -1598,7 +2005,7 @@ class CapacityProbe:
 
     def _skipped(self, entry: dict[str, Any]) -> dict[str, Any]:
         return {"position": entry["position"], "cell": entry["cell"], "streams": entry["streams"],
-                "itemsPerCall": entry["itemsPerCall"], "state": "skipped"}
+                "itemsPerCall": entry["itemsPerCall"], "role": entry.get("role"), "state": "skipped"}
 
     def _write(self, report: dict[str, Any], files: dict[str, Path], *, final: bool) -> None:
         if final:
@@ -1608,7 +2015,8 @@ class CapacityProbe:
         report["allowedConcurrency"] = allowed_concurrency(report, self.settings)
         text = self.scrub(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False)) + "\n"
         atomic_write(files["json"], text.encode("utf-8"))
-        atomic_write(files["markdown"], self.scrub(render_markdown(report)).encode("utf-8"))
+        # The markdown is rendered from the scrubbed report, so escaping for the table cannot hide a key from the scrub.
+        atomic_write(files["markdown"], self.scrub(render_markdown(json.loads(text))).encode("utf-8"))
 
 
 def _code_revision() -> str:
@@ -1621,9 +2029,6 @@ def _code_revision() -> str:
 
 
 # ----------------------------------------------------------------------------- verdicts
-MEASURED_STATES = ("completed", "saturated")      # cells whose window measured the server (eligible as best cell)
-
-
 def server_verdict(report: dict[str, Any]) -> dict[str, Any]:
     """Shared server: True on any evidence of other clients; False only when the baseline and every cell that ran
     were measured without such evidence by metrics that cover our own calls; None otherwise."""
@@ -1631,7 +2036,7 @@ def server_verdict(report: dict[str, Any]) -> dict[str, Any]:
     ran = [c for c in report.get("cells", []) if c.get("state") != "skipped"]
     evidence, gaps = [], []
     if baseline.get("foreign"):
-        evidence.append("baseline: other clients' requests or generated tokens on the server before the first cell")
+        evidence.append("baseline: other clients' requests, tokens or finished requests on the server before the first cell")
     elif baseline.get("metrics") != "recognized":
         gaps.append("no server load before the first cell")
     for cell in ran:
@@ -1640,10 +2045,18 @@ def server_verdict(report: dict[str, Any]) -> dict[str, Any]:
             evidence.append(f"{cell['cell']}: {server['foreignSamples']} samples with more requests than ours "
                             f"(max excess {server.get('maxExcess')})")
         counters = server.get("counters") or {}
-        if counters.get("foreign"):
+        by = set(counters.get("foreignBy") or ())
+        if "generation" in by:
             evidence.append(f"{cell['cell']}: the server generated {counters.get('generationExcess')} more tokens than "
                             f"our answers carried (allowance {counters.get('unansweredTokenBound', 0)} for unanswered "
                             f"calls and a margin of {counters.get('margin')})")
+        if "prompt" in by:
+            evidence.append(f"{cell['cell']}: the server read {counters.get('promptExcess')} more prompt tokens than our "
+                            f"answers carried (allowance {counters.get('promptBound', 0)} for unanswered calls and a "
+                            f"margin of {counters.get('margin')})")
+        if "requests" in by:
+            evidence.append(f"{cell['cell']}: the server finished {counters.get('requestExcess')} more requests than we "
+                            f"had answered (allowance {counters.get('requestBound', 0)} for unanswered calls)")
         if server.get("shared") is None:
             coverage = server.get("coverage") or {}
             if server.get("metrics") != "recognized":
@@ -1664,67 +2077,198 @@ def server_verdict(report: dict[str, Any]) -> dict[str, Any]:
             "gaps": gaps if shared is None else []}
 
 
-def _best(cells: list[dict[str, Any]]) -> dict[str, Any] | None:
-    eligible = [c for c in cells if c.get("state") in MEASURED_STATES and c["entries"].get("perSecond") is not None]
-    if not eligible:
+def above_allowed_reason(report: dict[str, Any], settings: ProbeSettings) -> str | None:
+    """Why a cell above the allowed concurrency must not run now (None when it may).
+
+    Such a cell can only matter when the server is shown not to be shared; otherwise the census concurrency stays at
+    the allowed streams, and the cell would only load other users of a shared server.
+    """
+    if settings.run_above_allowed:
         return None
-    best = max(eligible, key=lambda c: (c["entries"]["perSecond"], -c["streams"]))
-    return {"cell": best["cell"], "streams": best["streams"], "itemsPerCall": best["itemsPerCall"],
-            "state": best["state"], "measuredSeconds": (best.get("timing") or {}).get("measuredSeconds"),
-            "entriesPerSecond": best["entries"]["perSecond"], "invalidOutputShare": best["invalidOutputShare"],
-            "transportFailureShare": best["transportFailureShare"], "p95Seconds": best["latencySeconds"]["p95"]}
+    override = " (--run-above-allowed runs it anyway)"
+    if not (report.get("endpoint") or {}).get("metricsUrl"):
+        return ("no --metrics-url, so the report cannot show the server unshared and a cell above the allowed "
+                f"{settings.allowed_streams} streams cannot raise the census concurrency" + override)
+    verdict = server_verdict(report)
+    if verdict["shared"] is True:
+        return (f"the server showed other clients ({verdict['evidence'][0] if verdict['evidence'] else 'shared'}); a "
+                f"cell above the allowed {settings.allowed_streams} streams would load other users" + override)
+    baseline = report.get("baseline") or {}
+    ran = [c for c in report.get("cells", []) if c.get("state") != "skipped"]
+    if baseline.get("metrics") != "recognized" or any((c.get("server") or {}).get("shared") is None for c in ran):
+        return ("the server could not be shown unshared so far (" + "; ".join(verdict["gaps"][:2] or ["metrics gaps"])
+                + f"), so a cell above the allowed {settings.allowed_streams} streams cannot raise the census "
+                  "concurrency" + override)
+    return None
+
+
+def assess_cell(cell: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
+    """Whether a cell's measurement can decide, and the rate it decides with.
+
+    It must have measured the server (completed, or stopped by saturation or lost metrics with its calls finished),
+    be answered by the instrument's required model only (the census pauses on any other model and accepts no label),
+    and have a steady-state window of at least ``DECISION_CYCLES`` p95 call latencies, or its whole planned window
+    when that is shorter (a cell that stopped sending at once has its window end at the earliest start of the calls
+    it cut, about one call latency earlier). It decides with its time-weighted rate over that window. When tokens per
+    entry are predeclared and the cell's output tokens per entry depart from them by more than the tolerance, the
+    rate is also normalised to the expected output tokens (throughput read as output-token bound) and the lower one
+    decides.
+    """
+    state = cell.get("state")
+    out: dict[str, Any] = {"cell": cell.get("cell"), "streams": cell.get("streams"), "itemsPerCall": cell.get("itemsPerCall"),
+                           "role": cell.get("role"), "state": state, "eligible": False, "reason": None, "rate": None}
+    if state not in MEASURED_STATES:
+        reasons = {"skipped": f"skipped ({cell.get('reason')})", "aborted": "stopped by the "
+                   f"{(cell.get('abort') or {}).get('rule', 'transport-failures')} rule with its calls cut off",
+                   "interrupted": "interrupted"}
+        out["reason"] = reasons.get(state, f"state {state}")
+        return out
+    entries, timing = cell.get("entries") or {}, cell.get("timing") or {}
+    latency, tokens, served = cell.get("latencySeconds") or {}, cell.get("tokens") or {}, cell.get("served") or {}
+    out.update({"entriesPerSecond": entries.get("perSecond"), "entriesPerSecondCompleted": entries.get("perSecondCompleted"),
+                "measuredSeconds": timing.get("measuredSeconds"), "p95Seconds": latency.get("p95"),
+                "invalidOutputShare": cell.get("invalidOutputShare"), "transportFailureShare": cell.get("transportFailureShare"),
+                "promptTokensPerEntry": tokens.get("promptPerEntry"), "outputTokensPerEntry": tokens.get("completionPerEntry"),
+                "servedModels": sorted(served.get("models") or {})})
+    required_model = served.get("requiredModel") or C.instrument().manifest["requiredModel"]["served"]
+    if not served.get("matchesInstrument"):
+        models = ", ".join(f"`{m}`" for m in out["servedModels"]) or "no model"
+        out["reason"] = (f"the server answered as {models}, not the instrument's required model `{required_model}`: the "
+                         "census would pause on model drift and accept no label")
+        return out
+    cell_seconds, warmup = timing.get("cellSeconds"), timing.get("warmupSeconds")
+    planned = (settings.cell_seconds if cell_seconds is None else cell_seconds) - (
+        settings.warmup_seconds if warmup is None else warmup)
+    p95 = latency.get("p95")
+    required = planned if p95 is None else min(planned, DECISION_CYCLES * p95)
+    measured = timing.get("measuredSeconds") or 0.0
+    out["requiredSeconds"] = round(required, 3)
+    if measured < required:
+        indicative = (f"; indicative {entries['perSecond']:.1f} entries/s" if entries.get("perSecond") is not None else "")
+        out["reason"] = (f"a steady-state window of {measured:g} s, less than the {required:g} s needed ({DECISION_CYCLES} "
+                         f"p95 call latencies of {p95 if p95 is not None else 'n/a'} s, or the planned window){indicative}; "
+                         f"rerun it alone for longer (--cells {cell.get('cell')} --cell-seconds 900"
+                         + (" and a larger --saturation-seconds)" if state != "completed" else ")"))
+        return out
+    rate = entries.get("perSecond")
+    if rate is None:
+        out["reason"] = "no entries were measured"
+        return out
+    out["basis"] = "time-weighted rate over the steady-state window"
+    expectation = settings.expectation()
+    measured_output = tokens.get("completionPerEntry")
+    if expectation and expectation.get("outputTokensPerEntry") and measured_output:
+        departure = measured_output / expectation["outputTokensPerEntry"] - 1
+        out["outputDeparture"] = round(departure, 4)
+        if abs(departure) > expectation["tolerance"]:
+            out["normalisedRate"] = round(rate * measured_output / expectation["outputTokensPerEntry"], 2)
+            rate = min(rate, out["normalisedRate"])
+    if expectation and expectation.get("promptTokensPerEntry") and tokens.get("promptPerEntry"):
+        out["promptDeparture"] = round(tokens["promptPerEntry"] / expectation["promptTokensPerEntry"] - 1, 4)
+    out.update({"eligible": True, "rate": round(rate, 2)})
+    return out
 
 
 def _percent(value: float | None, digits: int = 1) -> str:
     return "n/a" if value is None else f"{value * 100:.{digits}f} %"
 
 
-def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
-    """The best measured cell at no more than the allowed streams, and whether it reaches the target rate.
+def _signed(value: float) -> str:
+    return f"{value * 100:+.0f} %"
 
-    Completed cells and cells stopped by the saturation rule (their calls finished, so their window measured the
-    server at capacity) are eligible; cells stopped by transport failures or interrupted are not.
+
+def _tokens_note(assessment: dict[str, Any], settings: ProbeSettings) -> str:
+    expectation = settings.expectation() or {}
+    prompt, output = assessment.get("promptTokensPerEntry"), assessment.get("outputTokensPerEntry")
+    note = (f"tokens per entry: prompt {prompt if prompt is not None else 'n/a'}, output "
+            f"{output if output is not None else 'n/a'}")
+    expected = [f"{name} {expectation[key]:g} ({_signed(assessment[departure])})"
+                for name, key, departure in (("prompt", "promptTokensPerEntry", "promptDeparture"),
+                                             ("output", "outputTokensPerEntry", "outputDeparture"))
+                if expectation.get(key) and assessment.get(departure) is not None]
+    if expected:
+        note += " against the expected " + ", ".join(expected)
+    if assessment.get("normalisedRate") is not None:
+        note += (f"; WARNING: output tokens per entry depart from the expectation by more than "
+                 f"{expectation['tolerance'] * 100:g} %, token-normalised rate {assessment['normalisedRate']:.1f} entries/s")
+    elif not expected:
+        note += " (no expectation predeclared: --expect-output-tokens or --profile)"
+    return note
+
+
+def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
+    """The instrument's geometry at the allowed concurrency, and whether it reaches the target rate.
+
+    Only that cell decides (the census sends nothing else); the other geometries at or below the allowed streams are
+    reported as exploratory and never pass the criterion.
     """
-    cells = [c for c in report.get("cells", []) if c.get("streams", 0) <= settings.allowed_streams]
-    best = _best(cells)
-    target, allowed = settings.target_rate, settings.allowed_streams
-    head = f"Exit criterion (\u2265 {target:g} entries/s at the allowed concurrency of {allowed} streams):"
-    if best is None:
-        return {"targetEntriesPerSecond": target, "allowedStreams": allowed, "bestCell": None, "passes": None,
-                "line": f"{head} not assessed - no completed or saturated cell at \u2264 {allowed} streams."}
-    passes = best["entriesPerSecond"] >= target
-    quality = (best["invalidOutputShare"] is not None and best["invalidOutputShare"] <= 0.01
-               and (best["transportFailureShare"] or 0) <= 0.005)
-    stopped = (f" (stopped by the saturation rule after {best['measuredSeconds']:g} s of measurement)"
-               if best["state"] == "saturated" and best["measuredSeconds"] is not None else "")
-    line = (f"{head} {'PASS' if passes else 'FAIL'} - best cell at \u2264 {allowed} streams: {best['streams']} streams x "
-            f"{best['itemsPerCall']} items per call, {best['entriesPerSecond']:.1f} entries/s{stopped}; invalid outputs "
-            f"{_percent(best['invalidOutputShare'], 2)}, transport failures {_percent(best['transportFailureShare'], 2)}"
-            f" ({'within' if quality else 'outside'} the census limits of 1 % and 0.5 %)"
-            + ("." if passes else "; the author decides."))
-    return {"targetEntriesPerSecond": target, "allowedStreams": allowed, "bestCell": best, "passes": passes,
-            "withinQualityLimits": quality, "line": line}
+    target, allowed, items = settings.target_rate, settings.allowed_streams, instrument_items()
+    name = label(allowed, items)
+    head = (f"Exit criterion (≥ {target:g} entries/s with the instrument's {items} items per call at the allowed "
+            f"concurrency of {allowed} streams):")
+    cells = report.get("cells", [])
+    decisive = next((c for c in cells if c.get("streams") == allowed and c.get("itemsPerCall") == items), None)
+    exploratory = [assess_cell(c, settings) for c in cells
+                   if c.get("streams", 0) <= allowed and c.get("itemsPerCall") != items]
+    best_exploratory = max((a for a in exploratory if a["eligible"]), key=lambda a: a["rate"], default=None)
+    side = (f" Exploratory geometries at ≤ {allowed} streams (not the instrument's, never deciding): best "
+            f"{best_exploratory['cell']} at {best_exploratory['rate']:.1f} entries/s." if best_exploratory else "")
+    base = {"targetEntriesPerSecond": target, "allowedStreams": allowed, "itemsPerCall": items, "cell": name,
+            "exploratoryBest": best_exploratory}
+    if decisive is None:
+        return {**base, "assessment": None, "passes": None,
+                "line": f"{head} not assessed - the grid has no {name} cell.{side}"}
+    assessment = assess_cell(decisive, settings)
+    if not assessment["eligible"]:
+        return {**base, "assessment": assessment, "passes": None,
+                "line": f"{head} not assessed - {name}: {assessment['reason']}.{side}"}
+    passes = assessment["rate"] >= target
+    quality = (assessment["invalidOutputShare"] is not None and assessment["invalidOutputShare"] <= 0.01
+               and (assessment["transportFailureShare"] or 0) <= 0.005)
+    timing = decisive.get("timing") or {}
+    window = f" over a {assessment['measuredSeconds']:g} s steady-state window"
+    stopped = window
+    if decisive.get("state") != "completed":
+        stopped = (f"{window} (stopped by the {(decisive.get('abort') or {}).get('rule')} rule; the window ends at the "
+                   f"earliest start of the calls the stop cut off; completed calls "
+                   f"{_num(assessment['entriesPerSecondCompleted'], 1)} entries/s)")
+    elif not timing.get("tailComplete", True):
+        stopped = (f"{window} (the window's last calls outlasted the tail, so it ends at the earliest start of the calls "
+                   f"still open; completed calls {_num(assessment['entriesPerSecondCompleted'], 1)} entries/s)")
+    model = ", ".join(assessment["servedModels"])
+    line = (f"{head} {'PASS' if passes else 'FAIL'} - {name}: {assessment['rate']:.1f} entries/s{stopped}; invalid outputs "
+            f"{_percent(assessment['invalidOutputShare'], 2)}, transport failures "
+            f"{_percent(assessment['transportFailureShare'], 2)} ({'within' if quality else 'outside'} the census limits "
+            f"of 1 % and 0.5 %); {_tokens_note(assessment, settings)}; served model `{model}`"
+            + ("." if passes else "; the author decides.") + side)
+    return {**base, "assessment": assessment, "passes": passes, "withinQualityLimits": quality, "line": line}
 
 
 def allowed_concurrency(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
     """The allowed concurrency stays at ``allowed_streams`` unless the report shows the server is not shared."""
     shared = (report.get("server") or {}).get("shared")
-    allowed = settings.allowed_streams
-    above = _best([c for c in report.get("cells", []) if c.get("streams", 0) > allowed])
+    allowed, items = settings.allowed_streams, instrument_items()
+    above = [assess_cell(c, settings) for c in report.get("cells", []) if c.get("streams", 0) > allowed]
+    eligible = [a for a in above if a["eligible"]]
+    native = max((a for a in eligible if a["itemsPerCall"] == items), key=lambda a: a["rate"], default=None)
+    other = max((a for a in eligible if a["itemsPerCall"] != items), key=lambda a: a["rate"], default=None)
     if shared is True:
         basis = "the server load showed other clients (shared server)"
     elif shared is False:
-        basis = "no other clients in any sample or token counter: the server is not shared, so the author may allow more streams"
+        basis = "no other clients in any sample or counter: the server is not shared, so the author may allow more streams"
     elif not settings.metrics_url:
         basis = "no metrics endpoint (--metrics-url), so the report cannot show that the server is not shared"
     else:
         basis = ("the server load was not measured before and in every cell by metrics that account for our own "
                  "calls, so the report cannot show that the server is not shared")
     line = f"Allowed concurrency: {allowed} streams - {basis}."
-    if shared is False and above:
-        line += (f" Best cell above {allowed} streams: {above['streams']} streams x {above['itemsPerCall']} items per call, "
-                 f"{above['entriesPerSecond']:.1f} entries/s.")
-    return {"streams": allowed, "serverShared": shared, "mayExceed": shared is False, "bestAbove": above, "line": line}
+    if shared is False and native:
+        line += (f" Best cell above {allowed} streams with the instrument's {items} items per call: {native['cell']}, "
+                 f"{native['rate']:.1f} entries/s.")
+    if shared is False and other:
+        line += f" Exploratory geometries above {allowed} streams: best {other['cell']} at {other['rate']:.1f} entries/s."
+    return {"streams": allowed, "serverShared": shared, "mayExceed": shared is False, "bestAbove": native,
+            "exploratoryAbove": other, "line": line}
 
 
 # ----------------------------------------------------------------------------- markdown
@@ -1739,15 +2283,17 @@ def _num(value: Any, digits: int = 1) -> str:
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [f"# Capacity probe: {report['instrument']['id']} ({report['instrument']['tier']} tier)", ""]
     endpoint, request, grid = report["endpoint"], report["request"], report["grid"]
+    profile_source = (report.get("synthetic") or {}).get("profileSource") or {}
     lines += [f"- State: **{report['state']}**; started {report['startedAt']}, finished {report.get('finishedAt') or '-'}",
               f"- Endpoint: {endpoint['baseUrl']} (metrics: {endpoint.get('metricsUrl') or 'not configured'}); "
               f"requested model `{request['model']}`",
               f"- Requests: temperature {request['temperature']:g}, reasoning {request['reasoningEffort']}, "
               f"stream off, max_tokens = {request['maxTokensRule']}, first calls only (no repair pass)",
-              f"- Synthetic entries: seed {report['synthetic']['seed']}, instrument digest "
+              f"- Synthetic entries: seed {report['synthetic']['seed']}, profile "
+              f"{_cell(profile_source.get('path') or profile_source.get('source') or 'built-in')}, instrument digest "
               f"`{report['instrument']['digest'][:16]}`",
               f"- Grid: order {grid['order']}; each cell {grid['cellSeconds']:g} s with a {grid['warmupSeconds']:g} s "
-              f"warm-up, drain up to {grid['drainSeconds']:g} s", ""]
+              f"warm-up, a tail until the window's last calls finish and a drain of up to {grid['drainSeconds']:g} s", ""]
     exit_line = (report.get("exitCriterion") or {}).get("line")
     concurrency = (report.get("allowedConcurrency") or {}).get("line")
     if exit_line:
@@ -1759,22 +2305,24 @@ def render_markdown(report: dict[str, Any]) -> str:
     notes += [f"- Not shown unshared: {item}" for item in server.get("gaps") or []]
     if notes:
         lines += notes + [""]
-    lines += ["| Cell | State | Calls answered | Items/call | Entries/s | Entries/s (completed) | Concurrency | "
-              "p50 s | p95 s | p99 s | Invalid | Transport failures | Failure classes |",
-              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    lines += ["| Cell | Role | State | Calls answered | Items/call | Window s | Entries/s | Entries/s (completed) | "
+              "Concurrency | p50 s | p95 s | p99 s | Invalid | Transport failures | Failure classes |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for cell in report.get("cells", []):
+        role = cell.get("role") or "-"
         if cell["state"] == "skipped":
-            lines.append(f"| {cell['cell']} | skipped: {_cell(cell.get('reason'))} |  |  |  |  |  |  |  |  |  |  |  |")
+            lines.append(f"| {cell['cell']} | {role} | skipped: {_cell(cell.get('reason'))} |  |  |  |  |  |  |  |  |  |  |  |  |")
             continue
         failures = ", ".join(f"{k} {v}" for k, v in cell["failures"].items()) or "-"
-        latency = cell["latencySeconds"]
+        latency, timing = cell["latencySeconds"], cell.get("timing") or {}
         lines.append(
-            f"| {cell['cell']} | {cell['state']} | {cell['calls']['answered']} | {_num(cell['calls']['meanItems'], 1)} | "
+            f"| {cell['cell']} | {role} | {cell['state']} | {cell['calls']['answered']} | {_num(cell['calls']['meanItems'], 1)} | "
+            f"{_num(timing.get('measuredSeconds'), 0)} | "
             f"{_num(cell['entries']['perSecond'], 2)} | {_num(cell['entries']['perSecondCompleted'], 2)} | "
             f"{_num(cell['entries']['meanConcurrency'], 1)} | {_num(latency['p50'], 2)} | {_num(latency['p95'], 2)} | "
             f"{_num(latency['p99'], 2)} | {_percent(cell['invalidOutputShare'], 2)} | "
             f"{_percent(cell['transportFailureShare'], 2)} | {failures} |")
-    lines += ["", "| Cell | Prompt tokens/call | Output tokens/entry | Cached share | Server running max (mean) | "
+    lines += ["", "| Cell | Prompt tokens/entry | Output tokens/entry | Cached share | Server running max (mean) | "
               "Waiting max | KV cache max | Shared | Client RSS MB | Connections opened | Served model / fingerprints |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for cell in report.get("cells", []):
@@ -1786,9 +2334,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         models = ", ".join(served["models"]) or "-"
         fingerprints = ", ".join(served["fingerprints"]) or "none offered"
         shared = {True: "yes", False: "no", None: "unknown"}[srv.get("shared")]
+        cached = _percent(tokens.get("cachedShare")) + (" (server)" if tokens.get("cachedShareSource") ==
+                                                        "server-prefix-cache" else "")
         lines.append(
-            f"| {cell['cell']} | {_num(tokens['promptPerCall'], 0)} | {_num(tokens['completionPerEntry'], 1)} | "
-            f"{_percent(tokens['cachedShare'])} | {_num(running.get('max'), 0)} ({_num(running.get('mean'), 1)}) | "
+            f"| {cell['cell']} | {_num(tokens.get('promptPerEntry'), 1)} | {_num(tokens['completionPerEntry'], 1)} | "
+            f"{cached} | {_num(running.get('max'), 0)} ({_num(running.get('mean'), 1)}) | "
             f"{_num((srv.get('waiting') or {}).get('max'), 0)} | {_percent((srv.get('kvCacheUsage') or {}).get('max'))} | "
             f"{shared} | {_num(client.get('rssMaxMB'), 0)} | {client.get('connectionsOpened')} | "
             f"{_cell(models)} / {_cell(fingerprints)} |")
@@ -1815,7 +2365,9 @@ def _cell(value: Any) -> str:
 
 
 def render_plan(plan: dict[str, Any]) -> str:
-    request, grid = plan["request"], plan["grid"]
+    request, grid, decision = plan["request"], plan["grid"], plan["decision"]
+    source = (plan["synthetic"].get("profileSource") or {})
+    expectation = plan.get("expectation") or {}
     lines = ["Capacity probe plan (dry run: nothing is sent)",
              f"instrument {plan['instrument']['id']} {plan['instrument']['digest'][:16]}, {plan['instrument']['tier']} tier; "
              f"model {request['model']}",
@@ -1823,36 +2375,43 @@ def render_plan(plan: dict[str, Any]) -> str:
              f"max_tokens = {request['maxTokensRule']}; first calls only",
              f"endpoint: {plan['endpoint']['baseUrl'] or '(no --base-url)'} (not contacted); metrics: "
              f"{plan['endpoint']['metricsUrl'] or 'not configured'}",
-             f"synthetic entries: seed {plan['synthetic']['seed']}; abstracts cut by the instrument at "
-             f"{request['abstractCut']} characters", "",
+             f"synthetic entries: seed {plan['synthetic']['seed']}, profile {source.get('path') or source.get('source')}; "
+             f"abstracts cut by the instrument at {request['abstractCut']} characters",
+             "expected tokens per entry: " + (", ".join(f"{k.replace('TokensPerEntry', '')} {v:g}" for k, v in expectation.items()
+                                                       if k.endswith("PerEntry")) or "none predeclared"),
+             f"exit criterion: cell {decision['cell']} only (the instrument's {decision['itemsPerCall']} items per call at "
+             f"the allowed {decision['allowedStreams']} streams), ≥ {decision['targetEntriesPerSecond']:g} entries/s; "
+             f"{decision['aboveAllowed']}", "",
              f"Request sizes (first {plan['requestSizes'][0]['callsSampled'] if plan['requestSizes'] else 0} calls per "
              f"geometry; tokens estimated at {TOKEN_CHARACTERS} characters per token):",
              "| items/call | mean items | user chars p50 | user chars max | body bytes p50 | body bytes max | "
-             "~prompt tokens p50 | ~prompt tokens p95 | max_tokens | cut abstracts |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "~prompt tokens p50 | ~prompt tokens p95 | ~prompt tokens/entry | max_tokens | cut abstracts |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for size in plan["requestSizes"]:
         lines.append(f"| {size['itemsPerCall']} | {size['meanItems']} | {size['userCharacters']['p50']:.0f} | "
                      f"{size['userCharacters']['max']} | {size['bodyBytes']['p50']:.0f} | {size['bodyBytes']['max']} | "
                      f"{size['promptTokensEstimate']['p50']} | {size['promptTokensEstimate']['p95']} | "
-                     f"{size['maxTokens']} | {_percent(size['cutAbstractShare'])} |")
+                     f"{size['promptTokensPerEntryEstimate']} | {size['maxTokens']} | {_percent(size['cutAbstractShare'])} |")
     lines += ["", f"Grid (order {grid['order']}; cell {grid['cellSeconds']:g} s incl. {grid['warmupSeconds']:g} s "
-                  f"warm-up; drain up to {grid['drainSeconds']:g} s; pause {grid['pauseSeconds']:g} s):",
-              "| # | cell | state | items in flight | ~prompt tokens in flight | ~KV ceiling tokens | "
+                  f"warm-up; tail and drain up to {grid['drainSeconds']:g} s each; pause {grid['pauseSeconds']:g} s):",
+              "| # | cell | role | state | items in flight | ~prompt tokens in flight | ~KV ceiling tokens | "
               "latency budget s | entries for target |",
-              "|---|---|---|---|---|---|---|---|"]
+              "|---|---|---|---|---|---|---|---|---|"]
     for row in plan["load"]:
         if row["skip"]:
-            lines.append(f"| {row['position']} | {row['cell']} | skipped: {row['skip']} |  |  |  |  |  |")
+            lines.append(f"| {row['position']} | {row['cell']} | {row['role']} | skipped: {row['skip']} |  |  |  |  |  |")
             continue
-        lines.append(f"| {row['position']} | {row['cell']} | runs | {row['itemsInFlight']} | "
+        state = "runs if the server can be shown unshared" if row["aboveAllowed"] and not grid["runAboveAllowed"] else "runs"
+        lines.append(f"| {row['position']} | {row['cell']} | {row['role']} | {state} | {row['itemsInFlight']} | "
                      f"{row['promptTokensInFlightEstimate']} | {row['kvCeilingTokensEstimate']} | "
                      f"{row['latencyBudgetSeconds']} | {row['entriesForTarget']} |")
     rules, seconds = plan["abortRules"], plan["estimatedSeconds"]
     lines += ["", "latency budget: the mean call latency at which a cell reaches the target rate (streams x items / target).",
               f"abort: transport failures above {_percent(rules['transportFailureShare'], 0)} of calls in any "
               f"{rules['windowSeconds']:g} s window (once it holds {rules['minCalls']} calls or {rules['minFailures']} "
-              f"failures), or saturation (requests waiting, preemptions, HTTP 429/503) in every sample for more than "
-              f"{rules['saturationSeconds']:g} s after the warm-up; either stops the cell and the grid.",
+              f"failures), saturation (requests waiting, preemptions, HTTP 429/503) in every sample for more than "
+              f"{rules['saturationSeconds']:g} s after the warm-up, or metrics unreadable that long; each stops the cell "
+              "and the grid.",
               f"estimated duration: {_duration(seconds['min'])} to {_duration(seconds['max'])}.", ""]
     return "\n".join(lines)
 
@@ -1884,15 +2443,19 @@ def add_commands(families: Any, register: Callable[..., None]) -> None:
     grid.add_argument("--items", default=",".join(map(str, DEFAULT_ITEMS)), help="items per call (default 1,5,10,40)")
     grid.add_argument("--cells", action="append", help="run only these cells, STREAMSxITEMS, comma-separated (repeatable)")
     grid.add_argument("--order", choices=ORDERS, default="load",
-                      help="load (default: cells within --allowed-streams first, each group by ascending streams x "
-                           "items), streams, items, as-given or shuffle (seeded)")
+                      help="load (default: the instrument's geometry within --allowed-streams first, then the other "
+                           "cells within it, then those above it, each group by ascending streams x items), streams, "
+                           "items, as-given or shuffle (seeded)")
     grid.add_argument("--max-streams", type=int, help="skip cells with more streams than this")
+    grid.add_argument("--run-above-allowed", action="store_true",
+                      help="run cells above --allowed-streams even when the server is shared or cannot be shown unshared")
     timing = probe.add_argument_group("timing")
     timing.add_argument("--cell-seconds", type=float, default=300.0, help="fixed duration of each cell (default 300)")
-    timing.add_argument("--warmup-seconds", type=float, default=30.0, help="start of the measured window (default 30)")
+    timing.add_argument("--warmup-seconds", type=float, default=30.0,
+                        help="earliest start of the measured window (default 30; it also waits for the ramp's calls)")
     timing.add_argument("--ramp-seconds", type=float, default=10.0, help="stagger of the stream starts (default 10)")
     timing.add_argument("--drain-seconds", type=float, default=180.0,
-                        help="wait for calls in flight after a cell before abandoning them (default 180)")
+                        help="limit of the tail after the window and of the drain after it (default 180 each)")
     timing.add_argument("--pause-seconds", type=float, default=10.0, help="idle time after each cell (default 10)")
     timing.add_argument("--request-timeout", type=float, default=300.0,
                         help="read timeout per call (default 300; a connection opens within 10 s)")
@@ -1905,29 +2468,50 @@ def add_commands(families: Any, register: Callable[..., None]) -> None:
                        help="the failure share counts once the window holds this many calls (default 20) ...")
     rules.add_argument("--abort-min-failures", type=int, default=3, help="... or this many failures (default 3)")
     rules.add_argument("--saturation-seconds", type=float, default=60.0,
-                       help="stop when every sample after the warm-up shows saturation for longer than this (default 60)")
+                       help="stop when every sample after the warm-up shows saturation, or no metrics, for longer than "
+                            "this (default 60)")
     rules.add_argument("--saturation-waiting", type=float, default=1.0,
                        help="requests waiting on the server that count as saturation (default 1)")
     rules.add_argument("--saturation-kv", type=float,
                        help="also count KV cache usage at or above this share as saturation (off by default)")
-    rules.add_argument("--shared-tolerance", type=float, default=1.0,
-                       help="requests beyond ours a sample tolerates before it counts as another client's (default 1)")
+    rules.add_argument("--shared-tolerance", type=float, default=0.0,
+                       help="requests beyond ours a sample tolerates before it counts as another client's (default 0)")
     rules.add_argument("--allowed-streams", type=int, default=60,
                        help="allowed concurrency the exit criterion is assessed at (default 60)")
     rules.add_argument("--target-rate", type=float, default=40.0, help="exit criterion in entries/s (default 40)")
+    synthetic = probe.add_argument_group("synthetic entries and expectations")
+    synthetic.add_argument("--profile", help="size profile and expected tokens per entry (capacity profile output)")
+    synthetic.add_argument("--expect-output-tokens", type=float,
+                           help="predeclared output tokens per entry of the census's real entries")
+    synthetic.add_argument("--expect-prompt-tokens", type=float,
+                           help="predeclared prompt tokens per entry of the census's real entries")
+    synthetic.add_argument("--expect-tolerance", type=float, default=0.2,
+                           help="departure from the expected tokens per entry that warns and normalises (default 0.2)")
     probe.add_argument("--seed", type=int, default=1, help="seed of the synthetic entries (default 1)")
     probe.add_argument("--journal", default=DEFAULT_JOURNAL, help="journal parameter of the system prompt")
     probe.add_argument("--output", help="new or empty directory for the report, markdown table and call log")
     probe.add_argument("--dry-run", action="store_true", help="print the grid, request sizes and expected load; send nothing")
     register(probe, "capacity_probe", "command", "operator", state_required=False)
+    profile = commands.add_parser(
+        "profile", help="size profile of a census database's public inputs, for capacity probe --profile",
+        description="Entries per review, citing sentences and their length, abstract length and the tokens per entry of "
+                    "answered first calls, from the public reviews of a census scores database (read-only; no text, no "
+                    "verdict).")
+    profile.add_argument("--database", required=True, help="census scores database (working or frozen)")
+    profile.add_argument("--output", required=True, help="profile file to write (JSON; must not exist)")
+    register(profile, "capacity_probe", "profile_command", "workspace", state_required=False)
 
 
 def settings_from_args(args: Any) -> ProbeSettings:
+    profile = expected = source = None
+    if getattr(args, "profile", None):
+        profile, expected, source = load_profile(Path(args.profile))
     return ProbeSettings(
         base_url=args.base_url, model=args.model, api_key_env=args.api_key_env, metrics_url=args.metrics_url,
         proxy_pids=tuple(args.proxy_pid or ()), streams=parse_counts(args.streams, "--streams"),
         items=parse_counts(args.items, "--items"), cells=parse_cells(args.cells), order=args.order,
-        max_streams=args.max_streams, cell_seconds=args.cell_seconds, warmup_seconds=args.warmup_seconds,
+        max_streams=args.max_streams, run_above_allowed=bool(args.run_above_allowed),
+        cell_seconds=args.cell_seconds, warmup_seconds=args.warmup_seconds,
         ramp_seconds=args.ramp_seconds, drain_seconds=args.drain_seconds, pause_seconds=args.pause_seconds,
         request_timeout=args.request_timeout, sample_seconds=args.sample_seconds,
         abort_failure_share=args.abort_failure_share, abort_window_seconds=args.abort_window_seconds,
@@ -1935,6 +2519,8 @@ def settings_from_args(args: Any) -> ProbeSettings:
         saturation_seconds=args.saturation_seconds,
         saturation_waiting=args.saturation_waiting, saturation_kv=args.saturation_kv,
         shared_tolerance=args.shared_tolerance, allowed_streams=args.allowed_streams, target_rate=args.target_rate,
+        expect_output_tokens=args.expect_output_tokens, expect_prompt_tokens=args.expect_prompt_tokens,
+        expect_tolerance=args.expect_tolerance, profile=profile, profile_expected=expected, profile_source=source,
         seed=args.seed, journal=args.journal)
 
 
@@ -1955,7 +2541,18 @@ def command(args: Any) -> Any:
     return report if as_json else probe.scrub(render_markdown(report))
 
 
+def profile_command(args: Any) -> Any:
+    output = Path(args.output)
+    if output.exists():
+        raise ValidationError("the profile file already exists; write it to a new path")
+    value = profile_from_database(Path(args.database))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(output, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    return {"output": str(output), "source": value["source"], "expected": value["expected"]}
+
+
 __all__ = ["CapacityProbe", "ProbeSettings", "SyntheticCorpus", "ConnectionPool", "AbortMonitor", "classify_response",
            "parse_prometheus", "server_load", "time_weighted_rate", "completed_rate", "percentile", "ordered_grid",
            "parse_cells", "build_request", "render_markdown", "render_plan", "exit_criterion", "allowed_concurrency",
-           "server_verdict"]
+           "server_verdict", "assess_cell", "above_allowed_reason", "profile_from_database", "load_profile",
+           "validate_profile", "redact_key"]
