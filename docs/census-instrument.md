@@ -159,6 +159,11 @@ across reviews).
 
 ## Running a study
 
+Before a census commits to a concurrency, `ocsl-review capacity probe` measures
+the entries per second the judge sustains with this instrument's own requests
+over synthetic entries, and whether the judge serves other clients
+([capacity probe](capacity-probe.md)).
+
 ```bash
 ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input inputs/reviews.jsonl
 ocsl-review study judge --database work/census.sqlite3 --seed "$SEED" --base-url "$JUDGE_URL" \
