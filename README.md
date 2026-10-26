@@ -170,6 +170,7 @@ commands on a deployment.
 - [Extensive literature workflow](docs/literature-review.md)
 - [Resumable citation-support census](docs/citation-census.md)
 - [Census instrument, scores database, estimands and facts](docs/census-instrument.md)
+- [Judge capacity probe](docs/capacity-probe.md)
 - [Corpus review workflow](docs/corpus-review.md)
 - [Storage: packs, snapshots, delta branches and stores](docs/storage.md)
 - [Reference and claim screen](docs/claim-check.md)
@@ -203,9 +204,9 @@ The existing package is licensed under the [MIT License](LICENSE). The new
 `structured.py` and `census.py` modules, census prompt and assessment schema,
 structured/census tests and fixtures, census skill, and census guide are
 independently implemented Apache-2.0 originals, as are the `author_year.py`,
-`sanitize.py`, `retrieval.py`, `integrity.py`, `claim_check.py` and `screen.py`
-modules, the `schemas/claim-check.sql` extension, their tests and fixtures, and the
-claim-screen guide, with the
+`sanitize.py`, `retrieval.py`, `integrity.py`, `claim_check.py`, `screen.py` and
+`capacity_probe.py` modules, the `schemas/claim-check.sql` extension, their tests and
+fixtures, and the claim-screen and capacity-probe guides, with the
 [Apache license text](LICENSES/Apache-2.0.txt) included. Existing MIT assets
 remain under MIT. The adjacent
 `reference/nature-review-studio` project has no project license and is excluded

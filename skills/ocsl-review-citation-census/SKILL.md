@@ -15,9 +15,12 @@ For an entry-level census with a registered census instrument
 (`citation-census@1`: one verdict per printed bibliography entry, with the
 instrument's fixed evidence policy, batch geometry and request settings), use
 `ocsl-review study`: prepare, abstracts, judge, full-text, the predeclared
-sensitivities, gates, freeze and facts. Read
-`$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the instrument runs
-unchanged and its decisions are recorded per entry.
+sensitivities, gates, freeze and facts. A study that builds its population
+fresh enumerates it with population-level queries, acquires with the journals'
+live routes, derives each review's cited works with `study works`, records any
+protocol exclusion with `study exclude` and compares an earlier manifest only
+at the end. Read `$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the
+instrument runs unchanged and its decisions are recorded per entry.
 
 For a multi-paper corpus and a database that can support future questions, start
 with `ocsl-review-reference-analysis`. This census skill also supplies the

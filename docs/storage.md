@@ -87,11 +87,19 @@ tables in prefixed tables (`ocsl_delta_<table>`), and TEMP views under the
 plain table names show the branch's rows plus every parent row the branch does
 not override, so existing queries work unchanged:
 
-- inserts go to the branch; a row whose key exists in the parent is skipped,
-  except for runs, analyses and corpora, where a clash raises;
+- inserts go to the branch, and no write is dropped silently. When a row's
+  key or unique columns match a parent row that the branch shows, a plain
+  `INSERT` raises `sqlite3.IntegrityError` (`CHECK constraint failed:
+  works.work_id exists in the parent snapshot`) and `INSERT OR IGNORE` skips
+  the row, as on a full copy of the parent. `INSERT OR REPLACE` raises too,
+  because replacing would delete a parent row; an `UPDATE` overrides a parent
+  row instead. A parent row that the branch overrides clashes as its branch
+  copy (`UNIQUE constraint failed: ocsl_delta_works.work_id`). For runs,
+  analyses and corpora a key clash raises even with `OR IGNORE`;
 - updating a parent row copies it into the branch first, so append-only tables
-  still refuse the change; keys of shared rows cannot change, and parent rows
-  cannot be deleted;
+  still refuse the change; keys of shared rows cannot change, parent rows
+  cannot be deleted, and an update that would repeat the unique columns of
+  another row raises (`UPDATE OR IGNORE` skips it);
 - analysis queues (`corpus_tasks`, `corpus_batches`, `processing_state`) and any
   table outside the shared list stay branch-local;
 - SQLite cannot enforce foreign keys across databases, so branch connections
@@ -128,6 +136,15 @@ naming the store version. The study then re-checks the provider records before
 it uses any of it, exactly as for its own retained evidence; a frozen study
 never depends on the mount. Retained review captures are found through the
 store's retained-source index by DOI.
+
+Census inputs read a store without adopting anything into a library
+(`store_client.EvidenceStore`, and `ProviderCache` for a provider response
+cache): both are ATTACHed `mode=ro&immutable=1` behind a SQLite authorizer that
+refuses any table outside the cache's allowlist (for a store, the projection's
+kept tables), and every byte is verified against its digest. Only the
+label-free projection is accepted as a census store. See
+[census instrument](census-instrument.md), "Inputs from byte caches and live
+routes".
 
 ## The label-free projection `literature-evidence@2`
 

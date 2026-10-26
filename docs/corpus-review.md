@@ -271,7 +271,11 @@ ocsl-review corpus branch --workspace . --library results/literature-v2 \
 ```
 
 Resume imports existing results before resubmitting missing work. An accepted
-assessment is not rerun solely because a chat reconnects. Changed scientific
+assessment is not rerun solely because a chat reconnects. Export re-derives the
+facts in one read transaction. Their input digest (`inputManifestSha256`)
+covers every registered artifact digest except fact derivations and every
+assessment id of the analysis, in key order; it is hashed while keyset pages
+are read, so memory stays at one page at any corpus size. Changed scientific
 inputs or settings require a new analysis; histories remain distinct. A snapshot
 contains a consistent SQLite database and registered source artifacts. Verify
 it before transfer and in the destination workspace. Never transfer credentials

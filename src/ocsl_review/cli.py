@@ -419,6 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_store_commands(families, _set)
     from .screen import add_commands as add_screen_commands
     add_screen_commands(families, _set)
+    from .capacity_probe import add_commands as add_capacity_commands
+    add_capacity_commands(families, _set)
     return parser
 
 
