@@ -4,10 +4,14 @@
 Works are looked up 40 DOIs per query; works without a DOI fall back to their
 PMID. The raw ``abstractText`` is kept unchanged and its provider recorded, so
 the census judge sees one provider's abstracts across journals. Requests carry
-identifiers only.
+identifiers only. A study's byte caches (a literature-evidence@2 store, a
+provider response cache) are asked first; a cached Europe PMC record is used
+only with its digest verified and its identifiers agreeing. Each work records
+where its abstract came from (``abstractProvenance``).
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import threading
@@ -92,17 +96,38 @@ def looked_up(work: Mapping[str, Any]) -> bool:
     return bool(outcome) and outcome != "europe-pmc-failed"
 
 
+def _text_sha256(text: str | None) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[str, Any] | None], *,
-                overwrite: bool = False) -> dict[str, Any]:
+                overwrite: bool = False, cache: Any = None) -> dict[str, Any]:
     """A review record whose works carry Europe PMC abstracts, the one provider for every journal.
 
-    Every work not yet looked up (all works with ``overwrite``) is queried. A Europe PMC abstract replaces
-    whatever the work carried; where Europe PMC definitively has none, an abstract supplied from another
-    provider is kept as a recorded fallback (``abstractSource`` = ``fallback:<provider>``). A failed lookup
-    changes nothing but ``europePmcOutcome`` and is retried on the next run.
+    Every work not yet looked up (all works with ``overwrite``) is looked up: in the study's byte caches
+    first (``cache``: census_inputs.InputCaches), then live. A Europe PMC abstract replaces whatever the work
+    carried; where Europe PMC definitively has none, an abstract supplied from another provider is kept as a
+    recorded fallback (``abstractSource`` = ``fallback:<provider>``). A failed lookup changes nothing but
+    ``europePmcOutcome`` and is retried on the next run. ``abstractProvenance`` records cache-hit-public,
+    live-public, supplied (a fallback) or unavailable, with the digest of the text it vouches for.
     """
     works = {key: dict(work) for key, work in (record.get("works") or {}).items()}
     wanted = {key: work for key, work in works.items() if overwrite or not looked_up(work)}
+    rejected: dict[str, list] = {}
+    if cache is not None:
+        for key in list(wanted):
+            hit, refused = cache.abstract(works[key])
+            if refused:
+                rejected[key] = refused
+            if hit is None:
+                continue
+            work = works[key]
+            work["europePmcOutcome"] = hit["outcome"]
+            work["abstractRetrievedAt"] = hit["provenance"].get("retrievedAt")
+            work["abstract"], work["abstractSource"] = hit["abstract"], hit["outcome"]
+            work["abstractProvenance"] = {**hit["provenance"], "textSha256": _text_sha256(hit["abstract"]),
+                                          **({"rejected": refused} if refused else {})}
+            del wanted[key]
     for key, found in fetch_abstracts(wanted, get).items():
         work, outcome = works[key], found["abstractSource"]
         work["europePmcOutcome"] = outcome
@@ -111,10 +136,15 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
         work["abstractRetrievedAt"] = found["abstractRetrievedAt"]
         if found["abstract"]:
             work["abstract"], work["abstractSource"] = found["abstract"], outcome
+            provenance = {"provenance": "live-public", "provider": "europe-pmc", "retrievedAt": found["abstractRetrievedAt"]}
         elif work.get("abstract"):
             source = str(work.get("abstractSource") or "supplied")
             if not source.startswith(("europe-pmc-", "fallback:")):
                 work["abstractSource"] = "fallback:" + source
+            provenance = {"provenance": "supplied", "fallback": work["abstractSource"]}
         else:
             work["abstract"], work["abstractSource"] = None, outcome
+            provenance = {"provenance": "unavailable", "outcome": outcome}
+        work["abstractProvenance"] = {**provenance, "textSha256": _text_sha256(work.get("abstract")),
+                                      **({"rejected": rejected[key]} if key in rejected else {})}
     return {**record, "works": works}
