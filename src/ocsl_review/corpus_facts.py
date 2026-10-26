@@ -156,10 +156,12 @@ def _sensitivity_facts(journal: str) -> dict[str, tuple[str, str]]:
 
 
 def _coverage_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
-    """Coverage cells by first-online year and stratum as direct SQL facts."""
+    """Coverage cells by first-online year, stratum, route, provenance class and acquisition class as SQL facts."""
     j = _quote(journal)
     facts = {}
     dimensions = (("year", "year"), ("stratum", "stratum"), ("route", "route"), ("provenance", "provenance_class"))
+    if "provenance" in scores_db.table_columns(connection, "reviews"):
+        dimensions += (("acquisition", "provenance"),)
     for name, column in dimensions:
         values = [r[0] for r in connection.execute(
             f"SELECT DISTINCT {column} FROM reviews WHERE journal=? AND {column} IS NOT NULL ORDER BY {column}", (journal,))]
@@ -182,6 +184,118 @@ def _coverage_facts(connection: sqlite3.Connection, journal: str) -> dict[str, t
                 f"{prefix}.ft_read": (f"SELECT COUNT(*) {c} AND ft_class IS NOT NULL", f"full-text verdicts, {cell}"),
                 f"{prefix}.entries_invalid": (f"SELECT COUNT(*) {c} AND abs_basis LIKE 'invalid%'", f"invalid outputs, {cell}"),
             })
+    return facts
+
+
+READ = "document_sha256 IS NOT NULL AND json_extract(extraction_json, '$.extractionFailed') IS NULL"
+
+
+def _provenance_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
+    """Where the inputs came from, per acquisition class (cache-hit-public, cache-hit-entitled, live-public,
+    live-entitled, unavailable, supplied): reviews per journal and stratum, entries by the provenance of their
+    abstract and of their full-text window. Every class is a fact, zero included."""
+    j = _quote(journal)
+    facts: dict[str, tuple[str, str]] = {}
+    if "provenance" in scores_db.table_columns(connection, "reviews"):
+        strata = [r[0] for r in connection.execute(
+            "SELECT DISTINCT stratum FROM reviews WHERE journal=? AND stratum IS NOT NULL ORDER BY stratum", (journal,))]
+        for label in scores_db.PROVENANCE:
+            cell = f"provenance={_quote(label)}"
+            facts[f"provenance.reviews.{label}"] = (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell}",
+                                                    f"reviews whose document provenance is {label}")
+            facts[f"provenance.reviews_read.{label}"] = (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND {cell} AND {READ}",
+                                                         f"reviews with document provenance {label} and an extracted document")
+            for stratum in strata:
+                facts[f"provenance.stratum.{slug(stratum)}.reviews.{label}"] = (
+                    f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND stratum={_quote(stratum)} AND {cell}",
+                    f"reviews of stratum {stratum} whose document provenance is {label}")
+        facts["provenance.reviews.unrecorded"] = (f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND provenance IS NULL",
+                                                  "reviews prepared before document provenance was recorded")
+        facts["provenance.reviews_read.unrecorded"] = (
+            f"SELECT COUNT(*) FROM reviews WHERE journal={j} AND provenance IS NULL AND {READ}",
+            "reviews with an extracted document prepared before document provenance was recorded")
+    if scores_db.has_table(connection, "input_provenance"):
+        for label in scores_db.PROVENANCE:
+            # An IN list of the class's evidence units: one indexed pass, not one lookup per entry.
+            facts[f"provenance.abstracts.{label}"] = (
+                f"SELECT COUNT(*) FROM citations c WHERE c.journal={j} AND c.abs_evidence_id IN (SELECT item_id FROM "
+                f"input_provenance WHERE kind='abstract' AND provenance={_quote(label)})",
+                f"entries whose abstract evidence provenance is {label}")
+        facts["provenance.abstracts.unrecorded"] = (
+            f"SELECT COUNT(*) FROM citations c WHERE c.journal={j} AND c.abs_evidence_id IS NOT NULL AND "
+            "c.abs_evidence_id NOT IN (SELECT item_id FROM input_provenance)",
+            "entries whose abstract evidence was recorded before provenance existed")
+    if "ft_provenance" in scores_db.table_columns(connection, "citations"):
+        for label in scores_db.PROVENANCE:
+            facts[f"provenance.full_text.{label}"] = (
+                f"SELECT COUNT(*) FROM citations WHERE journal={j} AND ft_provenance={_quote(label)}",
+                f"escalated entries whose full-text provenance is {label} (unavailable: no window was sent)")
+        facts["provenance.full_text.unrecorded"] = (
+            f"SELECT COUNT(*) FROM citations WHERE journal={j} AND ft_retrieval IS NOT NULL AND ft_provenance IS NULL",
+            "escalated entries with a full-text outcome recorded before full-text provenance existed")
+    return facts
+
+
+def _enumeration_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
+    """The fresh enumeration (population, reviews in the study) and recorded manifest comparisons, per stratum."""
+    j = _quote(journal)
+    facts: dict[str, tuple[str, str]] = {}
+    if scores_db.has_table(connection, "enumeration") and connection.execute(
+            "SELECT 1 FROM enumeration WHERE journal=? LIMIT 1", (journal,)).fetchone():
+        in_study = "EXISTS (SELECT 1 FROM reviews r WHERE r.journal=e.journal AND r.doi=e.doi)"
+        facts["enumeration.reviews"] = (f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j}",
+                                        "reviews of the fresh enumeration")
+        facts["enumeration.in_study"] = (f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j} AND {in_study}",
+                                         "enumerated reviews in the study")
+        facts["enumeration.outside"] = (
+            f"SELECT COUNT(*) FROM reviews r WHERE r.journal={j} AND NOT EXISTS (SELECT 1 FROM enumeration e "
+            "WHERE e.journal=r.journal AND e.doi=r.doi)", "reviews in the study that the enumeration did not list (gate: 0)")
+        if scores_db.has_table(connection, "exclusions"):
+            excluded = "EXISTS (SELECT 1 FROM exclusions x WHERE x.journal=e.journal AND x.doi=e.doi)"
+            facts["enumeration.excluded"] = (
+                f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j} AND NOT {in_study} AND {excluded}",
+                "enumerated reviews excluded by the protocol, each with a recorded reason")
+            facts["enumeration.unexplained"] = (
+                f"SELECT COUNT(*) FROM enumeration e WHERE e.journal={j} AND NOT {in_study} AND NOT {excluded}",
+                "enumerated reviews neither in the study nor excluded (complete population: 0)")
+        for (stratum,) in connection.execute("SELECT DISTINCT stratum FROM enumeration WHERE journal=? AND stratum IS NOT "
+                                             "NULL ORDER BY stratum", (journal,)).fetchall():
+            cell = f"e.journal={j} AND e.stratum={_quote(stratum)}"
+            facts[f"enumeration.stratum.{slug(stratum)}.reviews"] = (f"SELECT COUNT(*) FROM enumeration e WHERE {cell}",
+                                                                      f"enumerated reviews of stratum {stratum}")
+            facts[f"enumeration.stratum.{slug(stratum)}.in_study"] = (
+                f"SELECT COUNT(*) FROM enumeration e WHERE {cell} AND {in_study}",
+                f"enumerated reviews of stratum {stratum} in the study")
+    if scores_db.has_table(connection, "manifest_comparisons"):
+        fields = (("fresh", "reviews in the fresh enumeration"), ("stored", "reviews in the stored manifest"),
+                  ("in_both", "reviews in both manifests"), ("fresh_only", "reviews only in the fresh enumeration"),
+                  ("stored_only", "reviews only in the stored manifest (counted, never imported)"))
+        if "in_study" in scores_db.table_columns(connection, "manifest_comparisons"):
+            fields += (("in_study", "enumerated reviews in the study at comparison time"),
+                       ("excluded", "enumerated reviews excluded by the protocol at comparison time"))
+        for label, stratum in connection.execute("SELECT label, stratum FROM manifest_comparisons WHERE journal=? "
+                                                 "ORDER BY label, stratum", (journal,)).fetchall():
+            cell = "all" if stratum == "*" else slug(stratum)
+            for name, meaning in fields:
+                facts[f"manifest_comparison.{label}.{cell}.{name}"] = (
+                    f"SELECT {name} FROM manifest_comparisons WHERE label={_quote(label)} AND journal={j} "
+                    f"AND stratum={_quote(stratum)}", f"comparison {label}, {'all strata' if stratum == '*' else stratum}: {meaning}")
+    return facts
+
+
+def _comparison_totals(connection: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """Totals of each recorded manifest comparison over every journal, unattributed stored reviews included."""
+    facts: dict[str, tuple[str, str]] = {}
+    if not scores_db.has_table(connection, "manifest_comparisons"):
+        return facts
+    names = ("fresh", "stored", "in_both", "fresh_only", "stored_only")
+    if "in_study" in scores_db.table_columns(connection, "manifest_comparisons"):
+        names += ("in_study", "excluded")
+    for (label,) in connection.execute("SELECT DISTINCT label FROM manifest_comparisons ORDER BY label").fetchall():
+        for name in names:
+            facts[f"census.manifest_comparison.{label}.{name}"] = (
+                f"SELECT SUM({name}) FROM manifest_comparisons WHERE label={_quote(label)} AND stratum='*'",
+                f"comparison {label}, all journals: {name.replace('_', ' ')}")
     return facts
 
 
@@ -264,10 +378,13 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
             raise ValidationError("unknown journals: " + ", ".join(sorted(missing)))
         estimates, report = compute_estimates(frozen, journals, b=b, seed=seed, ratio_pair=ratio_pair,
                                               trend_years=trend_years, panels=panels)
-        coverage = {journal: _coverage_facts(frozen, journal) for journal in journals}
+        coverage = {journal: {**_coverage_facts(frozen, journal), **_provenance_facts(frozen, journal),
+                              **_enumeration_facts(frozen, journal)} for journal in journals}
+        totals = _comparison_totals(frozen)
         frozen.execute("VACUUM INTO ?", (str(database),))
     scores_sha = scores_db.file_sha256(scores_path)
     revision = code_revision or _revision()
+    pinned = _pinned_inputs(meta)
     with closing(sqlite3.connect(database)) as target:
         target.execute("PRAGMA journal_mode=DELETE")
         target.execute("CREATE TABLE estimates(key TEXT PRIMARY KEY, value NOT NULL, estimand TEXT NOT NULL, "
@@ -277,7 +394,8 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
         target.executemany("INSERT INTO fact_inputs VALUES(?,?)", [
             ("scoresSha256", scores_sha), ("instrumentDigest", meta.get("instrumentDigest", "")),
             ("instrumentId", meta.get("instrumentId", "")), ("codeRevision", revision),
-            ("bootstrapB", str(b)), ("seed", str(seed)), ("complete", meta.get("complete", "unknown"))])
+            ("bootstrapB", str(b)), ("seed", str(seed)), ("complete", meta.get("complete", "unknown"))]
+            + [(key, value) for key, value in pinned.items() if value])
         target.commit()
         target.execute("VACUUM")
     for suffix in ("-wal", "-shm", "-journal"):
@@ -287,13 +405,15 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     database_sha = scores_db.file_sha256(database)
     inputs = {"scoresSha256": scores_sha, "instrumentDigest": meta.get("instrumentDigest"),
               "instrumentId": meta.get("instrumentId"), "estimandsModule": "ocsl_review.estimands",
-              "runComplete": meta.get("complete") == "1"}
+              "runComplete": meta.get("complete") == "1", **{key: value for key, value in pinned.items() if value}}
     queries: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     for journal in journals:
         s = slug(journal)
         for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **_sensitivity_facts(journal),
                                     **coverage[journal]}.items():
             queries[f"census.{s}.{name}"] = (sql, method, None)
+    for key, (sql, method) in totals.items():
+        queries[key] = (sql, method, None)
     for key, _value, estimand, journal, detail in estimates:
         queries[key] = (f"SELECT value FROM estimates WHERE key={_quote(key)}", estimand, json.loads(detail))
     facts = {}
@@ -320,6 +440,19 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     (output / "facts.json").write_text(json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     return {"facts": str(output / "facts.json"), "database": str(database), "databaseSha256": database_sha,
             "count": len(facts), "report": report}
+
+
+def _pinned_inputs(meta: Mapping[str, str]) -> dict[str, str | None]:
+    """The input versions a study pinned: store Merkle root, provider cache digest and fresh enumeration receipt."""
+    def field(key: str, name: str) -> str | None:
+        try:
+            value = json.loads(meta[key]) if key in meta else None
+        except ValueError:
+            return None
+        return value.get(name) if isinstance(value, dict) else None
+    return {"inputStoreMerkleRoot": field("inputStore", "merkleRoot"),
+            "inputProviderCacheSha256": field("inputProviderCache", "sha256"),
+            "enumerationSha256": meta.get("enumerationSha256")}
 
 
 def _revision() -> str:
