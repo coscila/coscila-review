@@ -165,8 +165,8 @@ def fill_works(source: Path, output: Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = Path(str(output) + ".partial")
     done = _resume_partial(partial)
-    counts = {"records": 0, "resumed": len(done), "derived": 0, "passedThrough": 0, "extractionFailed": 0, "works": 0,
-              "entriesWithoutIdentifier": 0}
+    counts = {"records": 0, "resumed": len(done), "derived": 0, "passedThrough": 0, "extractionFailed": 0,
+              "documentUnreadable": 0, "works": 0, "entriesWithoutIdentifier": 0}
     with partial.open("a", encoding="utf-8") as handle:
         for index, record in enumerate(iter_records(source)):
             if index < len(done):
@@ -178,13 +178,21 @@ def fill_works(source: Path, output: Path) -> dict[str, Any]:
                 raise ValidationError(f"record {index + 1} ({record.get('doi')}) already carries works; study works "
                                       "derives them from the review's own bibliography")
             acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), dict) else {}
-            document = None if acquisition.get("state") == "retry" else read_document(source.parent, record)
+            try:
+                document = None if acquisition.get("state") == "retry" else read_document(source.parent, record)
+                tables = read_table_pages(source.parent, record) if document is not None else []
+            except (OSError, ValidationError) as error:
+                # Preparation records the unreadable document in coverage; no works can be derived from it.
+                document, reason = None, f"{type(error).__name__}: {str(error)[:300]}"
+                record = {**record, "works": {}, "worksDerivation": {"derivation": WORKS_DERIVATION,
+                                                                     "state": "document-unreadable", "reason": reason}}
+                counts["documentUnreadable"] += 1
             if document is None:
                 result = dict(record)
-                counts["passedThrough"] += 1
+                counts["passedThrough"] += record.get("worksDerivation", {}).get("state") != "document-unreadable"
             else:
                 kind = (record.get("document") or {}).get("kind")
-                result = derived_record(record, document, kind, read_table_pages(source.parent, record))
+                result = derived_record(record, document, kind, tables)
                 derivation = result["worksDerivation"]
                 if derivation["state"] == "derived":
                     counts["derived"] += 1
