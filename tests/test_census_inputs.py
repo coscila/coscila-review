@@ -482,6 +482,12 @@ class CitedWorkTests(CacheTestCase):
         provenance = row["works"]["doi:10.5555/w1"]["workProvenance"]
         self.assertEqual((WORKS_DERIVATION, census_inputs.sha256_bytes(document)),
                          (provenance["derivation"], provenance["documentSha256"]))
+        missing = {**base, "doi": "10.5555/missing.review", "document": {"path": "missing.xml", "kind": "jats"}}
+        (folder / "two.jsonl").write_text(json.dumps(base) + "\n" + json.dumps(missing) + "\n")
+        two = fill_works(folder / "two.jsonl", folder / "two-works.jsonl")
+        self.assertEqual((1, 1, 0), (two["derived"], two["documentUnreadable"], two["passedThrough"]))
+        unreadable = json.loads((folder / "two-works.jsonl").read_text().splitlines()[1])
+        self.assertEqual(({}, "document-unreadable"), (unreadable["works"], unreadable["worksDerivation"]["state"]))
         (folder / "carried.jsonl").write_text(json.dumps({**base, "works": record()["works"]}) + "\n")
         with self.assertRaisesRegex(ValidationError, "already carries works"):
             fill_works(folder / "carried.jsonl", folder / "refused.jsonl")
