@@ -334,26 +334,37 @@ class BrokerTransport:
         return catalog
 
     def require(self, digests: Mapping[str, str], *, model: str) -> None:
-        """Refuse before any call unless the worker serves ``model`` and every digest is installed and granted
-        (the catalog is read again: grants and installed bundles may have changed since the last invocation)."""
+        """Refuse before any call unless the broker sends verbatim instruments unchanged (``instrumentVerbatim``), the
+        worker serves ``model`` and every digest is installed as a verbatim bundle and granted (the catalog is read
+        again: grants and installed bundles may have changed since the last invocation)."""
         try:
             catalog = self.open(refresh=True)
         except BrokerUnavailable:
             if self.catalog is None:
                 raise
             catalog = self.catalog      # an outage after the start: the calls meet it and the run pauses as an outage
+        if catalog.get("instrumentVerbatim") != 1:
+            raise ValidationError("the broker does not offer verbatim instrument mode (instrumentVerbatim): it would not "
+                                  "send the instrument's messages unchanged; the census needs an execution daemon that does")
         if model != self.worker_model:
             raise ValidationError(f"the broker worker {self.worker_id!r} requests model {self.worker_model!r}, the census "
                                   f"requests {model!r}: the request digests could never agree (pass --model to match)")
-        available = {item.get("digest") for item in catalog.get("instruments") or [] if isinstance(item, dict)}
+        listed = {item.get("digest"): item for item in catalog.get("instruments") or [] if isinstance(item, dict)}
         granted = set((catalog.get("authorization") or {}).get("instruments") or [])
-        missing = {label: digest for label, digest in digests.items() if digest not in available}
+        missing = {label: digest for label, digest in digests.items() if digest not in listed}
         if missing:
             detail = "; ".join(f"{label}: {digest} ({'granted, not installed' if digest in granted else 'not granted'})"
                                for label, digest in sorted(missing.items()))
             raise ValidationError("the run principal lacks instrument bundles: " + detail + ". Export each with "
                                   "'ocsl-review instruments export', install it with PUT /v2/instruments/{digest} and "
                                   "grant the digest to the run principal")
+        wrapped = {label: digest for label, digest in digests.items()
+                   if ((listed[digest].get("transport") or {}).get("messages")) != "verbatim"}
+        if wrapped:
+            # A policy-wrapped install would put the broker's worker policy in front of the instrument's prompt.
+            raise ValidationError("instrument bundles installed without transport.messages verbatim: " + "; ".join(
+                f"{label}: {digest}" for label, digest in sorted(wrapped.items())) + ". Install exactly the bundle "
+                "'ocsl-review instruments export' prints (it declares transport.messages: verbatim)")
 
     def describe(self) -> dict[str, Any]:
         with self._lock:
