@@ -302,6 +302,13 @@ def _token_count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+# Closed codes of an item the broker refused before any provider call (no attempt): it will not send the request the
+# instrument built. INSTRUMENT_MESSAGE_MISMATCH: the messages or settings differ from the bundle installed under the
+# digest (or the worker's model); PRINCIPAL_REQUIRED: the socket carries no run principal authority for a verbatim
+# instrument; INVALID_REQUEST: an item the broker cannot run verbatim at all.
+BROKER_REFUSALS = frozenset({"INSTRUMENT_MESSAGE_MISMATCH", "PRINCIPAL_REQUIRED", "INVALID_REQUEST"})
+
+
 def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, required_model: str, call_id: str,
                    digest: str, items: int) -> CallResult:
     """One logical call as a one-item broker job (``census_broker.BrokerTransport``); returns the receipt fields.
@@ -365,9 +372,11 @@ def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, requir
         # The judge server refused this very request (HTTP 400, 413 or 422): an answer without labels.
         receipt["error"] = "refused: broker INVALID_REQUEST"
         return CallResult(receipt, None, None, responded=True)
-    if code == "INVALID_REQUEST":
-        # The broker refused the item before any provider call: it does not run this instrument verbatim.
-        receipt["error"] = "broker refused the instrument call: INVALID_REQUEST"
+    if code in BROKER_REFUSALS and not receipt["attempts"]:
+        # The broker refused the item before any provider call: it would not send the request the instrument built.
+        # Nothing reached a judge, and the same request would be refused again: the run stops as a fidelity failure.
+        detail = " ".join(str(item.get("error") or "").split())[:300]
+        receipt["error"] = f"broker refused the instrument call: {code}" + (f" ({detail})" if detail else "")
         return CallResult(receipt, None, None, responded=False, stop="fidelity")
     receipt["error"] = "broker %s: %s" % (item.get("state"), code)
     return CallResult(receipt, None, None, responded=False)
@@ -792,8 +801,14 @@ class CensusRun:
             text = (f"call {result.call_id}: the broker reported request {reported or 'no request digest'}, the "
                     f"instrument built {r.get('request_sha256')}; the broker must send verbatim instrument calls "
                     "unchanged (no worker policy, no assignment text)")
+        elif r.get("broker_error_code") == "INSTRUMENT_MESSAGE_MISMATCH":
+            text = (f"call {result.call_id}: {r.get('error')}; the bundle installed under "
+                    f"{r.get('broker_instrument_digest')} or the broker worker's model differs from the request the "
+                    "instrument built (install exactly the bundle 'ocsl-review instruments export' prints for this tier "
+                    "and journal)")
         else:
-            text = f"call {result.call_id}: {r.get('error')}; the broker must run this instrument in verbatim mode"
+            text = (f"call {result.call_id}: {r.get('error')}; the broker must run this instrument in verbatim mode over "
+                    "the run principal's socket")
         with self.lock:
             self._fidelity.append(text)
 
@@ -1622,19 +1637,21 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
 
 
 def transport_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
-    """Study bundle and broker receipts: calls per transport, request-digest mismatches, and accepted verdicts (primary
-    and sensitivity variants, in the append-only history) whose broker call did not attest the request the instrument
-    built (0 by construction)."""
+    """Study bundle and broker receipts: calls per transport, request-digest mismatches, calls the broker refused before
+    any provider call, and accepted verdicts (primary and sensitivity variants, in the append-only history) whose broker
+    call did not attest the request the instrument built (0 by construction)."""
     pause = meta.get("runPause")
     out: dict[str, Any] = {"studyBundleSha256": meta.get("studyBundleSha256"),
                            "runPause": json.loads(pause) if pause else None}
     columns = scores_db.table_columns(c, "calls")
     if "transport" not in columns:
-        return {**out, "callsByTransport": {}, "brokerCalls": 0, "brokerRequestMismatches": 0,
+        return {**out, "callsByTransport": {}, "brokerCalls": 0, "brokerRequestMismatches": 0, "brokerRefusals": 0,
                 "brokerVerdictsFromUnverifiedRequests": 0, "receiptsWithoutStudyBundle": None}
     by_transport = {(row[0] or "direct"): row[1] for row in c.execute(
         "SELECT transport, COUNT(*) FROM calls GROUP BY transport ORDER BY transport")}
     mismatches = c.execute("SELECT COUNT(*) FROM calls WHERE transport='broker' AND error='request_mismatch'").fetchone()[0]
+    refusals = c.execute("SELECT COUNT(*) FROM calls WHERE transport='broker' AND "
+                         "error LIKE 'broker refused the instrument call:%'").fetchone()[0]
     verdicts = c.execute("SELECT COUNT(*) FROM history h JOIN calls k ON k.call_id=h.call_id WHERE h.outcome='accepted' "
                          "AND k.transport='broker' AND (k.broker_request_sha256 IS NULL OR "
                          "k.broker_request_sha256 != k.request_sha256)").fetchone()[0]
@@ -1642,7 +1659,7 @@ def transport_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
     without = (c.execute("SELECT COUNT(*) FROM calls WHERE study_bundle_sha256 IS NULL OR study_bundle_sha256 != ?",
                          (pinned,)).fetchone()[0] if pinned else None)
     return {**out, "callsByTransport": by_transport, "brokerCalls": by_transport.get("broker", 0),
-            "brokerRequestMismatches": mismatches, "brokerVerdictsFromUnverifiedRequests": verdicts,
+            "brokerRequestMismatches": mismatches, "brokerRefusals": refusals, "brokerVerdictsFromUnverifiedRequests": verdicts,
             "receiptsWithoutStudyBundle": without}
 
 

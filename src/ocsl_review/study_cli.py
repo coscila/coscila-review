@@ -277,6 +277,9 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
     if status.get("brokerCalls"):
         # A verdict counts only from a broker call whose receipt attests the request the instrument built.
         checks["everyBrokerVerdictFromAVerifiedRequest"] = status.get("brokerVerdictsFromUnverifiedRequests") == 0
+    if status.get("brokerRefusals"):
+        notes.append(f"{status['brokerRefusals']} broker calls were refused before any provider call (the installed bundle, "
+                     "the worker's model or the socket's authority does not match the instrument's request)")
     if status.get("brokerRequestMismatches"):
         notes.append(f"{status['brokerRequestMismatches']} broker calls reported another request than the instrument "
                      "built; they are invalid and their outputs were discarded")
