@@ -5,8 +5,10 @@ The executor never holds provider credentials or a bearer token. The run
 principal's socket is its identity: ``GET /configs`` over it names the
 principal, its run, its granted instruments and one bulk worker per granted
 provider. Each paper-batch call becomes one bulk job with one item that names
-the instrument's broker digest and carries the messages exactly as the
-instrument built them (``transport.messages: verbatim``). The broker reports a
+the instrument's broker digest and carries the request the instrument built:
+the messages exactly as built (``transport.messages: verbatim``) and the request
+settings, which the broker checks against the installed bundle and the worker's
+model before any provider call. The broker reports a
 receipt per item (served model, server fingerprint, settings digest and the
 digest of the request it sent upstream); the executor compares that request
 digest with the canonical JSON of the body it built itself.
@@ -384,20 +386,28 @@ class BrokerTransport:
 
     # ------------------------------------------------------------------ calls
     def call(self, *, item_id: str, messages: list[dict[str, Any]], item_count: int, digest: str, key: str,
-             wait_seconds: float | None = None) -> BrokerOutcome:
-        """Submit one instrument call as a one-item job and follow its job lineage until the item settles."""
+             settings: Mapping[str, Any] | None = None, wait_seconds: float | None = None) -> BrokerOutcome:
+        """Submit one instrument call as a one-item job and follow its job lineage until the item settles.
+
+        The item carries the request the instrument built: ``messages`` unchanged, ``item_count`` and ``settings``,
+        the request's other fields (model, max_tokens, temperature, stream, reasoning_effort). The broker checks every
+        setting against the installed bundle and the worker's model and refuses the item before any provider call when
+        one differs (INSTRUMENT_MESSAGE_MISMATCH), so a request other than the instrument's never reaches a judge.
+        """
         started = self.clock()
         deadline = started + (wait_seconds if wait_seconds is not None else self.wait_seconds)
-        outcome = self._call(item_id, messages, item_count, digest, key, deadline)
+        outcome = self._call(item_id, messages, item_count, digest, key, dict(settings or {}), deadline)
         outcome.seconds = round(self.clock() - started, 3)
         return outcome
 
-    def _call(self, item_id, messages, item_count, digest, key, deadline) -> BrokerOutcome:
+    def _call(self, item_id, messages, item_count, digest, key, settings, deadline) -> BrokerOutcome:
         halted = self.halted
         if halted:
             return BrokerOutcome("halted", error="transport halted: " + halted["reason"])
+        item = {**{name: value for name, value in settings.items() if name not in ("messages", "itemCount")},
+                "messages": messages, "itemCount": item_count}
         request = {"configId": self.worker_id, "idempotencyKey": key, "concurrency": 1, "instrumentDigest": digest,
-                   "items": [{"id": item_id, "input": {"messages": messages, "itemCount": item_count}}]}
+                   "items": [{"id": item_id, "input": item}]}
         try:
             job = _job(self.client.request("POST", "/bulk/submit?view=summary", request))
         except BrokerUnavailable as error:

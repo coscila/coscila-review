@@ -326,19 +326,23 @@ class MockBroker:
             self.settle(job, result, state="failed", errorCode=self.refuse_code,
                         error=f"Refused before any provider call ({self.refuse_code}).")
             return
-        if (not isinstance(messages, list) or not messages or set(data) - {"messages", "itemCount"}
+        count = data.get("itemCount", bundle["itemsPerCall"]) if isinstance(data, dict) else 0
+        max_tokens = max(bundle["maxOutputTokens"]["minimum"], bundle["maxOutputTokens"]["perItem"] * count)
+        # Settings an item may repeat must equal what is sent (the worker's model and the bundle), as in the daemon.
+        repeated = {"model": self.model, "max_tokens": max_tokens, "temperature": bundle["temperature"],
+                    "seed": bundle["seed"], "reasoning_effort": bundle["reasoning"], "stream": False}
+        if (not isinstance(messages, list) or not messages or set(data) - {"messages", "itemCount", *repeated}
                 or messages[0].get("role") != "system" or messages[0].get("content") != bundle["systemPrompt"]
-                or data.get("itemCount", 1) > bundle["itemsPerCall"]):
+                or not 1 <= count <= bundle["itemsPerCall"]
+                or any(name in data and data[name] != value for name, value in repeated.items())):
             # The daemon refuses every verbatim item that is not the installed instrument's request this way.
             self.settle(job, result, state="failed", errorCode="INSTRUMENT_MESSAGE_MISMATCH",
-                        error="Verbatim instrument call refused: the system message differs from the installed "
-                              "instrument prompt.")
+                        error="Verbatim instrument call refused: the messages or settings differ from the installed "
+                              "instrument.")
             return
-        count = data.get("itemCount", bundle["itemsPerCall"])
         system = (POLICY_PREFIX + "\n\n" if self.inject_policy else "") + messages[0]["content"]
         sent = [{"role": "system", "content": system}, *messages[1:]]
-        body = {"model": self.model, "messages": sent,
-                "max_tokens": max(bundle["maxOutputTokens"]["minimum"], bundle["maxOutputTokens"]["perItem"] * count),
+        body = {"model": self.model, "messages": sent, "max_tokens": max_tokens,
                 "temperature": bundle["temperature"], "stream": False, "reasoning_effort": bundle["reasoning"]}
         if bundle["seed"] is not None:
             body["seed"] = bundle["seed"]
@@ -562,8 +566,14 @@ class BrokerAbstractTierTests(BrokerTestCase):
         self.assertEqual(1, self.broker.calls_to_route("GET", "/configs"))
         job = self.broker.jobs[call["broker_job_id"]]
         self.assertEqual(idempotency_key(call["call_id"], call["request_sha256"]), job["idempotencyKey"])
-        self.assertEqual({"messages", "itemCount"}, set(job["items"][0]["input"]))
-        self.assertEqual(15, job["items"][0]["input"]["itemCount"])
+        # The item is the request the instrument built (messages and settings) and its entry count.
+        sent_item = job["items"][0]["input"]
+        self.assertEqual({"messages", "itemCount", "model", "max_tokens", "temperature", "stream", "reasoning_effort"},
+                         set(sent_item))
+        self.assertEqual((15, MODEL, 10500, 0.0, False, "none"),
+                         (sent_item["itemCount"], sent_item["model"], sent_item["max_tokens"], sent_item["temperature"],
+                          sent_item["stream"], sent_item["reasoning_effort"]))
+        self.assertEqual(call["request_sha256"], request_sha256({k: v for k, v in sent_item.items() if k != "itemCount"}))
         status = self.status()
         self.assertEqual((1, 0, 0, 0, {"broker": 1}), (status["brokerCalls"], status["brokerRequestMismatches"],
                                                        status["brokerVerdictsFromUnverifiedRequests"],
@@ -662,6 +672,20 @@ class BrokerAbstractTierTests(BrokerTestCase):
                                               and (attempts, served, parsed) == (0, None, 0)
                                               for kind, error, attempts, served, parsed in calls), calls)
         self.assertEqual([], self.broker.upstream)
+
+    def test_settings_that_differ_from_the_installed_bundle_are_refused_before_any_call(self):
+        # A bundle whose output-token rule differs from the instrument's: the item repeats the max_tokens the
+        # instrument built, so the broker refuses it instead of sending its own value upstream.
+        digests = self.broker.install_census()
+        self.broker.instruments[digests["abstract"]]["maxOutputTokens"] = {"perItem": 701, "minimum": 3000}
+        run = self.run_census()
+        self.prepare(run)
+        result = run.run_abstract()
+        self.assertEqual(("paused", 0), (result["state"], result["accepted"]))
+        self.assertIn("INSTRUMENT_MESSAGE_MISMATCH", result["reason"])
+        self.assertEqual([], self.broker.upstream, "no request other than the instrument's reached the judge")
+        self.assertEqual(["broker refused the instrument call: INSTRUMENT_MESSAGE_MISMATCH"],
+                         [c["error"].split(" (")[0] for c in self.rows("SELECT error FROM calls")])
 
     def test_a_bundle_installed_wrongly_under_the_census_digest_stops_the_run_before_any_call(self):
         digests = self.broker.install_census()
