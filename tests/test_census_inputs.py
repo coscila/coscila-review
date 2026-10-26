@@ -691,6 +691,25 @@ class FreshEnumerationTests(CacheTestCase):
                          (inputs["inputStoreMerkleRoot"], inputs["enumerationSha256"]))
         self.assertEqual({"ok": True, "facts": export["count"]}, corpus_facts.verify_export(self.root / "facts" / "facts.json"))
 
+    def test_stored_manifests_are_read_for_identities_only(self):
+        folder = self.root / "stored"
+        folder.mkdir()
+        rows = [{"doi": "https://doi.org/10.5555/A", "journal": "J", "stratum": "Review", "abs_class": "x"},
+                {"doi": "10.5555/a", "journal": "J"}, {"doi": "not a doi"}, ["not", "a", "record"]]
+        (folder / "m.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        (folder / "m.json").write_text(json.dumps({"reviews": rows}))
+        (folder / "m.tsv").write_text("DOI\tJournal\tStratum\n10.5555/a\tJ\tReview\n\tJ\t\n")
+        for name, invalid in (("m.jsonl", 2), ("m.json", 2), ("m.tsv", 1)):
+            records, info = census_inputs.load_stored_manifest(folder / name)
+            self.assertEqual(([{"doi": "10.5555/a", "journal": "J", "stratum": "Review"}], invalid, 1),
+                             (records, info["invalid"], info["records"]), name)
+            self.assertEqual(census_inputs.sha256_bytes((folder / name).read_bytes()), info["sha256"])
+        (folder / "bad.json").write_text("{")
+        with self.assertRaises(ValidationError):
+            census_inputs.load_stored_manifest(folder / "bad.json")
+        with self.assertRaisesRegex(ValidationError, "label"):
+            record_comparison(self.database, folder / "m.tsv", folder / "out.json", label="Not A Label")
+
     def test_compare_manifests_counts_by_journal_and_stratum(self):
         fresh = [{"journal": "A", "doi": "1", "stratum": "x"}, {"journal": "A", "doi": "2", "stratum": "y"}]
         stored = [{"journal": "a", "doi": "2", "stratum": "y"}, {"journal": "A ", "doi": "3", "stratum": "x"},
