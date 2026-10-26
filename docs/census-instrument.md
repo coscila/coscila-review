@@ -177,14 +177,15 @@ bytes.
 **The guard.** Each cache is ATTACHed with `mode=ro&immutable=1` behind a
 SQLite authorizer (`store_client.GuardedReader`). A statement may read the
 cache's allowlisted tables and nothing else: for the store, the projection's
-kept tables (works, identifiers, source artifacts, retrievals, sections,
-documents, the retained-source index and its metadata); for the provider cache,
-its `responses` table only, so leases, rate slots and recorded failures are
-never reused. A read of any other table, a view over one, a schema table, a
-table-valued function, a write, a pragma or a further ATTACH is refused with an
-error naming the table, never answered with an empty result, so no verdict,
-score, locus, attempt, summary or bibliography property can be read even from
-a store that carried one. Opening the store also verifies its Merkle root, that
+kept tables (corpora, works, identifiers, source artifacts, retrievals,
+sections, documents, the retained-source index and its metadata); for the
+provider cache, its `responses` table only, so leases, rate slots and recorded
+failures are never reused. A read of any other table, a view over one, a schema
+table or a table-valued function is refused with an error naming the table, and
+writes, pragmas, recursive queries and further ATTACHes are refused as well;
+nothing is ever answered with an empty result instead, so no verdict, score,
+locus, attempt, summary or bibliography property can be read even from a store
+that carried one. Opening the store also verifies its Merkle root, that
 it declares the projection format with the current rules, and the projection
 gate (no row outside the kept tables). Every byte read from either cache must
 hash to the digest the cache records and is refused if it carries legacy
@@ -218,8 +219,10 @@ class (entitled: the institution's licence). The same identity and article
 checks apply. Linked table pages of an HTML review come from the store, the
 provider cache or the route, in that order; a table page that declares a DOI
 must declare the review's. Without a route a journal is read from the caches
-only. Documents are written content-addressed to `documents/` beside the output,
-records stream through `<output>.partial` and resume, a throttled or failing
+only. Documents are written content-addressed to `documents/` beside the output
+(keep the study's later manifests, such as the abstracts output, in the same
+directory so the document paths resolve), records stream through
+`<output>.partial` and resume, a throttled or failing
 route leaves the record in state `retry` for the next run on the output, and
 `--retry-unavailable` tries the unavailable ones again.
 
