@@ -19,7 +19,8 @@ its result) instead of starting a second judgment. When that key holds work the
 broker will not run again for this call (it answers WORKER_KEY_CONFLICT: the job
 was submitted under another worker configuration, or its resume is refused with
 WORKER_CONFIG_CHANGED), the call takes the next key of a fixed sequence, after
-taking the result of the job the conflict names if that job settled the call.
+taking the result of the job the conflict names if that job, or a resume of it,
+settled the call.
 A paused job (provider limit, budget, expiry, withdrawn grant) halts the
 transport unless it may be resumed: a pause observed during an invocation is
 resumed once per job lineage (it may be a provider pause another call left), a
