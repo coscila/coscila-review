@@ -304,14 +304,17 @@ class MockBroker:
             return 409, {"error": "Only settled or paused jobs can resume.", "code": "INVALID_REQUEST"}
         if self.budget is not None and self.dispatched >= self.budget:
             return 409, {"error": "Principal admission is closed: budget_exhausted.", "code": "BUDGET_EXHAUSTED"}
-        if job["config"] != self.worker_config:
-            return 409, {"error": "Worker configuration changed since this job was submitted.", "code": "WORKER_CONFIG_CHANGED"}
+        items = [item for item in job["items"] if job["results"][item["id"]]["state"] != "completed"]
         key = sha(job["idempotencyKey"])[:48] + "-resume-" + job["jobId"]
-        if key in self.keys:
-            resumed = self.jobs[self.keys[key]]         # an earlier resume: answered as it is, no pause cleared
+        if not items:
+            resumed = job                               # nothing left to run: the job itself
+        elif key in self.keys:
+            # An earlier resume, answered as it is (a lookup before the configuration check): no pause is cleared.
+            resumed = self.jobs[self.keys[key]]
+        elif job["config"] != self.worker_config:
+            return 409, {"error": "Worker configuration changed since this job was submitted.", "code": "WORKER_CONFIG_CHANGED"}
         else:
             self.provider_paused = None
-            items = [item for item in job["items"] if job["results"][item["id"]]["state"] != "completed"]
             resumed = self.create(key, job["fingerprint"], job["instrumentDigest"], items, resumed_from=job["jobId"])
         full = self.summary(resumed)
         full["results"] = [dict(r) for r in resumed["results"].values()]
@@ -1432,6 +1435,35 @@ class BrokerWorkerChangeTests(BrokerTestCase):
         self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
         self.assertEqual((1, 1, 0), (len(self.broker.upstream), len(self.broker.jobs), done["transport"]["keyGenerations"]))
 
+    def test_a_call_whose_resumed_job_settled_before_the_worker_changed_takes_that_answer(self):
+        # The call's job paused (429) and was resumed; the resumed job answered, but the census died before recording
+        # it. The worker configuration then changed: the walk still reaches the answer, and nothing is judged twice.
+        self.broker.install_census()
+        self.broker.rate_limit_next = 1
+        transport = self.transport()
+        original = transport._await
+
+        def crash_on_resumed(job_id, deadline):
+            if self.broker.jobs[job_id]["resumedFromJobId"]:
+                raise Crash()
+            return original(job_id, deadline)
+        transport._await = crash_on_resumed
+        run = self.run_census(transport=transport)
+        self.prepare(run)
+        with self.assertRaises(Crash):
+            run.run_abstract()
+        run.close()
+        wait_until(lambda: any(job["state"] == "completed" for job in self.broker.jobs.values()))
+        self.broker.worker_config = {**self.broker.worker_config, "baseUrl": "http://127.0.0.1:10/v1"}
+        again = self.run_census()
+        done = again.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+        self.assertEqual((0, 1), (done["transport"]["keyGenerations"], done["transport"]["walked"]))
+        self.assertEqual((2, 2), (len(self.broker.jobs), len(self.broker.upstream)),
+                         "the paused call and its resume; no job under a new key")
+        settled = self.rows(f"SELECT broker_job_id FROM {CALLS}")[0]["broker_job_id"]
+        self.assertIsNotNone(self.broker.jobs[settled]["resumedFromJobId"])
+
 
 class BrokerLostAnswerTests(BrokerTestCase):
     def test_a_lost_full_text_answer_is_collected_from_its_job_and_never_judged_again(self):
@@ -1495,6 +1527,25 @@ class BrokerLostAnswerTests(BrokerTestCase):
         self.assertEqual(("completed", 2, 0), (done["state"], done["accepted"], done["invalid"]))
         self.assertEqual((2, 2), (len(self.broker.jobs), len(self.broker.upstream)),
                          "the next invocation sent exactly the repair that was due and met its job")
+        self.assertEqual(0, self.status()["duplicateJudgments"])
+
+    def test_a_job_a_daemon_restart_interrupted_is_resumed_and_judged_once(self):
+        self.broker.install_census()
+        self.broker.release.clear()                 # the job waits to run
+        run = self.run_census()
+        self.prepare(run)
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("run", run.run_abstract()))
+        thread.start()
+        wait_until(lambda: len(self.broker.jobs) == 1)
+        self.broker.restart()                       # the daemon restarts before the job ran: interrupted, not relaunched
+        self.broker.release.set()
+        thread.join(30)
+        self.assertEqual(("completed", 15), (result["run"]["state"], result["run"]["accepted"]))
+        jobs = sorted(self.broker.jobs.values(), key=lambda job: job["revision"])
+        self.assertEqual(["interrupted", "completed"], [job["state"] for job in jobs])
+        self.assertEqual(jobs[0]["jobId"], jobs[1]["resumedFromJobId"])
+        self.assertEqual(1, len(self.broker.upstream))
         self.assertEqual(0, self.status()["duplicateJudgments"])
 
     def test_a_job_settled_while_its_item_still_runs_is_not_an_answer(self):
