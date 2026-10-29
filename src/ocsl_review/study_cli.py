@@ -291,6 +291,11 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
     if (status.get("brokerPrincipals") or 0) > 1:
         notes.append(f"broker calls ran under {status['brokerPrincipals']} run principals: calls in flight when a principal "
                      "was revoked may also have been judged under it, outside this database")
+    if status.get("inputsWithControlTokens"):
+        notes.append(f"{status['inputsWithControlTokens']} inputs the judge sees carry chat-template control tokens "
+                     "(sanitizer rules control-token and control-block): the instrument sends its inputs byte for byte on "
+                     "either transport, and a judge server that reads special tokens inside message content may take them "
+                     "as role markers")
     if responded and not status["fingerprintOffered"]:
         notes.append("the judge server offered no system_fingerprint on any response, so the fingerprint gate cannot "
                      "pass with this server")
