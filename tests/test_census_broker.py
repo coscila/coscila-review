@@ -27,8 +27,8 @@ from pathlib import Path
 
 from ocsl_review import citation_census as C
 from ocsl_review import instruments, scores_db
-from ocsl_review.census_broker import (BrokerTransport, canonical_json, canonical_sha256, idempotency_key,
-                                       request_sha256)
+from ocsl_review.census_broker import (BrokerTransport, canonical_json, canonical_sha256, generation_key,
+                                       idempotency_key, request_sha256)
 from ocsl_review.census_runner import CensusRun, HttpChatTransport, census_status
 from ocsl_review.claim_check import ConfidentialPolicy
 from ocsl_review.cli import main
@@ -41,6 +41,8 @@ from test_citation_census_fidelity import SYSTEM
 
 POLICY_PREFIX = "Synthetic broker worker policy."
 REASONING = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode")
+# Call receipts with their transport row (a call has one row in each).
+CALLS = "calls LEFT JOIN call_transport USING(call_id)"
 
 
 def sha(text: str) -> str:
@@ -58,8 +60,10 @@ def _integral(value):
 
 
 def daemon_canonical(value) -> str:
-    """The daemon's canonical JSON for ASCII keys, BMP text and plain numbers: sorted keys, no whitespace, 0.0 as 0."""
-    return json.dumps(_integral(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """The daemon's canonical JSON for ASCII keys, BMP text and plain numbers: sorted keys, no whitespace, 0.0 as 0,
+    lone surrogates escaped as JSON.stringify writes them."""
+    text = json.dumps(_integral(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "".join("\\u%04x" % ord(ch) if "\ud800" <= ch <= "\udfff" else ch for ch in text)
 
 
 def validate_bundle(bundle) -> None:
@@ -78,8 +82,25 @@ def validate_bundle(bundle) -> None:
         raise ValueError("schema or transport")
 
 
+def load_legacy_scores_db():
+    """dev 1b355a9's scores_db module (tests/fixtures/legacy), loaded as a module of the ocsl_review package."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "fixtures" / "legacy" / "scores_db_1b355a9.py"
+    spec = importlib.util.spec_from_file_location("ocsl_review._legacy_scores_db_1b355a9", path)
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "ocsl_review"
+    spec.loader.exec_module(module)
+    return module
+
+
 class MockBroker:
-    """A run principal's socket with one bulk worker, executing one-item instrument jobs on background threads."""
+    """A run principal's socket with one bulk worker, executing one-item instrument jobs on background threads.
+
+    As the daemon: a job's fingerprint covers the worker configuration and the request (a key reused under another
+    configuration is WORKER_KEY_CONFLICT naming the job that holds it), a resume of a job whose worker configuration
+    changed is WORKER_CONFIG_CHANGED, a resume of a job resumed before answers that resume and clears no provider
+    pause, an exhausted budget pauses the job and leaves its item queued, and a verbatim item reports the served model
+    and system_fingerprint the upstream named (null when it named none) and the HTTP status."""
 
     def __init__(self, directory: Path):
         self.path = str(directory / "principal" / "broker.sock")
@@ -98,9 +119,15 @@ class MockBroker:
         self.release.set()
         self.latency = 0.0                      # simulated upstream seconds per call, outside the lock
         self.inject_policy = self.omit_request_digest = self.refuse_items = False
+        self.omit_served_model = self.omit_fingerprint = self.empty_answers = False
         self.refuse_code = "INSTRUMENT_MESSAGE_MISMATCH"
         self.fail_next: list[str] = []
+        self.status_next: list[int] = []        # upstream statuses answered to the next calls (4xx: INVALID_REQUEST)
         self.refuse_next = self.rate_limit_next = 0
+        self.worker_config = {"baseUrl": "http://127.0.0.1:9/v1", "label": "Synthetic judge"}
+        self.hold_repairs = threading.Event()   # set: repair calls wait until it is cleared
+        self.hold = None                        # callable(job) -> bool: the job waits while it answers True
+        self.settle_early_jobs = 0              # the next jobs report failed once while their item still runs
         self.resume_after = self.provider_paused = None
         self.budget: int | None = None
         self.dispatched = 0
@@ -247,12 +274,13 @@ class MockBroker:
             return 403, {"error": "This principal is not granted that instrument.", "code": "INSTRUMENT_NOT_GRANTED"}
         if digest not in self.instruments:
             return 400, {"error": "This instrument digest is not installed in the broker.", "code": "INSTRUMENT_NOT_ALLOWED"}
-        fingerprint = sha(json.dumps(body, sort_keys=True))
+        fingerprint = sha(json.dumps({"config": self.worker_config, "body": body}, sort_keys=True))
         existing = self.keys.get(body["idempotencyKey"])
         if existing is not None:
             job = self.jobs[existing]
             if job["fingerprint"] != fingerprint:
-                return 409, {"error": "Idempotency key was used for different work.", "code": "WORKER_KEY_CONFLICT"}
+                return 409, {"error": "Idempotency key was used for different work.", "code": "WORKER_KEY_CONFLICT",
+                             "jobId": job["jobId"]}
             return 200, self.summary(job)
         job = self.create(body["idempotencyKey"], fingerprint, digest, body["items"])
         return 200, self.summary(job)
@@ -260,7 +288,7 @@ class MockBroker:
     def create(self, key, fingerprint, digest, items, resumed_from=None) -> dict:
         job = {"jobId": str(uuid.uuid4()), "state": "queued", "idempotencyKey": key, "fingerprint": fingerprint,
                "configId": self.worker, "instrumentDigest": digest, "items": items, "error": None, "resumeAfter": None,
-               "resumedFromJobId": resumed_from, "results": {}}
+               "resumedFromJobId": resumed_from, "results": {}, "config": dict(self.worker_config)}
         for item in items:
             job["results"][item["id"]] = {"id": item["id"], "state": "queued", "providerId": self.worker,
                                           "model": self.model, "promptSha256": sha(json.dumps(item["input"])),
@@ -276,16 +304,31 @@ class MockBroker:
             return 409, {"error": "Only settled or paused jobs can resume.", "code": "INVALID_REQUEST"}
         if self.budget is not None and self.dispatched >= self.budget:
             return 409, {"error": "Principal admission is closed: budget_exhausted.", "code": "BUDGET_EXHAUSTED"}
-        self.provider_paused = None
+        if job["config"] != self.worker_config:
+            return 409, {"error": "Worker configuration changed since this job was submitted.", "code": "WORKER_CONFIG_CHANGED"}
         key = sha(job["idempotencyKey"])[:48] + "-resume-" + job["jobId"]
         if key in self.keys:
-            resumed = self.jobs[self.keys[key]]
+            resumed = self.jobs[self.keys[key]]         # an earlier resume: answered as it is, no pause cleared
         else:
+            self.provider_paused = None
             items = [item for item in job["items"] if job["results"][item["id"]]["state"] != "completed"]
             resumed = self.create(key, job["fingerprint"], job["instrumentDigest"], items, resumed_from=job["jobId"])
         full = self.summary(resumed)
         full["results"] = [dict(r) for r in resumed["results"].values()]
         return 200, full
+
+    def restart(self, *, relaunch: bool = False) -> None:
+        """A daemon restart: running and queued jobs are requeued and relaunched, or interrupted for a resume."""
+        with self.lock:
+            for job in self.jobs.values():
+                if job["state"] in ("queued", "running"):
+                    for result in job["results"].values():
+                        if result["state"] == "running":
+                            result["state"] = "queued"
+                    self.set_state(job, state="queued" if relaunch else "interrupted",
+                                   error=None if relaunch else "Runner restarted; resume the job.")
+                    if relaunch:
+                        threading.Thread(target=self.execute_job, args=(job["jobId"],), daemon=True).start()
 
     # ------------------------------------------------------------------ execution
     def execute_job(self, job_id) -> None:
@@ -294,9 +337,28 @@ class MockBroker:
             time.sleep(self.latency)
         with self.lock:
             job = self.jobs[job_id]
+            repair = any(self.is_repair(item) for item in job["items"])
+        while (repair and self.hold_repairs.is_set()) or (self.hold is not None and self.hold(job)):
+            time.sleep(0.01)
+        with self.lock:
             if job["state"] != "queued":
                 return
             self.set_state(job, state="running")
+            early = list(job["items"]) if self.settle_early_jobs > 0 else []
+            if early:
+                # A second launch of the job (as across a restart) settles it failed while the first still runs the item.
+                self.settle_early_jobs -= 1
+                for item in early:
+                    job["results"][item["id"]]["state"] = "running"
+                self.set_state(job, state="failed", error="settled by a second launch")
+        if early:
+            time.sleep(0.3)
+            with self.lock:
+                for item in early:
+                    self.execute_item(job, item)
+                job["revision"] = self.bump()
+            return
+        with self.lock:
             for item in job["items"]:
                 if job["state"] != "running":
                     break
@@ -304,6 +366,12 @@ class MockBroker:
             if job["state"] == "running":
                 done = all(r["state"] == "completed" for r in job["results"].values())
                 self.set_state(job, state="completed" if done else "failed")
+
+    @staticmethod
+    def is_repair(item) -> bool:
+        data = item.get("input") if isinstance(item, dict) else None
+        messages = data.get("messages") if isinstance(data, dict) else None
+        return bool(messages) and C.repair_note() in str(messages[-1].get("content"))
 
     def settle(self, job, result, **fields) -> None:
         result.update(fields)
@@ -316,8 +384,7 @@ class MockBroker:
             self.set_state(job, state="paused", error=self.provider_paused, resumeAfter=self.resume_after)
             return
         if self.budget is not None and self.dispatched >= self.budget:
-            self.settle(result, result, state="paused", errorCode="BUDGET_EXHAUSTED",
-                        error="Principal admission is closed: budget_exhausted.")
+            # As the daemon: the principal refuses admission, the item stays queued and the job pauses.
             self.set_state(job, state="paused", error="budget_exhausted")
             return
         data = item["input"]
@@ -352,8 +419,12 @@ class MockBroker:
         settings = {"model": body["model"], "temperature": body["temperature"], "seed": body.get("seed"),
                     "reasoning": body["reasoning_effort"], "max_tokens": body["max_tokens"], "response_format_sha256": None,
                     "system_prompt_sha256": sha(system)}
-        measured = {"model": self.served, "serverFingerprint": "fp-broker", "settingsSha256": sha(daemon_canonical(settings)),
-                    "attempts": 1, "finishReason": "stop", "promptSha256": sha(json.dumps(body)),
+        served = None if self.omit_served_model else self.served
+        measured = {"model": served or self.model, "servedModel": served,
+                    "systemFingerprint": None if self.omit_fingerprint else "fp-broker",
+                    "serverFingerprint": (f"{served or self.model}@0123456789abcdef" if self.omit_fingerprint else "fp-broker"),
+                    "httpStatus": 200, "settingsSha256": sha(daemon_canonical(settings)),
+                    "attempts": 1, "finishReason": "stop", "promptSha256": hashlib.sha256(json.dumps(body).encode("ascii")).hexdigest(),
                     "usage": {"input": 100, "output": 20, "cacheRead": 64, "cacheWrite": None, "reasoning": None,
                               "total": 120, "quality": "measured"}}
         if not self.omit_request_digest:
@@ -366,21 +437,26 @@ class MockBroker:
             self.set_state(job, state="paused", error=self.provider_paused, resumeAfter=self.resume_after)
             return
         if self.fail_next:
-            self.settle(job, result, **{**measured, "attempts": 3}, state="failed", errorCode=self.fail_next.pop(0),
-                        error="Provider request failed with HTTP 502.")
+            self.settle(job, result, **{**measured, "attempts": 3, "httpStatus": 502}, state="failed",
+                        errorCode=self.fail_next.pop(0), error="Provider request failed with HTTP 502.")
+            return
+        if self.status_next:
+            status = self.status_next.pop(0)
+            self.settle(job, result, **{**measured, "httpStatus": status}, state="failed", errorCode="INVALID_REQUEST",
+                        error=f"Provider request failed with HTTP {status}.")
             return
         if self.refuse_next:
             self.refuse_next -= 1
-            self.settle(job, result, **measured, state="failed", errorCode="INVALID_REQUEST",
+            self.settle(job, result, **{**measured, "httpStatus": 400}, state="failed", errorCode="INVALID_REQUEST",
                         error="Provider request failed with HTTP 400.")
             return
         required = bundle["requiredModelFingerprint"]
-        if required and self.served != required:
-            self.provider_paused = f"Model drift: the instrument requires {required}; the provider served {self.served}."
+        if required and served != required and measured["systemFingerprint"] != required:
+            self.provider_paused = f"Model drift: the instrument requires {required}; the provider served {served}."
             self.settle(job, result, **measured, state="paused", errorCode="MODEL_DRIFT", error=self.provider_paused)
             self.set_state(job, state="paused", error=self.provider_paused)
             return
-        output = self.judge.answer({"messages": sent})
+        output = "" if self.empty_answers else self.judge.answer({"messages": sent})
         self.settle(job, result, **measured, state="completed", output=output, outputDigest=sha(output),
                     outputBytes=len(output.encode()))
 
@@ -545,10 +621,11 @@ class BrokerAbstractTierTests(BrokerTestCase):
         self.assertEqual(("completed", 1, 15, 0), (result["state"], result["reviews"], result["accepted"], result["invalid"]))
         self.assertEqual(("broker", "run-principal-census", "remote_qwen38_none"),
                          (result["transport"]["kind"], result["transport"]["principalId"], result["transport"]["worker"]))
-        call = self.rows("SELECT * FROM calls")[0]
-        self.assertEqual(("broker", digests["abstract"], call["call_id"], self.bundle["sha256"], "fp-broker", MODEL),
+        call = self.rows(f"SELECT * FROM {CALLS}")[0]
+        self.assertEqual(("broker", digests["abstract"], call["call_id"], self.bundle["sha256"], "fp-broker", MODEL, 200),
                          (call["transport"], call["broker_instrument_digest"], call["broker_item_id"],
-                          call["study_bundle_sha256"], call["fingerprint"], call["served_model"]))
+                          call["study_bundle_sha256"], call["fingerprint"], call["served_model"], call["broker_http_status"]))
+        self.assertEqual("fp-broker", call["broker_server_fingerprint"])
         self.assertEqual(call["request_sha256"], call["broker_request_sha256"])
         self.assertIn(call["broker_job_id"], self.broker.jobs)
         self.assertEqual("run-principal-census", call["broker_principal_id"])
@@ -599,8 +676,8 @@ class BrokerAbstractTierTests(BrokerTestCase):
             self.prepare(run)
             self.assertEqual(15, run.run_abstract()["accepted"])
         with closing(sqlite3.connect(direct_db)) as c:
-            direct_calls = c.execute("SELECT kind, request_sha256, body_sha256, transport FROM calls ORDER BY kind").fetchall()
-        broker_calls = [tuple(r.values()) for r in self.rows("SELECT kind, request_sha256, body_sha256, transport FROM calls "
+            direct_calls = c.execute(f"SELECT kind, request_sha256, body_sha256, transport FROM {CALLS} ORDER BY kind").fetchall()
+        broker_calls = [tuple(r.values()) for r in self.rows(f"SELECT kind, request_sha256, body_sha256, transport FROM {CALLS} "
                                                              "ORDER BY kind")]
         self.assertEqual([(k, r, b) for k, r, b, _ in direct_calls], [(k, r, b) for k, r, b, _ in broker_calls])
         self.assertEqual(({"direct"}, {"broker"}), ({t for *_, t in direct_calls}, {t for *_, t in broker_calls}))
@@ -621,7 +698,7 @@ class BrokerAbstractTierTests(BrokerTestCase):
         self.assertTrue(result["reason"].startswith("fidelity: call "), result["reason"])
         self.assertIn("verbatim instrument calls unchanged", result["reason"])
         self.assertEqual("paused:fidelity", self.status()["runState"])
-        calls = self.rows("SELECT error, request_sha256, broker_request_sha256, n_parsed FROM calls")
+        calls = self.rows(f"SELECT error, request_sha256, broker_request_sha256, n_parsed FROM {CALLS}")
         self.assertTrue(calls and all(c["error"] == "request_mismatch" and c["n_parsed"] == 0 for c in calls))
         self.assertTrue(all(c["request_sha256"] != c["broker_request_sha256"] for c in calls))
         self.assertEqual(0, self.rows("SELECT COUNT(*) AS n FROM citations WHERE abs_basis IS NOT NULL AND "
@@ -718,7 +795,7 @@ class BrokerAbstractTierTests(BrokerTestCase):
         result = run.run_abstract()
         self.assertEqual(("completed", 15, 1), (result["state"], result["accepted"], result["transportFailures"]))
         calls = {c["kind"]: c for c in self.rows("SELECT * FROM calls")}
-        self.assertEqual(("broker failed: PROVIDER_UNREACHABLE", 3, None),
+        self.assertEqual(("broker failed: PROVIDER_UNREACHABLE (HTTP 502)", 3, None),
                          (calls["first"]["error"], calls["first"]["attempts"], calls["first"]["served_model"]))
         self.assertEqual((15, None), (calls["repair"]["n_items"], calls["repair"]["error"]))
         self.assertEqual(1, self.status()["transportFailures"])
@@ -730,7 +807,7 @@ class BrokerAbstractTierTests(BrokerTestCase):
         self.prepare(run)
         result = run.run_abstract()
         self.assertEqual(("completed", 0, 15), (result["state"], result["accepted"], result["invalid"]))
-        self.assertEqual(["refused: broker INVALID_REQUEST"] * 2, [c["error"] for c in self.rows("SELECT error FROM calls")])
+        self.assertEqual(["refused: broker INVALID_REQUEST (HTTP 400)"] * 2, [c["error"] for c in self.rows("SELECT error FROM calls")])
 
 
 class BrokerPauseTests(BrokerTestCase):
@@ -752,7 +829,7 @@ class BrokerPauseTests(BrokerTestCase):
         resumed = run.run_abstract()
         self.assertEqual(("completed", 15), (resumed["state"], resumed["accepted"]))
         self.assertEqual(1, self.broker.calls_to_route("POST", "/jobs/"))
-        call = self.rows("SELECT * FROM calls")[0]
+        call = self.rows(f"SELECT * FROM {CALLS}")[0]
         job = self.broker.jobs[call["broker_job_id"]]
         self.assertIsNotNone(job["resumedFromJobId"], "the call settled in the resumed job of the same lineage")
         self.assertEqual(2, len(self.broker.upstream))
@@ -805,7 +882,7 @@ class BrokerPauseTests(BrokerTestCase):
         paused = run.run_abstract()
         self.assertEqual("paused", paused["state"])
         self.assertIn("model_drift", paused["reason"])
-        call = self.rows("SELECT error, served_model, broker_error_code FROM calls")[0]
+        call = self.rows(f"SELECT error, served_model, broker_error_code FROM {CALLS}")[0]
         self.assertEqual(("model_drift", "another/model", "MODEL_DRIFT"), tuple(call.values()))
         self.assertEqual("paused:model_drift", self.status()["runState"])
         self.broker.served = MODEL
@@ -945,7 +1022,7 @@ class StudyBundleTests(BrokerTestCase):
         run = self.run_census(transport=transport)
         self.prepare(run, bundle=False)
         run.run_abstract()
-        self.assertEqual([None], [r["study_bundle_sha256"] for r in self.rows("SELECT study_bundle_sha256 FROM calls")])
+        self.assertEqual([None], [r["study_bundle_sha256"] for r in self.rows(f"SELECT study_bundle_sha256 FROM {CALLS}")])
         self.assertIsNone(self.status()["receiptsWithoutStudyBundle"])
         with self.assertRaisesRegex(ValidationError, "before the first call"):
             run.pin_study_bundle(self.bundle["sha256"])
@@ -955,24 +1032,46 @@ class StudyBundleTests(BrokerTestCase):
         self.prepare(run)
         run.run_abstract()
         self.assertEqual([(self.bundle["sha256"], "direct")],
-                         [tuple(r.values()) for r in self.rows("SELECT study_bundle_sha256, transport FROM calls")])
+                         [tuple(r.values()) for r in self.rows(f"SELECT study_bundle_sha256, transport FROM {CALLS}")])
         self.assertTrue(gates(self.status())["checks"]["everyReceiptCarriesTheStudyBundle"])
 
-    def test_old_working_databases_gain_the_receipt_columns(self):
+    def test_a_database_this_version_wrote_opens_and_takes_receipts_with_the_previous_version(self):
+        # The broker deploy can roll back: calls keeps exactly the columns every earlier version writes by position,
+        # and the transport, study-bundle and broker fields live in tables the earlier version ignores.
+        legacy = load_legacy_scores_db()
+        self.broker.install_census()
+        run = self.run_census()
+        self.prepare(run)
+        self.assertEqual("completed", run.run_abstract()["state"])
+        run.close()
         with closing(sqlite3.connect(self.database)) as c:
-            c.executescript(scores_db.DDL.replace(
-                ",\n  transport TEXT, study_bundle_sha256 TEXT, request_sha256 TEXT, broker_principal_id TEXT, broker_job_id TEXT,\n"
-                "  broker_item_id TEXT, broker_instrument_digest TEXT, broker_settings_sha256 TEXT, broker_request_sha256 TEXT,\n"
-                "  broker_error_code TEXT", ""))
-            self.assertNotIn("transport", scores_db.table_columns(c, "calls"))
-            c.execute("INSERT INTO meta VALUES('schemaVersion', '1')")
-            c.commit()
-        with closing(scores_db.open_readonly(self.database)) as c:
-            self.assertEqual(0, census_status(c)["brokerCalls"])
-        with closing(scores_db.connect(self.database, create=True)) as c:
-            self.assertLessEqual(set(scores_db.CALL_COLUMNS_ADDED), scores_db.table_columns(c, "calls"))
+            self.assertEqual(list(scores_db.CALL_COLUMNS), [r[1] for r in c.execute("PRAGMA table_info(calls)")])
+        with closing(legacy.connect(self.database, create=True)) as c:
+            self.assertEqual(legacy.SCHEMA_VERSION, scores_db.SCHEMA_VERSION)
             documented = {r[0] for r in c.execute("SELECT column_name FROM data_dictionary WHERE table_name='calls'")}
-            self.assertEqual(scores_db.table_columns(c, "calls"), documented)
+            self.assertEqual(set(scores_db.CALL_COLUMNS), documented)
+            # The earlier version's receipt insert, by position.
+            row = list(c.execute("SELECT * FROM calls LIMIT 1").fetchone())
+            row[0] = "call-recorded-by-the-earlier-version"
+            c.execute("INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+            c.commit()
+            self.assertEqual(0, legacy.completeness(c)["abstractPending"])
+        # And forward again: the earlier version's call counts as a direct call without the study bundle.
+        status = self.status()
+        self.assertEqual(({"broker": 1, "direct": 1}, 1), (status["callsByTransport"], status["receiptsWithoutStudyBundle"]))
+        self.assertFalse(gates(status)["checks"]["everyReceiptCarriesTheStudyBundle"])
+
+    def test_old_working_databases_gain_the_transport_tables(self):
+        legacy = load_legacy_scores_db()
+        with closing(legacy.connect(self.database, create=True)) as c:
+            self.assertFalse(scores_db.has_table(c, "call_transport"))
+        with closing(scores_db.open_readonly(self.database)) as c:
+            self.assertEqual((0, {}), (census_status(c)["brokerCalls"], census_status(c)["callsByTransport"]))
+        with closing(scores_db.connect(self.database, create=True)) as c:
+            self.assertEqual(list(scores_db.CALL_COLUMNS), [r[1] for r in c.execute("PRAGMA table_info(calls)")])
+            for table in ("call_transport", "pending_calls"):
+                documented = {r[0] for r in c.execute("SELECT column_name FROM data_dictionary WHERE table_name=?", (table,))}
+                self.assertEqual(scores_db.table_columns(c, table), documented, table)
 
 
 class BrokerFullTextTests(BrokerTestCase):
@@ -983,7 +1082,7 @@ class BrokerFullTextTests(BrokerTestCase):
         run.run_abstract()
         result = run.run_full_text(fetch_xml=lambda pmcid: (FIXTURES / "full_texts" / "ft2.xml").read_bytes())
         self.assertEqual(("completed", 3, 1), (result["state"], result["retrieved"], result["calls"]))
-        call = self.rows("SELECT * FROM calls WHERE tier='full-text'")[0]
+        call = self.rows(f"SELECT * FROM {CALLS} WHERE tier='full-text'")[0]
         self.assertEqual((digests["full-text"], 3000), (call["broker_instrument_digest"], call["max_tokens"]))
         self.assertEqual(call["request_sha256"], call["broker_request_sha256"])
         sent = self.broker.upstream[-1]
@@ -1043,7 +1142,7 @@ class BrokerCommandLineTests(BrokerTestCase):
         code, report = self.cli("study", "gates", "--database", database)
         self.assertEqual(0, code)
         self.assertTrue(report["ok"], report["checks"])
-        self.assertEqual({"broker"}, {r["transport"] for r in self.rows("SELECT transport FROM calls")})
+        self.assertEqual({"broker"}, {r["transport"] for r in self.rows(f"SELECT transport FROM {CALLS}")})
 
     def test_transport_options_are_exclusive_and_hold_no_credentials(self):
         from ocsl_review.study_cli import _transport
@@ -1099,6 +1198,433 @@ class BrokerCommandLineTests(BrokerTestCase):
         for value in (["bad id!"], [{"provider": "a", "models": "m"}], ["a", "a"]):
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 ConfidentialPolicy.from_mapping({"version": 2, "onPremBrokerProviders": value})
+
+
+class Crash(Exception):
+    """Stands for the census process dying in the middle of a call."""
+
+
+def wait_until(predicate, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while not predicate():
+        if time.time() > deadline:
+            raise AssertionError("condition not reached in time")
+        time.sleep(0.01)
+
+
+class BrokerAnswerTests(BrokerTestCase):
+    """What a broker item counts as: the judge's own response, classified as for a direct call."""
+
+    def test_a_fingerprint_the_server_did_not_offer_is_not_the_judge_fingerprint(self):
+        self.broker.install_census()
+        self.broker.omit_fingerprint = True
+        run = self.run_census()
+        self.prepare(run)
+        self.assertEqual("completed", run.run_abstract()["state"])
+        call = self.rows(f"SELECT fingerprint, broker_server_fingerprint FROM {CALLS}")[0]
+        self.assertIsNone(call["fingerprint"])
+        self.assertRegex(call["broker_server_fingerprint"], r"@[0-9a-f]{16}$", "the daemon's identity is kept apart")
+        status = self.status()
+        self.assertEqual((1, 0, False), (status["receiptsWithResponse"], status["receiptsWithFingerprint"],
+                                         status["fingerprintOffered"]))
+        report = gates(status)
+        self.assertFalse(report["checks"]["everyReceiptHasFingerprint"])
+        self.assertTrue(any("offered no system_fingerprint" in note for note in report["notes"]))
+
+    def test_a_response_naming_no_model_is_drift_whether_the_broker_or_the_executor_catches_it(self):
+        self.broker.install_census()
+        self.broker.omit_served_model = True
+        for required, broker_checks in ((MODEL, True), (None, False)):
+            with self.subTest(broker_checks=broker_checks):
+                # Without requiredModelFingerprint the broker completes the item; the executor's own check pauses.
+                for digest, bundle in self.broker.instruments.items():
+                    bundle["requiredModelFingerprint"] = required
+                database = self.root / f"no-model-{broker_checks}.sqlite3"
+                run = CensusRun(database, seed=1234 + broker_checks, transport=self.transport(), concurrency=4,
+                                sleep=lambda s: None)
+                self.addCleanup(run.close)
+                self.prepare(run)
+                paused = run.run_abstract()
+                self.assertEqual("paused", paused["state"])
+                self.assertIn("model_drift: served '(no model named in the response)'", paused["reason"])
+                with closing(sqlite3.connect(database)) as c:
+                    call = c.execute("SELECT error, served_model, n_parsed FROM calls").fetchone()
+                    undecided = c.execute("SELECT COUNT(*) FROM citations WHERE cited_inbody=1 AND abs_basis IS NULL "
+                                          "AND identity IN ('resolved','resolved_unverified')").fetchone()[0]
+                    state = c.execute("SELECT value FROM meta WHERE key='runState'").fetchone()[0]
+                self.assertEqual(("model_drift", None, 0), tuple(call))
+                self.assertEqual((15, "paused:model_drift"), (undecided, state), "no entry became an invalid output")
+                self.broker.provider_paused = None
+
+    def test_a_direct_response_naming_no_model_pauses_as_drift_instead_of_invalidating_entries(self):
+        judge = MockJudge()
+        judge.model = None
+        server = start_server(judge)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        run = self.run_census(transport=HttpChatTransport("http://127.0.0.1:%d/v1" % server.server_address[1]))
+        self.prepare(run)
+        paused = run.run_abstract()
+        self.assertEqual("paused", paused["state"])
+        self.assertIn("no model named in the response", paused["reason"])
+        self.assertEqual(0, self.rows("SELECT COUNT(*) AS n FROM citations WHERE abs_basis LIKE 'invalid%'")[0]["n"])
+
+    def test_a_transient_upstream_status_leaves_entries_open_while_400_413_422_are_answers(self):
+        self.broker.install_census()
+        self.broker.status_next = [408, 425]
+        run = self.run_census()
+        self.prepare(run)
+        result = run.run_abstract(transport_retries=1, cooldown=0)
+        self.assertEqual(("completed", 15, 0), (result["state"], result["accepted"], result["invalid"]))
+        errors = [r["error"] for r in self.rows("SELECT error FROM calls ORDER BY created_at, rowid")]
+        self.assertEqual(["broker failed: INVALID_REQUEST (HTTP 408)", "broker failed: INVALID_REQUEST (HTTP 425)", None],
+                         errors)
+        self.assertEqual((2, 2), (result["transportFailures"], self.status()["transportFailures"]))
+        for status in (400, 413, 422):
+            with self.subTest(status=status):
+                database = self.root / f"refused-{status}.sqlite3"
+                self.broker.status_next = [status, status]
+                other = CensusRun(database, seed=status, transport=self.transport(), concurrency=4, sleep=lambda s: None)
+                self.addCleanup(other.close)
+                self.prepare(other)
+                refused = other.run_abstract(transport_retries=0)
+                self.assertEqual(("completed", 0, 15), (refused["state"], refused["accepted"], refused["invalid"]))
+
+    def test_an_empty_completion_is_an_answer_without_labels(self):
+        self.broker.install_census()
+        self.broker.empty_answers = True
+        run = self.run_census()
+        self.prepare(run)
+        result = run.run_abstract()
+        self.assertEqual(("completed", 0, 15), (result["state"], result["accepted"], result["invalid"]))
+        self.assertEqual(["empty content; finish=stop"] * 2, [r["error"] for r in self.rows("SELECT error FROM calls")])
+
+    def test_a_call_without_a_usable_answer_stays_open(self):
+        self.broker.install_census()
+        self.broker.fail_next = ["NO_FINAL_MESSAGE", "NO_FINAL_MESSAGE"]
+        run = self.run_census()
+        self.prepare(run)
+        paused = run.run_abstract(transport_retries=0)
+        self.assertEqual(("paused", 0, 0), (paused["state"], paused["accepted"], paused["invalid"]))
+        self.assertEqual(15, self.status()["openEntries"])
+        done = run.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+
+    def test_a_lone_surrogate_travels_as_an_escape_and_keeps_the_request_digest(self):
+        self.broker.install_census()
+        digest = broker_bundle("citation-census@1", tier="abstract", parameters={"journal": JOURNAL})["digest"]
+        transport = self.transport()
+        transport.open()
+        item = {"label": "1", "citing_passages": [{"sentence": "A claim [1].", "section": "Intro"}],
+                "cited_work": {"title": "T", "venue": "V", "year": 2020}, "abstract": "Broken \ud800 surrogate."}
+        payload = C.request_payload(C.build_abstract_messages([item], "Review", JOURNAL), model=MODEL, items=1)
+        outcome = transport.call(item_id="call-surrogate", messages=payload["messages"], item_count=1, digest=digest,
+                                 key=idempotency_key("call-surrogate", request_sha256(payload)),
+                                 settings={k: v for k, v in payload.items() if k != "messages"})
+        self.assertEqual("settled", outcome.kind)
+        self.assertEqual(request_sha256(payload), outcome.item["requestSha256"])
+        self.assertIn("\ud800", self.broker.upstream[0]["messages"][1]["content"])
+
+
+class BrokerStudyBundleStatusTests(BrokerTestCase):
+    def test_a_bare_sha256_pin_is_reported_as_unverified(self):
+        self.broker.install_census()
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        status = self.status()
+        self.assertEqual((self.bundle["sha256"], False), (status["studyBundleSha256"], status["studyBundleVerified"]))
+        self.assertTrue(any("pinned by its sha256 alone" in note for note in gates(status)["notes"]))
+        path = self.root / "bundle.json"
+        path.write_text(json.dumps(self.bundle))
+        run.pin_study_bundle(path)
+        status = self.status()
+        self.assertTrue(status["studyBundleVerified"])
+        self.assertFalse(any("pinned by its sha256 alone" in note for note in gates(status)["notes"]))
+
+    def test_broker_bundles_refuse_request_fields_the_executor_does_not_send(self):
+        import dataclasses
+        from unittest import mock
+        instrument = instruments.load("citation-census@1")
+        for change, message in ((lambda request: request.pop("reasoningEffort"), "declares no reasoningEffort"),
+                                (lambda request: request.update(seed=7), "declares a seed")):
+            manifest = json.loads(json.dumps(instrument.manifest))
+            change(manifest["tiers"]["abstract"]["request"])
+            changed = dataclasses.replace(instrument, manifest=manifest)
+            with self.subTest(message=message), mock.patch("ocsl_review.instruments.load", return_value=changed), \
+                    self.assertRaisesRegex(ValidationError, message):
+                broker_bundle("citation-census@1", tier="abstract", parameters={"journal": JOURNAL})
+
+
+class BrokerLineageTests(BrokerTestCase):
+    def test_a_lineage_longer_than_the_resume_bound_still_resumes_once_the_provider_recovers(self):
+        self.broker.install_census()
+        self.broker.rate_limit_next = 10 ** 6       # a sustained 429 without a reset header
+        run = self.run_census()
+        self.prepare(run)
+        for _ in range(10):
+            self.assertEqual("paused", run.run_abstract()["state"])
+        self.assertGreater(len(self.broker.jobs), 16, "every invocation added to the call's lineage")
+        self.broker.rate_limit_next = 0
+        before = dict(run.transport.counters)
+        done = run.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+        self.assertGreater(done["transport"]["walked"] - before["walked"], 16, "the lineage was walked to its tail")
+        self.assertEqual(1, done["transport"]["resumed"] - before["resumed"], "and resumed once, there")
+        self.assertEqual(0, self.status()["duplicateJudgments"])
+
+    def test_walking_a_lineage_clears_no_provider_pause_before_the_tail_may_resume(self):
+        self.broker.install_census()
+        later = datetime.fromtimestamp(self.now[0], timezone.utc) + timedelta(minutes=5)
+        self.broker.rate_limit_next = 10 ** 6
+        run = self.run_census()
+        self.prepare(run)
+        self.assertEqual("paused", run.run_abstract()["state"])
+        jobs = len(self.broker.jobs)
+        # The tail now carries a future resumeAfter: a re-run walks to it and stops there, sending nothing.
+        self.broker.resume_after = later.isoformat().replace("+00:00", "Z")
+        tail = max(self.broker.jobs.values(), key=lambda job: job["revision"])
+        tail["resumeAfter"] = self.broker.resume_after
+        upstream = len(self.broker.upstream)
+        paused = run.run_abstract()
+        self.assertEqual("paused", paused["state"])
+        self.assertEqual(self.broker.resume_after, paused["resumeAfter"])
+        self.assertEqual((jobs, upstream), (len(self.broker.jobs), len(self.broker.upstream)))
+        self.assertIsNotNone(self.broker.provider_paused, "the walk cleared no provider pause")
+
+
+class BrokerWorkerChangeTests(BrokerTestCase):
+    def test_a_changed_worker_configuration_moves_a_paused_call_to_its_next_key(self):
+        self.broker.install_census()
+        later = datetime.fromtimestamp(self.now[0], timezone.utc) + timedelta(minutes=5)
+        self.broker.rate_limit_next = 1
+        self.broker.resume_after = later.isoformat().replace("+00:00", "Z")
+        run = self.run_census()
+        self.prepare(run)
+        self.assertEqual("paused", run.run_abstract()["state"])
+        # The operator fixes the provider in the daemon's configuration while the call is paused.
+        self.broker.worker_config = {**self.broker.worker_config, "baseUrl": "http://127.0.0.1:10/v1"}
+        self.now[0] = later.timestamp() + 1
+        done = run.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+        self.assertEqual(1, done["transport"]["keyGenerations"])
+        call = self.rows(f"SELECT call_id, request_sha256, broker_job_id FROM {CALLS}")[0]
+        key = idempotency_key(call["call_id"], call["request_sha256"])
+        settled = self.broker.jobs[call["broker_job_id"]]
+        root = self.broker.jobs[settled["resumedFromJobId"]] if settled["resumedFromJobId"] else settled
+        self.assertEqual(generation_key(key, 1), root["idempotencyKey"], "the call's second key started its new lineage")
+        self.assertEqual(2, len(self.broker.upstream), "the paused call and its successor; nothing judged twice")
+        jobs = len(self.broker.jobs)
+        # A later invocation finds nothing open, and the jobs stay as they are.
+        self.assertEqual("completed", run.run_abstract()["state"])
+        self.assertEqual(jobs, len(self.broker.jobs))
+
+    def test_a_key_conflict_takes_the_answer_of_the_job_that_settled_the_call(self):
+        self.broker.install_census()
+        self.broker.release.clear()
+        run = self.run_census(transport=self.transport(wait_seconds=0.3))
+        self.prepare(run)
+        self.assertEqual("paused", run.run_abstract(transport_retries=0)["state"])
+        self.broker.release.set()
+        wait_until(lambda: any(job["state"] == "completed" for job in self.broker.jobs.values()))
+        self.broker.worker_config = {**self.broker.worker_config, "label": "Renamed judge"}
+        done = run.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+        self.assertEqual((1, 1, 0), (len(self.broker.upstream), len(self.broker.jobs), done["transport"]["keyGenerations"]))
+
+
+class BrokerLostAnswerTests(BrokerTestCase):
+    def test_a_lost_full_text_answer_is_collected_from_its_job_and_never_judged_again(self):
+        self.broker.install_census()
+        run = self.run_census()
+        self.prepare(run, record(), record(doi="10.5555/second"), record(doi="10.5555/third"))
+        run.run_abstract()
+        before = set(self.broker.jobs)
+        held: list[str] = []
+
+        def hold(job):
+            if job["jobId"] in before or self.broker.hold is None:
+                return False
+            if not held:
+                held.append(job["jobId"])
+            return job["jobId"] == held[0]
+        self.broker.hold = hold
+        fetch = lambda pmcid: (FIXTURES / "full_texts" / "ft2.xml").read_bytes()
+        run.transport.wait_seconds = 0.5
+        paused = run.run_full_text(fetch_xml=fetch, transport_retries=0)
+        self.assertEqual("paused", paused["state"])
+        pending = self.rows("SELECT call_id, labels_json FROM pending_calls")
+        self.assertEqual(1, len(pending), "the call that got no answer is kept with its exact request")
+        self.broker.hold = None
+        wait_until(lambda: self.broker.jobs[held[0]]["state"] == "completed")
+        jobs, upstream = len(self.broker.jobs), len(self.broker.upstream)
+        run.transport.wait_seconds = 15.0
+        done = run.run_full_text(fetch_xml=fetch)
+        self.assertEqual(("completed", 1), (done["state"], done["replayed"]))
+        self.assertEqual((jobs, upstream), (len(self.broker.jobs), len(self.broker.upstream)),
+                         "the pending call met its job: no second job, no second judgment")
+        self.assertEqual([], self.rows("SELECT * FROM pending_calls"))
+        judged = self.rows("SELECT doi, label, COUNT(*) AS n FROM history WHERE tier='full-text' GROUP BY doi, label")
+        self.assertTrue(judged and all(row["n"] == 1 for row in judged))
+        call = self.rows(f"SELECT broker_job_id FROM {CALLS} WHERE call_id=?", pending[0]["call_id"])[0]
+        self.assertEqual(held[0], call["broker_job_id"])
+
+    def test_a_crash_while_a_repair_runs_resumes_with_that_repair_and_keeps_the_first_answers(self):
+        self.broker.install_census()
+        self.broker.judge.drop_first = {"2", "9"}
+        self.broker.hold_repairs.set()
+        transport = self.transport()
+        original = transport._await
+
+        def crash_on_repair(job_id, deadline):
+            if MockBroker.is_repair(self.broker.jobs[job_id]["items"][0]):
+                raise Crash()
+            return original(job_id, deadline)
+        transport._await = crash_on_repair
+        run = self.run_census(transport=transport)
+        self.prepare(run)
+        with self.assertRaises(Crash):
+            run.run_abstract()
+        run.close()
+        # The first call's answers were written with its receipt; the repair job runs on in the broker.
+        self.assertEqual(13, self.rows("SELECT COUNT(*) AS n FROM citations WHERE abs_basis='model'")[0]["n"])
+        self.broker.hold_repairs.clear()
+        wait_until(lambda: len(self.broker.upstream) == 2)
+        again = self.run_census()
+        done = again.run_abstract()
+        self.assertEqual(("completed", 2, 0), (done["state"], done["accepted"], done["invalid"]))
+        self.assertEqual((2, 2), (len(self.broker.jobs), len(self.broker.upstream)),
+                         "the next invocation sent exactly the repair that was due and met its job")
+        self.assertEqual(0, self.status()["duplicateJudgments"])
+
+    def test_a_job_settled_while_its_item_still_runs_is_not_an_answer(self):
+        self.broker.install_census()
+        self.broker.settle_early_jobs = 1
+        run = self.run_census()
+        self.prepare(run)
+        paused = run.run_abstract(transport_retries=0)
+        self.assertEqual(("paused", 0), (paused["state"], paused["accepted"]))
+        self.assertEqual([], self.rows("SELECT * FROM calls"), "a failed job whose item still runs is no answer")
+        wait_until(lambda: all(result["state"] == "completed" for job in self.broker.jobs.values()
+                               for result in job["results"].values()))
+        done = run.run_abstract()
+        self.assertEqual(("completed", 15), (done["state"], done["accepted"]))
+        self.assertEqual((1, 1), (len(self.broker.jobs), len(self.broker.upstream)))
+        self.assertEqual([None], [r["error"] for r in self.rows("SELECT error FROM calls")])
+
+
+class BrokerStopTests(BrokerTestCase):
+    def test_a_fidelity_stop_sends_none_of_the_batches_already_queued(self):
+        self.broker.install_census()
+        self.broker.inject_policy = True
+        run = self.run_census()                     # concurrency 4: eight batches queued at a time
+        self.prepare(run, *[record(doi=f"10.5555/review.{index}") for index in range(12)])
+        result = run.run_abstract()
+        self.assertEqual("paused", result["state"])
+        self.assertLessEqual(len(self.broker.upstream), 4, "only the calls already in flight reached the judge")
+        self.assertEqual("FIDELITY", result["transport"]["halted"]["code"])
+        status = self.status()
+        self.assertEqual(len(self.rows("SELECT call_id FROM calls")), status["brokerRequestMismatches"])
+        self.assertEqual((0, 0), (status["transportFailures"], result["transportFailures"]),
+                         "a fidelity stop is reported apart from transport failures")
+
+    def test_an_outage_names_a_possible_revocation_and_a_second_principal_is_noted(self):
+        self.broker.install_census()
+        run = self.run_census(breaker=2)
+        self.prepare(run, record(), record(doi="10.5555/second"))
+        run.transport.open()
+        self.broker.stop()                          # the principal's socket is gone
+        paused = run.run_abstract(transport_retries=0)
+        self.assertEqual(("paused", 0), (paused["state"], paused["transportFailures"]))
+        self.assertIn("may have been revoked", paused["transport"]["lastUnavailable"])
+        run.close()
+        with self.assertRaisesRegex(ValidationError, "may have been revoked"):
+            self.transport()
+        # A new principal takes over the run.
+        self.broker.principal = "run-principal-census-2"
+        self.broker.start()
+        again = self.run_census()
+        self.assertEqual("completed", again.run_abstract()["state"])
+        again.close()
+        self.broker.principal = "run-principal-census-3"
+        third = self.run_census()
+        third.prepare_review(record(doi="10.5555/third"), (FIXTURES / "review.xml").read_bytes())
+        self.assertEqual("completed", third.run_abstract()["state"])
+        status = self.status()
+        self.assertEqual(2, status["brokerPrincipals"])
+        self.assertTrue(any("2 run principals" in note for note in gates(status)["notes"]))
+
+
+class BrokerCursorTests(unittest.TestCase):
+    """The feed cursor and a job that settles between its own summary reading and the cursor's start."""
+
+    class Feed:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.jobs = {"A": {"jobId": "A", "state": "running", "revision": 5},
+                         "B": {"jobId": "B", "state": "running", "revision": 10}}
+            self.gate = threading.Event()
+            self.feed_reads = 0
+            self.summary_reads = {"A": 0, "B": 0}
+
+        def request(self, method, route, payload=None):
+            if route.startswith("/jobs?"):
+                after = int(route.split("after=")[1].split("&")[0])
+                with self.lock:
+                    self.feed_reads += 1
+                    changed = sorted((dict(j) for j in self.jobs.values() if j["revision"] > after),
+                                     key=lambda j: j["revision"])
+                return {"jobs": changed, "nextCursor": changed[-1]["revision"] if changed else after, "hasMore": False}
+            job_id = route.split("/")[2].split("?")[0]
+            with self.lock:
+                self.summary_reads[job_id] += 1
+                first = self.summary_reads[job_id] == 1
+                value = dict(self.jobs[job_id])
+            if job_id == "A" and first:
+                value = {"jobId": "A", "state": "running", "revision": 5}
+                self.gate.wait(5)           # A's first reading is delayed until B has started the cursor
+            return value
+
+    def test_a_job_awaited_before_the_cursor_started_moves_it_back_and_settles(self):
+        feed = self.Feed()
+        transport = BrokerTransport("/unused", client=feed, poll_interval=0.01, recheck_seconds=3600)
+        self.addCleanup(transport.close)
+        results = {}
+        first = threading.Thread(target=lambda: results.setdefault("A", transport._await("A", time.monotonic() + 3)))
+        first.start()
+        wait_until(lambda: feed.summary_reads["A"] == 1)
+        with feed.lock:
+            feed.jobs["A"] = {"jobId": "A", "state": "completed", "revision": 7}   # A settles before B's reading
+        second = threading.Thread(target=lambda: results.setdefault("B", transport._await("B", time.monotonic() + 3)))
+        second.start()
+        wait_until(lambda: (transport._cursor or 0) >= 9)                         # B started the cursor past A's 7
+        wait_until(lambda: feed.feed_reads >= 2)
+        feed.gate.set()
+        first.join(5)
+        self.assertEqual("completed", results["A"]["state"], results)
+        with feed.lock:
+            feed.jobs["B"] = {"jobId": "B", "state": "completed", "revision": 12}
+        second.join(5)
+        self.assertEqual("completed", results["B"]["state"])
+
+    def test_a_waiting_call_reads_its_job_again_when_the_feed_never_reports_it(self):
+        feed = self.Feed()
+        feed.gate.set()
+        transport = BrokerTransport("/unused", client=feed, poll_interval=0.01, recheck_seconds=0.2)
+        self.addCleanup(transport.close)
+        with feed.lock:
+            feed.jobs["B"]["revision"] = 3                                         # the feed will never list A again
+        started = time.monotonic()
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("A", transport._await("A", time.monotonic() + 5)))
+        thread.start()
+        wait_until(lambda: feed.summary_reads["A"] == 1)
+        with feed.lock:
+            transport._cursor = 100                                                # as if the feed had passed A
+            feed.jobs["A"] = {"jobId": "A", "state": "completed", "revision": 6}
+        thread.join(5)
+        self.assertEqual("completed", result["A"]["state"])
+        self.assertLess(time.monotonic() - started, 3)
 
 
 if __name__ == "__main__":

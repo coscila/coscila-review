@@ -494,7 +494,9 @@ executor; `--api-key-env` is refused with the broker transport.
    study prompt, template, instrument digests, dataset versions and package
    tags; a file is checked against its sha256 and its citation-census@1
    digest) before the first call. Every call receipt records its digest, and a
-   broker run refuses to start without it.
+   broker run refuses to start without it. A bare sha256 is recorded unchecked:
+   `status` reports `studyBundleVerified: false` and `gates` notes it until the
+   bundle file is pinned as well.
 4. Run the tiers with `--broker-socket` (or `OCSL_BROKER_SOCKET`) instead of
    `--base-url`: `study judge|full-text|no-truncation|replicate --database ...
    --seed ... --broker-socket "$SOCKET"`. `--broker-worker` selects the worker
@@ -523,7 +525,11 @@ without a worker policy or assignment text, as canonical JSON. The item id is
 the call id, and the job's idempotency key is derived from the call id and the
 request digest.
 The executor follows the principal's changed-job feed (`GET /jobs?view=summary`)
-and reads each settled job's result page.
+and reads each settled job's result page; a waiting call also reads its own job
+again every 30 seconds, so a settlement the feed missed never waits for the
+deadline. A job reported settled while the call's item is still running (a
+double launch across a daemon restart) is no answer yet: the call stays open
+and meets the job again.
 
 **Fidelity.** Every receipt must report `requestSha256` (the executor reads it
 from the item on the job's result page), the sha256 of the canonical JSON of
@@ -544,14 +550,31 @@ daemon cannot run the instrument verbatim). No repair call follows, since the
 same request would be refused again. The next invocation tries again, so fix
 the daemon or the installed bundle first.
 
-**Receipts.** Each settled broker call is a `calls` row with `transport =
-broker`, `broker_principal_id`, `broker_job_id` (the job that settled it, after
-any resume), `broker_item_id` (the call id), `broker_instrument_digest`,
-`broker_settings_sha256` and `broker_request_sha256` from the broker receipt,
-`broker_error_code`, `request_sha256` and `study_bundle_sha256`, plus the
-fields of a direct call; `fingerprint` holds the receipt's `serverFingerprint`
-(the upstream `system_fingerprint`, else the served model and a digest of the
-server identity headers), so every answered broker call carries one.
+**What counts as the judge's answer.** Exactly what counts for a direct call: the
+item's `servedModel` is the model the judge's response named (a response naming
+none, or another model, is model drift, never the requested model taken on
+trust), `fingerprint` is the response's own `system_fingerprint`
+(`systemFingerprint`; NULL when the server offered none, so the fingerprint
+gate fails with the same note on both transports), and the upstream status
+decides as it does directly: 400, 413 or 422 is the judge refusing this very
+request (an answer without labels), any other failure after the broker's own
+attempts (408, 425, 5xx, an unreachable judge, a 2xx without a chat completion
+message, `NO_FINAL_MESSAGE`) is a transport failure whose entries stay open, and
+an empty completion (asked again by the broker, as a direct call would) is an
+answer without labels.
+
+**Receipts.** Each call has a `calls` row (the columns every earlier version
+writes) and a `call_transport` row beside it: `transport` (direct or broker),
+`study_bundle_sha256`, `request_sha256` and, for broker calls,
+`broker_principal_id`, `broker_job_id` (the job that settled it, after any
+resume), `broker_item_id` (the call id), `broker_instrument_digest`,
+`broker_settings_sha256`, `broker_request_sha256`, `broker_error_code`,
+`broker_server_fingerprint` (the daemon's `serverFingerprint`: the server's
+`system_fingerprint` when offered, else its own identity of the served model
+and the server headers) and `broker_http_status`. Keeping `calls` unchanged
+keeps a deploy reversible: an earlier version still opens a database this one
+wrote and records its own receipts in it (a call it records counts as a direct
+call without the study bundle).
 
 **Pauses and outages.** A provider-limit pause whose `resumeAfter` lies in the
 future, an exhausted budget, an expired principal, a withdrawn grant, a
@@ -561,21 +584,44 @@ submitted, calls in flight still settle and are recorded, and the run pauses as
 the command's result carries `resumeAfter`). A call that never settled records
 no receipt row, so the next invocation repeats the same call id, meets the same
 broker job and resumes it: a provider-limit pause once `resumeAfter` has
-passed, a budget pause once the operator has raised the budget. Within one
+passed, a budget pause once the operator has raised the budget. A job resumed
+in earlier invocations is followed along its lineage to the tail (each earlier
+resume answers with the job it created, changes nothing and does not count as a
+resume) and resumed there, after the tail's own `resumeAfter`. Within one
 invocation a pause is resumed once per job lineage (a provider pause another
-job left behind) and halts the transport if it returns. A model drift pauses as
-`paused:model_drift`, as with the direct transport. An unreachable socket, a
-job feed that keeps failing for a minute or a call without a settlement before
-its wait deadline leaves the call open, without a repair call that would
-duplicate a call that may still run; the breaker, further passes and
-`paused:transport` follow as with the direct transport. An item that failed
-after the broker's own retries (for example `PROVIDER_UNREACHABLE`) is a failed
-call (a transport failure) and the repair pass asks again; an upstream refusal
-(`INVALID_REQUEST` after a provider call) is an answer without labels.
+job left behind) and halts the transport if it returns. When the daemon's
+worker configuration changed since a call was submitted (a provider's endpoint,
+model, credential variable or label), the job under the call's key cannot be
+resumed (`WORKER_CONFIG_CHANGED`) and a new submission under it is refused
+(`WORKER_KEY_CONFLICT`, naming that job): the executor takes that job's answer
+if it settled the call, and otherwise moves the call to the next key of a fixed
+sequence, so every later invocation meets the same new job. A model drift
+pauses as `paused:model_drift`, as with the direct transport. An unreachable
+socket, a job feed that keeps failing for a minute or a call without a
+settlement before its wait deadline leaves the call open, without a repair call
+that would duplicate a call that may still run; the breaker, further passes and
+`paused:transport` follow as with the direct transport (only recorded failures
+count as transport failures). A socket that is gone is reported as such: the
+run principal may have been revoked (or its socket withdrawn) or the daemon is
+restarting; calls in flight at a revocation finish unless it cancels them, and
+a run continued under a new principal cannot meet the old principal's jobs, so
+`gates` notes when calls ran under more than one principal. A fidelity failure
+halts the transport too: calls already queued are not sent, and fidelity stops
+(`request_mismatch`, broker refusals) are reported apart from transport
+failures.
 
 **Never twice.** A call repeated after a crash meets its job through the
 idempotency key and takes that job's result without a second provider call;
-the unique index on accepted primary verdicts guards the database.
+the unique index on accepted primary verdicts guards the database. A primary
+abstract call's accepted verdicts are written with its receipt, so after a
+crash a batch resumes with exactly the repair call that was due (the same call
+id and request, which meets the repair job that may still run). A full-text
+call is recorded in `pending_calls` before it is submitted and removed with its
+receipt; the next pass or invocation sends a pending call first, unchanged, and
+keeps its entries out of the new chunks, so a lost answer is collected from its
+job instead of being judged again by a re-chunked call. (A sensitivity batch is
+still re-run whole when it ends incomplete.) `pending_calls` is execution
+state: it is never exported and is emptied in a frozen database.
 
 ## Scores database
 
@@ -584,9 +630,12 @@ One SQLite file per study: `reviews` (counts per tier and class), `citations`
 and full-text verdicts, classes, call ids and positions), `loci`, `works`,
 `identity`, `evidence`, `calls` (one receipt per call: instrument digest,
 served model, fingerprint, settings digest, system, user, message-list and body
-digests, the canonical request digest, tokens, finish reason, attempts, the
-transport, the pinned study bundle and, for broker calls, the principal, job,
-item, bundle digest and the broker's settings and request digests), `history` (append-only),
+digests, tokens, finish reason and attempts), `call_transport` (beside each
+receipt: the transport, the canonical request digest, the pinned study bundle
+and, for broker calls, the principal, job, item, bundle digest, the broker's
+settings and request digests, its server identity and the upstream status),
+`pending_calls` (broker full-text calls submitted and not yet recorded),
+`history` (append-only),
 `review_scores` and `work_scores` (beta-binomial excess and Benjamini-Hochberg
 q-values), `sanitizer_findings`, `input_provenance` (where each review document,
 abstract evidence unit and full-text source came from), `enumeration` (a pinned

@@ -285,6 +285,12 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
                      "built; they are invalid and their outputs were discarded")
     if status.get("studyBundleSha256"):
         checks["everyReceiptCarriesTheStudyBundle"] = status.get("receiptsWithoutStudyBundle") == 0
+        if status.get("studyBundleVerified") is False:
+            notes.append("the study bundle was pinned by its sha256 alone: no bundle file was checked against that digest "
+                         "and the instrument's registry digest (pin the bundle file with study prepare --study-bundle)")
+    if (status.get("brokerPrincipals") or 0) > 1:
+        notes.append(f"broker calls ran under {status['brokerPrincipals']} run principals: calls in flight when a principal "
+                     "was revoked may also have been judged under it, outside this database")
     if responded and not status["fingerprintOffered"]:
         notes.append("the judge server offered no system_fingerprint on any response, so the fingerprint gate cannot "
                      "pass with this server")
