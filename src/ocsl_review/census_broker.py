@@ -15,13 +15,19 @@ digest with the canonical JSON of the body it built itself.
 
 The job's idempotency key is derived from the call id and the request digest,
 so a call repeated after a crash meets the job the broker already holds (and
-its result) instead of starting a second judgment. A paused job (provider
-limit, budget, expiry, withdrawn grant) halts the transport unless it may be
-resumed: a pause observed during an invocation is resumed once per job lineage
-(it may be a provider pause another call left), a job met already paused is
-resumed along its lineage, and nothing is resumed while the job's
-``resumeAfter`` lies in the future or once the transport has halted. A
-cancellation observed during an invocation is never resumed by it.
+its result) instead of starting a second judgment. When that key holds work the
+broker will not run again for this call (it answers WORKER_KEY_CONFLICT: the job
+was submitted under another worker configuration, or its resume is refused with
+WORKER_CONFIG_CHANGED), the call takes the next key of a fixed sequence, after
+taking the result of the job the conflict names if that job settled the call.
+A paused job (provider limit, budget, expiry, withdrawn grant) halts the
+transport unless it may be resumed: a pause observed during an invocation is
+resumed once per job lineage (it may be a provider pause another call left), a
+job met already paused is followed along its lineage to its tail (each earlier
+resume answers with the job it created, without side effects) and resumed
+there, and nothing is resumed while the job's ``resumeAfter`` lies in the
+future or once the transport has halted. A cancellation observed during an
+invocation is never resumed by it.
 
 Nothing here builds prompts or reads verdicts; the census runner maps the
 outcomes onto its receipts.
@@ -49,7 +55,11 @@ SETTLED_STATES = frozenset({"completed", "failed"})
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 DEFAULT_WAIT_SECONDS = 7200.0
 DEFAULT_OUTAGE_SECONDS = 60.0
-MAX_RESUMES = 16            # resumes followed along one call's job lineage within one invocation
+DEFAULT_RECHECK_SECONDS = 30.0  # a waiting call reads its job's summary at least this often (beside the feed)
+MAX_RESUMES = 16            # new resumes one call asks for along its job lineage within one invocation
+MAX_LINEAGE = 4096          # earlier resumes of one lineage followed to its tail (each answers the job it created)
+MAX_KEY_GENERATIONS = 8     # idempotency keys one call tries while earlier ones hold work the broker will not rerun
+SETTLED_ITEM_STATES = frozenset({"completed", "failed"})
 
 
 # ----------------------------------------------------------------------------- canonical JSON
@@ -150,17 +160,26 @@ def idempotency_key(call_id: str, request_digest: str) -> str:
     return "census-" + hashlib.sha256(f"{call_id}\n{request_digest}".encode("utf-8")).hexdigest()[:48]
 
 
+def generation_key(key: str, generation: int) -> str:
+    """The idempotency key of a call's ``generation``-th submission: 0 is the call's own key. A later one is used only
+    while every earlier key holds work the broker will not run again for this call, so every invocation walks the
+    same sequence and meets the job the first usable key holds."""
+    if generation == 0:
+        return key
+    return "census-" + hashlib.sha256(f"{key}\n{generation}".encode("utf-8")).hexdigest()[:48]
+
+
 # ----------------------------------------------------------------------------- socket client
 class BrokerUnavailable(ReviewError):
     """The principal socket could not be reached or answered without a readable body."""
 
 
 class BrokerRefused(ReviewError):
-    """The broker answered and refused the request (an error status with a closed code)."""
+    """The broker answered and refused the request (an error status with a closed code); ``detail`` is its body."""
 
-    def __init__(self, status: int, code: str, message: str = ""):
+    def __init__(self, status: int, code: str, message: str = "", detail: Mapping[str, Any] | None = None):
         super().__init__(f"{code} (HTTP {status})" + (f": {message[:200]}" if message else ""))
-        self.status, self.code = status, code
+        self.status, self.code, self.detail = status, code, dict(detail or {})
 
 
 def check_socket(path: str) -> str:
@@ -168,6 +187,9 @@ def check_socket(path: str) -> str:
         raise ValidationError("the broker socket must be an absolute path (--broker-socket or OCSL_BROKER_SOCKET)")
     try:
         mode = os.stat(path).st_mode
+    except FileNotFoundError as error:
+        raise ValidationError("the broker socket is not reachable: FileNotFoundError (the run principal may have been "
+                              "revoked, its socket withdrawn, or the daemon is restarting)") from error
     except OSError as error:
         raise ValidationError(f"the broker socket is not reachable: {type(error).__name__}") from error
     if not stat.S_ISSOCK(mode):
@@ -198,13 +220,18 @@ class BrokerClient:
         self.path, self.timeout = path, timeout
 
     def request(self, method: str, route: str, payload: Any = None) -> dict[str, Any]:
+        # ASCII JSON: every string, a lone surrogate included, travels as escapes the broker parses back unchanged, so
+        # the request it hashes is the one built here (the canonical digest never depends on this encoding).
+        body = None if payload is None else json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         connection = _UnixConnection(self.path, self.timeout)
         try:
-            body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             connection.request(method, route, body, {"Content-Type": "application/json"} if body is not None else {})
             response = connection.getresponse()
             raw = response.read(MAX_RESPONSE_BYTES + 1)
             status = response.status
+        except FileNotFoundError as error:
+            raise BrokerUnavailable("broker socket: FileNotFoundError (the socket is gone: the run principal may have been "
+                                    "revoked or its socket withdrawn, or the daemon is restarting)") from error
         except (OSError, http.client.HTTPException) as error:
             raise BrokerUnavailable(f"broker socket: {type(error).__name__}") from error
         finally:
@@ -217,7 +244,8 @@ class BrokerClient:
             raise BrokerUnavailable(f"broker answered HTTP {status} without JSON") from error
         if status != 200:
             detail = value if isinstance(value, dict) else {}
-            raise BrokerRefused(status, str(detail.get("code") or "HTTP_%d" % status), str(detail.get("error") or ""))
+            raise BrokerRefused(status, str(detail.get("code") or "HTTP_%d" % status), str(detail.get("error") or ""),
+                                detail)
         if not isinstance(value, dict):
             raise BrokerUnavailable("broker answer is not a JSON object")
         return value
@@ -247,6 +275,7 @@ class _Waiter:
     event: threading.Event = field(default_factory=threading.Event)
     job: dict[str, Any] | None = None
     unavailable: str | None = None
+    seq: int = 0
 
 
 def _job(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -278,12 +307,13 @@ class BrokerTransport:
 
     def __init__(self, socket_path: str, *, worker: str | None = None, on_premises: bool = False,
                  client: Any = None, poll_interval: float = 0.5, wait_seconds: float = DEFAULT_WAIT_SECONDS,
-                 outage_seconds: float = DEFAULT_OUTAGE_SECONDS, clock: Callable[[], float] = time.monotonic,
-                 wall: Callable[[], float] = time.time):
+                 outage_seconds: float = DEFAULT_OUTAGE_SECONDS, recheck_seconds: float = DEFAULT_RECHECK_SECONDS,
+                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         self.socket_path = check_socket(socket_path) if client is None else socket_path
         self.client = client or BrokerClient(self.socket_path)
         self.requested_worker, self.on_premises = worker, on_premises
         self.poll_interval, self.wait_seconds, self.outage_seconds = poll_interval, wait_seconds, outage_seconds
+        self.recheck_seconds = recheck_seconds
         self.clock, self.wall = clock, wall
         self.catalog: dict[str, Any] | None = None
         self.principal_id = self.run_id = self.worker_id = self.provider_id = self.worker_model = None
@@ -291,11 +321,15 @@ class BrokerTransport:
         self._cond = threading.Condition(self._lock)
         self._waiters: dict[str, _Waiter] = {}
         self._cursor: int | None = None
+        self._registered = 0        # waiters registered so far
+        self._started_at = 0        # waiters registered when the cursor was started from a job summary
+        self._lowered = 0           # bumped whenever a waiter moves the cursor back; a poll begun before keeps it there
         self._resumed: set[str] = set()
         self._halted: dict[str, Any] | None = None
         self._closed = False
         self._poller: threading.Thread | None = None
-        self.counters = {"jobs": 0, "replayed": 0, "resumed": 0, "polls": 0}
+        self.last_unavailable: str | None = None
+        self.counters = {"jobs": 0, "replayed": 0, "resumed": 0, "walked": 0, "keyGenerations": 0, "polls": 0}
 
     # ------------------------------------------------------------------ identity and grants
     def open(self, *, refresh: bool = False) -> dict[str, Any]:
@@ -371,7 +405,8 @@ class BrokerTransport:
             halted = dict(self._halted) if self._halted else None
             counters = dict(self.counters)
         return {"kind": self.kind, "principalId": self.principal_id, "runId": self.run_id, "worker": self.worker_id,
-                "model": self.worker_model, "onPremises": self.on_premises, "halted": halted, **counters}
+                "model": self.worker_model, "onPremises": self.on_premises, "halted": halted,
+                "lastUnavailable": self.last_unavailable, **counters}
 
     def _count(self, name: str) -> None:
         with self._lock:
@@ -417,13 +452,48 @@ class BrokerTransport:
             return BrokerOutcome("halted", error="transport halted: " + halted["reason"])
         item = {**{name: value for name, value in settings.items() if name not in ("messages", "itemCount")},
                 "messages": messages, "itemCount": item_count}
-        request = {"configId": self.worker_id, "idempotencyKey": key, "concurrency": 1, "instrumentDigest": digest,
-                   "items": [{"id": item_id, "input": item}]}
+        for generation in range(MAX_KEY_GENERATIONS):
+            if generation:
+                self._count("keyGenerations")
+            request = {"configId": self.worker_id, "idempotencyKey": generation_key(key, generation), "concurrency": 1,
+                       "instrumentDigest": digest, "items": [{"id": item_id, "input": item}]}
+            outcome = self._generation(request, item_id, digest, deadline)
+            if outcome is not None:
+                return self._unavailable(outcome)
+        reason = (f"every one of the call's {MAX_KEY_GENERATIONS} idempotency keys holds work submitted under another worker "
+                  "configuration (WORKER_KEY_CONFLICT or WORKER_CONFIG_CHANGED); check the daemon's provider configuration")
+        self.halt(reason, code="WORKER_KEY_CONFLICT")
+        return BrokerOutcome("refused", error=reason, code="WORKER_KEY_CONFLICT")
+
+    def _unavailable(self, outcome: BrokerOutcome) -> BrokerOutcome:
+        if outcome.kind == "unavailable" and outcome.error:
+            with self._lock:
+                self.last_unavailable = outcome.error[:300]
+        return outcome
+
+    def _generation(self, request: dict[str, Any], item_id: str, digest: str, deadline: float) -> BrokerOutcome | None:
+        """Submit the call under one key and follow its job lineage; None when this key holds work the broker will not
+        run again for this call (the caller moves to the next key)."""
         try:
             job = _job(self.client.request("POST", "/bulk/submit?view=summary", request))
         except BrokerUnavailable as error:
             return BrokerOutcome("unavailable", error=str(error))
         except BrokerRefused as error:
+            if error.code == "WORKER_KEY_CONFLICT":
+                # The key holds a job of another worker configuration (or an older daemon's request shape). If that
+                # job settled the call, its answer is the call's; otherwise the next key carries the call.
+                held = error.detail.get("jobId")
+                if not isinstance(held, str) or not held:
+                    return None
+                try:
+                    job = _job(self.client.request("GET", f"/jobs/{held}?view=summary"))
+                except BrokerUnavailable as failure:
+                    return BrokerOutcome("unavailable", error=str(failure))
+                except BrokerRefused:
+                    return None
+                if job.get("instrumentDigest") not in (None, digest):
+                    return None
+                return self._follow(job, item_id, deadline, held=True)
             self.halt(f"the broker refused the job: {error}", code=error.code)
             return BrokerOutcome("refused", error=f"broker refused the job: {error.code}", code=error.code)
         if job.get("instrumentDigest") not in (None, digest):
@@ -432,9 +502,19 @@ class BrokerTransport:
         self._count("jobs")
         if job.get("state") not in ("queued", None):
             self._count("replayed")
+        return self._follow(job, item_id, deadline)
+
+    def _follow(self, job: dict[str, Any], item_id: str, deadline: float, *, held: bool = False) -> BrokerOutcome | None:
+        """Follow a call's job lineage until its item settles, resuming paused jobs where allowed.
+
+        Resuming a job that was resumed before answers that resume's job without any side effect, so the lineage is
+        walked to its tail (``MAX_LINEAGE`` steps) without counting as resumes; only a resume that yields a running job
+        counts towards ``MAX_RESUMES``. Each step's ``resumeAfter`` is checked before it is resumed. ``held``: the job a
+        key conflict named; a pause it cannot leave sends the call to its next key instead of halting.
+        """
         # ``observed``: this invocation saw the current job leave queued/running. A job met already paused (a
         # repeated call, or a resume answered with the lineage's existing job) paused before this invocation.
-        root, observed, hops = job["jobId"], False, 0
+        root, observed, resumes, walked = job["jobId"], False, 0, 0
         while True:
             state = job.get("state")
             if state in ACTIVE_STATES or state is None:
@@ -449,7 +529,14 @@ class BrokerTransport:
                 return BrokerOutcome("unavailable", job=job, error=str(error))
             if state in SETTLED_STATES:
                 if item is None:
+                    if held:
+                        return None
                     return BrokerOutcome("unavailable", job=job, error="the broker job holds no result for the call")
+                if item.get("state") not in SETTLED_ITEM_STATES:
+                    # A job settled while its item still runs (a double launch across a restart): not an answer yet.
+                    # The call stays unrecorded and meets the job again on the next pass or invocation.
+                    return BrokerOutcome("unavailable", job=job, error=f"the broker job is {state} but the call's item "
+                                         f"is still {item.get('state')}")
                 return BrokerOutcome("settled", job=job, item=item)
             if item is not None and item.get("errorCode") == "MODEL_DRIFT":
                 # The broker keeps the provider paused; resuming other jobs would only meet the drift again.
@@ -466,19 +553,26 @@ class BrokerTransport:
                 again = observed and (root in self._resumed or state == "cancelled")
                 if observed:
                     self._resumed.add(root)
-            if halted or again or (until is not None and until > self.wall()) or hops >= MAX_RESUMES:
+            if halted or again or (until is not None and until > self.wall()) or resumes >= MAX_RESUMES \
+                    or walked >= MAX_LINEAGE:
                 self.halt(reason, code=code, resume_after=resume_after)
                 return BrokerOutcome("paused", job=job, item=item, error=reason, code=code)
-            hops += 1
             try:
-                job = _job(self.client.request("POST", f"/jobs/{job['jobId']}/resume"))
+                answered = _job(self.client.request("POST", f"/jobs/{job['jobId']}/resume"))
             except BrokerUnavailable as error:
                 return BrokerOutcome("unavailable", error=str(error))
             except BrokerRefused as error:
+                if error.code == "WORKER_CONFIG_CHANGED":
+                    return None             # the lineage cannot continue under today's worker: the next key carries the call
                 self.halt(f"{reason}; resume refused: {error.code}", code=error.code, resume_after=resume_after)
                 return BrokerOutcome("paused", item=item, error=f"broker resume refused: {error.code}", code=error.code)
-            self._count("resumed")
-            observed = False
+            if answered.get("state") in ACTIVE_STATES or answered.get("state") is None:
+                resumes += 1
+                self._count("resumed")
+            else:
+                walked += 1                 # an earlier resume of this lineage, met settled or paused
+                self._count("walked")
+            job, observed = answered, False
 
     def _item(self, job_id: str, item_id: str) -> dict[str, Any] | None:
         after = 0
@@ -493,11 +587,20 @@ class BrokerTransport:
             after = cursor
 
     def _await(self, job_id: str, deadline: float) -> dict[str, Any] | BrokerOutcome:
-        """The job once it leaves queued/running: registered first, then checked, then left to the poller."""
+        """The job once it leaves queued/running: registered first, then checked, then left to the poller.
+
+        The feed cursor starts from the first awaited job's summary. A job awaited from before that start may have
+        settled between its own reading and the start, at a revision the cursor already passed: such a job moves the
+        cursor back to its reading's revision, and a poll begun before keeps it there. (A job awaited later settles at
+        a revision beyond any the cursor has passed.) Its summary is also read again every ``recheck_seconds`` while
+        it waits, so no settlement can wait for the deadline.
+        """
         waiter = _Waiter()
         with self._cond:
             if self._closed:
                 return BrokerOutcome("unavailable", error="transport closed")
+            self._registered += 1
+            waiter.seq = self._registered
             self._waiters[job_id] = waiter
             self._start_poller()
         try:
@@ -507,16 +610,33 @@ class BrokerTransport:
                 return BrokerOutcome("unavailable", error=str(error))
             except BrokerRefused as error:
                 return BrokerOutcome("unavailable", error=f"broker job lookup refused: {error.code}", code=error.code)
-            revision = current.get("revision")
-            with self._cond:
-                if self._cursor is None and isinstance(revision, int) and not isinstance(revision, bool):
-                    self._cursor = max(0, revision - 1)
-                    self._cond.notify_all()
             if current.get("state") not in ACTIVE_STATES:
                 return current
+            revision = current.get("revision")
+            with self._cond:
+                if isinstance(revision, int) and not isinstance(revision, bool):
+                    floor = max(0, revision - 1)
+                    if self._cursor is None:
+                        self._cursor, self._started_at = floor, self._registered
+                        self._cond.notify_all()
+                    elif waiter.seq <= self._started_at and floor < self._cursor:
+                        self._cursor = floor
+                        self._lowered += 1
+                        self._cond.notify_all()
+            checked = self.clock()
             while not waiter.event.wait(timeout=max(0.0, min(1.0, deadline - self.clock()))):
-                if self.clock() >= deadline:
+                now = self.clock()
+                if now >= deadline:
                     return BrokerOutcome("timeout", job=current, error="no broker settlement before the wait deadline")
+                if now - checked >= self.recheck_seconds:
+                    checked = now
+                    try:
+                        again = _job(self.client.request("GET", f"/jobs/{job_id}?view=summary"))
+                    except (BrokerUnavailable, BrokerRefused):
+                        continue            # the feed reports an outage once it lasts
+                    if again.get("state") not in ACTIVE_STATES:
+                        return again
+                    current = again
             if waiter.unavailable is not None:
                 return BrokerOutcome("unavailable", job=current, error=waiter.unavailable)
             return waiter.job
@@ -540,7 +660,7 @@ class BrokerTransport:
                     self._cond.wait()
                 if self._closed:
                     return
-                cursor = self._cursor
+                cursor, lowered = self._cursor, self._lowered
             try:
                 page = self.client.request("GET", f"/jobs?view=summary&after={cursor}&limit=1000")
             except (BrokerUnavailable, BrokerRefused) as error:
@@ -564,9 +684,11 @@ class BrokerTransport:
                         waiter.job = _job(entry)
                         waiter.event.set()
                 following = page.get("nextCursor")
-                if isinstance(following, int) and not isinstance(following, bool) and following > (self._cursor or 0):
+                # A waiter that moved the cursor back during this poll needs the revisions before it: keep its cursor.
+                if (lowered == self._lowered and isinstance(following, int) and not isinstance(following, bool)
+                        and following > (self._cursor or 0)):
                     self._cursor = following
-                if not page.get("hasMore"):
+                if not page.get("hasMore") and lowered == self._lowered:
                     self._cond.wait(timeout=self.poll_interval)
 
     def close(self) -> None:

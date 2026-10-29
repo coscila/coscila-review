@@ -272,6 +272,15 @@ def broker_bundle(instrument_id: str, *, tier: str | None = None,
                 raise ValidationError(f"{instrument.id}: parameter {name} token must occur once in the system prompt")
             prompt = prompt.replace(token, value)
     request = spec["request"]
+    # The broker sends reasoning_effort always and a seed whenever the bundle has one; the census executor sends
+    # reasoning_effort only when the tier declares it and never a seed. A tier for which the two requests would
+    # differ cannot run verbatim: every call would stop as a request mismatch.
+    if not request.get("reasoningEffort"):
+        raise ValidationError(f"{instrument.id} tier {tier} declares no reasoningEffort: the executor would send no "
+                              "reasoning_effort while the broker always sends one; such a tier cannot run verbatim")
+    if request.get("seed") is not None:
+        raise ValidationError(f"{instrument.id} tier {tier} declares a seed the executor does not send: the broker would "
+                              "add it to every request; such a tier cannot run verbatim")
     rule = request["maxOutputTokens"]
     required = manifest.get("requiredModel") or {}
     bundle = {"instrumentId": instrument.id, "version": instrument.version, "systemPrompt": prompt,

@@ -56,11 +56,17 @@ Each call is a one-item bulk job carrying the request the instrument built (its
 messages unchanged and its settings, which the broker checks against the
 installed bundle before any provider call); a refusal, or a receipt whose
 request digest differs from the request the instrument built, makes the call
-invalid and pauses the run as `paused:fidelity`. A broker pause
-(provider limit, budget, expiry, withdrawn grant) pauses the run as
+invalid and pauses the run as `paused:fidelity`. Only what the judge's response
+itself said counts: its model (one naming none is model drift), its
+`system_fingerprint` (none offered means none recorded) and its status (only
+400, 413 and 422 are refusals; other failures keep the entries open). A broker
+pause (provider limit, budget, expiry, withdrawn grant) pauses the run as
 `paused:transport` with the broker's reason and `resumeAfter`; running the same
-command again resumes the same broker jobs and never judges an entry twice.
-Details: `$OCSL_REVIEW_HOME/docs/census-instrument.md`.
+command again resumes the same broker jobs (following earlier resumes to the
+lineage's tail, and moving to a new key when the daemon's worker configuration
+changed) and never judges an entry twice. A socket that is gone may mean a
+revoked principal or a restarting daemon. Details:
+`$OCSL_REVIEW_HOME/docs/census-instrument.md`.
 
 ## Durable execution
 
