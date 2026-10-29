@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Study-identifying tokens (session, workspace and chat identifiers, file names, outcome figures and interval
 # bounds, corpus totals, title fragments and a date seed) are kept here only as sha256 digests, grouped by
 # length; lab-facing files, and every tracked file outside tests, must contain none of them at a word start.
-# No-break and thin spaces count as spaces, so "16.0<NBSP>%" is the same token as "16.0 %".
+# No-break and thin spaces count as spaces, so "12.5<NBSP>%" is the same token as "12.5 %".
 FORBIDDEN = {
     4: {"0c90dd551bf12b5fecc7a9c5caa5a728d45b1c2a5f1760aca9331c12ce0df252",
         "c31e0fcedb154b3269a7fbf9b8e71a41d16af95fd4b16cb805df3dcdddf0e700"},
@@ -63,6 +63,7 @@ FORBIDDEN = {
 LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/instrument.schema.json",
               "src/ocsl_review/instruments.py", "src/ocsl_review/citation_census.py",
               "src/ocsl_review/census_extraction.py", "src/ocsl_review/census_runner.py",
+              "src/ocsl_review/census_broker.py",
               "src/ocsl_review/scores_db.py", "src/ocsl_review/estimands.py", "src/ocsl_review/corpus_facts.py",
               "src/ocsl_review/study_cli.py", "src/ocsl_review/census_abstracts.py"]
 

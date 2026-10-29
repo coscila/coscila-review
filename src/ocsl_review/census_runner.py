@@ -7,7 +7,10 @@ around the instrument: review preparation from structured documents, the
 chat-completions transport with bounded retries, the repair pass, the served
 model check, per-call receipts with prompt and body digests, identity-bound
 evidence, the append-only verdict history and the predeclared no-truncation
-sensitivity. The working database is ``scores_db``.
+sensitivity. Calls go to a judge directly (chat completions) or through the
+run principal's broker socket (``census_broker``), where the broker's request
+digest must equal the canonical digest of the body built here. The working
+database is ``scores_db``.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from xml.etree import ElementTree as ET
 
+from . import census_broker
 from . import citation_census as C
 from . import scores_db
 from .census_extraction import extract_review, resolve_identity
@@ -103,6 +107,8 @@ class TransportError(ReviewError):
 
 
 REFUSED_STATUS = frozenset({400, 413, 422})
+# The served model of a drift whose response named no model: never the requested model taken on trust.
+MISSING_MODEL = "(no model named in the response)"
 
 
 class ModelDrift(ReviewError):
@@ -134,6 +140,40 @@ def code_revision() -> str:
     except (OSError, subprocess.SubprocessError):
         commit = ""
     return f"ocsl-review {__version__}" + (f"+{commit}" if commit else "")
+
+
+STUDY_BUNDLE_FORMAT = "ocsl-study-bundle-v1"
+
+
+def load_study_bundle(value: str | Path, *, instrument: Any) -> tuple[dict[str, Any] | None, str]:
+    """(bundle, sha256) of ``study prepare --study-bundle``: a bundle file whose digest and instrument pin are
+    checked, or a bare sha256 (bundle None) when the bundle itself lives with the Study Run."""
+    from .instruments import canonical as bundle_canonical, sha256_bytes
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return None, text
+    path = Path(text)
+    if not text or not path.is_file():
+        raise ValidationError("--study-bundle takes a study bundle file (JSON) or the bundle's sha256")
+    data = path.read_bytes()
+    if len(data) > 1024 * 1024:
+        raise ValidationError("the study bundle file exceeds 1 MiB")
+    try:
+        bundle = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValidationError("the study bundle file is not UTF-8 JSON") from error
+    if not isinstance(bundle, dict) or bundle.get("format") != STUDY_BUNDLE_FORMAT:
+        raise ValidationError(f"the study bundle file is no {STUDY_BUNDLE_FORMAT} record")
+    bundle.pop("artifactSha256", None)
+    record = {key: item for key, item in bundle.items() if key != "sha256"}
+    digest = sha256_bytes(bundle_canonical(record).encode("utf-8"))
+    if bundle.get("sha256") != digest:
+        raise ValidationError("the study bundle's sha256 differs from its content")
+    pinned = (bundle.get("instruments") or {}).get(instrument.id)
+    if pinned != instrument.digest:
+        raise ValidationError(f"the study bundle pins {instrument.id} as {pinned or 'nothing'}; the installed instrument "
+                              f"is {instrument.digest}")
+    return bundle, digest
 
 
 class HttpChatTransport:
@@ -172,8 +212,11 @@ class HttpChatTransport:
 class CallResult:
     receipt: dict[str, Any]
     text: str | None
-    served_model: str | None
+    served_model: str | None    # the served model, or MISSING_MODEL for a drift whose response named no model
     responded: bool = True      # False when no attempt received a response (connection, HTTP error, timeout)
+    record: bool = True         # False: no receipt row (a broker call that never settled keeps its call id for a replay)
+    stop: str | None = None     # "fidelity": the broker sent another request than the instrument built, or refused it
+    call_id: str | None = None
 
 
 class EmptyCompletion(TransportError):
@@ -247,14 +290,123 @@ def execute(transport: Any, payload: dict[str, Any], *, tier: str, required_mode
         receipt.update({"seconds": round(time.monotonic() - started, 3), **_response_fields(response), "error": None})
         if served != required_model:
             receipt["error"] = "model_drift"
-            return CallResult(receipt, None, served)
+            return CallResult(receipt, None, served or MISSING_MODEL)
         return CallResult(receipt, content, served)
     if empty is not None:
         receipt.update(_response_fields(empty))
-        receipt["error"] = "model_drift" if receipt["served_model"] != required_model else error
+        if receipt["served_model"] != required_model:
+            receipt["error"] = "model_drift"
+            return CallResult(receipt, None, receipt["served_model"] or MISSING_MODEL)
+        receipt["error"] = error
         return CallResult(receipt, None, receipt["served_model"])
     receipt["error"] = error or "transport failure"
     return CallResult(receipt, None, None, responded=refused)
+
+
+def _token_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+# Closed codes of an item the broker refused before any provider call (no attempt): it will not send the request the
+# instrument built. INSTRUMENT_MESSAGE_MISMATCH: the messages or settings differ from the bundle installed under the
+# digest (or the worker's model); PRINCIPAL_REQUIRED: the socket carries no run principal authority for a verbatim
+# instrument; INVALID_REQUEST: an item the broker cannot run verbatim at all.
+BROKER_REFUSALS = frozenset({"INSTRUMENT_MESSAGE_MISMATCH", "PRINCIPAL_REQUIRED", "INVALID_REQUEST"})
+# Receipt errors of calls stopped as fidelity failures; status and facts count them apart from transport failures.
+FIDELITY_ERRORS = ("request_mismatch", "broker refused the instrument call:%")
+
+
+def _http_status(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
+
+
+def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, required_model: str, call_id: str,
+                   digest: str, items: int) -> CallResult:
+    """One logical call as a one-item broker job (``census_broker.BrokerTransport``); returns the receipt fields.
+
+    The item carries ``payload`` whole: its messages unchanged and its settings, which the broker checks against the
+    installed bundle and the worker's model before any provider call; a refusal stops the run (``BROKER_REFUSALS``).
+    The broker retries transport failures itself. A completed item counts only when it reports the digest of
+    the request it sent upstream and that digest equals the canonical digest of ``payload``; otherwise the call
+    is invalid, its output is never parsed and the run stops (``stop="fidelity"``). A call that never settled
+    (paused, halted, unavailable, timed out) records no receipt row, so the next invocation repeats the same call
+    id and meets the same broker job. Never-dispatched items and calls without an answer carry no served model.
+
+    What counts is what the judge's own response said, exactly as for a direct call: the served model is the model the
+    response named (``servedModel``; a response naming none is model drift, never the requested model), the fingerprint
+    is the response's own ``system_fingerprint`` (``systemFingerprint``; the daemon's synthesized identity is kept apart
+    in ``broker_server_fingerprint``), an upstream status other than 400, 413 or 422 is a transport failure (the entries
+    stay open), and an empty completion is an answer without labels.
+    """
+    expected = census_broker.request_sha256(payload)
+    body = C.request_body(payload)
+    settings = {k: v for k, v in payload.items() if k != "messages"}
+    receipt = {**C.digests(payload["messages"], body), "settings_sha256": sha256_text(canonical(settings)),
+               "max_tokens": payload["max_tokens"], "request_model": payload["model"], "attempts": 0, "error": None,
+               "transport": "broker", "request_sha256": expected,
+               "broker_principal_id": getattr(transport, "principal_id", None), "broker_item_id": call_id,
+               "broker_instrument_digest": digest}
+    outcome = transport.call(item_id=call_id, messages=payload["messages"], item_count=items, digest=digest,
+                             key=census_broker.idempotency_key(call_id, expected), settings=settings)
+    receipt["seconds"] = outcome.seconds
+    if outcome.job:
+        receipt["broker_job_id"] = outcome.job.get("jobId")
+    item = outcome.item if isinstance(outcome.item, dict) else None
+    served = fingerprint = None
+    if item is not None:
+        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        served = item.get("servedModel") if isinstance(item.get("servedModel"), str) else None
+        fingerprint = item.get("systemFingerprint") if isinstance(item.get("systemFingerprint"), str) else None
+        receipt.update({"attempts": _token_count(item.get("attempts")) or 0,
+                        "prompt_tokens": _token_count(usage.get("input")),
+                        "completion_tokens": _token_count(usage.get("output")),
+                        "total_tokens": _token_count(usage.get("total")),
+                        "cached_tokens": _token_count(usage.get("cacheRead")),
+                        "finish_reason": item.get("finishReason"),
+                        "truncated": int(bool(item.get("truncated")) or item.get("finishReason") == "length"),
+                        "broker_settings_sha256": item.get("settingsSha256"),
+                        "broker_request_sha256": item.get("requestSha256"),
+                        "broker_error_code": item.get("errorCode"),
+                        "broker_server_fingerprint": item.get("serverFingerprint"),
+                        "broker_http_status": _http_status(item.get("httpStatus"))})
+    if outcome.kind == "drift" and item is not None:
+        receipt.update({"served_model": served, "fingerprint": fingerprint, "error": "model_drift"})
+        return CallResult(receipt, None, served or MISSING_MODEL)
+    if outcome.kind != "settled" or item is None:
+        receipt["error"] = outcome.error or outcome.kind
+        return CallResult(receipt, None, None, responded=False, record=False)
+    status = receipt.get("broker_http_status")
+    if item.get("state") == "completed":
+        receipt.update({"served_model": served, "fingerprint": fingerprint})
+        if served != required_model:
+            receipt["error"] = "model_drift"
+            return CallResult(receipt, None, served or MISSING_MODEL)
+        if item.get("requestSha256") != expected:
+            receipt["error"] = "request_mismatch"
+            return CallResult(receipt, None, served, responded=False, stop="fidelity")
+        output = item.get("output")
+        text = output if isinstance(output, str) else ("" if output is None else json.dumps(output, ensure_ascii=False))
+        if not text.strip():
+            # The judge answered with an empty completion (the broker asked again as a direct call would): an answer
+            # without labels.
+            receipt["error"] = "empty content; finish=%s" % item.get("finishReason")
+            return CallResult(receipt, None, served)
+        return CallResult(receipt, text, served)
+    code = str(item.get("errorCode") or "INTERNAL")
+    if code == "INVALID_REQUEST" and receipt["attempts"] and status in REFUSED_STATUS:
+        # The judge server refused this very request (HTTP 400, 413 or 422): an answer without labels.
+        receipt["error"] = f"refused: broker INVALID_REQUEST (HTTP {status})"
+        return CallResult(receipt, None, None, responded=True)
+    if code in BROKER_REFUSALS and not receipt["attempts"]:
+        # The broker refused the item before any provider call: it would not send the request the instrument built.
+        # Nothing reached a judge, and the same request would be refused again: the run stops as a fidelity failure.
+        detail = " ".join(str(item.get("error") or "").split())[:300]
+        receipt["error"] = f"broker refused the instrument call: {code}" + (f" ({detail})" if detail else "")
+        return CallResult(receipt, None, None, responded=False, stop="fidelity")
+    # Any other failure (an upstream status other than 400, 413 or 422, no usable answer after the broker's attempts,
+    # an unreachable judge) is a transport failure: no response decided the entries, so they stay open.
+    receipt["error"] = "broker %s: %s" % (item.get("state"), code) + (f" (HTTP {status})" if status else "")
+    return CallResult(receipt, None, None, responded=False)
 
 
 def writer_lock(database: Path) -> int:
@@ -288,6 +440,8 @@ class CensusRun:
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
         self.input_caches: Any = None
+        self._fidelity: list[str] = []
+        self._digests: dict[tuple[str, str], str] = {}
         self._writer = writer_lock(Path(database))
         try:
             self.connection = scores_db.connect(Path(database), create=True)
@@ -306,6 +460,7 @@ class CensusRun:
             self.close()
             raise
         self.seed = seed
+        self.study_bundle = scores_db.meta(self.connection).get("studyBundleSha256")
 
     def _release(self) -> None:
         if self._writer is not None:
@@ -317,7 +472,31 @@ class CensusRun:
         connection = getattr(self, "connection", None)
         if connection is not None:
             connection.close()
+        closer = getattr(getattr(self, "transport", None), "close", None)
+        if callable(closer):
+            closer()
         self._release()
+
+    # ------------------------------------------------------------------ study bundle
+    def pin_study_bundle(self, value: str | Path) -> dict[str, Any]:
+        """Pin the study bundle before the first call; its digest is recorded in every call receipt.
+
+        ``value`` is a study bundle file (``ocsl-study-bundle-v1``, the record of
+        ``instruments.study_bundle_digest``; its sha256 and its citation-census@1 digest are checked) or the
+        bundle's sha256 alone. A database pins one bundle.
+        """
+        bundle, digest = load_study_bundle(value, instrument=self.instrument)
+        with self.lock, self.connection:
+            pinned = scores_db.meta(self.connection).get("studyBundleSha256")
+            if pinned is None and self.connection.execute("SELECT 1 FROM calls LIMIT 1").fetchone():
+                raise ValidationError("the study bundle is pinned before the first call: this database already holds "
+                                      "call receipts without it")
+            values: dict[str, Any] = {"studyBundleSha256": digest}
+            if bundle is not None:
+                values["studyBundle"] = canonical(bundle)
+            scores_db.set_meta(self.connection, values)
+        self.study_bundle = digest
+        return {"studyBundleSha256": digest, "contentVerified": bundle is not None}
 
     # ------------------------------------------------------------------ input pins
     def pin_inputs(self, caches: Any) -> dict[str, Any]:
@@ -589,23 +768,159 @@ class CensusRun:
                           "abstract": row["abstract"] or ""})
         return items
 
-    def _receipt(self, result: CallResult, *, journal: str, doi: str, tier: str, variant: str, batch: int,
-                 kind: str, labels: Sequence[str], parsed: int, missing: int, problems: int) -> str:
-        base = canonical([self.run_id, journal, doi, tier, variant, batch, kind])
-        with self.lock, self.connection:
+    def _call_id(self, journal: str, doi: str, tier: str, variant: str, batch: int, kind: str,
+                 labels: Sequence[str] | None = None) -> str:
+        """The receipt id of the next call of this batch and kind (one thread handles a batch at a time).
+
+        A call recorded with an error advances the id; a broker call that never settled keeps it, so a later
+        invocation repeats the same id and meets the broker job that already holds it. A full-text call's id also
+        names its labels: chunks are numbered per pass, and a call still pending from an earlier pass keeps its id
+        beside a new chunk of the same number.
+        """
+        base = canonical([self.run_id, journal, doi, tier, variant, batch, kind] + ([list(labels)] if labels else []))
+        with self.lock:
             nonce = self.connection.execute(
                 "SELECT COUNT(*) FROM calls WHERE run_id=? AND journal=? AND doi=? AND tier=? AND variant=? AND batch=? AND kind=?",
                 (self.run_id, journal, doi, tier, variant, batch, kind)).fetchone()[0]
-            call_id = "call-" + sha256_text(base + ":" + str(nonce))[:24]
-            r = result.receipt
+        return "call-" + sha256_text(base + ":" + str(nonce))[:24]
+
+    def _broker(self) -> bool:
+        return getattr(self.transport, "kind", None) == "broker"
+
+    def _broker_digest(self, tier: str, journal: str) -> str:
+        """The broker allow-list digest of this tier's bundle for the journal (``instruments export``)."""
+        key = (tier, journal)
+        digest = self._digests.get(key)
+        if digest is None:
+            from .instruments import broker_bundle
+            digest = broker_bundle(self.instrument.id, tier=tier, parameters={"journal": journal})["digest"]
+            self._digests[key] = digest
+        return digest
+
+    def _broker_preflight(self, tier: str, condition: str, params: Sequence[Any] = ()) -> None:
+        """Before any broker call: a pinned study bundle, the worker's model and every needed bundle granted."""
+        if not self._broker():
+            return
+        if not self.study_bundle:
+            raise ValidationError("a broker run records the study bundle in every receipt: pin it first with "
+                                  "study prepare --study-bundle")
+        with self.lock:
+            journals = [row[0] for row in self.connection.execute(
+                f"SELECT DISTINCT journal FROM reviews WHERE {condition} ORDER BY journal", params)]
+        self.transport.require({f"{tier} tier, {journal}": self._broker_digest(tier, journal) for journal in journals},
+                               model=self.request_model)
+
+    def _call(self, payload: dict[str, Any], *, tier: str, journal: str, doi: str, variant: str, batch: int, kind: str,
+              items: int, call_id: str | None = None, pending: Sequence[dict[str, Any]] | None = None) -> CallResult:
+        """One call. ``pending`` (full-text items) is recorded before a broker call is submitted and removed with its
+        receipt, so a call that does not settle in this pass is sent again, unchanged, by the next pass or invocation
+        instead of being re-chunked into a new call while its broker job still runs."""
+        call_id = call_id or self._call_id(journal, doi, tier, variant, batch, kind)
+        if self._broker():
+            if pending is not None:
+                self._pend(call_id, payload, journal=journal, doi=doi, tier=tier, variant=variant, batch=batch,
+                           kind=kind, items=pending)
+            result = execute_broker(self.transport, payload, tier=tier, required_model=self.required_model,
+                                    call_id=call_id, digest=self._broker_digest(tier, journal), items=items)
+        else:
+            result = execute(self.transport, payload, tier=tier, required_model=self.required_model, sleep=self.sleep)
+            result.receipt.setdefault("transport", "direct")
+            result.receipt.setdefault("request_sha256", census_broker.request_sha256(payload))
+        result.call_id = call_id
+        return result
+
+    def _pend(self, call_id: str, payload: dict[str, Any], *, journal: str, doi: str, tier: str, variant: str,
+              batch: int, kind: str, items: Sequence[dict[str, Any]]) -> None:
+        labels = [item["label"] for item in items]
+        with self.lock, self.connection:
             self.connection.execute(
-                "INSERT INTO calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (call_id, self.run_id, journal, doi, tier, variant, batch, kind, len(labels), canonical(list(labels)),
-                 self.instrument.id, self.instrument.digest, self.revision, r.get("request_model"), r.get("served_model"),
-                 r.get("fingerprint"), r["settings_sha256"], r["systemSha256"], r["userSha256"], r["messagesSha256"],
-                 r["bodySha256"], r["max_tokens"], r.get("prompt_tokens"), r.get("completion_tokens"),
-                 r.get("total_tokens"), r.get("cached_tokens"), r.get("finish_reason"), r.get("truncated"),
-                 r["attempts"], r.get("seconds"), r.get("error"), parsed, missing, problems, utc_now()))
+                "INSERT OR REPLACE INTO pending_calls VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (call_id, self.run_id, journal, doi, tier, variant, batch, kind, canonical(labels),
+                 census_broker.request_sha256(payload), json.dumps(list(items), ensure_ascii=False, sort_keys=True),
+                 utc_now()))
+
+    def _stop(self, result: CallResult) -> None:
+        """A fidelity failure: the call is invalid, its labels stay open and no further call is dispatched (calls
+        already queued meet the halted transport and are not sent)."""
+        r = result.receipt
+        if r.get("error") == "request_mismatch":
+            reported = r.get("broker_request_sha256")
+            text = (f"call {result.call_id}: the broker reported request {reported or 'no request digest'}, the "
+                    f"instrument built {r.get('request_sha256')}; the broker must send verbatim instrument calls "
+                    "unchanged (no worker policy, no assignment text)")
+        elif r.get("broker_error_code") == "INSTRUMENT_MESSAGE_MISMATCH":
+            text = (f"call {result.call_id}: {r.get('error')}; the bundle installed under "
+                    f"{r.get('broker_instrument_digest')} or the broker worker's model differs from the request the "
+                    "instrument built (install exactly the bundle 'ocsl-review instruments export' prints for this tier "
+                    "and journal)")
+        else:
+            text = (f"call {result.call_id}: {r.get('error')}; the broker must run this instrument in verbatim mode over "
+                    "the run principal's socket")
+        with self.lock:
+            self._fidelity.append(text)
+        halt = getattr(self.transport, "halt", None)
+        if callable(halt):
+            halt(text, code="FIDELITY")
+
+    def _stop_reason(self) -> tuple[str, str, dict[str, Any]] | None:
+        with self.lock:
+            if self._fidelity:
+                return "fidelity", self._fidelity[0], {"reason": self._fidelity[0]}
+        halted = getattr(self.transport, "halted", None)
+        if halted:
+            return "transport", "broker halted: " + str(halted.get("reason")), halted
+        return None
+
+    def _stopped(self, totals: dict[str, Any]) -> dict[str, Any] | None:
+        """The paused result of a fidelity failure or a halted broker (provider limit, budget, refusal), or None."""
+        stop = self._stop_reason()
+        if stop is None:
+            return None
+        kind, text, detail = stop
+        self._pause(kind, detail)
+        result = {**totals, "state": "paused", "reason": f"{kind}: {text}; run the command again to resume"}
+        if detail.get("resumeAfter"):
+            result["resumeAfter"] = detail["resumeAfter"]
+        return result
+
+    def _with_transport(self, result: dict[str, Any]) -> dict[str, Any]:
+        describe = getattr(self.transport, "describe", None)
+        return {**result, "transport": describe()} if self._broker() and callable(describe) else result
+
+    def _receipt(self, result: CallResult, *, journal: str, doi: str, tier: str, variant: str, batch: int,
+                 kind: str, labels: Sequence[str], parsed: int, missing: int, problems: int,
+                 accepted: Callable[[str, str], None] | None = None) -> str:
+        """Record the call's receipt (``calls`` as every version writes it, ``call_transport`` beside it) and, in the
+        same transaction, ``accepted(call_id, now)``: the verdicts the call decided, so a crash never loses a
+        recorded call's answers. The call's pending row, if any, goes with it."""
+        call_id = result.call_id or self._call_id(journal, doi, tier, variant, batch, kind)
+        r = result.receipt
+        now = utc_now()
+        row = {"call_id": call_id, "run_id": self.run_id, "journal": journal, "doi": doi, "tier": tier, "variant": variant,
+               "batch": batch, "kind": kind, "n_items": len(labels), "labels_json": canonical(list(labels)),
+               "instrument_id": self.instrument.id, "instrument_digest": self.instrument.digest,
+               "code_revision": self.revision, "request_model": r.get("request_model"),
+               "served_model": r.get("served_model"), "fingerprint": r.get("fingerprint"),
+               "settings_sha256": r["settings_sha256"], "system_sha256": r["systemSha256"], "user_sha256": r["userSha256"],
+               "messages_sha256": r["messagesSha256"], "body_sha256": r["bodySha256"], "max_tokens": r["max_tokens"],
+               "prompt_tokens": r.get("prompt_tokens"), "completion_tokens": r.get("completion_tokens"),
+               "total_tokens": r.get("total_tokens"), "cached_tokens": r.get("cached_tokens"),
+               "finish_reason": r.get("finish_reason"), "truncated": r.get("truncated"), "attempts": r["attempts"],
+               "seconds": r.get("seconds"), "error": r.get("error"), "n_parsed": parsed, "n_missing": missing,
+               "n_problems": problems, "created_at": now}
+        transport = {"call_id": call_id, "transport": r.get("transport", "direct"), "study_bundle_sha256": self.study_bundle,
+                     "request_sha256": r.get("request_sha256"),
+                     **{column: r.get(column) for column in scores_db.BROKER_CALL_COLUMNS}}
+        with self.lock, self.connection:
+            self.connection.execute(f"INSERT INTO calls({', '.join(scores_db.CALL_COLUMNS)}) "
+                                    f"VALUES({', '.join('?' * len(scores_db.CALL_COLUMNS))})",
+                                    tuple(row[column] for column in scores_db.CALL_COLUMNS))
+            self.connection.execute(f"INSERT INTO call_transport({', '.join(scores_db.TRANSPORT_COLUMNS)}) "
+                                    f"VALUES({', '.join('?' * len(scores_db.TRANSPORT_COLUMNS))})",
+                                    tuple(transport[column] for column in scores_db.TRANSPORT_COLUMNS))
+            self.connection.execute("DELETE FROM pending_calls WHERE call_id=?", (call_id,))
+            if accepted is not None:
+                accepted(call_id, now)
         return call_id
 
     def _judge_batch(self, journal: str, doi: str, title: str, batch_index: int, batch: list[dict[str, Any]], *,
@@ -617,27 +932,51 @@ class CensusRun:
         open; ``start="repair"`` resumes a batch whose first call was answered but whose repair call never
         was. When the call that would decide the open labels got no response after its transport attempts,
         the outcome is ``incomplete``: those labels stay open for the next pass instead of becoming invalid.
+
+        A primary call's accepted verdicts are written with its receipt, in one transaction: a crash or a pause after
+        the first call loses none of its answers, so the batch resumes with exactly the repair call that was due (the
+        same call id and request, which meets the broker job that may still hold it). A sensitivity batch is written
+        whole when it completes and re-run whole otherwise.
         """
         open_labels = set(it["label"] for it in batch) if todo is None else set(todo)
         got: dict[str, tuple[dict[str, Any], str, int]] = {}
-        failures, drift, responded, answered = 0, None, False, True
+        failures, drift, responded, answered, stopped = 0, None, False, True, False
         for kind in ("first", "repair"):
             if kind == "first" and start == "repair":
                 continue
+            if self._stop_reason():
+                # A fidelity failure or a halted broker: nothing more is sent and the open labels stay open.
+                answered, stopped = False, True
+                break
             sub = batch if kind == "first" else [it for it in batch if it["label"] in open_labels and it["label"] not in got]
             if not sub:
                 break
             messages = (C.build_abstract_messages(sub, title, journal, cut=cut) if kind == "first"
                         else C.build_repair_messages(sub, title, journal, cut=cut))
             payload = C.request_payload(messages, model=self.request_model, items=len(sub), tier="abstract")
-            result = execute(self.transport, payload, tier="abstract", required_model=self.required_model, sleep=self.sleep)
+            result = self._call(payload, tier="abstract", journal=journal, doi=doi, variant=variant, batch=batch_index,
+                                kind=kind, items=len(sub))
             labels = [it["label"] for it in sub]
             if result.text is None:
-                failures += result.receipt.get("error") != "model_drift"
-                self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant, batch=batch_index,
-                              kind=kind, labels=labels, parsed=0, missing=len(sub), problems=0)
+                # Only recorded failures count (a broker call that never settled has no receipt yet); a fidelity
+                # stop is counted apart.
+                failures += int(result.record and not result.stop and result.receipt.get("error") != "model_drift")
+                if result.record:
+                    self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant, batch=batch_index,
+                                  kind=kind, labels=labels, parsed=0, missing=len(sub), problems=0)
                 if result.receipt.get("error") == "model_drift":
                     drift = result.served_model
+                    break
+                if result.stop:
+                    # Another request than the instrument built went upstream (or the broker refused it): nothing
+                    # is parsed, the labels stay open and the run stops dispatching.
+                    self._stop(result)
+                    answered, stopped = False, True
+                    break
+                if not result.record:
+                    # A broker call that never settled may still run there: no repair call duplicates it, and the
+                    # next pass or invocation repeats the same call id and meets the same broker job.
+                    answered = False
                     break
                 # An empty completion is an answer without labels; only a call nobody answered stays open.
                 answered = result.responded
@@ -645,19 +984,55 @@ class CensusRun:
                 continue
             responded, answered = True, True
             records, problems, missing = C.parse_labels(result.text, labels, stage="abstract")
+            positions = {label: i + 1 for i, label in enumerate(labels)}
+            accepted = {label: (record, positions[label]) for label, record in records.items()
+                        if label in open_labels and label not in got}
+            writer = (None if variant != "primary" else
+                      lambda call_id, now, chosen=accepted: self._write_accepted(journal, doi, batch_index, batch, chosen,
+                                                                                 call_id=call_id, cut=cut, now=now))
             call_id = self._receipt(result, journal=journal, doi=doi, tier="abstract", variant=variant, batch=batch_index,
                                     kind=kind, labels=labels, parsed=len(records), missing=len(missing),
-                                    problems=len(problems))
-            positions = {label: i + 1 for i, label in enumerate(labels)}
-            for label, record in records.items():
-                if label in open_labels:
-                    got[label] = (record, call_id, positions[label])
+                                    problems=len(problems), accepted=writer)
+            for label, (record, position) in accepted.items():
+                got[label] = (record, call_id, position)
         incomplete = drift is None and not answered and any(label not in got for label in open_labels)
         return {"batch": batch_index, "items": batch, "got": got, "todo": open_labels, "failures": failures,
-                "drift": drift, "incomplete": incomplete, "responded": responded}
+                "drift": drift, "incomplete": incomplete, "responded": responded, "stopped": stopped}
+
+    def _write_accepted(self, journal: str, doi: str, batch_index: int, batch: list[dict[str, Any]],
+                        accepted: Mapping[str, tuple[dict[str, Any], int]], *, call_id: str, cut: Any, now: str) -> None:
+        """A primary call's accepted verdicts (inside the receipt's transaction): the citation rows and the history."""
+        positions = {it["label"]: index for index, it in enumerate(batch, 1)}
+        items = {it["label"]: it for it in batch}
+        for label, (record, call_position) in accepted.items():
+            item = items[label]
+            sent = C.abstract_evidence(item, cut=cut)
+            abstract_sent = (item.get("abstract") or "").strip().replace("\n", " ")
+            if sent["cutCharacters"] is not None:
+                abstract_sent = abstract_sent[:sent["cutCharacters"]]
+            quote = C.quote_check(record, abstract_sent)
+            self.connection.execute(
+                "UPDATE citations SET model_judged=1, abs_category=?, abs_support_verdict=?, abs_escalated=?,"
+                " abs_class=?, abs_basis='model', abs_confidence=?, abs_reason=?, abs_quote=?,"
+                " abs_quote_present=?, abs_quote_in_evidence=?, abs_call_id=?, abs_batch=?, abs_position=?"
+                " WHERE journal=? AND doi=? AND label=?",
+                (record["category"], record["support_verdict"], record["escalate"],
+                 C.abstract_class(record["category"], record["escalate"]), record["confidence"],
+                 record["reason"], record["quote"],
+                 None if quote["quotePresent"] is None else int(quote["quotePresent"]),
+                 None if quote["quoteInEvidence"] is None else int(quote["quoteInEvidence"]),
+                 call_id, batch_index, positions[label], journal, doi, label))
+            self.connection.execute(
+                "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
+                " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (journal, doi, label, "abstract", "primary", call_id, call_position, "accepted", record["category"],
+                 record["support_verdict"], record["escalate"], record["quote"], record["reason"],
+                 canonical(record), now))
 
     def _write_abstract(self, journal: str, doi: str, outcomes: list[dict[str, Any]], *, cut: Any, variant: str) -> dict[str, int]:
-        """Write decided labels; an incomplete batch leaves its unanswered labels open (never invalid)."""
+        """Settle the batches of one review: labels without a parseable line become invalid once the call that would
+        decide them was answered; an incomplete batch leaves its unanswered labels open (never invalid). A primary
+        batch's accepted verdicts were written with their receipts; a sensitivity batch writes all of its rows here."""
         now = utc_now()
         counts = {"accepted": 0, "invalid": 0, "open": 0}
         with self.lock, self.connection:
@@ -682,30 +1057,7 @@ class CensusRun:
                         counts["accepted" if found else "invalid"] += 1
                         continue
                     if found:
-                        record, call_id, call_position = found
-                        sent = C.abstract_evidence(item, cut=cut)
-                        abstract_sent = (item.get("abstract") or "").strip().replace("\n", " ")
-                        if sent["cutCharacters"] is not None:
-                            abstract_sent = abstract_sent[:sent["cutCharacters"]]
-                        quote = C.quote_check(record, abstract_sent)
-                        self.connection.execute(
-                            "UPDATE citations SET model_judged=1, abs_category=?, abs_support_verdict=?, abs_escalated=?,"
-                            " abs_class=?, abs_basis='model', abs_confidence=?, abs_reason=?, abs_quote=?,"
-                            " abs_quote_present=?, abs_quote_in_evidence=?, abs_call_id=?, abs_batch=?, abs_position=?"
-                            " WHERE journal=? AND doi=? AND label=?",
-                            (record["category"], record["support_verdict"], record["escalate"],
-                             C.abstract_class(record["category"], record["escalate"]), record["confidence"],
-                             record["reason"], record["quote"],
-                             None if quote["quotePresent"] is None else int(quote["quotePresent"]),
-                             None if quote["quoteInEvidence"] is None else int(quote["quoteInEvidence"]),
-                             call_id, outcome["batch"], position, journal, doi, label))
-                        self.connection.execute(
-                            "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
-                            " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (journal, doi, label, "abstract", variant, call_id, call_position, "accepted", record["category"],
-                             record["support_verdict"], record["escalate"], record["quote"], record["reason"],
-                             canonical(record), now))
-                        counts["accepted"] += 1
+                        counts["accepted"] += 1     # written with its call's receipt
                     elif outcome["incomplete"]:
                         counts["open"] += 1     # no response decided this label; the next pass asks again
                     else:
@@ -727,9 +1079,12 @@ class CensusRun:
                 scores_db.aggregate_reviews(self.connection, journal, doi)
         return counts
 
-    def _pause(self, reason: str) -> None:
+    def _pause(self, reason: str, detail: Mapping[str, Any] | None = None) -> None:
         with self.lock, self.connection:
             self.connection.execute("INSERT OR REPLACE INTO meta VALUES('runState', ?)", ("paused:" + reason,))
+            if detail:
+                self.connection.execute("INSERT OR REPLACE INTO meta VALUES('runPause', ?)",
+                                        (json.dumps(dict(detail), sort_keys=True, ensure_ascii=False),))
 
     def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]], Any, str]]]], *,
                   cut: Any, variant: str) -> tuple[dict[str, int], str | None, bool]:
@@ -769,12 +1124,15 @@ class CensusRun:
                     slot["left"] -= 1
                     if outcome["drift"] is None:
                         slot["outcomes"].append(outcome)
+                    elif variant == "primary":
+                        # A drifted batch keeps the verdicts its earlier call wrote with its receipt.
+                        totals["accepted"] += len(outcome["got"])
                     if slot["left"] == 0 and not drift:
                         write(key, slot["outcomes"])
                         del pending[key]
 
             for journal, doi, title, batches in work:
-                if drift or tripped:
+                if drift or tripped or self._stop_reason():
                     break
                 key = (journal, doi)
                 if not batches:
@@ -783,16 +1141,16 @@ class CensusRun:
                     continue
                 pending[key] = {"left": len(batches), "outcomes": []}
                 for index, batch, todo, start in batches:
-                    while len(inflight) >= limit and not (drift or tripped):
+                    while len(inflight) >= limit and not (drift or tripped or self._stop_reason()):
                         collect()
-                    if drift or tripped:
+                    if drift or tripped or self._stop_reason():
                         break
                     future = pool.submit(self._judge_batch, journal, doi, title, index, batch, cut=cut, variant=variant,
                                          todo=todo, start=start)
                     inflight[future] = key
             while inflight:
                 collect()
-            # Reviews cut short by a drift or by the breaker keep what their answered batches decided; the
+            # Reviews cut short by a drift, the breaker or a stop keep what their answered batches decided; the
             # batches that drifted or were never sent stay open and resume with the call they still need.
             for key, slot in pending.items():
                 if slot["outcomes"]:
@@ -810,10 +1168,16 @@ class CensusRun:
             raise ConfidentialityError(f"{entitled} entitled reviews may only be judged by an on-premises judge")
 
     def _resume(self) -> None:
-        """A new invocation resumes a run paused by model drift or by a transport outage."""
+        """A new invocation resumes a run paused by model drift, a transport outage, a halted broker or a fidelity
+        failure; the broker transport starts the invocation afresh (no halt, no resumed job yet)."""
+        with self.lock:
+            self._fidelity = []
+        begin = getattr(self.transport, "begin", None)
+        if callable(begin):
+            begin()
         if scores_db.meta(self.connection).get("runState", "").startswith("paused:"):
             with self.lock, self.connection:
-                self.connection.execute("DELETE FROM meta WHERE key='runState'")
+                self.connection.execute("DELETE FROM meta WHERE key IN ('runState', 'runPause')")
 
     def _paused(self, totals: dict[str, Any], drift: str | None) -> dict[str, Any]:
         if drift is None:
@@ -848,6 +1212,7 @@ class CensusRun:
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='pending'")
+        self._broker_preflight("abstract", "abstract_state='pending'")
         self._resume()
         with self.lock:
             reviews = [tuple(r) for r in self.connection.execute(
@@ -874,7 +1239,7 @@ class CensusRun:
                     "SELECT journal, doi FROM reviews WHERE abstract_state='pending'")}
             totals["reviews"] += sum(1 for journal, doi, _ in reviews if (journal, doi) not in open_reviews)
             reviews = [review for review in reviews if review[:2] in open_reviews]
-            if not reviews or retries >= transport_retries:
+            if not reviews or retries >= transport_retries or self._stop_reason():
                 break
             retries += 1
             self.sleep(cooldown * 2 ** (retries - 1))
@@ -883,11 +1248,14 @@ class CensusRun:
                                                       (self.run_id,)).fetchone()[0]
         if drift is None and reviews:
             totals["openReviews"] = len(reviews)
+            stopped = self._stopped(totals)
+            if stopped is not None:
+                return self._with_transport(stopped)
             self._pause("transport")
-            return {**totals, "state": "paused",
-                    "reason": f"transport: {len(reviews)} reviews still open after {totals['passes']} passes; "
-                              "run the command again to resume"}
-        return self._paused(totals, drift)
+            return self._with_transport({**totals, "state": "paused",
+                                         "reason": f"transport: {len(reviews)} reviews still open after {totals['passes']} "
+                                                   "passes; run the command again to resume"})
+        return self._with_transport(self._paused(totals, drift))
 
     # ------------------------------------------------------------------ full-text tier
     def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
@@ -995,47 +1363,87 @@ class CensusRun:
                                          "label": label}})
         return doi, journal, title, retrieved, retry
 
-    def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]]):
+    def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]],
+                         call_id: str | None = None) -> dict[str, Any]:
+        """One full-text call; its entries are written with its receipt. ``call_id`` replays a pending broker call.
+
+        Returns ``failed`` (no response: counts towards the breaker), ``recordedFailure`` (a failed call with a
+        receipt), ``skipped`` (not sent: the run is stopping), the drift, and the judged and missing entries.
+        """
+        outcome = {"drift": None, "failed": False, "recordedFailure": False, "skipped": False, "judged": 0, "missing": 0}
+        if self._stop_reason():
+            return {**outcome, "skipped": True}
+        labels = [it["label"] for it in items]
         messages = C.build_full_text_messages(items, title, journal)
         payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
-        result = execute(self.transport, payload, tier="full-text", required_model=self.required_model, sleep=self.sleep)
-        labels = [it["label"] for it in items]
+        call_id = call_id or self._call_id(journal, doi, "full-text", "primary", index, "full-text", labels=labels)
+        result = self._call(payload, tier="full-text", journal=journal, doi=doi, variant="primary", batch=index,
+                            kind="full-text", items=len(items), call_id=call_id, pending=items)
         if result.text is None:
-            call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
-                                    kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0)
+            answered = result.record and result.responded and not result.stop and result.receipt.get("error") != "model_drift"
+            if result.record:
+                # An empty completion or a refusal answers the call: its entries are recorded as missing (no repair).
+                self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
+                              kind="full-text", labels=labels, parsed=0, missing=len(items), problems=0,
+                              accepted=(lambda cid, now: self._full_text_rows(journal, doi, items, {}, cid, now))
+                              if answered else None)
             if result.receipt.get("error") == "model_drift":
-                return {"drift": result.served_model, "failed": False, "judged": 0, "missing": 0}
-            if result.responded:
-                # An empty completion answers the call: its entries are recorded as missing (no repair pass).
-                self._record_full_text(journal, doi, items, {}, call_id)
-                return {"drift": None, "failed": False, "judged": 0, "missing": len(items)}
-            return {"drift": None, "failed": True, "judged": 0, "missing": 0}
+                return {**outcome, "drift": result.served_model}
+            if result.stop:
+                self._stop(result)
+                return {**outcome, "skipped": True}
+            if answered:
+                return {**outcome, "missing": len(items)}
+            return {**outcome, "failed": True, "recordedFailure": result.record}
         records, problems, missing = C.parse_labels(result.text, labels, stage="fulltext")
-        call_id = self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
-                                kind="full-text", labels=labels, parsed=len(records), missing=len(missing),
-                                problems=len(problems))
-        self._record_full_text(journal, doi, items, records, call_id)
-        return {"drift": None, "failed": False, "judged": len(records), "missing": len(missing)}
+        self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
+                      kind="full-text", labels=labels, parsed=len(records), missing=len(missing), problems=len(problems),
+                      accepted=lambda cid, now: self._full_text_rows(journal, doi, items, records, cid, now))
+        return {**outcome, "judged": len(records), "missing": len(missing)}
 
     _ESCALATED = ("c.model_judged=1 AND c.abs_escalated=1 AND c.cited_inbody=1 "
                   "AND c.identity IN ('resolved','resolved_unverified')")
 
     def _full_text_pass(self, fetch_xml, entitled, fetch_workers: int, totals: dict[str, int],
                         touched: set[tuple[str, str]], cache=None) -> tuple[str | None, bool]:
-        """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped)."""
+        """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped).
+
+        Broker calls an earlier pass or invocation submitted without recording them (``pending_calls``) are sent first,
+        unchanged (the same call id and request meet the broker job that holds them); their entries stay out of this
+        pass's chunks, so no entry is judged by a second call while the first may still finish.
+        """
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
                 "SELECT c.journal, c.doi, c.label, c.cited_work_key, r.title FROM citations c JOIN reviews r "
                 f"ON r.journal=c.journal AND r.doi=c.doi WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL "
                 "ORDER BY r.review_order, c.ordinal")]
             touched.update((row["journal"], row["doi"]) for row in rows)
+            pending = [dict(r) for r in self.connection.execute(
+                "SELECT p.call_id, p.journal, p.doi, p.batch, p.labels_json, p.items_json, r.title FROM pending_calls p "
+                "JOIN reviews r ON r.journal=p.journal AND r.doi=p.doi WHERE p.run_id=? AND p.tier='full-text' "
+                "ORDER BY p.created_at, p.call_id", (self.run_id,))]
+        open_entries = {(row["journal"], row["doi"], row["label"]) for row in rows}
+        replays, reserved, stale = [], set(), []
+        for entry in pending:
+            keys = {(entry["journal"], entry["doi"], label) for label in json.loads(entry["labels_json"])}
+            if entry["items_json"] and keys <= open_entries and not keys & reserved:
+                replays.append(entry)
+                reserved |= keys
+            else:
+                stale.append(entry["call_id"])      # its entries were decided since: nothing is left to collect
+        if stale:
+            with self.lock, self.connection:
+                self.connection.executemany("DELETE FROM pending_calls WHERE call_id=?", [(call_id,) for call_id in stale])
+        totals["escalated"] = max(totals.get("escalated", 0), len(rows))
+        rows = [row for row in rows if (row["journal"], row["doi"], row["label"]) not in reserved]
+        totals["replayed"] = totals.get("replayed", 0) + len(replays)
+        with self.lock:
             needed = sorted({row["cited_work_key"] for row in rows})
             works = {}
             for start in range(0, len(needed), 500):
                 chunk = needed[start:start + 500]
                 works.update({r["work_key"]: dict(r) for r in self.connection.execute(
                     f"SELECT * FROM works WHERE work_key IN ({','.join('?' * len(chunk))})", chunk)})
-        totals["escalated"] = max(totals.get("escalated", 0), len(rows))
         groups = C.full_text_groups(rows, self.seed, review=lambda row: row["doi"])
         allow_entitled = bool(getattr(self.transport, "on_premises", False))
         drift: list[str] = []
@@ -1058,21 +1466,28 @@ class CensusRun:
                     silent[0] = silent[0] + 1 if outcome["failed"] else 0
                     if silent[0] >= self.breaker:
                         tripped[0] = True
-                    totals["transportFailures"] += int(outcome["failed"])
-                    totals["calls"] += int(not outcome["failed"] and outcome["drift"] is None)
+                    totals["transportFailures"] += int(outcome["recordedFailure"])
+                    totals["calls"] += int(not outcome["failed"] and not outcome["skipped"] and outcome["drift"] is None)
                     totals["judged"] += outcome["judged"]
                     totals["missing"] += outcome["missing"]
 
+            for entry in replays:
+                if drift or tripped[0] or self._stop_reason():
+                    break
+                while len(calls) >= limit:
+                    collect(True)
+                calls.add(call_pool.submit(self._judge_full_text, entry["journal"], entry["doi"], entry["title"] or "",
+                                           entry["batch"], json.loads(entry["items_json"]), entry["call_id"]))
             for future in concurrent.futures.as_completed(retrievals):
                 doi, journal, title, retrieved, retry = future.result()
                 totals["retrieved"] += len(retrieved)
                 totals["fetchRetries"] += retry
-                if drift or tripped[0]:
+                if drift or tripped[0] or self._stop_reason():
                     continue
                 for index, chunk in enumerate(C.full_text_chunks(retrieved)):
                     while len(calls) >= limit:
                         collect(True)
-                    if drift or tripped[0]:
+                    if drift or tripped[0] or self._stop_reason():
                         break
                     calls.add(call_pool.submit(self._judge_full_text, journal, doi, title, index, chunk))
                 if calls:
@@ -1107,9 +1522,10 @@ class CensusRun:
                     "UPDATE reviews SET full_text_state='pending' WHERE EXISTS (SELECT 1 FROM citations c WHERE "
                     f"c.journal=reviews.journal AND c.doi=reviews.doi AND {self._ESCALATED} AND c.ft_retrieval IS NULL)")
         self._egress_gate("full_text_state='pending'")
+        self._broker_preflight("full-text", "full_text_state='pending'")
         self._resume()
         totals = {"escalated": 0, "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0,
-                  "fetchRetries": 0, "passes": 0}
+                  "fetchRetries": 0, "passes": 0, "replayed": 0}
         drift, retries, still_open = None, 0, 0
         touched: set[tuple[str, str]] = set()
         while True:
@@ -1118,7 +1534,7 @@ class CensusRun:
             with self.lock:
                 still_open = self.connection.execute(
                     f"SELECT COUNT(*) FROM citations c WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL").fetchone()[0]
-            if drift is not None or not still_open or retries >= transport_retries:
+            if drift is not None or not still_open or retries >= transport_retries or self._stop_reason():
                 break
             retries += 1
             self.sleep(cooldown * 2 ** (retries - 1))
@@ -1131,55 +1547,58 @@ class CensusRun:
                 f"{self._ESCALATED} AND c.ft_retrieval IS NULL)")
         if drift is None and still_open:
             totals["openEntries"] = still_open
+            stopped = self._stopped(totals)
+            if stopped is not None:
+                return self._with_transport(stopped)
             self._pause("transport")
-            return {**totals, "state": "paused",
-                    "reason": f"transport: {still_open} escalated entries still open after {totals['passes']} passes "
-                              "(throttled or failed fetches, or calls without a response); run the command again"}
-        return self._paused(totals, drift)
+            return self._with_transport({**totals, "state": "paused",
+                                         "reason": f"transport: {still_open} escalated entries still open after "
+                                                   f"{totals['passes']} passes (throttled or failed fetches, or calls "
+                                                   "without a response); run the command again"})
+        return self._with_transport(self._paused(totals, drift))
 
     def _loci(self, journal: str, doi: str, label: str):
         return self.connection.execute(
             "SELECT sentence, section FROM loci WHERE journal=? AND doi=? AND label=? AND sent=1 ORDER BY seq",
             (journal, doi, label)).fetchall()
 
-    def _record_full_text(self, journal: str, doi: str, items: list[dict[str, Any]], records: Mapping[str, Any],
-                          call_id: str | None) -> None:
-        now = utc_now()
-        with self.lock, self.connection:
-            for position, item in enumerate(items, 1):
-                entry = item["_entry"]
-                row = entry["row"]
-                current = self.connection.execute(
-                    "SELECT c.cited_work_key, w.identity_version FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
-                    "WHERE c.journal=? AND c.doi=? AND c.label=?", (journal, doi, row["label"])).fetchone()
-                if current is None or current[0] != row["cited_work_key"]:
-                    raise ValidationError("full-text evidence identity differs from the citation's current identity")
-                window = item["fulltext_window"]
-                evidence_id = "ftw-" + sha256_text(canonical([current[0], current[1], sha256_text(window)]))[:32]
-                self.connection.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
-                    evidence_id, current[0], current[1], "full-text", sha256_text(window), entry["source"], "window",
-                    entry["provenance"], now, len(window), None, window))
-                record = records.get(row["label"])
-                quote = C.quote_check(record, window) if record else {"quotePresent": None, "quoteInEvidence": None}
-                self.connection.execute(
-                    "UPDATE citations SET ft_retrieval=?, ft_source=?, ft_provenance=?, ft_evidence_id=?, ft_window_characters=?,"
-                    " ft_call_id=?, ft_position=?, ft_category=?, ft_support_verdict=?, ft_class=?, ft_reason=?, ft_quote=?,"
-                    " ft_quote_present=?, ft_quote_in_evidence=? WHERE journal=? AND doi=? AND label=?",
-                    (entry["outcome"], entry["source"], entry.get("label") or "supplied", evidence_id, len(window), call_id,
-                     position,
-                     record["category"] if record else None, record["support_verdict"] if record else None,
-                     C.full_text_class(record["category"]) if record else None,
-                     record["reason"] if record else None, record["quote"] if record else None,
-                     None if quote["quotePresent"] is None else int(quote["quotePresent"]),
-                     None if quote["quoteInEvidence"] is None else int(quote["quoteInEvidence"]),
-                     journal, doi, row["label"]))
-                self.connection.execute(
-                    "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
-                    " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (journal, doi, row["label"], "full-text", "primary", call_id, position,
-                     "accepted" if record else "missing", record and record["category"],
-                     record and record["support_verdict"], record and record["escalate"], record and record["quote"],
-                     record and record["reason"], canonical(record) if record else None, now))
+    def _full_text_rows(self, journal: str, doi: str, items: list[dict[str, Any]], records: Mapping[str, Any],
+                        call_id: str | None, now: str) -> None:
+        """A full-text call's entries (inside its receipt's transaction): windows, verdicts or missing, and history."""
+        for position, item in enumerate(items, 1):
+            entry = item["_entry"]
+            row = entry["row"]
+            current = self.connection.execute(
+                "SELECT c.cited_work_key, w.identity_version FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
+                "WHERE c.journal=? AND c.doi=? AND c.label=?", (journal, doi, row["label"])).fetchone()
+            if current is None or current[0] != row["cited_work_key"]:
+                raise ValidationError("full-text evidence identity differs from the citation's current identity")
+            window = item["fulltext_window"]
+            evidence_id = "ftw-" + sha256_text(canonical([current[0], current[1], sha256_text(window)]))[:32]
+            self.connection.execute("INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+                evidence_id, current[0], current[1], "full-text", sha256_text(window), entry["source"], "window",
+                entry["provenance"], now, len(window), None, window))
+            record = records.get(row["label"])
+            quote = C.quote_check(record, window) if record else {"quotePresent": None, "quoteInEvidence": None}
+            self.connection.execute(
+                "UPDATE citations SET ft_retrieval=?, ft_source=?, ft_provenance=?, ft_evidence_id=?, ft_window_characters=?,"
+                " ft_call_id=?, ft_position=?, ft_category=?, ft_support_verdict=?, ft_class=?, ft_reason=?, ft_quote=?,"
+                " ft_quote_present=?, ft_quote_in_evidence=? WHERE journal=? AND doi=? AND label=?",
+                (entry["outcome"], entry["source"], entry.get("label") or "supplied", evidence_id, len(window), call_id,
+                 position,
+                 record["category"] if record else None, record["support_verdict"] if record else None,
+                 C.full_text_class(record["category"]) if record else None,
+                 record["reason"] if record else None, record["quote"] if record else None,
+                 None if quote["quotePresent"] is None else int(quote["quotePresent"]),
+                 None if quote["quoteInEvidence"] is None else int(quote["quoteInEvidence"]),
+                 journal, doi, row["label"]))
+            self.connection.execute(
+                "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, category,"
+                " support_verdict, escalate, quote, reason, record_json, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (journal, doi, row["label"], "full-text", "primary", call_id, position,
+                 "accepted" if record else "missing", record and record["category"],
+                 record and record["support_verdict"], record and record["escalate"], record and record["quote"],
+                 record and record["reason"], canonical(record) if record else None, now))
 
     # ------------------------------------------------------------------ predeclared sensitivity
     def no_truncation_sample(self, entries: int | None = None) -> list[tuple[str, str, int]]:
@@ -1206,6 +1625,7 @@ class CensusRun:
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='completed'")
+        self._broker_preflight("abstract", "abstract_state='completed'")
         self._resume()
         selected = self.no_truncation_sample(entries)
         return self._run_variant(selected, variant="no-truncation", cut=None, transport_retries=transport_retries,
@@ -1242,16 +1662,20 @@ class CensusRun:
             for name in ("reviews", "accepted", "invalid", "transportFailures"):
                 totals[name] += outcome[name]
             by_review = open_batches()
-            if drift is not None or not by_review or retries >= transport_retries:
+            if drift is not None or not by_review or retries >= transport_retries or self._stop_reason():
                 break
             retries += 1
             self.sleep(cooldown * 2 ** (retries - 1))
         if drift is None and by_review:
             totals["openBatches"] = sum(len(v) for v in by_review.values())
+            stopped = self._stopped(totals)
+            if stopped is not None:
+                return self._with_transport(stopped)
             self._pause("transport")
-            return {**totals, "state": "paused",
-                    "reason": f"transport: {totals['openBatches']} {variant} batches still open; run the command again"}
-        return self._paused(totals, drift)
+            return self._with_transport({**totals, "state": "paused",
+                                         "reason": f"transport: {totals['openBatches']} {variant} batches still open; "
+                                                   "run the command again"})
+        return self._with_transport(self._paused(totals, drift))
 
     def replicate_sample(self, entries: int) -> list[tuple[str, str, int]]:
         """Whole primary batches stratified by journal and year, allocated in proportion to judged entries."""
@@ -1285,6 +1709,7 @@ class CensusRun:
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
         self._egress_gate("abstract_state='completed'")
+        self._broker_preflight("abstract", "abstract_state='completed'")
         self._resume()
         selected = self.replicate_sample(entries)
         return self._run_variant(selected, variant="replicate", cut=True, transport_retries=transport_retries,
@@ -1303,9 +1728,10 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
     """Run status from any connection, including a read-only one: nothing is written or pinned."""
     c = connection
     meta = {row[0]: row[1] for row in c.execute("SELECT key, value FROM meta")}
-    abstract_calls = c.execute("SELECT COUNT(*), SUM(error IS NOT NULL AND error!='model_drift'), SUM(truncated=1), "
-                               "SUM(prompt_tokens), SUM(completion_tokens) FROM calls "
-                               "WHERE tier='abstract' AND variant='primary'").fetchone()
+    # A fidelity stop (a request digest mismatch, a broker refusal) is no transport failure: it is reported apart.
+    abstract_calls = c.execute("SELECT COUNT(*), SUM(error IS NOT NULL AND error!='model_drift' AND error!=? AND "
+                               "error NOT LIKE ?), SUM(truncated=1), SUM(prompt_tokens), SUM(completion_tokens) FROM calls "
+                               "WHERE tier='abstract' AND variant='primary'", FIDELITY_ERRORS).fetchone()
     # Fingerprints can only come with a response: receipts of calls that never got one are counted apart.
     responded = c.execute("SELECT COUNT(*), SUM(fingerprint IS NOT NULL) FROM calls WHERE served_model IS NOT NULL").fetchone()
     judgeable = c.execute("SELECT COUNT(*) FROM citations WHERE cited_inbody=1 AND identity IN ('resolved','resolved_unverified')"
@@ -1318,6 +1744,11 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
                            "variant='primary' AND outcome='accepted' GROUP BY journal, doi, label HAVING COUNT(*) > 1)").fetchone()[0]
     reviews = {r[0]: r[1] for r in c.execute("SELECT abstract_state, COUNT(*) FROM reviews GROUP BY abstract_state")}
     full_text = {r[0]: r[1] for r in c.execute("SELECT full_text_state, COUNT(*) FROM reviews GROUP BY full_text_state")}
+    # Inputs the judge sees byte for byte that carry chat-template control tokens (detected, never removed).
+    control = c.execute("SELECT COUNT(DISTINCT scope || ':' || field || ':' || COALESCE(evidence_id, '') || ':' || "
+                        "COALESCE(journal, '') || ':' || COALESCE(doi, '') || ':' || COALESCE(label, '') || ':' || "
+                        "COALESCE(seq, '')) FROM sanitizer_findings WHERE rule IN ('control-token', 'control-block')"
+                        ).fetchone()[0]
     calls = abstract_calls[0] or 0
     pinned = meta.get("instrumentDigest")
     result = {"runId": meta.get("runId"), "instrumentDigest": pinned, "codeInstrumentDigest": code_instrument_digest,
@@ -1333,12 +1764,48 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
               "receiptsWithResponse": responded[0] or 0, "receiptsWithFingerprint": responded[1] or 0,
               "fingerprintOffered": bool(responded[1]),
               "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
-              "duplicateJudgments": duplicates,
+              "duplicateJudgments": duplicates, "inputsWithControlTokens": control,
               "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
               "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
                                                    "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
+    result.update(transport_status(c, meta))
     result.update(input_status(c, meta))
     return result
+
+
+def transport_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
+    """Study bundle and broker receipts: calls per transport, request-digest mismatches, calls the broker refused before
+    any provider call, the run principals calls went through, and accepted verdicts (primary and sensitivity
+    variants, in the append-only history) whose broker call did not attest the request the instrument built (0 by
+    construction). A call recorded by a version without ``call_transport`` counts as a direct call without a study
+    bundle."""
+    pause = meta.get("runPause")
+    pinned = meta.get("studyBundleSha256")
+    out: dict[str, Any] = {"studyBundleSha256": pinned,
+                           # A bundle file was checked (its digest and instrument pin); a bare sha256 was not.
+                           "studyBundleVerified": (bool(meta.get("studyBundle")) if pinned else None),
+                           "runPause": json.loads(pause) if pause else None}
+    if not scores_db.has_table(c, "call_transport"):
+        calls = c.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+        return {**out, "callsByTransport": {"direct": calls} if calls else {}, "brokerCalls": 0,
+                "brokerRequestMismatches": 0, "brokerRefusals": 0, "brokerVerdictsFromUnverifiedRequests": 0,
+                "brokerPrincipals": 0, "receiptsWithoutStudyBundle": calls if pinned else None}
+    joined = "FROM calls k LEFT JOIN call_transport t ON t.call_id=k.call_id"
+    by_transport = {(row[0] or "direct"): row[1] for row in c.execute(
+        f"SELECT t.transport, COUNT(*) {joined} GROUP BY t.transport ORDER BY t.transport")}
+    mismatches = c.execute(f"SELECT COUNT(*) {joined} WHERE t.transport='broker' AND k.error='request_mismatch'").fetchone()[0]
+    refusals = c.execute(f"SELECT COUNT(*) {joined} WHERE t.transport='broker' AND "
+                         "k.error LIKE 'broker refused the instrument call:%'").fetchone()[0]
+    verdicts = c.execute("SELECT COUNT(*) FROM history h JOIN calls k ON k.call_id=h.call_id JOIN call_transport t "
+                         "ON t.call_id=k.call_id WHERE h.outcome='accepted' AND t.transport='broker' AND "
+                         "(t.broker_request_sha256 IS NULL OR t.broker_request_sha256 != t.request_sha256)").fetchone()[0]
+    principals = c.execute("SELECT COUNT(DISTINCT broker_principal_id) FROM call_transport "
+                           "WHERE transport='broker' AND broker_principal_id IS NOT NULL").fetchone()[0]
+    without = (c.execute(f"SELECT COUNT(*) {joined} WHERE t.study_bundle_sha256 IS NULL OR t.study_bundle_sha256 != ?",
+                         (pinned,)).fetchone()[0] if pinned else None)
+    return {**out, "callsByTransport": by_transport, "brokerCalls": by_transport.get("broker", 0),
+            "brokerRequestMismatches": mismatches, "brokerRefusals": refusals, "brokerVerdictsFromUnverifiedRequests": verdicts,
+            "brokerPrincipals": principals, "receiptsWithoutStudyBundle": without}
 
 
 def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:

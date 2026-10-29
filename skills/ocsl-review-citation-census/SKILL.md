@@ -19,8 +19,12 @@ sensitivities, gates, freeze and facts. A study that builds its population
 fresh enumerates it with population-level queries, acquires with the journals'
 live routes, derives each review's cited works with `study works`, records any
 protocol exclusion with `study exclude` and compares an earlier manifest only
-at the end. Read `$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the
-instrument runs unchanged and its decisions are recorded per entry.
+at the end. In the lab the judging commands run through the run principal's
+broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`) once the operator has
+installed the bundles that `ocsl-review instruments export` prints, with the
+study bundle pinned by `study prepare --study-bundle`. Read
+`$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the instrument runs
+unchanged and its decisions are recorded per entry.
 
 For a multi-paper corpus and a database that can support future questions, start
 with `ocsl-review-reference-analysis`. This census skill also supplies the

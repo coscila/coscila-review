@@ -100,8 +100,9 @@ def _call_facts(journal: str) -> dict[str, tuple[str, str]]:
     return {
         "calls_abstract": (f"SELECT COUNT(*) {k} AND tier='abstract'", "abstract-tier call receipts"),
         "calls_full_text": (f"SELECT COUNT(*) {k} AND tier='full-text'", "full-text call receipts"),
-        "calls_transport_failed": (f"SELECT COUNT(*) {k} AND error IS NOT NULL AND error!='model_drift'",
-                                   "calls that failed after their transport attempts"),
+        "calls_transport_failed": (f"SELECT COUNT(*) {k} AND error IS NOT NULL AND error!='model_drift' AND "
+                                   "error!='request_mismatch' AND error NOT LIKE 'broker refused the instrument call:%'",
+                                   "calls that failed after their transport attempts (fidelity stops apart)"),
         "calls_with_fingerprint": (f"SELECT COUNT(*) {k} AND fingerprint IS NOT NULL", "receipts carrying a server fingerprint"),
         "prompt_tokens": (f"SELECT COALESCE(SUM(prompt_tokens),0) {k}", "provider-reported prompt tokens"),
         "completion_tokens": (f"SELECT COALESCE(SUM(completion_tokens),0) {k}", "provider-reported completion tokens"),

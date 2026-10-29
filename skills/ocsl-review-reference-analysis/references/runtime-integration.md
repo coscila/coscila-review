@@ -37,6 +37,37 @@ identity, public provenance and evidence hashes must still be verified. A local
 operator-plan route. An already approved public study does not need a new
 permission request for each paper. Report a real refusal without bypassing it.
 
+## Census studies through the run principal's broker
+
+An entry-level census (`citation-census@1`, `ocsl-review study`) runs in the lab
+through the run principal's broker socket: the launcher binds the principal's
+socket directory read-only into the sandbox and sets `OCSL_BROKER_SOCKET` to the
+socket inside it, and `study judge`, `full-text`, `no-truncation` and
+`replicate` then run without `--base-url`. The socket is the run's identity;
+the executor holds no token or provider key and installs nothing. Before the
+run the operator installs each bundle that `ocsl-review instruments export
+citation-census@1 --tier <tier> --param journal=<journal>` prints, one per tier
+and journal (`PUT /v2/instruments/{digest}`), and grants the digests and the
+judge provider to the principal; `study prepare --study-bundle` pins the study
+bundle that every call receipt records. Entitled reviews reach only a broker
+provider that the operator policy lists in `onPremBrokerProviders`.
+
+Each call is a one-item bulk job carrying the request the instrument built (its
+messages unchanged and its settings, which the broker checks against the
+installed bundle before any provider call); a refusal, or a receipt whose
+request digest differs from the request the instrument built, makes the call
+invalid and pauses the run as `paused:fidelity`. Only what the judge's response
+itself said counts: its model (one naming none is model drift), its
+`system_fingerprint` (none offered means none recorded) and its status (only
+400, 413 and 422 are refusals; other failures keep the entries open). A broker
+pause (provider limit, budget, expiry, withdrawn grant) pauses the run as
+`paused:transport` with the broker's reason and `resumeAfter`; running the same
+command again resumes the same broker jobs (following earlier resumes to the
+lineage's tail, and moving to a new key when the daemon's worker configuration
+changed) and never judges an entry twice. A socket that is gone may mean a
+revoked principal or a restarting daemon. Details:
+`$OCSL_REVIEW_HOME/docs/census-instrument.md`.
+
 ## Durable execution
 
 Run `corpus status`, then `corpus resume` to recover existing work. Use

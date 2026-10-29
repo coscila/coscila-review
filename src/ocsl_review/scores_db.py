@@ -22,10 +22,26 @@ from typing import Any, Iterable
 from .errors import ValidationError
 
 SCHEMA_VERSION = 1
-TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "history",
+TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "call_transport", "history",
           "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "exclusions",
           "manifest_comparisons", "data_dictionary")
+# Execution state documented in the data dictionary but never exported, and emptied in a frozen database.
+EXECUTION_TABLES = ("pending_calls",)
 PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
+# The receipt columns of ``calls`` as every earlier version writes them, by position. ``calls`` keeps exactly these
+# columns: the transport, study-bundle and broker receipt fields of a call live in ``call_transport``, so a database
+# this version opened still opens with an earlier version (its data dictionary check and its positional receipt
+# insert both see the calls table it knows) and the run can roll back.
+CALL_COLUMNS = ("call_id", "run_id", "journal", "doi", "tier", "variant", "batch", "kind", "n_items", "labels_json",
+                "instrument_id", "instrument_digest", "code_revision", "request_model", "served_model", "fingerprint",
+                "settings_sha256", "system_sha256", "user_sha256", "messages_sha256", "body_sha256", "max_tokens",
+                "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "finish_reason", "truncated",
+                "attempts", "seconds", "error", "n_parsed", "n_missing", "n_problems", "created_at")
+# Receipt fields of a call made through the run principal's broker socket (NULL for direct calls).
+BROKER_CALL_COLUMNS = ("broker_principal_id", "broker_job_id", "broker_item_id", "broker_instrument_digest",
+                       "broker_settings_sha256", "broker_request_sha256", "broker_error_code", "broker_server_fingerprint",
+                       "broker_http_status")
+TRANSPORT_COLUMNS = ("call_id", "transport", "study_bundle_sha256", "request_sha256") + BROKER_CALL_COLUMNS
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -78,6 +94,15 @@ CREATE TABLE IF NOT EXISTS calls(
   max_tokens INTEGER NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
   cached_tokens INTEGER, finish_reason TEXT, truncated INTEGER, attempts INTEGER NOT NULL, seconds REAL,
   error TEXT, n_parsed INTEGER, n_missing INTEGER, n_problems INTEGER, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS call_transport(
+  call_id TEXT PRIMARY KEY REFERENCES calls(call_id), transport TEXT NOT NULL, study_bundle_sha256 TEXT,
+  request_sha256 TEXT, broker_principal_id TEXT, broker_job_id TEXT, broker_item_id TEXT, broker_instrument_digest TEXT,
+  broker_settings_sha256 TEXT, broker_request_sha256 TEXT, broker_error_code TEXT, broker_server_fingerprint TEXT,
+  broker_http_status INTEGER);
+CREATE TABLE IF NOT EXISTS pending_calls(
+  call_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, journal TEXT NOT NULL, doi TEXT NOT NULL, tier TEXT NOT NULL,
+  variant TEXT NOT NULL, batch INTEGER NOT NULL, kind TEXT NOT NULL, labels_json TEXT NOT NULL,
+  request_sha256 TEXT NOT NULL, items_json TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS history(
   history_id INTEGER PRIMARY KEY AUTOINCREMENT, journal TEXT NOT NULL, doi TEXT NOT NULL, label TEXT NOT NULL,
   tier TEXT NOT NULL, variant TEXT NOT NULL DEFAULT 'primary', call_id TEXT, position INTEGER, outcome TEXT NOT NULL,
@@ -131,11 +156,14 @@ CREATE TRIGGER IF NOT EXISTS history_no_delete BEFORE DELETE ON history
   BEGIN SELECT RAISE(ABORT, 'verdict history is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS calls_no_update BEFORE UPDATE ON calls
   BEGIN SELECT RAISE(ABORT, 'call receipts are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS call_transport_no_update BEFORE UPDATE ON call_transport
+  BEGIN SELECT RAISE(ABORT, 'call receipts are immutable'); END;
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
-    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state, pinned input caches and "
-                    "fresh enumeration; when frozen: completeness and the entitled-text redaction)",
+    "meta": {"key": "run metadata key (schema version, instrument id and digest, seed, run state and pause detail, pinned "
+                    "input caches, fresh enumeration and study bundle; when frozen: completeness and the entitled-text "
+                    "redaction)",
              "value": "metadata value"},
     "reviews": {
         "journal": "journal of the review (study input)", "doi": "review DOI, lower case", "paper_key": "local review key",
@@ -212,15 +240,50 @@ DICTIONARY: dict[str, dict[str, str]] = {
               "variant": "primary or a predeclared sensitivity", "batch": "batch or call index within the review",
               "kind": "first, repair or full-text", "n_items": "items in the call", "labels_json": "labels in call order",
               "instrument_id": "instrument id", "instrument_digest": "instrument bundle digest", "code_revision": "code tag",
-              "request_model": "model name requested", "served_model": "model reported by the server", "fingerprint": "server fingerprint when offered",
+              "request_model": "model name requested",
+              "served_model": "model the response named (NULL when no response arrived or it named none)",
+              "fingerprint": "server fingerprint: the response's own system_fingerprint when the server offered one "
+                             "(through the broker too), else NULL",
               "settings_sha256": "digest of the request settings without messages", "system_sha256": "sha256 of the system prompt",
               "user_sha256": "sha256 of the user message", "messages_sha256": "sha256 of the JSON message list",
-              "body_sha256": "sha256 of the bytes sent", "max_tokens": "output token limit", "prompt_tokens": "provider prompt tokens",
+              "body_sha256": "sha256 of the bytes sent (direct transport) or of the same body as the executor built it "
+                             "(broker transport, where call_transport.request_sha256 and broker_request_sha256 attest "
+                             "what was sent)",
+              "max_tokens": "output token limit", "prompt_tokens": "provider prompt tokens",
               "completion_tokens": "provider completion tokens", "total_tokens": "provider total tokens",
               "cached_tokens": "provider cached prompt tokens", "finish_reason": "provider finish reason",
               "truncated": "1 when the finish reason is length", "attempts": "transport attempts", "seconds": "latency of the last attempt",
-              "error": "transport, model_drift or other failure", "n_parsed": "labels parsed", "n_missing": "labels missing",
+              "error": "transport, model_drift, request_mismatch (the broker's request digest differs: the call is "
+                       "invalid and its output was discarded), a broker refusal or other failure",
+              "n_parsed": "labels parsed", "n_missing": "labels missing",
               "n_problems": "parser problems", "created_at": "receipt time"},
+    "call_transport": {
+        "call_id": "receipt id (calls.call_id); a call recorded by a version without this table has no row",
+        "transport": "direct (chat completions to the judge) or broker (a bulk job over the run principal's socket)",
+        "study_bundle_sha256": "sha256 of the study bundle pinned on the run (study prepare --study-bundle)",
+        "request_sha256": "sha256 of the canonical JSON (keys sorted, no whitespace, numbers as JSON.stringify writes "
+                          "them) of the request body the executor built",
+        "broker_principal_id": "run principal of the broker socket the call went through",
+        "broker_job_id": "broker job that settled the call (after any resume of a paused job)",
+        "broker_item_id": "broker item id (the call id)",
+        "broker_instrument_digest": "broker allow-list digest of the instrument bundle the job named "
+                                    "(ocsl-review instruments export)",
+        "broker_settings_sha256": "settingsSha256 of the broker receipt (effective settings of the call as sent)",
+        "broker_request_sha256": "requestSha256 of the broker receipt; must equal request_sha256",
+        "broker_error_code": "closed failure code of the broker item, when it failed or paused",
+        "broker_server_fingerprint": "serverFingerprint of the broker receipt: the server's system_fingerprint when "
+                                     "offered, else the daemon's identity of the served model and server headers "
+                                     "(never the judge's own fingerprint; see calls.fingerprint)",
+        "broker_http_status": "HTTP status of the upstream answer that settled the broker item"},
+    "pending_calls": {
+        "call_id": "receipt id the broker call will be recorded under",
+        "run_id": "census run", "journal": "journal", "doi": "review DOI", "tier": "abstract or full-text",
+        "variant": "primary or a predeclared sensitivity", "batch": "batch or call index within the review",
+        "kind": "first, repair or full-text", "labels_json": "labels in call order",
+        "request_sha256": "sha256 of the canonical JSON of the request built for the call",
+        "items_json": "the full-text call's items (windows and entry records), so a later pass sends the same call",
+        "created_at": "time the call was submitted (execution state: removed once the call is recorded, and emptied "
+                      "in a frozen database)"},
     "history": {"history_id": "append-only row id", "journal": "journal", "doi": "review DOI", "label": "label", "tier": "tier",
                 "variant": "primary or sensitivity", "call_id": "receipt", "position": "position in call",
                 "outcome": "accepted, superseded, missing, deterministic or invalid", "category": "category", "support_verdict": "support type",
@@ -309,7 +372,9 @@ def connect(path: Path, *, create: bool = False) -> sqlite3.Connection:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    """Additive changes for working databases created before them: provenance, work derivation and comparison columns."""
+    """Additive changes for working databases created before them: provenance, work derivation and comparison columns.
+    Call receipts gain no column: their transport, study-bundle and broker fields go to ``call_transport``, a table an
+    earlier version ignores."""
     for table, column in (("reviews", "provenance"), ("citations", "ft_provenance"), ("works", "derivation"),
                           ("works", "metadata_provenance"), ("manifest_comparisons", "population_sha256")):
         if column not in table_columns(connection, table):
@@ -329,7 +394,7 @@ def has_table(connection: sqlite3.Connection, table: str) -> bool:
 
 def write_dictionary(connection: sqlite3.Connection) -> None:
     rows = []
-    for table in TABLES:
+    for table in TABLES + EXECUTION_TABLES:
         declared = {r[1]: r[2] for r in connection.execute(f"PRAGMA table_info({table})")}
         meanings = DICTIONARY.get(table, {})
         missing = set(declared) - set(meanings)
@@ -513,6 +578,9 @@ def freeze(source: Path, output: Path, *, keep_text: bool = False, allow_incompl
     redacted: dict[str, int] = {}
     with closing(sqlite3.connect(output)) as frozen:
         frozen.execute("PRAGMA journal_mode=DELETE")
+        for table in EXECUTION_TABLES:          # in-flight execution state, never part of the closed database
+            if has_table(frozen, table):
+                frozen.execute(f"DELETE FROM {table}")
         if not keep_text:
             frozen.execute("UPDATE evidence SET text=NULL")
             redacted = redact_entitled(frozen)
