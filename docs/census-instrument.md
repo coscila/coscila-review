@@ -650,7 +650,11 @@ these columns gains them when a study command opens it. Citing sentences that ar
 sent, every abstract (once per database) and every full-text window pass the
 sanitizer in detect mode: hidden characters and prompt-injection sentences are
 recorded by offset, rule and digest, and the text the judge receives stays the
-instrument's, byte for byte. `study freeze` writes the closed, read-only
+instrument's, byte for byte. `status` counts the inputs that carry chat-template
+control tokens (`inputsWithControlTokens`, rules `control-token` and
+`control-block`) and `gates` notes them: a judge server that reads special
+tokens inside message content may take them as role markers, on either
+transport. `study freeze` writes the closed, read-only
 copy (rollback journal, evidence text removed unless `--keep-text`). It refuses
 a paused run, one with pending reviews, or a fresh-enumeration study whose
 population is incomplete, unless `--allow-incomplete`, which is

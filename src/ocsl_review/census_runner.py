@@ -1744,6 +1744,11 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
                            "variant='primary' AND outcome='accepted' GROUP BY journal, doi, label HAVING COUNT(*) > 1)").fetchone()[0]
     reviews = {r[0]: r[1] for r in c.execute("SELECT abstract_state, COUNT(*) FROM reviews GROUP BY abstract_state")}
     full_text = {r[0]: r[1] for r in c.execute("SELECT full_text_state, COUNT(*) FROM reviews GROUP BY full_text_state")}
+    # Inputs the judge sees byte for byte that carry chat-template control tokens (detected, never removed).
+    control = c.execute("SELECT COUNT(DISTINCT scope || ':' || field || ':' || COALESCE(evidence_id, '') || ':' || "
+                        "COALESCE(journal, '') || ':' || COALESCE(doi, '') || ':' || COALESCE(label, '') || ':' || "
+                        "COALESCE(seq, '')) FROM sanitizer_findings WHERE rule IN ('control-token', 'control-block')"
+                        ).fetchone()[0]
     calls = abstract_calls[0] or 0
     pinned = meta.get("instrumentDigest")
     result = {"runId": meta.get("runId"), "instrumentDigest": pinned, "codeInstrumentDigest": code_instrument_digest,
@@ -1759,7 +1764,7 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
               "receiptsWithResponse": responded[0] or 0, "receiptsWithFingerprint": responded[1] or 0,
               "fingerprintOffered": bool(responded[1]),
               "promptTokens": abstract_calls[3], "completionTokens": abstract_calls[4],
-              "duplicateJudgments": duplicates,
+              "duplicateJudgments": duplicates, "inputsWithControlTokens": control,
               "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
               "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
                                                    "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
