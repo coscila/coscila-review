@@ -593,9 +593,10 @@ job left behind) and halts the transport if it returns. When the daemon's
 worker configuration changed since a call was submitted (a provider's endpoint,
 model, credential variable or label), the job under the call's key cannot be
 resumed (`WORKER_CONFIG_CHANGED`) and a new submission under it is refused
-(`WORKER_KEY_CONFLICT`, naming that job): the executor takes that job's answer
-if it settled the call, and otherwise moves the call to the next key of a fixed
-sequence, so every later invocation meets the same new job. A model drift
+(`WORKER_KEY_CONFLICT`, naming that job): the executor takes the answer of that
+job, or of a resume of it, if one settled the call, and otherwise moves the call
+to the next key of a fixed sequence, so every later invocation meets the same
+new job. A model drift
 pauses as `paused:model_drift`, as with the direct transport. An unreachable
 socket, a job feed that keeps failing for a minute or a call without a
 settlement before its wait deadline leaves the call open, without a repair call
