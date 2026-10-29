@@ -22,7 +22,12 @@ different instrument. Transport, retries and storage are outside the digest.
 "$OCSL_REVIEW_HOME/bin/ocsl-review" instruments list
 "$OCSL_REVIEW_HOME/bin/ocsl-review" instruments show citation-census@1
 "$OCSL_REVIEW_HOME/bin/ocsl-review" instruments verify
+"$OCSL_REVIEW_HOME/bin/ocsl-review" instruments export citation-census@1 --tier abstract --param journal="$JOURNAL"
 ```
+
+`instruments export` prints the bundle the execution daemon installs for one
+tier of an instrument that declares `transport.messages: verbatim`, with its
+broker digest (see [running a study through the broker](#running-a-study-through-the-broker)).
 
 | Instrument | Status | Role |
 |---|---|---|
@@ -442,9 +447,182 @@ class agreement and the T/F kappa against the primary verdicts. `status` and
 invalid outputs (at most 1 %), transport failures (at most 0.5 % of calls),
 uncovered anchors (0), duplicate judgments (0), complete abstract and full-text
 tiers, and a fingerprint on every receipt that received a response (all tiers
-and variants); it notes when the server never offers `system_fingerprint`. The transport sends the request body bytes exactly as built and
-records their sha256 in the receipt; the key comes from the named environment
-variable, never from a file.
+and variants); it notes when the server never offers `system_fingerprint`. The
+direct transport sends the request body bytes exactly as built and records
+their sha256 in the receipt; the key comes from the named environment
+variable, never from a file. With a pinned study bundle, `gates` also checks
+that every call receipt carries it, and after broker calls that every accepted
+verdict comes from a call whose receipt attests the request the instrument
+built.
+
+## Running a study through the broker
+
+In the lab the judge is reached through the execution daemon's broker, not
+through a URL. The executor holds one handle: the run principal's Unix socket
+(`--broker-socket`, or `OCSL_BROKER_SOCKET` when no `--base-url` is given; the
+lab launcher binds the principal's socket directory read-only into the
+sandbox). The socket is the identity: `GET /configs` over it names the
+principal, its run, its granted instruments and one bulk worker per granted
+provider, and a socket that names no active run principal (a chat turn socket,
+for example) is refused. No bearer token, provider address or key reaches the
+executor; `--api-key-env` is refused with the broker transport.
+
+1. Export one bundle per tier and journal and give them to the operator:
+
+   ```bash
+   ocsl-review instruments export citation-census@1 --tier abstract --param journal="$JOURNAL_A"
+   ocsl-review instruments export citation-census@1 --tier full-text --param journal="$JOURNAL_A" --body > full-text-a.json
+   ```
+
+   The output names `digest` (the broker allow-list key), `registryDigest`
+   (the instrument's registry digest), the tier, the parameters,
+   `bundleSha256` and `bundle`, the exact body of `PUT /v2/instruments/{digest}`
+   (`--body` prints only that): the system prompt with the journal
+   substituted, byte for byte the builder's; `responseSchema: null` (the
+   label parser validates); `maxOutputTokens` `{perItem: 700, minimum: 3000}`;
+   temperature 0; seed null; reasoning `none` (abstract) or `low` (full text);
+   `itemsPerCall` 40 or 5; `requiredModelFingerprint`, the required served
+   model (a different model pauses the job); and `transport.messages:
+   verbatim`. The digest is the sha256 of the canonical JSON of
+   `{format: ocsl-broker-instrument-v1, instrument, registryDigest, tier,
+   parameters, bundleSha256}`, so a changed body never reuses a digest.
+2. The operator installs every bundle (`PUT /v2/instruments/{digest}`) and
+   grants the digests and the judge provider to the run principal. The
+   executor installs nothing.
+3. `study prepare ... --study-bundle <file|sha256>` pins the study bundle (an
+   `ocsl-study-bundle-v1` record of `instruments.study_bundle_digest`: protocol,
+   study prompt, template, instrument digests, dataset versions and package
+   tags; a file is checked against its sha256 and its citation-census@1
+   digest) before the first call. Every call receipt records its digest, and a
+   broker run refuses to start without it. A bare sha256 is recorded unchecked:
+   `status` reports `studyBundleVerified: false` and `gates` notes it until the
+   bundle file is pinned as well.
+4. Run the tiers with `--broker-socket` (or `OCSL_BROKER_SOCKET`) instead of
+   `--base-url`: `study judge|full-text|no-truncation|replicate --database ...
+   --seed ... --broker-socket "$SOCKET"`. `--broker-worker` selects the worker
+   when the principal offers several; the worker's model must be the model the
+   census requests (`--model`). Entitled text goes only to a broker provider
+   the operator's egress policy lists as on premises: `--on-premises --policy`
+   with `onPremBrokerProviders: [{"provider": "<id>", "models": [...]}]`.
+
+Before any call, each command reads the principal's catalog again and refuses
+unless the daemon offers verbatim instrument mode (`instrumentVerbatim: 1`),
+the worker requests the census model, and every bundle the pending reviews
+need is installed and granted and is listed with `transport.messages:
+verbatim` (a policy-wrapped install would put the broker's worker policy in
+front of the prompt); the error names the digests at fault.
+
+**Calls.** Each paper-batch call (first, repair or full-text call) is one bulk
+job with one item whose input is the chat-completions request the instrument
+built plus its entry count: `{messages, model, max_tokens, temperature,
+stream, reasoning_effort, itemCount}`, the system and user messages unchanged.
+The job names the bundle digest. The daemon checks the item against the bundle
+installed under it and the worker's model (the system message is the installed
+prompt; model, `max_tokens`, temperature, seed, reasoning and `stream` are the
+values it sends) and refuses any difference before a provider call with
+`INSTRUMENT_MESSAGE_MISMATCH`; otherwise it sends exactly that request upstream,
+without a worker policy or assignment text, as canonical JSON. The item id is
+the call id, and the job's idempotency key is derived from the call id and the
+request digest.
+The executor follows the principal's changed-job feed (`GET /jobs?view=summary`)
+and reads each settled job's result page; a waiting call also reads its own job
+again every 30 seconds, so a settlement the feed missed never waits for the
+deadline. A job reported settled while the call's item is still running (a
+double launch across a daemon restart) is no answer yet: the call stays open
+and meets the job again.
+
+**Fidelity.** Every receipt must report `requestSha256` (the executor reads it
+from the item on the job's result page), the sha256 of the canonical JSON of
+the body the daemon sent upstream, and it must equal the
+sha256 of the canonical JSON of the chat-completions body the executor built
+(`model`, `messages`, `max_tokens`, `temperature`, `stream`,
+`reasoning_effort`). Canonical JSON sorts object keys by UTF-16 code unit,
+has no whitespace and writes strings and numbers as `JSON.stringify` does (an
+integral float such as 0.0 is written 0). A missing or different digest makes
+the call invalid: it is recorded with error `request_mismatch`, its output is
+never parsed, its entries stay open (never invalid outputs) and the run pauses
+as `paused:fidelity`. An item the broker refuses before any provider call (no
+attempt) stops the run the same way, with the broker's reason in the call's
+error: `INSTRUMENT_MESSAGE_MISMATCH` (the messages or settings differ from the
+bundle installed under the digest, or from the worker's model),
+`PRINCIPAL_REQUIRED` (no run principal authority) or `INVALID_REQUEST` (the
+daemon cannot run the instrument verbatim). No repair call follows, since the
+same request would be refused again. The next invocation tries again, so fix
+the daemon or the installed bundle first.
+
+**What counts as the judge's answer.** Exactly what counts for a direct call: the
+item's `servedModel` is the model the judge's response named (a response naming
+none, or another model, is model drift, never the requested model taken on
+trust), `fingerprint` is the response's own `system_fingerprint`
+(`systemFingerprint`; NULL when the server offered none, so the fingerprint
+gate fails with the same note on both transports), and the upstream status
+decides as it does directly: 400, 413 or 422 is the judge refusing this very
+request (an answer without labels), any other failure after the broker's own
+attempts (408, 425, 5xx, an unreachable judge, a 2xx without a chat completion
+message, `NO_FINAL_MESSAGE`) is a transport failure whose entries stay open, and
+an empty completion (asked again by the broker, as a direct call would) is an
+answer without labels.
+
+**Receipts.** Each call has a `calls` row (the columns every earlier version
+writes) and a `call_transport` row beside it: `transport` (direct or broker),
+`study_bundle_sha256`, `request_sha256` and, for broker calls,
+`broker_principal_id`, `broker_job_id` (the job that settled it, after any
+resume), `broker_item_id` (the call id), `broker_instrument_digest`,
+`broker_settings_sha256`, `broker_request_sha256`, `broker_error_code`,
+`broker_server_fingerprint` (the daemon's `serverFingerprint`: the server's
+`system_fingerprint` when offered, else its own identity of the served model
+and the server headers) and `broker_http_status`. Keeping `calls` unchanged
+keeps a deploy reversible: an earlier version still opens a database this one
+wrote and records its own receipts in it (a call it records counts as a direct
+call without the study bundle).
+
+**Pauses and outages.** A provider-limit pause whose `resumeAfter` lies in the
+future, an exhausted budget, an expired principal, a withdrawn grant, a
+cancelled job or a refused job halt the transport: no further job is
+submitted, calls in flight still settle and are recorded, and the run pauses as
+`paused:transport` with the broker's reason (`status` shows it as `runPause`,
+the command's result carries `resumeAfter`). A call that never settled records
+no receipt row, so the next invocation repeats the same call id, meets the same
+broker job and resumes it: a provider-limit pause once `resumeAfter` has
+passed, a budget pause once the operator has raised the budget. A job resumed
+in earlier invocations is followed along its lineage to the tail (each earlier
+resume answers with the job it created, changes nothing and does not count as a
+resume) and resumed there, after the tail's own `resumeAfter`. Within one
+invocation a pause is resumed once per job lineage (a provider pause another
+job left behind) and halts the transport if it returns. When the daemon's
+worker configuration changed since a call was submitted (a provider's endpoint,
+model, credential variable or label), the job under the call's key cannot be
+resumed (`WORKER_CONFIG_CHANGED`) and a new submission under it is refused
+(`WORKER_KEY_CONFLICT`, naming that job): the executor takes the answer of that
+job, or of a resume of it, if one settled the call, and otherwise moves the call
+to the next key of a fixed sequence, so every later invocation meets the same
+new job. A model drift
+pauses as `paused:model_drift`, as with the direct transport. An unreachable
+socket, a job feed that keeps failing for a minute or a call without a
+settlement before its wait deadline leaves the call open, without a repair call
+that would duplicate a call that may still run; the breaker, further passes and
+`paused:transport` follow as with the direct transport (only recorded failures
+count as transport failures). A socket that is gone is reported as such: the
+run principal may have been revoked (or its socket withdrawn) or the daemon is
+restarting; calls in flight at a revocation finish unless it cancels them, and
+a run continued under a new principal cannot meet the old principal's jobs, so
+`gates` notes when calls ran under more than one principal. A fidelity failure
+halts the transport too: calls already queued are not sent, and fidelity stops
+(`request_mismatch`, broker refusals) are reported apart from transport
+failures.
+
+**Never twice.** A call repeated after a crash meets its job through the
+idempotency key and takes that job's result without a second provider call;
+the unique index on accepted primary verdicts guards the database. A primary
+abstract call's accepted verdicts are written with its receipt, so after a
+crash a batch resumes with exactly the repair call that was due (the same call
+id and request, which meets the repair job that may still run). A full-text
+call is recorded in `pending_calls` before it is submitted and removed with its
+receipt; the next pass or invocation sends a pending call first, unchanged, and
+keeps its entries out of the new chunks, so a lost answer is collected from its
+job instead of being judged again by a re-chunked call. (A sensitivity batch is
+still re-run whole when it ends incomplete.) `pending_calls` is execution
+state: it is never exported and is emptied in a frozen database.
 
 ## Scores database
 
@@ -453,7 +631,12 @@ One SQLite file per study: `reviews` (counts per tier and class), `citations`
 and full-text verdicts, classes, call ids and positions), `loci`, `works`,
 `identity`, `evidence`, `calls` (one receipt per call: instrument digest,
 served model, fingerprint, settings digest, system, user, message-list and body
-digests, tokens, finish reason, attempts), `history` (append-only),
+digests, tokens, finish reason and attempts), `call_transport` (beside each
+receipt: the transport, the canonical request digest, the pinned study bundle
+and, for broker calls, the principal, job, item, bundle digest, the broker's
+settings and request digests, its server identity and the upstream status),
+`pending_calls` (broker full-text calls submitted and not yet recorded),
+`history` (append-only),
 `review_scores` and `work_scores` (beta-binomial excess and Benjamini-Hochberg
 q-values), `sanitizer_findings`, `input_provenance` (where each review document,
 abstract evidence unit and full-text source came from), `enumeration` (a pinned
@@ -468,7 +651,11 @@ these columns gains them when a study command opens it. Citing sentences that ar
 sent, every abstract (once per database) and every full-text window pass the
 sanitizer in detect mode: hidden characters and prompt-injection sentences are
 recorded by offset, rule and digest, and the text the judge receives stays the
-instrument's, byte for byte. `study freeze` writes the closed, read-only
+instrument's, byte for byte. `status` counts the inputs that carry chat-template
+control tokens (`inputsWithControlTokens`, rules `control-token` and
+`control-block`) and `gates` notes them: a judge server that reads special
+tokens inside message content may take them as role markers, on either
+transport. `study freeze` writes the closed, read-only
 copy (rollback journal, evidence text removed unless `--keep-text`). It refuses
 a paused run, one with pending reviews, or a fresh-enumeration study whose
 population is incomplete, unless `--allow-incomplete`, which is
@@ -547,10 +734,14 @@ from that journal's own recorded calls.
 
 ## Limits
 
-- The direct chat-completions transport is for on-premises judges and probes;
-  broker bulk jobs need a verbatim instrument mode before they can carry this
-  instrument unchanged. Its calls are receipted in the scores database
-  (`calls`), not in the workspace egress ledger.
+- The direct chat-completions transport is for on-premises judges and probes.
+  The broker transport needs the execution daemon's verbatim instrument mode
+  (`transport.messages: verbatim` in the bundle, the system message checked
+  against the installed prompt, the request sent unchanged and its canonical
+  digest reported as `requestSha256`); a daemon without it refuses the bundle
+  at installation or the calls, and the run stops before any verdict. Calls of
+  both transports are receipted in the scores database (`calls`), not in the
+  workspace egress ledger.
 - `study works` derives cited works from identifiers only (a DOI or PMID in the
   bibliography markup, or a DOI printed in the entry); entries without one stay
   unresolved, and there is no title search. Derived works take their metadata

@@ -34,8 +34,10 @@ native or API worker jobs, configuration revisions and assessment history. Its
 SQL/hash facts export supports reproducible writing without treating model
 judgments as scientific ground truth. Local JATS and publisher HTML ingestion
 preserve citation targets and display loci before measurement. Registered,
-digest-pinned instruments, the entry-level `citation-census@1` study commands,
-the scores database, estimands and facts export are described in
+digest-pinned instruments, the entry-level `citation-census@1` study commands
+(calling a judge directly or through a run principal's broker socket, whose
+receipts attest the request the instrument built), the scores database,
+estimands and facts export are described in
 [census-instrument.md](docs/census-instrument.md).
 
 For one manuscript, [`ocsl-review screen`](docs/claim-check.md) is research-integrity
@@ -204,8 +206,8 @@ The existing package is licensed under the [MIT License](LICENSE). The new
 `structured.py` and `census.py` modules, census prompt and assessment schema,
 structured/census tests and fixtures, census skill, and census guide are
 independently implemented Apache-2.0 originals, as are the `author_year.py`,
-`sanitize.py`, `retrieval.py`, `integrity.py`, `claim_check.py`, `screen.py` and
-`capacity_probe.py` modules, the `schemas/claim-check.sql` extension, their tests and
+`sanitize.py`, `retrieval.py`, `integrity.py`, `claim_check.py`, `screen.py`,
+`capacity_probe.py` and `census_broker.py` modules, the `schemas/claim-check.sql` extension, their tests and
 fixtures, and the claim-screen and capacity-probe guides, with the
 [Apache license text](LICENSES/Apache-2.0.txt) included. Existing MIT assets
 remain under MIT. The adjacent
