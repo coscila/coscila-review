@@ -14,7 +14,8 @@ parsed verdicts, section trails and sentence text are removed), plus materialize
 
 Every fact is one scalar SQL query over the closed file (at most five seconds), with the file's sha256, the inputs and
 the code revision; keys are ``followup.<family>.<...>`` (status, census, strata, support, function, dependency,
-numeric, citedby, secondgen, calls, requests, estimates from ``fu_estimates``, coverage from ``fu_coverage``).
+numeric, citedby, secondgen, calls, requests, estimates from ``fu_estimates`` with their ``followup.`` key placed under
+``followup.estimates.``, coverage from ``fu_coverage``).
 ``followup verify-facts`` checks an export with ``corpus_facts.verify_export``.
 """
 from __future__ import annotations
@@ -52,7 +53,23 @@ def key_part(value: Any) -> str:
     text = str(value if value is not None else "none")
     if text in ("*", ""):
         return "all"
+    if text == "-":  # the reason of an assessable coverage row
+        return "none"
     return slug(text)
+
+
+def estimate_fact(key: Any) -> str:
+    """The fact key of an ``fu_estimates`` key: ``followup.<estimand>...`` becomes ``followup.estimates.<estimand>...``
+    (a key without the prefix gets it), so estimates never collide with the other fact families."""
+    name = str(key)
+    for prefix in ("followup.estimates.", "followup."):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    fact = "followup.estimates." + name
+    if not FACT_KEY.fullmatch(fact):
+        fact = "followup.estimates." + ".".join(key_part(part) for part in name.split("."))
+    return fact
 
 
 def _text_columns(connection: sqlite3.Connection, table: str) -> list[tuple[str, bool]]:
@@ -302,9 +319,7 @@ def define_facts(connection: sqlite3.Connection) -> Facts:
     # estimates and coverage of the analysis track
     for key, estimand, detail in _distinct(connection, "SELECT key, estimand, detail_json FROM fu_estimates "
                                                        "ORDER BY key"):
-        fact = key if str(key).startswith("followup.estimates.") else "followup.estimates." + str(key)
-        if not FACT_KEY.fullmatch(fact):
-            fact = "followup.estimates." + ".".join(key_part(part) for part in str(key).split("."))
+        fact = estimate_fact(key)
         try:
             derivation = json.loads(detail) if detail else None
         except ValueError:

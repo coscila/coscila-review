@@ -90,6 +90,15 @@ def populated_branch(root: Path, census: dict, name: str) -> FollowupBranch:
                            (F.JOURNAL_A, json.dumps({"b": 200, "seed": 13, "interval": "percentile"})))
         connection.execute("INSERT INTO fu_coverage VALUES('sole-or-essential', ?, '*', 'S1', 'unassessable', "
                            "'fetch-failed', 1, 1.0)", (F.JOURNAL_B,))
+        # rows as followup estimands writes them: keys in the followup. namespace, a share that is not measured, and
+        # the reason "-" of assessable units
+        detail = json.dumps({"b": 200, "seed": 13, "interval": "percentile"})
+        connection.execute("INSERT INTO fu_estimates VALUES('followup.cited-after-notice.retracted.all.all.share', "
+                           "0.5, 'cited-after-notice', NULL, NULL, 'S1', 1.0, 2.0, 2, ?)", (detail,))
+        connection.execute("INSERT INTO fu_estimates VALUES('followup.distortion-type.all.all.share', "
+                           "'not-measured', 'distortion-type', NULL, NULL, 'S2', 0, 0, 0, ?)", (detail,))
+        connection.execute("INSERT INTO fu_coverage VALUES('sole-or-essential', ?, '*', 'S1', 'assessable', '-', 2, "
+                           "2.0)", (F.JOURNAL_B,))
     return branch
 
 
@@ -170,6 +179,11 @@ class FactsTests(unittest.TestCase):
         key = ("followup.coverage.sole-or-essential.journal-of-synthetic-reviews-b.all.s1.unassessable."
                "fetch-failed.units")
         self.assertEqual(1, self.value(key))
+        self.assertEqual(0.5, self.value("followup.estimates.cited-after-notice.retracted.all.all.share"))
+        self.assertEqual("not-measured", self.value("followup.estimates.distortion-type.all.all.share"))
+        self.assertFalse([fact for fact in self.facts if fact.startswith("followup.estimates.followup.")])
+        self.assertEqual(2, self.value("followup.coverage.sole-or-essential.journal-of-synthetic-reviews-b.all.s1."
+                                       "assessable.none.units"))
 
     def test_no_text_of_a_review_or_a_cited_work_reaches_the_facts(self):
         raw = (self.output / "facts.sqlite3").read_bytes()

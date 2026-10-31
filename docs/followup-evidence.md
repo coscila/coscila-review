@@ -181,9 +181,12 @@ against the resolved status) and `fact_inputs` (parent, branch and protocol dige
 dataset versions, code revision, the protocol's bootstrap replicates and seeds). `facts.json` (schemaVersion 1) holds
 one scalar SQL query per fact with the file's sha256: `followup.status.*`, `followup.census.*`, `followup.strata.*`,
 `followup.support.*`, `followup.function.*`, `followup.dependency.*`, `followup.numeric.*`, `followup.citedby.*`,
-`followup.secondgen.*`, `followup.calls.*`, `followup.requests.*`, `followup.estimates.*` (from `fu_estimates`, with
-their derivation) and `followup.coverage.*` (from `fu_coverage`). `verify-facts` re-runs every query read-only against
-the snapshot (`corpus_facts.verify_export`).
+`followup.secondgen.*`, `followup.calls.*`, `followup.requests.*`, `followup.estimates.*` (every `fu_estimates` row
+with its derivation: the estimate key `followup.<estimand>...` becomes `followup.estimates.<estimand>...`, and a share
+that is not measured keeps the value `not-measured`) and
+`followup.coverage.<estimand>.<journal>.<year>.<stratum>.<state>.<reason>.units` and `.weighted` (from `fu_coverage`;
+`*` reads `all` and the reason `-` of assessable units reads `none`). `verify-facts` re-runs every query read-only
+against the snapshot (`corpus_facts.verify_export`).
 
 ## Export: `followup export --output DIR [--allow-entitled-text]`
 
