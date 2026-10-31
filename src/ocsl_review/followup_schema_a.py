@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Follow-up branch tables private to the evidence modules: status lookups, cited-by traversal, support evidence and
-alert records (followup_status, followup_citedby, followup_support, followup_exports).
+"""Follow-up branch tables private to the evidence modules: cited-by coverage, support evidence and alert records
+(followup_citedby, followup_support, followup_exports).
 
 Only those modules write these tables. Interface tables that other modules read live in ``followup_schema``.
 """
@@ -22,11 +22,12 @@ CREATE TABLE IF NOT EXISTS fu_evidence(
 CREATE INDEX IF NOT EXISTS ix_fu_evidence_work ON fu_evidence(work_key, unit);
 CREATE TABLE IF NOT EXISTS fu_evidence_units(
   evidence_id TEXT NOT NULL REFERENCES fu_evidence(evidence_id), unit_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
-  kind TEXT NOT NULL, text TEXT NOT NULL, PRIMARY KEY(evidence_id, unit_id));
+  kind TEXT NOT NULL, locator TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, PRIMARY KEY(evidence_id, unit_id));
 CREATE TABLE IF NOT EXISTS fu_alerts(
   alert_id TEXT PRIMARY KEY, journal TEXT NOT NULL, doi TEXT NOT NULL, claim_id TEXT NOT NULL, locus_id TEXT NOT NULL,
   work_key TEXT NOT NULL, status TEXT NOT NULL, notice_date TEXT, function_class TEXT, dependency_class TEXT,
-  support_json TEXT NOT NULL, confidence TEXT NOT NULL, suggested_action TEXT NOT NULL, created_at TEXT NOT NULL);
+  support_json TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', confidence TEXT NOT NULL,
+  suggested_action TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
@@ -42,14 +43,17 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "characters": "characters of extracted text", "complete": "1 when the evidence covers the whole unit",
         "outcome": "obtained, fetch-failed, no-open-full-text, unavailable or incomplete",
         "request_id": "provider request (fu_requests)", "retrieved_at": "time retrieved",
-        "detail_json": "retrieval details (attempts, cache hits)"},
+        "detail_json": "retrieval details (attempts, cache hits, rejected cache candidates)"},
     "fu_evidence_units": {"evidence_id": "evidence", "unit_id": "unit id", "ordinal": "document order",
-                          "kind": "abstract, paragraph, caption, table", "text": "unit text"},
+                          "kind": "abstract, paragraph, caption or table", "locator": "section trail of the unit",
+                          "text": "unit text"},
     "fu_alerts": {
-        "alert_id": "alert id", "journal": "journal of the citing review", "doi": "citing review DOI",
-        "claim_id": "citing sentence", "locus_id": "frame locus", "work_key": "compromised cited work",
-        "status": "status of the cited work", "notice_date": "notice date", "function_class": "citation function",
-        "dependency_class": "dependency class", "support_json": "support verdicts with quotes",
+        "alert_id": "alert id (digest of claim and cited work)", "journal": "journal of the citing review",
+        "doi": "citing review DOI", "claim_id": "citing sentence", "locus_id": "frame locus",
+        "work_key": "compromised cited work", "status": "status of the cited work", "notice_date": "notice date",
+        "function_class": "citation function", "dependency_class": "dependency class",
+        "support_json": "support verdicts with quotes (entitled quotes only in a private export)",
+        "evidence_json": "status source and date, timing, function, dependency and the judge receipts",
         "confidence": "check suggested (no calibration set measures a positive predictive value)",
         "suggested_action": "suggested action for the authors of the citing work or a study team",
         "created_at": "time created"},
