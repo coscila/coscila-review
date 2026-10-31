@@ -190,6 +190,9 @@ def _execute(args, repo, progress):
 
 def command(args):
     name = args.corpus_command
+    if name in ("import-snapshot", "import-legacy"):
+        from .blind import refuse_in_blind_study
+        refuse_in_blind_study(f"corpus {name}")
     if name == "import-snapshot":
         from .corpus_export import import_snapshot
         return import_snapshot(Path(args.workspace).absolute(), args.library, args.input)

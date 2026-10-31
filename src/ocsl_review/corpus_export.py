@@ -21,6 +21,8 @@ def import_snapshot(workspace, destination, source_path):
     Snapshot files are immutable, so they are hard-linked when the seed is on the
     same filesystem and copied otherwise; the copy is verified again.
     """
+    from .blind import refuse_in_blind_study
+    refuse_in_blind_study("corpus import-snapshot")
     from .corpus_library import Workspace, Library, link_or_copy
     from .errors import ValidationError
     source = Path(source_path).absolute()

@@ -56,7 +56,9 @@ Cache requests and portable metadata redact credentials and retain only an
 authorization-scope fingerprint; provider bodies that echo supplied credentials
 are rejected before persistence.
 
-Use `corpus import-legacy PATH --kind historical|census` for an explicitly selected
+In a blind study (`OCSL_REVIEW_BLIND=1`) `corpus import-legacy`, `corpus import-snapshot` and `store attach` of
+anything but a `literature-evidence@2` projection refuse. Otherwise, use
+`corpus import-legacy PATH --kind historical|census` for an explicitly selected
 historical database or census input. The source is imported as labelled history,
 not overwritten or counted as fresh v2 judgments. Import reports and raw inputs
 must reconcile the original records. A scores-only import cannot supply absent

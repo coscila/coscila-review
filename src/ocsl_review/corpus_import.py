@@ -159,6 +159,8 @@ def _observation(analysis: str, work: str, property_name: str, key: str, value: 
 
 def import_legacy_scores(repo: CorpusRepository, source_db: Path, *, namespace: str = "legacy-scores") -> dict:
     """Preserve scores as scores: the old table does not contain exact quote/locus evidence."""
+    from .blind import refuse_in_blind_study
+    refuse_in_blind_study("corpus import-legacy (historical scores)")
     with _snapshot(repo, source_db) as (source, manifest):
         _require(source, {"reviews": {"doi", "title"}, "citations": {"doi", "label"}})
         analysis, method = _namespace(repo, namespace, "scores", manifest)
@@ -271,6 +273,8 @@ def _import_census_database(repo: CorpusRepository, db_path: Path, namespace: st
 
 
 def import_legacy_census(repo: CorpusRepository, source_path: Path, *, namespace: str = "legacy-census") -> dict:
+    from .blind import refuse_in_blind_study
+    refuse_in_blind_study("corpus import-legacy (census ledger)")
     source = Path(source_path).absolute()
     if source.is_file():
         databases = [_regular(source)]

@@ -294,6 +294,8 @@ def _digests(value):
 
 def attach_store(repo, path, *, level: str = "standard") -> dict:
     """Verify a store and pin it (path and Merkle root) in a mutable study library."""
+    from .blind import require_projection_in_blind_study
+    require_projection_in_blind_study(Path(path))
     if repo.library.is_snapshot:
         raise ValidationError("immutable snapshots cannot be modified; branch first")
     store = Store(Path(path), level=level)

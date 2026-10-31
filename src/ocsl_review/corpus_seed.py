@@ -195,6 +195,8 @@ def _raw_core(repo, root, progress):
 def import_legacy_evidence(repo: CorpusRepository, source_db: Path, *, source_root: Path | None = None,
                            progress=None) -> dict:
     """Import old evidence independently of active-study inclusion and verdicts."""
+    from .blind import refuse_in_blind_study
+    refuse_in_blind_study("corpus import-legacy (legacy evidence)")
     source_db = _regular(Path(source_db))
     wal = Path(str(source_db) + "-wal")
     if wal.exists() and wal.stat().st_size:
