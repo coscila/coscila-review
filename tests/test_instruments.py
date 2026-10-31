@@ -58,6 +58,64 @@ FORBIDDEN = {
     42: {"d8e6d64915d843b393a00b1c75711cf9b95a45cb5ec3ca55f2194600e4daea33"},
     53: {"4a644f4c0b74832906e22a4322b92a083cc26e14fa38b131b03fc46b4c16684e"},
 }
+# Rounded, fraction and spacing variants of study figures, the forms a facts-lint example or a written range can take.
+for _length, _digests in {
+    4: {"3e239cbbd360793f0ebd640df0b475e267be0cf1d7d7c80a6250ba0fc6e1f566",
+        "974c474e03d760995d1bac1d06fbcd28a8d62b16a5b53f212cbbe6134832939d",
+        "a7071849fb72be7f6138ee4d048867bcd88f2250589bc6da81141fb8fce73d89",
+        "aaae6b81b3239e64dbcd6dc0b5dfa117884d112b56ddaf59ab9ef9b8f94bb7d2",
+        "f1e8aa5a065b37a6d729411d50b8531b35a836efa6ca8efb20d028d9df83d2aa"},
+    5: {"f9cd6c42de299434f0cace60f6d4837206dddb9dddeee6a9e37869cf671859cf"},
+    6: {"3bd54cc0263127e91067fca32cd9b3a1f0ec2f73e1c1647a88b93ad4033c2751",
+        "928423789231f88fc7042d8140369886581e87d1d7c342385f687467fc5037fc"},
+    7: {"52a3d7397e8776140a09443ec657d971371625d344c9208cfdee6e56661a144a"},
+    9: {"52ae8db672be4012d76616a42c6b3093fa364d46c1b687c0e26895a566068f9f"},
+    10: {"0040ce1bd1f1b649087327396c80c29d5b68f4a2d7861ecf52c0ed8ddcb97204",
+         "039ed5ce153c651a4c083c0ce5a57b0831843bf7c13cc2ced001bee5d9dba80c"},
+    11: {"b3d18e1164052ad49fcb59ee72190d6ca9594d6ccd2f04c2149633f4faf2fded"},
+}.items():
+    FORBIDDEN.setdefault(_length, set()).update(_digests)
+# Further study figures and identifiers a final review found missing: population and readable counts with and without
+# separators, corpus totals, the diagnostic bands in both dash spellings, token and runtime totals, the corrected
+# report's title and file names, the snapshot's directory name, and the identifiers of further census sessions.
+for _length, _digests in {
+    4: {"0a95ca5e3efad73cd92ae12559d1189d05ff48b6344f0f83f760e59352f22689",
+        "6c4c237fa6808f1c64a0a64254a296c0b006ede809a804447cd6dc06b46cb192",
+        "aaae6b81b3239e64dbcd6dc0b5dfa117884d112b56ddaf59ab9ef9b8f94bb7d2"},
+    5: {"139923821f09b19101c003fb15d7b873c0d37b528a80f61936eff528b1a0acbc",
+        "20d4ea1b58b071504152736437b77fd13793af17b3a4ca0611f9793d0d36a838",
+        "589b1174e8d1f3a929d4c9237c06614379e9d061503c19ede8c00529b320ec98",
+        "69d325d196c62c699477760d45136fb4b56550cd8fc6ded59d5ed6f6e8bb1488",
+        "ce7971f95aeac24e316891e78bfa924ceac221030e7f03ffdae5c0f9af06e4a5"},
+    6: {"6dc2606829c647713389befda0fb36a684a41d042c738863a40bf4b060488ba7",
+        "b3384b6dff9e1bef0865f9d58d8b78d43ae118f5fbe6ad874a3b032df584bfd8",
+        "c603e8999513029e44d9e978c1fc67f6fe08f7dda2158d8a9d22ed7ebbaac7de"},
+    7: {"28ad27422591424f71c86df882f94dfaf52a45930cf67e8486a27bd892fae388",
+        "3007dd62825805d659236c8fbbbeddfbf6c0142ea348a48e41b93517856ffee3",
+        "35a94fec15e6ecef565c0e271154a4490d7b3e6a2c524fa5105126af55be3d45",
+        "52a3d7397e8776140a09443ec657d971371625d344c9208cfdee6e56661a144a",
+        "b8c2168dd9b003c2831c38e953d3e93ca149a7c83ad6399af08f05b1637d6529",
+        "f379cdca4ff319e198b2bb178c54cdeb6ce6aad81206092c55522c3f90c69fe2"},
+    8: {"1003143bea389f7ef87fa8c910464010c8bc8c7d5864f116bb2a4878688f48c9",
+        "322ade8662be4dd8776d5021ddb866ed3ffdd26d8d6c91b03ac5c2a0ad4bb668",
+        "54b0dc5426c4e7100617f94b1421a71a42f8b986f395378e7b7f087e15b8fd44",
+        "8d9174f77b32df3dd6bd11330a9f2f0e38582340619fb3ac472ba1bc3f4ceeca",
+        "c08b71f7f21a6d9b060343d2426c243e742aea023f08074d0c46b54f6c89ca09",
+        "dcc58a67a288e50ff9f31b805e7cf1a29e9ba2d188e8cce3a0ee944566d89d75"},
+    9: {"0d5887fe37d9f3447ee1f57da00aee968a4e47adb40f1a129f679f10d45258a8"},
+    10: {"b23d1ce0d23777d1e3d54a39edb274ec0e3ca91dcb8eda72a0e32344868f7da7",
+        "d8c0e27bab7b0333437c043441f313ff792755325b8c5b37cfcb445142a5c3b7"},
+    12: {"7e67e8069bd0cdf29a6f7608d7ebcc6a8cc181be232a119b7df0072c5cb6265d"},
+    16: {"290b42a29e439a84354ca30fcfa035dca0d3eec9297f5ef35b77b89113b9a235",
+        "9ceab4517efe93e787263de5fdcd5bbd5ea955ac47449f93453905505ad8138c"},
+    20: {"b77790e3aec8b76e96fef34e34ca6667da8c87f786d5b01352c2e6b8cebdc7d0",
+        "b965fe2d415f0f51958dcaeb121e5feb863b6258496ea78f078303213af0a9a0"},
+    21: {"3837e95ba23a92e4ec96e2768e54ba4c6091f22c2fda291b219c511deafa5332",
+        "715a0fcdccb251665c3abd899d877027259671e21c2bf9eb69cc9a9e11063ade"},
+    23: {"31f89bc0c1520411347e937220e6c599ba8f5f67ebb56d9e6d4086d504015c81"},
+    51: {"eae3d450ca367e62d119f56da83d611e6f5239d32ba2746dd08e8a72ecbcc531"},
+}.items():
+    FORBIDDEN.setdefault(int(_length), set()).update(_digests)
 # Everything the lab sees: skills (with their assets and references), instruments, prompts, docs and the
 # modules that build prompts or runtime output.
 LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/instrument.schema.json",
@@ -257,6 +315,24 @@ class BlindnessTests(unittest.TestCase):
             text = (ROOT / "skills" / skill / "SKILL.md").read_text()
             self.assertIn("citation-census@1", text)
             self.assertIn("ocsl-review study", text)
+
+    def test_files_the_census_skills_route_to_name_no_earlier_study(self):
+        """Phrases that tell a reader an earlier census, its manifest or its selections exist; whitespace (a line
+        break inside a phrase) is folded before matching."""
+        analysis = ROOT / "skills/ocsl-review-reference-analysis"
+        routed = [analysis / "SKILL.md", ROOT / "skills/ocsl-review-citation-census/SKILL.md",
+                  *sorted((analysis / "references").glob("*.md")), ROOT / "docs/census-instrument.md",
+                  ROOT / "docs/corpus-review.md", ROOT / "docs/citation-census.md", ROOT / "docs/capacity-probe.md",
+                  ROOT / "docs/storage.md"]
+        phrases = ("earlier census", "earlier study", "earlier studies", "earlier runs", "earlier run's",
+                   "earlier population", "earlier manifest", "earlier acquisition", "earlier corpus",
+                   "legacy-original-source", "oncology audit", "private record set", "are comparators",
+                   "historical oncology", "earlier judgments", "original census")
+        for path in routed:
+            text = " ".join(path.read_text(encoding="utf-8").lower().split())
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                for phrase in phrases:
+                    self.assertNotIn(phrase, text)
 
     def test_scanner_detects_tokens_at_word_starts_only(self):
         table = {5: {hashlib.sha256(b"7.7 %").hexdigest()}}

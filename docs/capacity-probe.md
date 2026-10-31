@@ -56,7 +56,7 @@ to `--drain-seconds` each; the dry run prints the estimate.
 | `--sample-seconds` | 5 | server load sampling interval |
 | `--abort-*`, `--saturation-*` | see [abort rules](#abort-rules) | |
 | `--shared-tolerance` | 0 | requests beyond ours that a sample tolerates while our calls are in flight |
-| `--allowed-streams`, `--target-rate` | 60, 40 | the exit criterion: entries/s with the instrument's geometry at the allowed concurrency |
+| `--allowed-streams`, `--target-rate` | 60, 40 | the exit criterion: entries/s with the instrument's geometry at the allowed concurrency (operator settings; a study derives its own capacity gate) |
 | `--profile` | built-in | size profile and expected tokens per entry from `capacity profile` |
 | `--expect-output-tokens`, `--expect-prompt-tokens` | none (or the profile's) | predeclared tokens per entry of the census's real entries |
 | `--expect-tolerance` | 0.2 | departure from the expected tokens per entry that warns and normalises the rate |
@@ -301,11 +301,11 @@ concurrency are reported as exploratory and never pass the criterion. One
 line, wrapped here:
 
 ```text
-Exit criterion (≥ 40 entries/s with the instrument's 40 items per call at the allowed concurrency of 60 streams):
-PASS - 60x40: 44.5 entries/s over a 236 s steady-state window; invalid outputs 0.10 %, transport failures 0.00 %
+Exit criterion (≥ <target-rate> entries/s with the instrument's 40 items per call at the allowed concurrency of <allowed-streams> streams):
+PASS - 60x40: <rate> entries/s over a 236 s steady-state window; invalid outputs 0.10 %, transport failures 0.00 %
 (within the census limits of 1 % and 0.5 %); tokens per entry: prompt 512.3, output 41.6 against the expected
 output 43 (-3 %); served model `nvidia/Qwen3.8-Flash-Next-NVFP4`. Exploratory geometries at ≤ 60 streams (not the
-instrument's, never deciding): best 60x10 at 52.0 entries/s.
+instrument's, never deciding): best 60x10 at <rate> entries/s.
 ```
 
 The census gates for invalid outputs and transport failures are reported, not

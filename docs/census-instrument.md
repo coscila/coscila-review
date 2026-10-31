@@ -176,8 +176,8 @@ across reviews).
 
 A study may read two byte caches: a `literature-evidence@2` store (the
 label-free projection, see [storage](storage.md)) and a provider response cache
-(the response database of an earlier corpus acquisition with its
-content-addressed artifact directory). `study acquire`, `study abstracts`,
+(a provider response database with its content-addressed artifact
+directory). `study acquire`, `study abstracts`,
 `study prepare` and `study full-text` take `--store DIR` (absolute path;
 `--store-root ROOT` requires that Merkle root, the pinned dataset version) and
 `--provider-cache FILE`. Both are only ever byte caches: a cached copy stands in
@@ -270,14 +270,14 @@ counts as supplied. Works an input supplied keep their metadata.
 --europe-pmc` reads cached Europe PMC fullTextXML first (the provider cache by
 the PMCID's fullTextXML address, the store's Europe PMC documents) and accepts
 it when its PMCID or DOI agrees with the work; otherwise Europe PMC live, then
-entitled text. The caches are given only together with `--europe-pmc`: earlier
-runs fetched full texts only for their own escalations, so a cache-only tier
-would limit full-text coverage to their selection, while with live retrieval a
-cache hit only stands in for a download the run makes for every escalated work
-(`liveRetrieval` in the source's provenance record). The source paths an
-earlier census selected (`legacy-original-source` documents in the store) are
-never candidates. Each escalated entry records `ft_provenance`: the class of
-the source behind its window, or `unavailable` when no window was sent.
+entitled text. The caches are given only together with `--europe-pmc`: a
+cache holds whatever full texts happened to be fetched before, so a cache-only
+tier would let that accident decide full-text coverage, while with live
+retrieval a cache hit only stands in for a download the run makes for every
+escalated work (`liveRetrieval` in the source's provenance record). Only Europe
+PMC documents are candidates. Each escalated entry records `ft_provenance`: the
+class of the source behind its window, or `unavailable` when no window was
+sent.
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
@@ -301,8 +301,8 @@ facts carry them per journal and stratum (see Facts).
 
 ## Fresh enumeration
 
-A study that must not import an earlier population builds it live and compares
-the stored manifest only afterwards:
+A fresh study builds its population live; a comparison with any other
+manifest comes only after the census is complete:
 
 ```bash
 ocsl-review study enumerate --spec protocol/enumeration.json --output study/enumeration.jsonl
@@ -316,8 +316,9 @@ ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input 
   --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json
 ocsl-review study exclude --database work/census.sqlite3 --input protocol/exclusions.jsonl   # if the protocol excludes any
 ocsl-review study gates --database work/census.sqlite3 --require-fresh-enumeration
-ocsl-review study compare-manifest --database work/census.sqlite3 --stored old/manifest.csv \
-  --output results/manifest-comparison.json --label stored
+# after the census is complete, only if the protocol predeclares a comparison:
+ocsl-review study compare-manifest --database work/census.sqlite3 --stored "$COMPARISON_MANIFEST" \
+  --output results/manifest-comparison.json --label comparison
 ```
 
 The enumeration spec lists groups, each with a journal label, a Europe PMC
@@ -329,8 +330,8 @@ with a population-level field (`ISSN`, `JOURNAL`, `PUB_TYPE`, `SRC`, `LANG` and
 the date fields `PUB_YEAR`, `FIRST_PDATE`, `FIRST_IDATE`, `P_PDATE`, `E_PDATE`),
 joined by `AND`, `OR`, `NOT` and parentheses. Identifier fields (`DOI`,
 `EXT_ID`, `PMCID`, `PMID`, ...) and bare terms, which search every field
-including identifiers, are refused, so an earlier manifest cannot be replayed
-as a fresh population. `study enumerate` pages through Europe PMC search with
+including identifiers, are refused, so a list of reviews cannot be replayed as
+a fresh population. `study enumerate` pages through Europe PMC search with
 cursors, keeps every raw page content-addressed in `<output>.pages/` and writes
 the manifest and, last, the receipt `<output>.receipt.json` (spec, query rule,
 effective queries, hit counts, page digests and the population digest). A
@@ -339,8 +340,8 @@ refused; a review listed twice is kept once and records without a DOI are
 listed by provider id. Requests carry identifiers only.
 
 `study acquire` for a fresh study runs with `--live` and a `--route` for every
-journal: its byte caches then only stand in for downloads, so which reviews an
-earlier study happened to keep cannot decide which reviews are read. `study
+journal: its byte caches then only stand in for downloads, so what a cache
+happens to hold cannot decide which reviews are read. `study
 works` derives each review's cited works from its own bibliography: a DOI or
 PMID in the bibliography markup, else a DOI printed in the entry, one work per
 cited work keyed `doi:<doi>` (else `pmid:<pmid>`), bound to the digest of the
@@ -378,7 +379,7 @@ provenance and was acquired with its journal's live route, that every cache hit
 (review, abstract, full text) was re-checked against the pinned caches, that
 cached full texts were taken only while retrieving live, that every abstract
 comes from a recorded lookup (a cache hit, a live lookup, a recorded fallback
-or a definitive absence), not from text an earlier manifest carried, that no
+or a definitive absence), not from text an input record carried, that no
 identity map or country was supplied, and that every work was derived from its
 review with its metadata from a recorded lookup. Once a manifest comparison is
 recorded, a further check requires the population to be unchanged since.
@@ -729,18 +730,10 @@ to come from a fact token.
 
 ## Fidelity tests
 
-`tests/test_citation_census_fidelity.py` pins the instrument to recorded sha256
-values: system prompts, first and repair calls, the label parser, JATS
-conversion, full-text windows, full-text call geometry and prompts built from
-fixture documents through the maintained extraction. It reads inputs only.
-Setting `OCSL_REVIEW_CENSUS_FIDELITY_RECORDS` to a JSON-lines file of recorded
-calls (`title`, `journal`, `items`, `note`, and any of `systemSha256`,
-`userSha256` and `messagesSha256`, the sha256 of the JSON message list) adds a
-check against a private record set. Every digest a record carries must match
-the rebuilt call; a record whose user digest is the digest of an empty string
-holds no rebuilt prompt and is counted as unusable, never as a pass, and the
-check needs at least one usable record. Records for each journal have to come
-from that journal's own recorded calls.
+The instrument is pinned by tests on fixture documents: system prompts, first
+and repair calls, the label parser, JATS conversion, full-text windows and
+full-text call geometry, built through the maintained extraction. The tests
+read inputs only.
 
 ## Limits
 

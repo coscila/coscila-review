@@ -163,9 +163,9 @@ and reruns SQL before rendering numeric prose; this checks derivation, not truth
 For abstract/full-text, panel or model comparisons, use matched loci and source
 versions, retain paired direction changes and all missingness, and account for
 clustering within papers. This exporter handles one pinned run; cross-run
-statistics require an explicitly specified analysis. Historical oncology audit
-judgments may be comparators, not undisputed human labels. Parser tests, schema
-checks and fixture success do not establish live-provider scientific accuracy.
+statistics require an explicitly specified analysis. Judgments of other runs
+are not human labels. Parser tests, schema checks and fixture success do not
+establish live-provider scientific accuracy.
 
 Synthetic integration coverage is in `tests/test_census.py`, with original
 Apache-2.0 JATS fixture `tests/fixtures/citation_census_canary.xml`. No historical
