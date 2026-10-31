@@ -433,6 +433,18 @@ class PublicDestinationTests(unittest.TestCase):
             self.assertNotIn("Cookie", headers)
             self.assertNotIn("operator@example.org", str(headers))
 
+    def test_document_requests_keep_the_callers_accept_and_tool_identification(self):
+        connection = Mock()
+        connection.getresponse.return_value = Mock(status=200, headers={})
+        request = urllib.request.Request("https://journal.example/articles/review-1",
+                                         headers={"Accept": "text/html", "User-Agent": "ocsl-review census inputs",
+                                                  "Cookie": "session"})
+        with patch("ocsl_review.fulltext._PublicHTTPSConnection", return_value=connection):
+            with open_public_https(request, timeout=5, allow_cross_origin=True):
+                pass
+        headers = connection.request.call_args.kwargs["headers"]
+        self.assertEqual({"Accept": "text/html", "User-Agent": "ocsl-review census inputs"}, headers)
+
     def test_metadata_cannot_redirect_credentials_to_other_origin(self):
         connection = Mock()
         connection.getresponse.return_value = Mock(status=302, headers={"Location": "https://different.example/steal"})

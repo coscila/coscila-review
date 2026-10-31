@@ -209,6 +209,14 @@ def open_public_https(
     url = request.full_url
     initial = validate_public_url(url)
     headers = dict(request.header_items())
+    supplied = {key.lower(): str(value) for key, value in headers.items()}
+    # Document requests keep the caller's media preference and tool identification (a census page fetch asks for
+    # text/html as its own User-Agent): only those two, and never an identification that carries a contact address.
+    document_headers = {
+        "Accept": supplied.get("accept") or "application/pdf, application/xml, text/xml",
+        "User-Agent": (supplied["user-agent"] if supplied.get("user-agent") and "@" not in supplied["user-agent"]
+                       and "mailto" not in supplied["user-agent"].lower() else "ocsl-review/0.1"),
+    }
     deadline = time.monotonic() + timeout
     for redirect in range(MAX_REDIRECTS + 1):
         parsed = validate_public_url(url)
@@ -217,7 +225,7 @@ def open_public_https(
         if allow_cross_origin:
             # Document requests carry only protocol controls. In particular,
             # they never inherit contact email, API keys, cookies, or a referer.
-            headers = {"Accept": "application/pdf, application/xml, text/xml", "User-Agent": "ocsl-review/0.1"}
+            headers = dict(document_headers)
             if any(key.lower() in _CREDENTIAL_QUERY_KEYS for key, _ in urllib.parse.parse_qsl(parsed.query)):
                 raise ProviderError("document URL contains a provider credential parameter")
         if authorize_url:
