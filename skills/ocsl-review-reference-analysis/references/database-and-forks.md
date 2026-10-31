@@ -46,6 +46,11 @@ For original evidence databases and raw source captures, use the supported
 imported with `corpus import-snapshot /operator/supplied/seed --workspace .
 --library work/seed`, then branched into the new analysis. Obtain the actual
 seed path from the operator; no historical absolute path is a runtime default.
+
+In a blind study (the sandbox sets `OCSL_REVIEW_BLIND=1`) every one of these
+imports refuses, and `store attach` accepts only a label-free
+`literature-evidence@2` projection: a blind study reads byte caches and never
+earlier judgments or libraries.
 These imports retain source bytes and provenance without completing new tasks.
 A sealed store mounted read-only can instead be attached as a byte cache with
 `ocsl-review store attach --store /mounted/store --workspace . --library

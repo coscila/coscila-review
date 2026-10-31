@@ -54,8 +54,10 @@ def command(args):
             return verify_projection(path, level=args.level)
         return {"verified": True, "level": args.level, **Store(path, level=args.level).describe()}
     if name == "attach":
+        from .blind import require_projection_in_blind_study
         from .corpus_store import CorpusRepository
         from .store_client import attach_store
+        require_projection_in_blind_study(Path(args.store).absolute())
         repo = CorpusRepository(Path(args.workspace).absolute(), args.library)
         return attach_store(repo, Path(args.store))
     raise ValidationError("unknown store command")
