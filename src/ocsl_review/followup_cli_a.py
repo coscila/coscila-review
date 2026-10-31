@@ -42,11 +42,20 @@ def add_commands(commands: Any, register: Any) -> None:
     parsers["status-fetch"].add_argument("--snapshot", help="continue this status snapshot instead of starting one")
     parsers["status-resolve"] = commands.add_parser(
         "status-resolve", help="one status row (source and date) for every cited work of the parent census")
+    parsers["status-resolve"].add_argument("--snapshot", action="append",
+                                           help="status snapshots to resolve (default: the latest live snapshot and "
+                                                "the latest Retraction Watch import)")
     parsers["support"] = commands.add_parser(
         "support", help="citation-support@2 verdicts for the frozen strata at one evidence tier")
     parsers["support"].add_argument("--tier", required=True, choices=("abstract", "full-text"))
     parsers["support"].add_argument("--store", help="literature-evidence@2 projection read as a byte cache")
     parsers["support"].add_argument("--store-root", help="Merkle root the store must have")
+    parsers["support"].add_argument("--provider-cache", help="provider response cache read as a byte cache")
+    parsers["support"].add_argument("--documents", help="directory of the parent census's review documents, for the "
+                                                        "sentences before and after each citing sentence")
+    parsers["support"].add_argument("--entitled-documents",
+                                    help="directory of entitled full texts the study supplies (entitled-documents.json; "
+                                         "on-premises judges only)")
     parsers["support"].add_argument("--europe-pmc", action="store_true",
                                     help="fetch open full text from Europe PMC for works the caches do not hold")
     parsers["support"].add_argument("--fetch-workers", type=int, default=4)
@@ -65,6 +74,10 @@ def add_commands(commands: Any, register: Any) -> None:
                                     help="sources to ask (default: the protocol's second-generation sources)")
     parsers["citedby"].add_argument("--limit", type=int, help="at most this many targets (a smoke test)")
     parsers["citedby"].add_argument("--workspace", help="workspace whose egress ledger records the requests")
+    parsers["citedby"].add_argument("--widen", action="store_true",
+                                    help="traverse every review with an S1 locus, not only the affected reviews")
+    parsers["citedby"].add_argument("--max-pages", type=int, default=100,
+                                    help="pages per target and source before the traversal counts as truncated")
     parsers["facts"] = commands.add_parser("facts", help="facts v1 with per-fact SQL over a closed snapshot")
     parsers["facts"].add_argument("--output", required=True, help="new directory for facts.sqlite3 and facts.json")
     parsers["verify-facts"] = commands.add_parser("verify-facts", help="postflight of a follow-up facts export")
@@ -72,6 +85,8 @@ def add_commands(commands: Any, register: Any) -> None:
     parsers["export"] = commands.add_parser(
         "export", help="compromised-claim database, per-article alert records and the propagation graph")
     parsers["export"].add_argument("--output", required=True, help="new directory for the exports")
+    parsers["export"].add_argument("--allow-entitled-text", action="store_true",
+                                   help="keep entitled text in the exports (a private export; never share it)")
     for name, parser in parsers.items():
         if name != "verify-facts":
             parser.add_argument("--database", required=True, help="follow-up branch database")
