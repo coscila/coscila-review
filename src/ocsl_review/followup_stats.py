@@ -29,7 +29,7 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from . import estimands
 from .errors import ValidationError
@@ -46,20 +46,36 @@ INTERVAL = "percentile bootstrap: reviews resampled with replacement within jour
 
 
 # ----------------------------------------------------------------------------- hotspot test
-def hotspot_entries(connection: sqlite3.Connection, protocol: Mapping[str, Any], *,
-                    limit: int | None = None) -> list[tuple[str, str, str, str, Any]]:
-    """Classifiable parent entries: (journal, doi, work key, abstract category, review year)."""
+ENTRY_FIELDS = {"journal": 0, "year": 4}
+
+
+def _entry_filter(protocol: Mapping[str, Any]) -> tuple[str, list[Any]]:
     clause, params = scope(protocol)
     identities = list(protocol["strata"]["S1"]["identities"])
+    return ("c.cited_inbody=1 AND c.model_judged=1 AND c.abs_category IN ('true','false') AND c.cited_work_key IS NOT "
+            f"NULL AND c.identity IN ({','.join('?' for _ in identities)}) AND {clause}", [*identities, *params])
+
+
+def hotspot_entries(connection: sqlite3.Connection, protocol: Mapping[str, Any], *,
+                    limit: int | None = None) -> sqlite3.Cursor:
+    """Classifiable parent entries, grouped by cited work: (journal, doi, work key, abstract category, review year)."""
+    condition, params = _entry_filter(protocol)
     cursor = connection.cursor()
     cursor.row_factory = None
     return cursor.execute(
         "SELECT c.journal, c.doi, c.cited_work_key, c.abs_category, r.year FROM census.citations c "
-        "JOIN census.reviews r ON r.journal=c.journal AND r.doi=c.doi "
-        "WHERE c.cited_inbody=1 AND c.model_judged=1 AND c.abs_category IN ('true','false') "
-        f"AND c.cited_work_key IS NOT NULL AND c.identity IN ({','.join('?' for _ in identities)}) AND {clause} "
+        f"JOIN census.reviews r ON r.journal=c.journal AND r.doi=c.doi WHERE {condition} "
         "ORDER BY c.cited_work_key, c.journal, c.doi, c.label" + (" LIMIT ?" if limit else ""),
-        [*identities, *params, *([int(limit)] if limit else [])]).fetchall()
+        [*params, *([int(limit)] if limit else [])])
+
+
+def base_rates(connection: sqlite3.Connection, protocol: Mapping[str, Any], base: Sequence[str]) -> dict[tuple, Any]:
+    """Not-supported share and counts of every base cell over all classifiable entries."""
+    condition, params = _entry_filter(protocol)
+    columns = ", ".join({"journal": "c.journal", "year": "r.year"}[name] for name in base)
+    return {tuple(row[:-2]): {"k": row[-2], "n": row[-1], "rate": row[-2] / row[-1]} for row in connection.execute(
+        f"SELECT {columns}, SUM(c.abs_category='false'), COUNT(*) FROM census.citations c "
+        f"JOIN census.reviews r ON r.journal=c.journal AND r.doi=c.doi WHERE {condition} GROUP BY {columns}", params)}
 
 
 def moment_rho(units: Iterable[tuple[int, int, float]]) -> float:
@@ -73,67 +89,95 @@ def moment_rho(units: Iterable[tuple[int, int, float]]) -> float:
     return min(max(numerator / denominator, 0.0), RHO_CEILING)
 
 
-def hotspot_test(entries: Iterable[Sequence[Any]], *, min_reviews: int, fdr: float, base: Sequence[str],
-                 excluded: Callable[[str], bool]) -> dict[str, Any]:
-    """The S2 test over classifiable entries (journal, doi, work key, category, year); see the module docstring."""
-    fields = {"journal": 0, "year": 4}
-    cell_counts: dict[tuple, list[int]] = defaultdict(lambda: [0, 0])
-    works: dict[str, dict[tuple, list[int]]] = defaultdict(lambda: defaultdict(lambda: [0, 0]))
-    reviews: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    for entry in entries:
-        cell = tuple(entry[fields[name]] for name in base)
-        negative = int(entry[3] == "false")
-        cell_counts[cell][0] += negative
-        cell_counts[cell][1] += 1
-        works[entry[2]][cell][0] += negative
-        works[entry[2]][cell][1] += 1
-        reviews[entry[2]].add((entry[0], entry[1]))
-    rates = {cell: k / n for cell, (k, n) in cell_counts.items()}
-    rows = []
-    for work in sorted(works):
-        cells = works[work]
+def work_rows(entries: Iterable[Sequence[Any]], rates: Mapping[tuple, Mapping[str, Any]], *, base: Sequence[str],
+              min_reviews: int, excluded: Callable[[str], bool]) -> Iterator[dict[str, Any]]:
+    """One row per cited work from entries grouped by work: n, k, mu, expected, excess, candidate, family flag."""
+    def row(work: str, cells: Mapping[tuple, list[int]], reviews: set) -> dict[str, Any]:
         n = sum(value[1] for value in cells.values())
         k = sum(value[0] for value in cells.values())
-        mu = sum(value[1] * rates[cell] for cell, value in cells.items()) / n
+        mu = sum(value[1] * rates[cell]["rate"] for cell, value in cells.items()) / n
         family = bool(excluded(work))
-        rows.append({"work_key": work, "citing_reviews": len(reviews[work]), "n": n, "k": k, "mu": mu,
-                     "expected": n * mu, "excess": k - n * mu, "family_excluded": int(family),
-                     "candidate": int(len(reviews[work]) >= min_reviews and not family)})
-    candidates = [row for row in rows if row["candidate"]]
+        return {"work_key": work, "citing_reviews": len(reviews), "n": n, "k": k, "mu": mu, "expected": n * mu,
+                "excess": k - n * mu, "family_excluded": int(family),
+                "candidate": int(len(reviews) >= min_reviews and not family)}
+    current, cells, reviews = None, defaultdict(lambda: [0, 0]), set()
+    for entry in entries:
+        if entry[2] != current:
+            if current is not None:
+                yield row(current, cells, reviews)
+            current, cells, reviews = entry[2], defaultdict(lambda: [0, 0]), set()
+        value = cells[tuple(entry[ENTRY_FIELDS[name]] for name in base)]
+        value[0] += int(entry[3] == "false")
+        value[1] += 1
+        reviews.add((entry[0], entry[1]))
+    if current is not None:
+        yield row(current, cells, reviews)
+
+
+def screen_candidates(candidates: Sequence[dict[str, Any]], fdr: float) -> float:
+    """rho over the candidates, then each candidate's upper-tail p, BH q and selection (in place); returns rho."""
     rho = moment_rho((row["k"], row["n"], row["mu"]) for row in candidates)
     p_values = [estimands.upper_tail(row["k"], row["n"], row["mu"], rho) for row in candidates]
     for row, p, q in zip(candidates, p_values, estimands.benjamini_hochberg(p_values)):
-        row["p_value"], row["q_value"] = p, q
+        row.update(p_value=p, q_value=q, rho=rho, selected=int(q is not None and q <= fdr))
+    return rho
+
+
+def hotspot_test(entries: Iterable[Sequence[Any]], *, min_reviews: int, fdr: float, base: Sequence[str],
+                 excluded: Callable[[str], bool]) -> dict[str, Any]:
+    """The S2 test over in-memory entries (journal, doi, work key, category, year); see the module docstring."""
+    ordered = sorted(entries, key=lambda entry: str(entry[2]))
+    totals: dict[tuple, list[int]] = defaultdict(lambda: [0, 0])
+    for entry in ordered:
+        cell = totals[tuple(entry[ENTRY_FIELDS[name]] for name in base)]
+        cell[0] += int(entry[3] == "false")
+        cell[1] += 1
+    rates = {cell: {"k": k, "n": n, "rate": k / n} for cell, (k, n) in totals.items()}
+    rows = list(work_rows(ordered, rates, base=base, min_reviews=min_reviews, excluded=excluded))
+    rho = screen_candidates([row for row in rows if row["candidate"]], fdr)
     for row in rows:
         row.setdefault("p_value", None)
         row.setdefault("q_value", None)
+        row.setdefault("selected", 0)
         row["rho"] = rho
-        row["selected"] = int(bool(row["candidate"] and row["q_value"] is not None and row["q_value"] <= fdr))
-    return {"rows": rows, "rho": rho, "cells": {canonical(list(cell)): {"k": k, "n": n, "rate": k / n}
-                                                 for cell, (k, n) in sorted(cell_counts.items(), key=lambda item:
-                                                                            canonical(list(item[0])))}}
+    return {"rows": rows, "rho": rho, "cells": rates}
+
+
+HOTSPOT_INSERT = ("INSERT INTO fu_hotspots(work_key, citing_reviews, n, k, expected, excess, rho, p_value, q_value, "
+                  "candidate, family_excluded, selected, model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+
+def _hotspot_row(row: Mapping[str, Any]) -> tuple:
+    return (row["work_key"], row["citing_reviews"], row["n"], row["k"], row["expected"], row["excess"],
+            row.get("rho", 0.0), row.get("p_value"), row.get("q_value"), row["candidate"], row["family_excluded"],
+            row.get("selected", 0), MODEL)
 
 
 def run_hotspots(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict[str, Any]:
+    """Stream the entries work by work: non-candidates are written at once, candidates are tested together."""
     if frozen(connection):
         raise ValidationError("the follow-up strata are frozen; the hotspot test that selects S2 cannot run again")
     spec = protocol["strata"]["S2"]
+    base, fdr = list(spec["base"]), float(spec["fdr"])
     excluded_keys = family_works(connection, excluded_patterns(protocol))
-    result = hotspot_test(hotspot_entries(connection, protocol), min_reviews=int(spec["minCitingReviews"]),
-                          fdr=float(spec["fdr"]), base=list(spec["base"]), excluded=excluded_keys.__contains__)
+    rates = base_rates(connection, protocol, base)
     connection.execute("DELETE FROM fu_hotspots")
-    connection.executemany(
-        "INSERT INTO fu_hotspots(work_key, citing_reviews, n, k, expected, excess, rho, p_value, q_value, candidate, "
-        "family_excluded, selected, model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [(row["work_key"], row["citing_reviews"], row["n"], row["k"], row["expected"], row["excess"], row["rho"],
-          row["p_value"], row["q_value"], row["candidate"], row["family_excluded"], row["selected"], MODEL)
-         for row in result["rows"]])
-    rows = result["rows"]
-    return {"model": MODEL, "works": len(rows), "candidates": sum(row["candidate"] for row in rows),
-            "familyExcluded": sum(row["family_excluded"] for row in rows),
-            "selected": sum(row["selected"] for row in rows), "rho": result["rho"],
-            "minCitingReviews": int(spec["minCitingReviews"]), "fdr": float(spec["fdr"]), "base": list(spec["base"]),
-            "baseCells": len(result["cells"])}
+    candidates: list[dict[str, Any]] = []
+    works = family = 0
+    for row in work_rows(hotspot_entries(connection, protocol), rates, base=base,
+                         min_reviews=int(spec["minCitingReviews"]), excluded=excluded_keys.__contains__):
+        works += 1
+        family += row["family_excluded"]
+        if row["candidate"]:
+            candidates.append(row)
+        else:
+            connection.execute(HOTSPOT_INSERT, _hotspot_row(row))
+    rho = screen_candidates(candidates, fdr)
+    connection.executemany(HOTSPOT_INSERT, [_hotspot_row(row) for row in candidates])
+    connection.execute("UPDATE fu_hotspots SET rho=?", (rho,))
+    return {"model": MODEL, "works": works, "candidates": len(candidates), "familyExcluded": family,
+            "selected": sum(row["selected"] for row in candidates), "rho": rho,
+            "minCitingReviews": int(spec["minCitingReviews"]), "fdr": fdr, "base": base, "baseCells": len(rates)}
 
 
 def cmd_hotspots(args: Any) -> dict[str, Any]:

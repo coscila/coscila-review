@@ -11,7 +11,6 @@ from contextlib import closing, redirect_stderr, redirect_stdout
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import followup_fixtures as F

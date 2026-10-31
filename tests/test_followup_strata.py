@@ -175,6 +175,8 @@ class StrataTests(unittest.TestCase):
         self.assertIn(lid(F.JOURNAL_A, A2, "3"), s0)
         self.assertIn(lid(F.JOURNAL_B, B1, "3"), s0)
         chosen = (pool_a2021 & set(s0)).pop()
+        self.assertEqual([chosen], followup_strata.seeded_sample(F.PROTOCOL["seed"], ("S0", [F.JOURNAL_A, 2021]),
+                                                                 pool_a2021, 1))
         self.assertEqual(0.5, s0[chosen]["inclusion_probability"])
         self.assertEqual({"journal": F.JOURNAL_A, "year": 2021}, json.loads(s0[chosen]["cell"]))
         self.assertEqual(1.0, s0[lid(F.JOURNAL_A, A2, "3")]["inclusion_probability"])

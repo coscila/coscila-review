@@ -35,7 +35,7 @@ import sqlite3
 from collections import Counter, defaultdict
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from . import scores_db
 from .errors import ValidationError
@@ -267,9 +267,11 @@ def frozen(connection: sqlite3.Connection) -> bool:
     return connection.execute("SELECT COUNT(*) FROM fu_protocol_freeze").fetchone()[0] > 0
 
 
-def _register_rank(connection: sqlite3.Connection) -> None:
-    connection.create_function("fu_seeded_rank", 2, lambda prefix, key: hashlib.sha256(
-        (prefix + key).encode("utf-8")).hexdigest(), deterministic=True)
+def _register_rank(connection: sqlite3.Connection, seed: Any) -> None:
+    """fu_s0_rank(key, cell values...): the seeded rank of seeded_order with scope ("S0", cell), inside SQL."""
+    def rank(key: str, *cell: Any) -> str:
+        return hashlib.sha256((canonical([seed, "S0", list(cell)]) + "\x1f" + key).encode("utf-8")).hexdigest()
+    connection.create_function("fu_s0_rank", -1, rank, deterministic=True)
 
 
 def _temp_keys(connection: sqlite3.Connection, name: str, keys: Iterable[str]) -> None:
@@ -297,7 +299,7 @@ def build(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict[s
                               "before followup strata")
     if not connection.execute("SELECT COUNT(*) FROM fu_hotspots").fetchone()[0]:
         from .followup_stats import hotspot_entries
-        if hotspot_entries(connection, protocol, limit=1):
+        if hotspot_entries(connection, protocol, limit=1).fetchone():
             raise ValidationError("the hotspot test has not run; run followup hotspots before followup strata")
     family = s3_family(protocol)
     excluded_keys = family_works(connection, excluded_patterns(protocol))
@@ -318,7 +320,7 @@ def build(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict[s
                                         eligible_params).fetchone()[0]
     _temp_keys(connection, "fu_excluded_works", excluded_keys)
     _temp_keys(connection, "fu_family_works", family_keys)
-    _register_rank(connection)
+    _register_rank(connection, seed)
     match_on = list(strata["S0"]["matchOn"])
     cells_sql = ", ".join(f"f.{CELL_FIELDS[name]}" for name in match_on)
 
@@ -354,19 +356,17 @@ def build(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict[s
         f"SELECT {cells_sql}, COUNT(*) {pool} GROUP BY {cells_sql}", eligible_params)}
     pool_count = sum(capacity.values())
     allocation, shortfall = allocate(int(strata["S0"]["size"]), Counter(tuple(row[3:]) for row in s1), capacity)
+    # One ordered pass over the pool: within each cell, loci in seeded order; the first allocated ones are sampled.
     s0: dict[str, tuple[float, str]] = {}
-    for cell in sorted(capacity, key=_cell_key):
-        take = allocation.get(cell, 0)
-        if not take:
-            continue
-        prefix = canonical([seed, "S0", list(cell)]) + "\x1f"
-        condition = " AND ".join(f"f.{CELL_FIELDS[name]} IS ?" for name in match_on)
-        probability = take / capacity[cell]
-        label = canonical(dict(zip(match_on, cell)))
-        for (unit,) in connection.execute(
-                f"SELECT f.locus_id {pool} AND {condition} ORDER BY fu_seeded_rank(?, f.locus_id), f.locus_id LIMIT ?",
-                [*eligible_params, *cell, prefix, take]):
-            s0[unit] = (probability, label)
+    taken: Counter[tuple] = Counter()
+    if any(allocation.values()):
+        for row in connection.execute(
+                f"SELECT {cells_sql}, f.locus_id, fu_s0_rank(f.locus_id, {cells_sql}) AS seeded {pool} "
+                f"ORDER BY {cells_sql}, seeded, f.locus_id", eligible_params):
+            cell, unit = tuple(row[:len(match_on)]), row[len(match_on)]
+            if taken[cell] < allocation.get(cell, 0):
+                taken[cell] += 1
+                s0[unit] = (allocation[cell] / capacity[cell], canonical(dict(zip(match_on, cell))))
 
     pilot_s1: dict[str, float] = {}
     pilot_s0: dict[str, float] = {}
