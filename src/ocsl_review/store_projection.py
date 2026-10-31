@@ -6,11 +6,10 @@ interprets it: works and identifiers, source documents and sections with their
 bytes, and provider records stay; every work observation (all ``legacy.*``
 properties among them: scores, loci, attempts, summaries and bibliography rows),
 assessment, model receipt, citation locus, bibliography entry, study selection,
-task queue and fact is dropped. Every document an earlier study imported or
-selected (providers ``legacy*``: legacy abstract columns, the full texts an
-earlier run fetched for its own escalations, audited excerpts) is dropped with
-its sections, the raw legacy table shards behind them are withheld, and so are
-retrievals that hold no bytes (failure records of an earlier acquisition). The
+task queue and fact is dropped. Every document of a ``legacy*`` provider
+(imported legacy columns, selected full texts, audited excerpts) is dropped
+with its sections, the raw legacy table shards behind them are withheld, and so
+are retrievals that hold no bytes (failure records). The
 only derived table is a neutral retained-source index (DOI, capture digest,
 media type, route; no capture date) built from the legacy review manifests,
 which is how retained review captures are found again.
@@ -60,14 +59,14 @@ ALWAYS_KINDS = ("source-document", "provider-document", "raw-source", "raw-provi
                 "raw-publisher-source", "acquisition-receipt", "identity-reconciliation", "title-resolution")
 # Archived legacy evidence kinds, kept only when a kept row refers to them: retained review captures (through the
 # retained-source index only) and retained provider responses (Europe PMC records of kept documents). Raw legacy
-# table shards (legacy-evidence-shard: whole rows of an earlier study's works table, with its source paths) are
+# table shards (legacy-evidence-shard: whole rows of a legacy works table, with its source paths) are
 # never kept.
 REFERENCED_KINDS = ("legacy-original-source", "legacy-provider-response")
 # Kinds a kept document, identifier, retrieval or section may point to: retained provider responses only. A review
-# capture stays reachable through the retained-source index alone, so no row records which cited works an earlier
+# capture stays reachable through the retained-source index alone, so no row records which cited works a source
 # study fetched.
 ROW_REFERENCED_KINDS = ("legacy-provider-response",)
-# Documents an earlier study imported or selected (membership correlates with its verdicts and escalations): every
+# Documents a source store imported or selected (membership correlates with legacy verdicts and escalations): every
 # provider that starts with this prefix (legacy:<column>, legacy-original-source, legacy-audit-excerpt).
 DENIED_PROVIDER_PREFIX = "legacy"
 DENIED_PROVIDERS = ("legacy-audit-excerpt", "legacy-original-source")
@@ -129,7 +128,7 @@ RULES_SHA256 = hashlib.sha256(canonical(RULES).encode()).hexdigest()
 
 
 def denied_provider(provider) -> bool:
-    """A document provider of an earlier study's imports or selections (never kept)."""
+    """A document provider of legacy imports or selections (never kept)."""
     value = str(provider or "")
     return value.startswith(DENIED_PROVIDER_PREFIX) or value in DENIED_PROVIDERS
 
@@ -424,7 +423,7 @@ def _retained_index(connection, report, page):
                 if artifact is None or artifact[0] not in ALWAYS_KINDS + REFERENCED_KINDS:
                     report["retainedIndex"]["skipped"] += 1
                     continue
-                # No capture date: when an earlier acquisition captured a review is no evidence of the review.
+                # No capture date: when a capture was taken is no evidence of the review.
                 records.append((doi, digest, media, ROUTES[media], None))
         connection.executemany("INSERT OR IGNORE INTO main.retained_sources VALUES (?,?,?,?,?)", records)
         connection.commit()
@@ -478,7 +477,7 @@ def _rows(connection, report, page):
         connection.commit()
     connection.execute("INSERT INTO main.work_identifiers SELECT i.* FROM src.work_identifiers i "
                        "WHERE i.verified_by_sha256 IN (SELECT sha256 FROM temp.rowkeep) ORDER BY i.scheme, i.value")
-    # Only retrievals that hold kept bytes: a retrieval without bytes is a failure record of an earlier acquisition,
+    # Only retrievals that hold kept bytes: a retrieval without bytes is a failure record of an acquisition,
     # which says which works it tried to fetch and when.
     connection.execute("INSERT INTO main.retrievals SELECT r.* FROM src.retrievals r "
                        "WHERE r.artifact_sha256 IN (SELECT sha256 FROM temp.rowkeep) ORDER BY r.retrieval_id")

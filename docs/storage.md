@@ -161,17 +161,16 @@ that keeps evidence and drops every interpretation (`store_projection.py`):
   attempts, summaries, bibliography rows and review manifests), assessments,
   model receipts, citation loci, bibliography entries, study selections and
   review states, task queues and batches, imports, processing state, facts,
-  runs and analyses; every document an earlier study imported or selected
-  (providers `legacy*`: legacy abstract columns, full texts it fetched for its
-  own escalations, audited excerpts) with its sections; retrievals without
-  bytes (failure records of an earlier acquisition); and the bytes of every
+  runs and analyses; every document of a `legacy*` provider (imported legacy
+  columns, selected full texts, audited excerpts) with its sections;
+  retrievals without bytes (failure records); and the bytes of every
   other artifact kind (raw legacy table shards, model requests and responses,
   task inputs, legacy databases and import records, among others);
 - **derived:** `retained_sources(doi, capture_sha256, media_type, route,
   captured_at)`, a neutral index of retained review captures built from the
   legacy review manifests (route is derived from the media type; `captured_at`
-  is always empty, since when an earlier acquisition captured a review is no
-  evidence of it). It holds nothing else.
+  is always empty: a capture date is no evidence of the review). It holds
+  nothing else.
 
 The rules are deny-by-default and digested into the projection
 (`store_meta.rules_sha256` and the manifest's `store` block). The source store

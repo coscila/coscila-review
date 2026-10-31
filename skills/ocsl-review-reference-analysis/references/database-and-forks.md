@@ -35,13 +35,14 @@ remain tied to the question, locus, evidence and instrument that generated
 them. Use explicit analysis filters in every analytical query. Never obtain a
 new question's results by silently selecting the last judgment for each DOI.
 
-Existing `.ocsl-review` ledgers and historical exports enter through
-`corpus import-legacy --kind census|historical`; `init` does not populate the
-database. Import reconciliation and raw inputs remain registered provenance.
-Historical records never satisfy fresh v2 task completion. Preserve external
-run IDs as provenance, never as live job ownership.
+When a continuation needs them, existing `.ocsl-review` ledgers and exports of
+other runs enter through `corpus import-legacy --kind census|historical`;
+`init` does not populate the database. Import reconciliation and raw inputs
+remain registered provenance. Imported records never satisfy new v2 task
+completion. Preserve external run IDs as provenance, never as live job
+ownership.
 
-For original evidence databases and raw source captures, use the supported
+For evidence databases and raw source captures of other runs, use the supported
 `corpus import-legacy --kind evidence` adapter. An external verified seed is
 imported with `corpus import-snapshot /operator/supplied/seed --workspace .
 --library work/seed`, then branched into the new analysis. Obtain the actual
@@ -50,7 +51,7 @@ seed path from the operator; no historical absolute path is a runtime default.
 In a blind study (the sandbox sets `OCSL_REVIEW_BLIND=1`) every one of these
 imports refuses, and `store attach` accepts only a label-free
 `literature-evidence@2` projection: a blind study reads byte caches and never
-earlier judgments or libraries.
+judgments of other runs or their libraries.
 These imports retain source bytes and provenance without completing new tasks.
 A sealed store mounted read-only can instead be attached as a byte cache with
 `ocsl-review store attach --store /mounted/store --workspace . --library
@@ -128,7 +129,7 @@ database with the fresh analysis and records the parent manifest digest and
 Merkle root in `bundle.json`; the parent database is attached read-only and never
 copied. Queries see parent and branch rows together. New rows and new artifacts
 belong to the branch, and parent rows never change: an update copies the row into
-the branch first, and references are checked across both. Historical records stay labelled history; the new question's tasks do
+the branch first, and references are checked across both. Parent records stay labelled history; the new question's tasks do
 not become complete. The parent is unchanged. New extractions, provider updates
 and judgments receive new versioned records, while verified evidence can be
 read again without downloading it. A different question requires its own task
@@ -147,11 +148,11 @@ new protocol: for cohort size, distinguish participants from specimens and
 enrolled from analyzed populations; for reports containing multiple studies,
 include verified study/cohort/arm identifiers in the structured value. Preserve
 accepted and rejected observations; derive the active selection explicitly.
-Do not fabricate citation loci for these observations. The original
-`assessments` remain the historical claim-to-source measurements.
+Do not fabricate citation loci for these observations. The parent's
+`assessments` remain its claim-to-source measurements.
 
 For example, query a newly populated follow-up analysis without mixing it with
-the original census:
+the parent analysis:
 
 ```sql
 SELECT work_id, property, value_json, method_version
@@ -188,7 +189,7 @@ artifact storage, not solely in transient conversation context.
 Distinguish reproducibility levels: stored model responses allow exact replay
 of reported results; pinned SQL/code regenerates statistical outputs; a fresh
 model call can vary even with nominally identical parameters. A complete
-literature database enables new questions without pretending that historical
+literature database enables new questions without pretending that inherited
 model judgments are newly observed facts or that exact fresh inference is
 guaranteed.
 

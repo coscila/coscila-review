@@ -98,7 +98,7 @@ verified facts. Real commands and deployment boundaries are documented in
 workflow stores sources once, schedules per-locus tasks across reviews, imports
 results incrementally and snapshots research state. Its storage-only legacy
 helper remains available for existing bundles. Do not rebuild a coordinator
-inside each chat or migrate historical v1 judgments into fresh v2 results.
+inside each chat or migrate v1 judgments of other runs into new v2 results.
 
 Unpublished material is confidential by default. Every provider call and
 worker submission must carry the deployment's authorization for the actual

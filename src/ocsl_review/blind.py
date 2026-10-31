@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Blind studies: a study that must not see earlier judgments or earlier studies' stores.
+"""Blind studies: a study that must not see judgments of other runs or their libraries.
 
 The lab marks a blind study's sandbox with ``OCSL_REVIEW_BLIND=1`` (set by a blind chat or a study bundle). Then
-every way of bringing earlier judgments into a study refuses: ``corpus import-legacy`` (historical scores, legacy
-census ledgers, legacy evidence), ``corpus import-snapshot`` (a whole earlier library), and ``store attach`` of any
+every way of bringing judgments of other runs into a study refuses: ``corpus import-legacy`` (historical scores, legacy
+census ledgers, legacy evidence), ``corpus import-snapshot`` (a whole library), and ``store attach`` of any
 store that is not a label-free ``literature-evidence@2`` projection. The marker is a refusal, never a permission:
 without it the commands behave as documented.
 """
@@ -27,8 +27,8 @@ def blind_study(env: dict[str, str] | None = None) -> bool:
 def refuse_in_blind_study(action: str, env: dict[str, str] | None = None) -> None:
     if blind_study(env):
         raise ValidationError(
-            f"{action} is refused in a blind study ({BLIND_ENV} is set): a blind study never imports earlier "
-            "judgments or libraries; it reads a label-free literature-evidence@2 projection as a byte cache"
+            f"{action} is refused in a blind study ({BLIND_ENV} is set): a blind study never imports judgments "
+            "of other runs or their libraries; it reads a label-free literature-evidence@2 projection as a byte cache"
         )
 
 

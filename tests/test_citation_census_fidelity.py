@@ -7,6 +7,15 @@ call geometry (isolated, offline) on the synthetic fixtures in
 tests/fixtures/citation_census. They pin the maintained port to the same bytes.
 The tests read inputs only; no verdict data is involved. Journal names are
 study inputs.
+
+Setting OCSL_REVIEW_CENSUS_FIDELITY_RECORDS to a JSON-lines file of recorded
+calls (title, journal, items, note, and any of systemSha256, userSha256 and
+messagesSha256, the sha256 of the JSON message list) adds a check against a
+private record set. Every digest a record carries must match the rebuilt call;
+a record whose user digest is the digest of an empty string holds no rebuilt
+prompt and is counted as unusable, never as a pass, and the check needs at least
+one usable record. Records for each journal have to come from that journal's
+own recorded calls. This paragraph stays out of the lab-facing documentation.
 """
 from __future__ import annotations
 

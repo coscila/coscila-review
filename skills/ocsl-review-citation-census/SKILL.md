@@ -18,8 +18,8 @@ instrument's fixed evidence policy, batch geometry and request settings), use
 sensitivities, gates, freeze and facts. A study that builds its population
 fresh enumerates it with population-level queries, acquires with the journals'
 live routes, derives each review's cited works with `study works`, records any
-protocol exclusion with `study exclude` and compares an earlier manifest only
-at the end. In the lab the judging commands run through the run principal's
+protocol exclusion with `study exclude` and runs any predeclared manifest
+comparison only after the census is complete. In the lab the judging commands run through the run principal's
 broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`) once the operator has
 installed the bundles that `ocsl-review instruments export` prints, with the
 study bundle pinned by `study prepare --study-bundle`. Read
@@ -69,8 +69,8 @@ deployment's independent egress approval.
   abstract silence cannot establish an adverse verdict.
 - Mark filtered or limited runs as pilots. For comparisons, match loci,
   evidence versions and settings; report disagreements, abstentions, coverage,
-  and dependence between citations in one paper. Labels imported from earlier
-  runs are comparators, not human ground truth.
+  and dependence between citations in one paper. Labels imported from other
+  runs are not human ground truth.
 - Export facts and regenerate every reported count from its recorded SQL and
   SQLite hash. Report provider/model token counts with unknown values intact.
   A successful transport or parser check does not establish scientific accuracy.

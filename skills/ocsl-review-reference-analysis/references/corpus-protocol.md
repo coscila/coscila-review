@@ -67,7 +67,7 @@ Validate quote substrings, supplied unit IDs and identity links; preserve
 rejected responses and diagnostics. Do not request confidence scores or require
 an echo of hundreds of source-unit IDs. Those fields do not establish reading.
 Validate each item in a batch independently and retry only its eligible failures;
-accepted peers remain accepted. Keep selected replications blind to earlier
+accepted peers remain accepted. Keep selected replications blind to the primary
 judgments when the study calls for that design.
 
 ## One controller, durable execution
