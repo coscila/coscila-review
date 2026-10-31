@@ -1,0 +1,26 @@
+{
+ "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
+ "items": [
+  {
+   "id": "locus-1|sentence-1",
+   "originalClaim": "Marker zeta doubles the risk in adults ⟨R1⟩ ⟨R2⟩ .",
+   "originalReview": "Synthetic review 1",
+   "candidateSentence": "Marker zeta is reported to double the risk in adults ⟨b1⟩ .",
+   "candidateMarker": "⟨b1⟩",
+   "candidateSection": "Introduction",
+   "provenance": "public"
+  }
+ ],
+ "response": {
+  "items": [
+   {
+    "id": "locus-1|sentence-1",
+    "match": "same-claim",
+    "reliance": "cites-review-for-claim",
+    "quote": "Marker zeta is reported to double the risk in adults",
+    "rationale": "Same finding and population.",
+    "abstainReason": ""
+   }
+  ]
+ }
+}

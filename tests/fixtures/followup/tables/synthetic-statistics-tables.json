@@ -1,0 +1,69 @@
+{
+ "format": "ocsl-followup-tables-v1",
+ "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
+ "licensing": "synthetic",
+ "source": "synthetic statistics tables for tests",
+ "declaredVersion": "synthetic-tables-1",
+ "reports": [
+  {
+   "reportKey": "synthetic-disease-statistics",
+   "identifiers": {
+    "doi": [
+     "10.5555/fu.work.report"
+    ]
+   },
+   "editions": {
+    "second": {
+     "citedAs": {
+      "doi": "10.5555/fu.work.report"
+     },
+     "cells": [
+      {
+       "condition": "all",
+       "metric": "mortality-count",
+       "geography": "Exampleland",
+       "year": 2019,
+       "value": 12500,
+       "unit": "deaths",
+       "locator": "table 1"
+      },
+      {
+       "condition": "all",
+       "metric": "incidence-rate",
+       "geography": "Exampleland",
+       "year": 2018,
+       "value": 38.0,
+       "unit": "per population unit",
+       "locator": "table 2"
+      },
+      {
+       "condition": "all",
+       "metric": "mortality-count",
+       "geography": "Otherland",
+       "year": 2019,
+       "value": 7300,
+       "unit": "deaths",
+       "locator": "table 3"
+      }
+     ]
+    },
+    "first": {
+     "citedAs": {
+      "doi": "10.5555/fu.work.report.first"
+     },
+     "cells": [
+      {
+       "condition": "all",
+       "metric": "incidence-rate",
+       "geography": "Exampleland",
+       "year": 2016,
+       "value": 40.0,
+       "unit": "per population unit",
+       "locator": "table 2"
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

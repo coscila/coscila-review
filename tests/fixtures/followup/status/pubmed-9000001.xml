@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content -->
+<PubmedArticleSet><PubmedArticle><MedlineCitation Status="MEDLINE"><PMID Version="1">9000001</PMID>
+<Article><Journal><ISSN IssnType="Electronic">0000-0000</ISSN><JournalIssue><PubDate><Year>2018</Year></PubDate></JournalIssue>
+<Title>Synthetic Venue</Title></Journal><ArticleTitle>Fictional cohort study one</ArticleTitle>
+<Abstract><AbstractText>A fictional abstract.</AbstractText></Abstract>
+<PublicationTypeList><PublicationType>Journal Article</PublicationType><PublicationType>Retracted Publication</PublicationType></PublicationTypeList></Article>
+<CommentsCorrectionsList><CommentsCorrections RefType="RetractionIn"><RefSource>Synthetic Venue. Notice.</RefSource><PMID Version="1">9100001</PMID></CommentsCorrections></CommentsCorrectionsList></MedlineCitation>
+<PubmedData><ArticleIdList><ArticleId IdType="pubmed">9000001</ArticleId><ArticleId IdType="doi">10.5555/fu.work.retracted</ArticleId></ArticleIdList></PubmedData>
+</PubmedArticle></PubmedArticleSet>

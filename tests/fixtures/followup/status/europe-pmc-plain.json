@@ -1,0 +1,19 @@
+{
+ "version": "6.9",
+ "hitCount": 1,
+ "resultList": {
+  "result": [
+   {
+    "id": "9000004",
+    "source": "MED",
+    "pmid": "9000004",
+    "doi": "10.5555/fu.work.plain1",
+    "title": "Fictional mechanism study four",
+    "pubYear": "2016",
+    "isRetracted": "N",
+    "isOpenAccess": "N",
+    "journalTitle": "Synthetic Venue"
+   }
+  ]
+ }
+}

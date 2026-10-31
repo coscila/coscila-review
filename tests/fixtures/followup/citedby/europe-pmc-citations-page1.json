@@ -1,0 +1,34 @@
+{
+ "version": "6.9",
+ "hitCount": 3,
+ "request": {
+  "id": "9300001",
+  "source": "MED",
+  "page": 1,
+  "pageSize": 2
+ },
+ "citationList": {
+  "citation": [
+   {
+    "id": "9200001",
+    "source": "MED",
+    "citationType": "research-article",
+    "title": "A later synthetic article one",
+    "authorString": "Example A",
+    "journalAbbreviation": "Synth J",
+    "pubYear": 2024,
+    "doi": "10.5555/fu.later.1"
+   },
+   {
+    "id": "9200002",
+    "source": "MED",
+    "citationType": "research-article",
+    "title": "A later synthetic article two",
+    "authorString": "Example A",
+    "journalAbbreviation": "Synth J",
+    "pubYear": 2025,
+    "doi": "10.5555/fu.later.2"
+   }
+  ]
+ }
+}

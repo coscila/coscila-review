@@ -1,0 +1,41 @@
+{
+ "status": "ok",
+ "message-type": "work",
+ "message-version": "1.0.0",
+ "message": {
+  "DOI": "10.5555/fu.work.corrected",
+  "type": "journal-article",
+  "title": [
+   "Fictional survey three"
+  ],
+  "container-title": [
+   "Synthetic Venue"
+  ],
+  "published": {
+   "date-parts": [
+    [
+     2017,
+     1,
+     1
+    ]
+   ]
+  },
+  "updated-by": [
+   {
+    "DOI": "10.5555/fu.notice.correction1",
+    "type": "correction",
+    "source": "publisher",
+    "label": "Correction",
+    "updated": {
+     "date-parts": [
+      [
+       2019,
+       1,
+       15
+      ]
+     ]
+    }
+   }
+  ]
+ }
+}

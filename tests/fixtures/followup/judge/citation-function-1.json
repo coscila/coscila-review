@@ -1,0 +1,51 @@
+{
+ "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
+ "items": [
+  {
+   "id": "locus-1",
+   "marker": "⟨R1⟩",
+   "citingSentence": "Marker zeta doubles the risk in adults ⟨R1⟩ ⟨R2⟩ .",
+   "contextBefore": "",
+   "contextAfter": "Imaging was used as in earlier work ⟨R4⟩ .",
+   "section": "Results",
+   "citedWork": {
+    "title": "Fictional cohort study one",
+    "year": 2018
+   },
+   "provenance": "public"
+  },
+  {
+   "id": "locus-2",
+   "marker": "⟨S2⟩",
+   "citingSentence": "A retracted cohort study had suggested the same association ⟨S2⟩ .",
+   "contextBefore": "",
+   "contextAfter": "",
+   "section": "Discussion",
+   "citedWork": {
+    "title": "Fictional cohort study one",
+    "year": 2018
+   },
+   "provenance": "entitled"
+  }
+ ],
+ "response": {
+  "items": [
+   {
+    "id": "locus-1",
+    "function": "relies",
+    "quote": "Marker zeta doubles the risk in adults",
+    "quoteField": "citingSentence",
+    "rationale": "The review states the risk increase on this work.",
+    "abstainReason": ""
+   },
+   {
+    "id": "locus-2",
+    "function": "notes-retraction",
+    "quote": "A retracted cohort study",
+    "quoteField": "citingSentence",
+    "rationale": "The sentence says the cited study was retracted.",
+    "abstainReason": ""
+   }
+  ]
+ }
+}

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content -->
+<article xmlns:xlink="http://www.w3.org/1999/xlink" article-type="research-article">
+<front><article-meta><article-id pub-id-type="doi">10.5555/fu.later.1</article-id>
+<title-group><article-title>A later synthetic article one</article-title></title-group></article-meta></front>
+<body><sec><title>Introduction</title>
+<p>Marker zeta is reported to double the risk in adults <xref ref-type="bibr" rid="b1">1</xref>. Imaging protocols differ between centres <xref ref-type="bibr" rid="b2">2</xref>.</p>
+<p>The same review also summarised registry coverage <xref ref-type="bibr" rid="b1">1</xref>.</p>
+</sec></body>
+<back><ref-list>
+<ref id="b1"><label>1</label><element-citation publication-type="journal"><article-title>Synthetic review 1</article-title><source>Journal of Synthetic Reviews A</source><year>2021</year><pub-id pub-id-type="doi">10.5555/fu.review.a1</pub-id></element-citation></ref>
+<ref id="b2"><label>2</label><element-citation publication-type="journal"><article-title>Another synthetic work</article-title><source>Synthetic Venue</source><year>2020</year><pub-id pub-id-type="doi">10.5555/fu.other.2</pub-id></element-citation></ref>
+</ref-list></back>
+</article>

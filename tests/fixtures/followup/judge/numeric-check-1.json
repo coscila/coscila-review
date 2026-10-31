@@ -1,0 +1,55 @@
+{
+ "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
+ "items": [
+  {
+   "id": "locus-3",
+   "marker": "⟨R3⟩",
+   "citingSentence": "The disease caused 12.5 thousand deaths in Exampleland in 2019 ⟨R3⟩ .",
+   "citedWork": {
+    "title": "Synthetic disease statistics report, second edition",
+    "year": 2020
+   },
+   "provenance": "public"
+  },
+  {
+   "id": "locus-4",
+   "marker": "⟨R4⟩",
+   "citingSentence": "Imaging was used as in earlier work ⟨R4⟩ .",
+   "citedWork": {
+    "title": "Fictional imaging study five",
+    "year": 2020
+   },
+   "provenance": "public"
+  }
+ ],
+ "response": {
+  "items": [
+   {
+    "id": "locus-3",
+    "decision": "parsed",
+    "condition": "all",
+    "metric": "mortality-count",
+    "geography": "Exampleland",
+    "year": 2019,
+    "valueText": "12.5 thousand",
+    "unit": "deaths",
+    "quote": "caused 12.5 thousand deaths in Exampleland",
+    "rationale": "A mortality count with place and year.",
+    "abstainReason": ""
+   },
+   {
+    "id": "locus-4",
+    "decision": "not-epidemiological",
+    "condition": "",
+    "metric": "",
+    "geography": "",
+    "year": null,
+    "valueText": "",
+    "unit": "",
+    "quote": "",
+    "rationale": "A methods statement.",
+    "abstainReason": ""
+   }
+  ]
+ }
+}

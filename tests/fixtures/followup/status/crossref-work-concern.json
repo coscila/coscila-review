@@ -1,0 +1,40 @@
+{
+ "status": "ok",
+ "message-type": "work",
+ "message-version": "1.0.0",
+ "message": {
+  "DOI": "10.5555/fu.work.concern",
+  "type": "journal-article",
+  "title": [
+   "Fictional trial two"
+  ],
+  "container-title": [
+   "Synthetic Venue"
+  ],
+  "published": {
+   "date-parts": [
+    [
+     2019,
+     1,
+     1
+    ]
+   ]
+  },
+  "updated-by": [
+   {
+    "DOI": "10.5555/fu.notice.concern1",
+    "type": "expression_of_concern",
+    "source": "publisher",
+    "label": "Expression of concern",
+    "updated": {
+     "date-parts": [
+      [
+       2021,
+       7
+      ]
+     ]
+    }
+   }
+  ]
+ }
+}
