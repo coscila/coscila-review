@@ -371,8 +371,19 @@ def run_function(connection: Any, branch: FollowupBranch, judge: Any, policy: An
             "selection": selection, "items": len(items), "sent": len(pending),
             "withheldEntitled": len(items) - len(sendable), "blocked": dict(Counter(code for _, code, _ in blocked)),
             "blockedRecorded": blocks, "markers": dict(methods), "contexts": dict(documents.counts), "run": summary,
-            "rows": dict(sorted(rows.items())), "judge": {"name": getattr(judge, "name", "judge"),
-                                                         "location": getattr(judge, "location", "")}}
+            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge)}
+
+
+def judge_summary(judge: Any) -> dict[str, Any]:
+    """Name and location of the judge, and the reason a broker judge halted its transport (a fidelity stop)."""
+    return {"name": getattr(judge, "name", "judge"), "location": getattr(judge, "location", ""),
+            "stopped": getattr(judge, "stopped", None)}
+
+
+def close_judge(judge: Any) -> None:
+    close = getattr(judge, "close", None)
+    if callable(close):
+        close()
 
 
 def cmd_function(args: Any) -> dict[str, Any]:
@@ -380,9 +391,12 @@ def cmd_function(args: Any) -> dict[str, Any]:
     from .followup_judge import judge_from_args
     branch = FollowupBranch(Path(args.database))
     judge, policy = judge_from_args(args)
-    documents = ReviewDocuments(getattr(args, "documents", None))
-    with branch.writing() as connection:
-        return run_function(connection, branch, judge, policy, model=args.model, scope=args.scope,
-                            variant=args.variant, public_only=args.public_only, limit=args.limit,
-                            concurrency=args.concurrency, transport_retries=args.transport_retries,
-                            cooldown=args.transport_cooldown, documents=documents, code_revision=code_revision())
+    try:
+        documents = ReviewDocuments(getattr(args, "documents", None))
+        with branch.writing() as connection:
+            return run_function(connection, branch, judge, policy, model=args.model, scope=args.scope,
+                                variant=args.variant, public_only=args.public_only, limit=args.limit,
+                                concurrency=args.concurrency, transport_retries=args.transport_retries,
+                                cooldown=args.transport_cooldown, documents=documents, code_revision=code_revision())
+    finally:
+        close_judge(judge)

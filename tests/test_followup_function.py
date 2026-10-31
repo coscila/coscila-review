@@ -124,6 +124,7 @@ class FunctionTests(unittest.TestCase):
                                             by_id[locus("b1/2")]["contextAfter"]))
         self.assertEqual({"bibliography-order": 2, "single-marker": 5}, result["markers"])
         self.assertEqual({"document": 1, "sentence-not-found": 1, "no-document": 5}, result["contexts"])
+        self.assertEqual({"name": "scripted-judge", "location": "on-prem", "stopped": None}, result["judge"])
         rows = self.rows(branch)
         self.assertEqual(7, len(rows))
         self.assertEqual({"relies"}, {row["class"] for row in rows.values()})

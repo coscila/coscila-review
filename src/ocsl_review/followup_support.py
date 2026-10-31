@@ -33,9 +33,9 @@ from typing import Any, Mapping, Sequence
 
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, now, require_freeze
-from .followup_function import (ReviewDocuments, block_new, check_model, citation_target, cited_work,
-                                judgment_state, prepare_judge, provenance_of, reason_of, resolve_marker, sanitize,
-                                select_units, sentence_targets)
+from .followup_function import (ReviewDocuments, block_new, check_model, citation_target, cited_work, close_judge,
+                                judge_summary, judgment_state, prepare_judge, provenance_of, reason_of, resolve_marker,
+                                sanitize, select_units, sentence_targets)
 from .followup_model import canonical, digest
 from .followup_status import ProviderSession, Recorder, normal_doi, normal_pmid
 
@@ -640,8 +640,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
             "blockedRecorded": blocks, "evidence": dict(sorted(fetched.items())), "unsent": dict(unsent),
             "contexts": dict(documents.counts), "retrieval": {"k": k, "maxEvidenceCharacters": window},
             "requests": session.recorder.summary() if session else {}, "run": summary,
-            "rows": dict(sorted(rows.items())), "judge": {"name": getattr(judge, "name", "judge"),
-                                                         "location": getattr(judge, "location", "")}}
+            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge)}
 
 
 def cmd_support(args: Any) -> dict[str, Any]:
@@ -656,6 +655,8 @@ def cmd_support(args: Any) -> dict[str, Any]:
     caches = InputCaches.open(store=getattr(args, "store", None), store_root=getattr(args, "store_root", None),
                               provider_cache=getattr(args, "provider_cache", None))
     try:
+        if args.tier not in TIERS:
+            raise ValidationError("--tier is abstract or full-text")
         with branch.writing() as connection:
             return run_support(connection, branch, judge, policy, tier=args.tier, model=args.model,
                                scholarly=make_client(workspace), caches=caches, europe_pmc=args.europe_pmc,
@@ -667,3 +668,4 @@ def cmd_support(args: Any) -> dict[str, Any]:
     finally:
         if caches is not None:
             caches.close()
+        close_judge(judge)
