@@ -104,9 +104,67 @@ def _call_facts(journal: str) -> dict[str, tuple[str, str]]:
                                    "error!='request_mismatch' AND error NOT LIKE 'broker refused the instrument call:%'",
                                    "calls that failed after their transport attempts (fidelity stops apart)"),
         "calls_with_fingerprint": (f"SELECT COUNT(*) {k} AND fingerprint IS NOT NULL", "receipts carrying a server fingerprint"),
+        # A fingerprint comes only with a response: coverage is counted over the receipts of calls that got one.
+        "calls_with_response": (f"SELECT COUNT(*) {k} AND served_model IS NOT NULL",
+                                "receipts of calls that got a response from the judge"),
+        "fingerprint_share_of_responses": (
+            f"SELECT 1.0*SUM(fingerprint IS NOT NULL)/NULLIF(SUM(served_model IS NOT NULL),0) {k}",
+            "receipts with the judge's system_fingerprint among receipts with a response (target 1)"),
+        "calls_code_revisions": (f"SELECT COUNT(DISTINCT COALESCE(code_revision, '')) {k}",
+                                 "distinct code revisions across primary calls (1: one pinned release)"),
+        "calls_instrument_digests": (f"SELECT COUNT(DISTINCT instrument_digest) {k}",
+                                     "distinct instrument digests across primary calls (1: one pinned instrument)"),
+        "calls_full_text_truncated": (f"SELECT COUNT(*) {k} AND tier='full-text' AND (truncated=1 OR finish_reason='length')",
+                                      "full-text calls cut at their token limit"),
         "prompt_tokens": (f"SELECT COALESCE(SUM(prompt_tokens),0) {k}", "provider-reported prompt tokens"),
         "completion_tokens": (f"SELECT COALESCE(SUM(completion_tokens),0) {k}", "provider-reported completion tokens"),
     }
+
+
+ITEM_BUCKETS = (("1", "BETWEEN 1 AND 1"), ("2-9", "BETWEEN 2 AND 9"), ("10-39", "BETWEEN 10 AND 39"), ("40", ">= 40"))
+
+
+def _output_facts(journal: str) -> dict[str, tuple[str, str]]:
+    """Invalid outputs after repair by the items the first call of the entry's batch carried, and full-text entries
+    without a parseable verdict (no repair pass at that tier)."""
+    j = _quote(journal)
+    decided = (f"FROM citations c WHERE c.journal={j} AND c.cited_inbody=1 AND c.identity IN "
+               "('resolved','resolved_unverified') AND (c.abs_basis='model' OR c.abs_basis LIKE 'invalid%')")
+    items = ("(SELECT MAX(k.n_items) FROM calls k WHERE k.journal=c.journal AND k.doi=c.doi AND k.tier='abstract' "
+             "AND k.variant='primary' AND k.kind='first' AND k.batch=c.abs_batch)")
+    facts = {}
+    for name, condition in ITEM_BUCKETS:
+        key = slug(name)
+        facts[f"invalid_items_{key}.n"] = (f"SELECT COUNT(*) {decided} AND {items} {condition}",
+                                           f"decided entries whose batch's first call carried {name} items")
+        facts[f"invalid_items_{key}.invalid"] = (
+            f"SELECT COUNT(*) {decided} AND {items} {condition} AND c.abs_basis LIKE 'invalid%'",
+            f"entries without a parseable verdict after repair, batches of {name} items")
+        facts[f"invalid_items_{key}.share"] = (
+            f"SELECT 1.0*SUM(c.abs_basis LIKE 'invalid%')/NULLIF(COUNT(*),0) {decided} AND {items} {condition}",
+            f"invalid outputs after repair among decided entries, batches of {name} items")
+    c = f"FROM citations WHERE journal={j}"
+    facts["ft_without_verdict"] = (f"SELECT COUNT(*) {c} AND ft_evidence_id IS NOT NULL AND ft_class IS NULL",
+                                   "escalated entries whose full-text window was sent but got no parseable verdict")
+    facts["ft_invalid_share"] = (
+        f"SELECT 1.0*SUM(ft_class IS NULL)/NULLIF(COUNT(*),0) {c} AND ft_evidence_id IS NOT NULL",
+        "full-text entries without a parseable verdict among entries whose window was sent (no repair pass)")
+    return facts
+
+
+def _full_text_route_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
+    """Escalated entries by full-text retrieval outcome (the route that supplied the window, or why none did), so the
+    full-text tier's coverage by route is reported whatever routes the run used."""
+    j = _quote(journal)
+    facts = {}
+    values = [r[0] for r in connection.execute(
+        "SELECT DISTINCT ft_retrieval FROM citations WHERE journal=? AND model_judged=1 AND abs_escalated=1 "
+        "AND ft_retrieval IS NOT NULL ORDER BY ft_retrieval", (journal,))]
+    for value in values:
+        facts[f"ft_route.{slug(str(value))}"] = (
+            f"SELECT COUNT(*) FROM citations WHERE journal={j} AND model_judged=1 AND abs_escalated=1 "
+            f"AND ft_retrieval={_quote(value)}", f"escalated entries with full-text retrieval outcome {value}")
+    return facts
 
 
 def _sensitivity_facts(journal: str) -> dict[str, tuple[str, str]]:
@@ -140,7 +198,11 @@ def _sensitivity_facts(journal: str) -> dict[str, tuple[str, str]]:
         })
     c = f"FROM citations WHERE journal={j} AND abs_class!='not_cited'"
     strata = (("full-text-read", "ft_class IS NOT NULL", "ft_class"),
-              ("escalated-full-text-unavailable", "ft_class IS NULL AND abs_escalated=1", "'unsure'"),
+              # A window was sent but the call gave no parseable verdict: unsure, but not "full text unavailable".
+              ("escalated-no-parseable-full-text-verdict", "ft_class IS NULL AND abs_escalated=1 AND ft_evidence_id IS NOT NULL",
+               "'unsure'"),
+              ("escalated-full-text-unavailable", "ft_class IS NULL AND abs_escalated=1 AND ft_evidence_id IS NULL",
+               "'unsure'"),
               ("not-escalated", "ft_class IS NULL AND COALESCE(abs_escalated,0)=0", "abs_class"))
     for name, condition, value in strata:
         facts[f"composite.{name}.n"] = (f"SELECT COUNT(*) {c} AND {condition}", f"composite availability stratum {name}")
@@ -380,7 +442,8 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
         estimates, report = compute_estimates(frozen, journals, b=b, seed=seed, ratio_pair=ratio_pair,
                                               trend_years=trend_years, panels=panels)
         coverage = {journal: {**_coverage_facts(frozen, journal), **_provenance_facts(frozen, journal),
-                              **_enumeration_facts(frozen, journal)} for journal in journals}
+                              **_enumeration_facts(frozen, journal), **_full_text_route_facts(frozen, journal)}
+                    for journal in journals}
         totals = _comparison_totals(frozen)
         frozen.execute("VACUUM INTO ?", (str(database),))
     scores_sha = scores_db.file_sha256(scores_path)
@@ -410,8 +473,8 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     queries: dict[str, tuple[str, str, dict[str, Any] | None]] = {}
     for journal in journals:
         s = slug(journal)
-        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **_sensitivity_facts(journal),
-                                    **coverage[journal]}.items():
+        for name, (sql, method) in {**_count_facts(journal), **_call_facts(journal), **_output_facts(journal),
+                                    **_sensitivity_facts(journal), **coverage[journal]}.items():
             queries[f"census.{s}.{name}"] = (sql, method, None)
     for key, (sql, method) in totals.items():
         queries[key] = (sql, method, None)

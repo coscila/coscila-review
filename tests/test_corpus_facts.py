@@ -65,6 +65,7 @@ class FactsExportTests(unittest.TestCase):
         self.assertEqual((0.5, 1.0), (self.fact("census.j1.sensitivity.no-truncation.all.primary_share")["value"],
                                       self.fact("census.j1.sensitivity.no-truncation.all.variant_share")["value"]))
         names = {"full text read": "full-text-read", "escalated, full text unavailable": "escalated-full-text-unavailable",
+                 "escalated, no parseable full-text verdict": "escalated-no-parseable-full-text-verdict",
                  "not escalated": "not-escalated"}
         for stratum, counts in classes["composite"].items():
             key = names[stratum]

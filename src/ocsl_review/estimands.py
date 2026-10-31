@@ -280,10 +280,13 @@ def three_classes(connection: sqlite3.Connection, journal: str) -> dict[str, Any
         "SELECT ft_class, COUNT(*) FROM citations WHERE journal=? AND ft_class IS NOT NULL GROUP BY ft_class", (journal,))}
     composite = defaultdict(lambda: defaultdict(int))
     for row in _rows(connection,
-            "SELECT abs_class, abs_escalated, ft_class, ft_retrieval FROM citations WHERE journal=? AND abs_class!='not_cited'",
-            (journal,)):
-        stratum = "full text read" if row["ft_class"] else ("escalated, full text unavailable" if row["abs_escalated"]
-                                                           else "not escalated")
+            "SELECT abs_class, abs_escalated, ft_class, ft_retrieval, ft_evidence_id FROM citations WHERE journal=? "
+            "AND abs_class!='not_cited'", (journal,)):
+        # An escalated entry whose window was sent but whose call gave no parseable verdict stays unsure, in a stratum
+        # of its own: its full text was available.
+        stratum = ("full text read" if row["ft_class"] else
+                   "escalated, no parseable full-text verdict" if row["abs_escalated"] and row["ft_evidence_id"] else
+                   "escalated, full text unavailable" if row["abs_escalated"] else "not escalated")
         value = row["ft_class"] or (row["abs_class"] if not row["abs_escalated"] else "unsure")
         composite[stratum][value] += 1
     def share(counts):

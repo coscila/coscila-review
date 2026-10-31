@@ -262,8 +262,23 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
 def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) -> dict[str, Any]:
     from .census_inputs import QUERY_RULE
     responded = status["receiptsWithResponse"]
+    # Invalid outputs after the repair pass over the entries the census decided: entries still open never dilute it,
+    # so a gate on a few reviews of a larger prepared population measures those reviews.
+    decided_share = status.get("invalidShareDecided", status["invalidShare"])
+    full_text_share = status.get("fullTextInvalidShare")
+    prompts = status.get("systemPromptSha256") or {}
     checks = {
-        "invalidOutputsAtMostOnePercent": status["invalidShare"] is not None and status["invalidShare"] <= 0.01,
+        "invalidOutputsAtMostOnePercent": decided_share is not None and decided_share <= 0.01,
+        # The full-text tier has no repair pass: an entry without a parseable verdict stays unsure (it is no
+        # "full text unavailable" entry), and its share is checked on its own.
+        "fullTextInvalidOutputsAtMostOnePercent": full_text_share is None or full_text_share <= 0.01,
+        "fullTextCallsNotTruncated": not status.get("fullTextTruncatedCalls"),
+        # Judgments under different versions are never pooled: one instrument digest, one code revision, and per
+        # journal and tier one system prompt across every primary call.
+        "singleInstrumentDigest": len(status.get("callInstrumentDigests") or []) <= 1,
+        "singleCodeRevision": len(status.get("callCodeRevisions") or []) <= 1,
+        "oneSystemPromptPerJournalAndTier": all(len(digests) == 1 for tiers in prompts.values()
+                                                for digests in tiers.values()),
         "transportFailuresAtMostHalfPercent": status["transportFailureShare"] is None or status["transportFailureShare"] <= 0.005,
         "uncoveredIsZero": status["uncoveredReviews"] == 0,
         "noDuplicateJudgments": status["duplicateJudgments"] == 0,
@@ -296,6 +311,20 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
                      "(sanitizer rules control-token and control-block): the instrument sends its inputs byte for byte on "
                      "either transport, and a judge server that reads special tokens inside message content may take them "
                      "as role markers")
+    small = {name: value for name, value in (status.get("invalidByItemsPerCall") or {}).items()
+             if value.get("decided") and (value.get("share") or 0) > 0.01}
+    if small:
+        notes.append("invalid outputs after repair above 1 % in batches of " + ", ".join(
+            f"{name} items ({value['invalid']}/{value['decided']})" for name, value in small.items()))
+    if status.get("fullTextWithoutParseableVerdict"):
+        notes.append(f"{status['fullTextWithoutParseableVerdict']} full-text entries got no parseable verdict (no repair "
+                     "pass at that tier); they stay unsure and are counted apart from entries without a full text")
+    if len(status.get("callCodeRevisions") or []) > 1:
+        notes.append("judge calls ran under several code revisions: " + ", ".join(status["callCodeRevisions"]))
+    if prompts:
+        notes.append("system prompts (sha256) by journal and tier: " + "; ".join(
+            f"{journal} {tier} {','.join(digest[:12] for digest in digests)}"
+            for journal, tiers in sorted(prompts.items()) for tier, digests in sorted(tiers.items())))
     if responded and not status["fingerprintOffered"]:
         notes.append("the judge server offered no system_fingerprint on any response, so the fingerprint gate cannot "
                      "pass with this server")

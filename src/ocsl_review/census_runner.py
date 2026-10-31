@@ -131,15 +131,41 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def code_revision() -> str:
+RELEASE_STAMP = ".ocsl-release.json"
+
+
+def _package_digest() -> str:
+    """sha256 over the package's own files (path and content), so a live edit of a checkout changes the revision even
+    where git cannot tell (an exported release without .git, or an uncommitted change)."""
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*")):
+        if "__pycache__" in path.parts or not path.is_file() or path.suffix in (".pyc", ".pyo"):
+            continue
+        digest.update(path.relative_to(package).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def code_revision(home: Path | None = None) -> str:
+    """``ocsl-review <version>+<commit> src:<digest>``: the commit from git, else from the release stamp an exported
+    release carries (``.ocsl-release.json`` with ``commit``), and the digest of the package's files."""
     from . import __version__
-    home = Path(__file__).resolve().parents[2]
+    home = home or Path(__file__).resolve().parents[2]
     try:
         commit = subprocess.run(["git", "-C", str(home), "rev-parse", "--short=12", "HEAD"], capture_output=True,
                                 text=True, timeout=5, check=False).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         commit = ""
-    return f"ocsl-review {__version__}" + (f"+{commit}" if commit else "")
+    if not commit:
+        try:
+            stamp = json.loads((home / RELEASE_STAMP).read_text(encoding="utf-8"))
+            value = str(stamp.get("commit") or "")
+            commit = value[:12] if re.fullmatch(r"[0-9a-f]{7,64}", value) else ""
+        except (OSError, ValueError, AttributeError):
+            commit = ""
+    return f"ocsl-review {__version__}" + (f"+{commit}" if commit else "") + f" src:{_package_digest()[:12]}"
 
 
 STUDY_BUNDLE_FORMAT = "ocsl-study-bundle-v1"
@@ -1768,9 +1794,86 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
               "uncoveredReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE uncovered>0").fetchone()[0],
               "extractionFailedReviews": c.execute("SELECT COUNT(*) FROM reviews WHERE "
                                                    "json_extract(extraction_json, '$.extractionFailed') IS NOT NULL").fetchone()[0]}
+    result.update(output_status(c))
+    result.update(consistency_status(c))
     result.update(transport_status(c, meta))
     result.update(input_status(c, meta))
     return result
+
+
+# Items per call, in the buckets the gates report: a single item, small remainder batches, larger remainder batches and
+# full batches (the instrument sends at most 40 entries per abstract call and 5 per full-text call).
+ITEM_BUCKETS = (("1", 1, 1), ("2-9", 2, 9), ("10-39", 10, 39), ("40", 40, None))
+
+
+def _bucket(items: Any) -> str | None:
+    if not isinstance(items, int) or items < 1:
+        return None
+    for name, low, high in ITEM_BUCKETS:
+        if items >= low and (high is None or items <= high):
+            return name
+    return None
+
+
+def _shares(rows: Any) -> dict[str, dict[str, Any]]:
+    out = {name: {"decided": 0, "invalid": 0, "share": None} for name, _, _ in ITEM_BUCKETS}
+    for items, decided, invalid in rows:
+        name = _bucket(items)
+        if name is None:
+            continue
+        out[name]["decided"] += decided or 0
+        out[name]["invalid"] += invalid or 0
+    for value in out.values():
+        value["share"] = value["invalid"] / value["decided"] if value["decided"] else None
+    return out
+
+
+def output_status(c: Any) -> dict[str, Any]:
+    """Invalid outputs after the repair pass, over entries the census has decided (never diluted by entries still open),
+    overall and by the number of items the first call of the entry's batch carried; and the full-text tier's entries
+    without a parseable verdict (no repair pass there), by items per call, with its truncated calls."""
+    decided, invalid = c.execute(
+        "SELECT COUNT(*), SUM(abs_basis LIKE 'invalid%') FROM citations WHERE cited_inbody=1 AND identity IN "
+        "('resolved','resolved_unverified') AND (abs_basis='model' OR abs_basis LIKE 'invalid%')").fetchone()
+    by_items = c.execute(
+        "SELECT (SELECT MAX(k.n_items) FROM calls k WHERE k.journal=c.journal AND k.doi=c.doi AND k.tier='abstract' "
+        "AND k.variant='primary' AND k.kind='first' AND k.batch=c.abs_batch) AS items, COUNT(*), "
+        "SUM(c.abs_basis LIKE 'invalid%') FROM citations c WHERE c.cited_inbody=1 AND c.identity IN "
+        "('resolved','resolved_unverified') AND (c.abs_basis='model' OR c.abs_basis LIKE 'invalid%') GROUP BY items"
+    ).fetchall()
+    # Full text: the latest outcome per entry (a later pass may have judged an entry an earlier call missed).
+    latest = ("SELECT h.outcome, k.n_items FROM history h LEFT JOIN calls k ON k.call_id=h.call_id "
+              "WHERE h.tier='full-text' AND h.variant='primary' AND h.history_id=(SELECT MAX(h2.history_id) FROM history h2 "
+              "WHERE h2.journal=h.journal AND h2.doi=h.doi AND h2.label=h.label AND h2.tier='full-text' "
+              "AND h2.variant='primary')")
+    ft_rows = c.execute(f"SELECT n_items, COUNT(*), SUM(outcome='missing') FROM ({latest}) GROUP BY n_items").fetchall()
+    ft_decided = sum(row[1] or 0 for row in ft_rows)
+    ft_missing = sum(row[2] or 0 for row in ft_rows)
+    ft_truncated = c.execute("SELECT COUNT(*) FROM calls WHERE tier='full-text' AND variant='primary' AND "
+                             "(truncated=1 OR finish_reason='length')").fetchone()[0]
+    return {"decidedEntries": decided or 0, "invalidAfterRepair": invalid or 0,
+            "invalidShareDecided": (invalid or 0) / decided if decided else None,
+            "invalidByItemsPerCall": _shares(by_items),
+            "fullTextDecidedEntries": ft_decided, "fullTextWithoutParseableVerdict": ft_missing,
+            "fullTextInvalidShare": ft_missing / ft_decided if ft_decided else None,
+            "fullTextInvalidByItemsPerCall": _shares(ft_rows),
+            "fullTextTruncatedCalls": ft_truncated}
+
+
+def consistency_status(c: Any) -> dict[str, Any]:
+    """What every judge call of the census must share: one instrument digest, one code revision (judgments under
+    different versions are never pooled) and, per journal and tier, one system prompt."""
+    digests = [row[0] for row in c.execute(
+        "SELECT DISTINCT instrument_digest FROM calls WHERE variant='primary' ORDER BY instrument_digest")]
+    revisions = [row[0] for row in c.execute(
+        "SELECT DISTINCT COALESCE(code_revision, '') FROM calls WHERE variant='primary' ORDER BY 1")]
+    prompts: dict[str, dict[str, list[str]]] = {}
+    for journal, tier, digest in c.execute(
+            "SELECT DISTINCT journal, tier, system_sha256 FROM calls WHERE variant='primary' AND kind IN "
+            "('first', 'full-text') ORDER BY journal, tier, system_sha256"):
+        prompts.setdefault(journal, {}).setdefault(tier, []).append(digest)
+    return {"callInstrumentDigests": digests, "callCodeRevisions": revisions,
+            "systemPromptSha256": prompts}
 
 
 def transport_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
