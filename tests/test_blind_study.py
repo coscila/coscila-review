@@ -23,8 +23,21 @@ class BlindStudyTests(unittest.TestCase):
 
     def test_marker_values(self):
         for value, expected in (("1", True), ("true", True), ("on", True), ("0", False), ("", False), ("no", False)):
-            self.assertEqual(expected, blind.blind_study({blind.BLIND_ENV: value}))
-        self.assertFalse(blind.blind_study({}))
+            self.assertEqual(expected, blind.blind_study({blind.BLIND_ENV: value}, cwd=self.root))
+        self.assertFalse(blind.blind_study({}, cwd=self.root))
+
+    def test_the_workspace_marker_makes_a_study_blind_from_any_subdirectory(self):
+        workspace = self.root / "workspace"
+        nested = workspace / "work" / "census"
+        nested.mkdir(parents=True)
+        self.assertFalse(blind.blind_study({}, cwd=nested))
+        (workspace / ".ocsl").mkdir()
+        (workspace / ".ocsl" / "blind-study.json").write_text(json.dumps({"blind": True}))
+        self.assertTrue(blind.blind_study({}, cwd=nested))
+        (workspace / ".ocsl" / "blind-study.json").write_text("{not json")
+        self.assertTrue(blind.blind_study({}, cwd=nested))   # unreadable: no permission
+        (workspace / ".ocsl" / "blind-study.json").write_text(json.dumps({"blind": False}))
+        self.assertFalse(blind.blind_study({}, cwd=nested))
 
     def test_every_import_of_earlier_judgments_refuses_in_a_blind_study(self):
         with mock.patch.dict(os.environ, {blind.BLIND_ENV: "1"}):
