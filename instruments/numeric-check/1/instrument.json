@@ -8,7 +8,7 @@
   "files": {
     "systemPrompt": {
       "path": "system-prompt.txt",
-      "sha256": "d0061580cba0000bacc8c9a7e2c53363456c2a80065888e35d779df0e9c9e25b",
+      "sha256": "68f5af514281d15c6202aed1ff87f69b191a33f73567da7fceeb9c4b1073b633",
       "mediaType": "text/plain; charset=utf-8"
     },
     "outputSchema": {
