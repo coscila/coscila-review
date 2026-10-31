@@ -36,6 +36,7 @@ class MockJudge:
         self.requests = []
         self.drop_first = set()
         self.never = set()
+        self.never_full_text = set()
         self.fail_next = 0
         self.model = MODEL
         self.lock = threading.Lock()
@@ -57,6 +58,8 @@ class MockJudge:
         lines = []
         for label, evidence in self.items(user):
             if label in self.never or (label in self.drop_first and not repair and not full_text):
+                continue
+            if full_text and label in self.never_full_text:
                 continue
             number = int(re.sub(r"\D", "", label) or 0)
             if full_text:
@@ -323,6 +326,92 @@ class AbstractTierTests(RunnerTestCase):
         entry = self.rows("SELECT * FROM citations WHERE label='3'")[0]
         self.assertEqual((0, "unsure", "invalid:no-parseable-output"), (entry["model_judged"], entry["abs_class"], entry["abs_basis"]))
         self.assertAlmostEqual(1 / 15, run.status()["invalidShare"])
+
+    def test_invalid_share_counts_decided_entries_by_items_per_call(self):
+        from ocsl_review.study_cli import gates
+        self.judge.never = {"3"}
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        status = run.status()
+        self.assertEqual((15, 1), (status["decidedEntries"], status["invalidAfterRepair"]))
+        self.assertAlmostEqual(1 / 15, status["invalidShareDecided"])
+        buckets = status["invalidByItemsPerCall"]
+        self.assertEqual({"decided": 15, "invalid": 1}, {k: buckets["10-39"][k] for k in ("decided", "invalid")})
+        self.assertEqual([0, 0, 0], [buckets[name]["decided"] for name in ("1", "2-9", "40")])
+        verdict = gates(status)
+        self.assertFalse(verdict["checks"]["invalidOutputsAtMostOnePercent"])
+        self.assertTrue(any("batches of 10-39 items (1/15)" in note for note in verdict["notes"]))
+        # Entries prepared but not yet judged never dilute the share: open entries leave it unchanged.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            columns = [r[1] for r in connection.execute("PRAGMA table_info(citations)")]
+            row = dict(zip(columns, connection.execute("SELECT * FROM citations WHERE label='1'").fetchone()))
+            for number in range(100):
+                row.update(label=f"open-{number}", ordinal=1000 + number, abs_basis=None, abs_batch=None,
+                           model_judged=0, abs_class=None, abs_category=None)
+                connection.execute(f"INSERT INTO citations({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+                                   [row[name] for name in columns])
+        diluted = run.status()
+        self.assertAlmostEqual(1 / 115, diluted["invalidShare"])
+        self.assertAlmostEqual(1 / 15, diluted["invalidShareDecided"])
+        self.assertFalse(gates(diluted)["checks"]["invalidOutputsAtMostOnePercent"])
+
+    def test_full_text_entries_without_a_verdict_are_counted_apart(self):
+        from ocsl_review import estimands
+        from ocsl_review.study_cli import gates
+        self.judge.never_full_text = {"5"}
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        run.run_full_text(fetch_xml=full_text_fetcher([]), fetch_workers=2)
+        status = run.status()
+        self.assertEqual((3, 1), (status["fullTextDecidedEntries"], status["fullTextWithoutParseableVerdict"]))
+        self.assertAlmostEqual(1 / 3, status["fullTextInvalidShare"])
+        self.assertEqual(3, status["fullTextInvalidByItemsPerCall"]["2-9"]["decided"])
+        checks = gates(status)["checks"]
+        self.assertFalse(checks["fullTextInvalidOutputsAtMostOnePercent"])
+        self.assertTrue(checks["fullTextCallsNotTruncated"])
+        self.assertTrue(checks["singleInstrumentDigest"] and checks["singleCodeRevision"])
+        self.assertTrue(checks["oneSystemPromptPerJournalAndTier"])
+        self.assertEqual({"abstract", "full-text"}, set(status["systemPromptSha256"][JOURNAL]))
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            composite = estimands.three_classes(connection, JOURNAL)["composite"]
+        # Entry 5's window was sent: unsure, but not counted as "full text unavailable" (10 and 14 have no PMCID).
+        self.assertEqual({"unsure": 1}, composite["escalated, no parseable full-text verdict"])
+        self.assertEqual({"unsure": 2}, composite["escalated, full text unavailable"])
+
+    def test_calls_under_several_code_revisions_fail_the_single_revision_check(self):
+        from ocsl_review.study_cli import gates
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            # Receipts are immutable: a call recorded by another release is a further row.
+            connection.execute("INSERT INTO calls SELECT 'extra-call', run_id, journal, doi, tier, variant, batch, kind, "
+                               "n_items, labels_json, instrument_id, instrument_digest, 'ocsl-review 0.0+third', "
+                               "request_model, served_model, fingerprint, settings_sha256, 'f' || system_sha256, user_sha256, "
+                               "messages_sha256, body_sha256, max_tokens, prompt_tokens, completion_tokens, total_tokens, "
+                               "cached_tokens, finish_reason, truncated, attempts, seconds, error, n_parsed, n_missing, "
+                               "n_problems, created_at FROM calls WHERE rowid=(SELECT MIN(rowid) FROM calls)")
+        verdict = gates(run.status())
+        self.assertFalse(verdict["checks"]["singleCodeRevision"])
+        self.assertFalse(verdict["checks"]["oneSystemPromptPerJournalAndTier"])
+        self.assertTrue(any("several code revisions" in note for note in verdict["notes"]))
+
+    def test_code_revision_falls_back_to_the_release_stamp_and_names_the_package_digest(self):
+        from unittest import mock
+        from ocsl_review import census_runner
+        revision = census_runner.code_revision()
+        self.assertRegex(revision, r" src:[0-9a-f]{12}$")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with mock.patch.object(census_runner.subprocess, "run", side_effect=OSError("no git")):
+                self.assertNotIn("+", census_runner.code_revision(home))
+                (home / census_runner.RELEASE_STAMP).write_text(json.dumps({"commit": "abcdef1234567890"}))
+                stamped = census_runner.code_revision(home)
+        self.assertIn("+abcdef123456 ", stamped)
+        # The package digest is the same, whatever names the commit: it covers the code that runs.
+        self.assertEqual(revision.split(" ")[-1], stamped.split(" ")[-1])
 
     def test_transport_failure_is_retried_then_repaired(self):
         self.judge.fail_next = 3

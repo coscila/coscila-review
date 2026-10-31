@@ -444,10 +444,20 @@ first-online year and allocated in proportion to judged entries; its verdicts go
 to the history as variant `replicate`, and the estimands report category and
 class agreement and the T/F kappa against the primary verdicts. `status` and
 `gates` read the database without writing (also the frozen one). `gates` checks
-invalid outputs (at most 1 %), transport failures (at most 0.5 % of calls),
-uncovered anchors (0), duplicate judgments (0), complete abstract and full-text
-tiers, and a fingerprint on every receipt that received a response (all tiers
-and variants); it notes when the server never offers `system_fingerprint`. The
+invalid outputs after repair (at most 1 % of the entries the census decided, so
+entries still open never dilute it; `status` also reports them by the items the
+first call of the entry's batch carried: 1, 2–9, 10–39 and 40, and `gates`
+notes a bucket above 1 %), full-text entries without a parseable verdict (at
+most 1 %; that tier has no repair pass, and such an entry stays unsure in a
+composite stratum of its own, never "full text unavailable") and truncated
+full-text calls (0), transport failures (at most 0.5 % of calls), uncovered
+anchors (0), duplicate judgments (0), complete abstract and full-text tiers, a
+fingerprint on every receipt that received a response (all tiers and variants),
+and that every primary call shares one instrument digest, one code revision
+(`ocsl-review <version>+<commit> src:<package digest>`; an exported release
+without git names its commit in `.ocsl-release.json`) and, per journal and tier,
+one system prompt, whose digests it notes; it notes when the server never offers
+`system_fingerprint`. The
 direct transport sends the request body bytes exactly as built and records
 their sha256 in the receipt; the key comes from the named environment
 variable, never from a file. With a pinned study bundle, `gates` also checks
