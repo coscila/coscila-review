@@ -27,8 +27,15 @@ geometries are exploratory. Cells above the allowed concurrency run only while
 the server can still be shown not to be shared. The report is JSON plus a
 markdown table with the exit criterion line.
 
-The probe only measures: it is not part of any instrument digest, sends only
-first calls (no repair pass) and never writes a scores database.
+The probe only measures: it is not part of any instrument digest and never
+writes a scores database. It sends first calls only, unless ``--repair`` adds
+the census's one repair pass: for every batch whose first call left labels
+without a parseable line (every label when the first call failed), the same
+stream sends the repair call the census runner builds (``census_runner``'s
+``repair_items`` and ``abstract_call``, with the instrument's repair note), and
+each cell reports its invalid outputs before and after the repair pass, overall
+and by the items of the batch's first call (1, 2-9, 10-39, 40), as the census
+gates count them.
 """
 from __future__ import annotations
 
@@ -322,6 +329,7 @@ class ProbeSettings:
     journal: str = DEFAULT_JOURNAL
     heartbeat_seconds: float = 30.0
     plan_calls: int = 32
+    repair: bool = False
 
     def validate(self, *, live: bool) -> None:
         if live and not self.base_url:
@@ -643,10 +651,22 @@ def cell_corpus(settings: ProbeSettings, streams: int, items: int) -> SyntheticC
 
 
 def build_request(batch: Batch, *, journal: str, model: str) -> tuple[dict[str, Any], bytes, list[str]]:
-    """The instrument's first call for one batch: its messages, settings and exact body bytes."""
-    messages = C.build_abstract_messages(batch.items, batch.title, journal)
-    payload = C.request_payload(messages, model=model, items=len(batch.items), tier=TIER)
+    """The instrument's first call for one batch, built as the census builds it: messages, settings, body bytes."""
+    from .census_runner import abstract_call
+    payload = abstract_call(batch.items, batch.title, journal, kind="first", model=model)
     return payload, C.request_body(payload), [item["label"] for item in batch.items]
+
+
+def build_repair_request(batch: Batch, labels: Sequence[str], answered: Sequence[str], *, journal: str,
+                         model: str) -> tuple[dict[str, Any], bytes, list[str]] | None:
+    """The census's repair call for one batch whose first call (over ``labels``) answered only ``answered``: the
+    census runner's own selection and builder (``repair_items``, ``abstract_call``); None when nothing is left."""
+    from .census_runner import abstract_call, repair_items
+    items = repair_items(batch.items, labels, answered)
+    if not items:
+        return None
+    payload = abstract_call(items, batch.title, journal, kind="repair", model=model)
+    return payload, C.request_body(payload), [item["label"] for item in items]
 
 
 class _BatchSource:
@@ -918,7 +938,7 @@ def classify_response(status: int, body: bytes, labels: Sequence[str],
     model, fingerprint = payload.get("model"), payload.get("system_fingerprint")
     finish = choices[0].get("finish_reason")
     return {"outcome": "answered", "failure": None, "valid": len(records), "missing": len(missing),
-            "problems": len(problems), "empty": not content,
+            "missingLabels": list(missing), "problems": len(problems), "empty": not content,
             "finishReason": scrub(finish)[:40] if isinstance(finish, str) else None,
             "model": scrub(model) if isinstance(model, str) else None,
             "fingerprint": scrub(fingerprint) if isinstance(fingerprint, str) else None,
@@ -1178,6 +1198,104 @@ def _round(value: float | None, digits: int = 3) -> float | None:
     return None if value is None else round(value, digits)
 
 
+# ----------------------------------------------------------------------------- the repair pass
+def item_bucket(items: Any) -> str | None:
+    """The census gates' bucket of a batch by the items of its first call (``census_runner.ITEM_BUCKETS``)."""
+    from .census_runner import ITEM_BUCKETS
+    if not isinstance(items, int) or isinstance(items, bool) or items < 1:
+        return None
+    for name, low, high in ITEM_BUCKETS:
+        if items >= low and (high is None or items <= high):
+            return name
+    return None
+
+
+def _share(part: int, whole: int) -> float | None:
+    return round(part / whole, 5) if whole else None
+
+
+def repair_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Invalid outputs before and after the census's repair pass, overall and by the items of each batch's first call.
+
+    ``records`` are a cell's calls with ``kind`` first or repair, joined by batch. Before the repair pass: labels an
+    answered first call left without a parseable line, over the entries those calls carried (the share the probe
+    reports without ``--repair``). After it: labels still without one once the batch's repair call was answered, over
+    the entries decided, which is how the census gates count them. A batch whose repair call got no answer, or was not
+    sent (an abort rule, or the cell's end cut it off), leaves its labels open: undecided, as in the census, counted
+    apart and never as valid or invalid. A failed first call is repaired in full, as the census does.
+    """
+    from .census_runner import ITEM_BUCKETS
+    names = [name for name, _, _ in ITEM_BUCKETS]
+    firsts: dict[int, dict[str, Any]] = {}
+    repairs: dict[int, dict[str, Any]] = {}
+    for record in records:
+        (repairs if record.get("kind") == "repair" else firsts)[record["batch"]] = record
+    before = {name: {"entries": 0, "invalid": 0} for name in names}
+    after = {name: {"decided": 0, "invalid": 0, "open": 0} for name in names}
+    needed = 0
+    for index, first in firsts.items():
+        size = first.get("items") or 0
+        name = item_bucket(size)
+        if name is None:
+            continue
+        repair = repairs.get(index)
+        repaired = bool(repair and repair.get("outcome") == "answered")
+        if first.get("outcome") == "answered":
+            missing = first.get("missing") or 0
+            before[name]["entries"] += size
+            before[name]["invalid"] += missing
+            if not missing:
+                after[name]["decided"] += size
+                continue
+            needed += 1
+            if repaired:
+                after[name]["decided"] += size
+                after[name]["invalid"] += repair.get("missing") or 0
+            else:
+                after[name]["decided"] += size - missing
+                after[name]["open"] += missing
+        elif first.get("outcome") == "failed":
+            needed += 1
+            if repaired:
+                after[name]["decided"] += size
+                after[name]["invalid"] += repair.get("missing") or 0
+            else:
+                after[name]["open"] += size
+        else:
+            after[name]["open"] += size       # cut off before an answer: never decided
+    for row in before.values():
+        row["share"] = _share(row["invalid"], row["entries"])
+    for row in after.values():
+        row["share"] = _share(row["invalid"], row["decided"])
+    calls = list(repairs.values())
+    answered = [r for r in calls if r.get("outcome") == "answered"]
+    latencies = [r["seconds"] for r in answered if isinstance(r.get("seconds"), (int, float))]
+    entries, invalid_before = sum(r["entries"] for r in before.values()), sum(r["invalid"] for r in before.values())
+    decided, invalid_after = sum(r["decided"] for r in after.values()), sum(r["invalid"] for r in after.values())
+    return {
+        "builder": "census_runner.repair_items and abstract_call (kind repair, the instrument's repair note)",
+        "batchesNeedingRepair": needed,
+        "calls": {"sent": len(calls), "answered": len(answered),
+                  "failed": sum(1 for r in calls if r.get("outcome") == "failed"),
+                  "abandoned": sum(1 for r in calls if r.get("outcome") == "abandoned"),
+                  "notSent": max(0, needed - len(calls)),
+                  "items": sum(r.get("items") or 0 for r in calls),
+                  "recovered": sum(r.get("valid") or 0 for r in answered),
+                  "stillWithoutLine": sum(r.get("missing") or 0 for r in answered),
+                  "emptyCompletions": sum(1 for r in answered if r.get("empty")),
+                  "truncatedCalls": sum(1 for r in answered if r.get("finishReason") == "length"),
+                  "promptTokens": sum(r.get("promptTokens") or 0 for r in answered),
+                  "completionTokens": sum(r.get("completionTokens") or 0 for r in answered),
+                  "failures": dict(sorted(Counter(r.get("failure") or "unknown" for r in calls
+                                                  if r.get("outcome") == "failed").items())),
+                  "latencySeconds": {"p50": _round(percentile(latencies, 0.5)), "p95": _round(percentile(latencies, 0.95))}},
+        "beforeRepair": {"entries": entries, "invalid": invalid_before, "share": _share(invalid_before, entries),
+                         "byItemsPerCall": before},
+        "afterRepair": {"decided": decided, "invalid": invalid_after, "share": _share(invalid_after, decided),
+                        "open": sum(r["open"] for r in after.values()), "byItemsPerCall": after},
+    }
+
+
 # ----------------------------------------------------------------------------- one cell
 class _Inflight:
     """Our own calls in flight, with the peak since the last mark (for the shared-server comparison)."""
@@ -1279,16 +1397,54 @@ class _CellRun:
                     outcome = self._call(pool, body, labels)
                 except PoolClosed:
                     break
+                missing = outcome.pop("missingLabels", None)
                 examples, detail = outcome.pop("examples", None), outcome.pop("detail", None)
                 record = {"cell": self.label, "stream": index, "seq": seq, "batch": batch.index, "review": batch.review,
                           "items": len(labels), "bodyBytes": len(body), "bodySha256": hashlib.sha256(body).hexdigest(),
                           **outcome}
+                if self.settings.repair:
+                    record["kind"] = "first"
                 self._record(record, examples, detail)
                 seq += 1
+                if self.settings.repair:
+                    try:
+                        seq += self._repair(index, seq, pool, batch, labels, outcome, missing or [])
+                    except PoolClosed:
+                        break
         except Exception as error:  # noqa: BLE001 - a probe defect stops the grid and is reported
             with self.lock:
                 self.errors.append(f"{type(error).__name__}: {str(error)[:200]}")
             self.monitor.fire({"rule": "internal-error", "at": round(time.monotonic() - self.t0, 3)})
+
+    def _repair(self, stream: int, seq: int, pool: ConnectionPool, batch: Batch, labels: list[str],
+                first: dict[str, Any], missing: Sequence[str]) -> int:
+        """The census's one repair call for ``batch`` (``--repair``), sent by the same stream right after the first call:
+        the labels the first call left without a parseable line, or every label of a failed first call, built by the
+        census runner. Nothing is sent once an abort rule fired or the calls in flight are being cut off; the batch's
+        open labels then stay undecided, as they would in the census. Returns the number of calls made (0 or 1)."""
+        if first["outcome"] == "answered":
+            if not missing:
+                return 0
+            left = set(missing)
+            answered = [label for label in labels if label not in left]
+        elif first["outcome"] == "failed":
+            answered = []
+        else:
+            return 0                    # abandoned: the cell is cutting its calls off
+        if self.aborted.is_set() or self.abandoning.is_set():
+            return 0
+        request = build_repair_request(batch, labels, answered, journal=self.settings.journal, model=self.probe.model)
+        if request is None:
+            return 0
+        _, body, repair_labels = request
+        outcome = self._call(pool, body, repair_labels)
+        outcome.pop("missingLabels", None)
+        examples, detail = outcome.pop("examples", None), outcome.pop("detail", None)
+        record = {"cell": self.label, "stream": stream, "seq": seq, "batch": batch.index, "review": batch.review,
+                  "kind": "repair", "items": len(repair_labels), "firstItems": len(labels), "bodyBytes": len(body),
+                  "bodySha256": hashlib.sha256(body).hexdigest(), **outcome}
+        self._record(record, examples, detail)
+        return 1
 
     def _record(self, record: dict[str, Any], examples: dict[str, Any] | None, detail: str | None = None) -> None:
         with self.lock:
@@ -1296,7 +1452,8 @@ class _CellRun:
             if record.get("failure") in ("http-429", "http-503"):
                 self.saturation_responses += 1
             if examples and len(self.invalid_examples) < 3:
-                self.invalid_examples.append({"batch": record["batch"], **examples})
+                kind = {"kind": record["kind"]} if record.get("kind") else {}
+                self.invalid_examples.append({"batch": record["batch"], **kind, **examples})
             if detail is not None:
                 kept = self.failure_examples.setdefault(record["failure"], [])
                 if len(kept) < 3:
@@ -1460,7 +1617,10 @@ class _CellRun:
     # -------------------------------------------------------------- summary
     def summarize(self, *, started_at: str, window_end: float, tail: dict[str, Any], cut: Sequence[float],
                   drained: float, abandoned_in_flight: int, pool: dict[str, int], unjoined: int) -> dict[str, Any]:
-        settings, records = self.settings, list(self.records)
+        settings, every = self.settings, list(self.records)
+        # The first calls give every statistic E0 compares (a repair call, with --repair, is reported apart); every
+        # call counts for our concurrency, the server counters and the served model.
+        records = [r for r in every if r.get("kind", "first") == "first"]
         abort = self.monitor.fired
         answered = [r for r in records if r["outcome"] == "answered"]
         failed = [r for r in records if r["outcome"] == "failed"]
@@ -1484,14 +1644,16 @@ class _CellRun:
         cached_calls = [r for r in answered if r.get("cachedTokens") is not None and r.get("promptTokens")]
         prompt = sum(r.get("promptTokens") or 0 for r in answered)
         completion = sum(r.get("completionTokens") or 0 for r in answered)
-        concurrency = mean_concurrency(records, window_start, window_end) if measured else None
-        served_models = Counter(r.get("model") or "(none)" for r in answered)
-        fingerprints = Counter(r.get("fingerprint") for r in answered if r.get("fingerprint"))
+        concurrency = mean_concurrency(every, window_start, window_end) if measured else None
+        answered_all = [r for r in every if r["outcome"] == "answered"]
+        served_models = Counter(r.get("model") or "(none)" for r in answered_all)
+        fingerprints = Counter(r.get("fingerprint") for r in answered_all if r.get("fingerprint"))
         required = C.instrument().manifest["requiredModel"]["served"]
         # A cell stopped by saturation or lost metrics stopped dispatching and let its calls finish: its window
         # measured the server, though without the tail.
         state = "completed" if abort is None else STOP_RULES.get(abort["rule"], "aborted")
-        server = self._server_summary(records, failed, abandoned, window_end)
+        server = self._server_summary(every, [r for r in every if r["outcome"] == "failed"],
+                                      [r for r in every if r["outcome"] == "abandoned"], window_end)
         cached_share, cached_source = None, None
         if cached_calls:
             cached_share = _round(sum(r["cachedTokens"] for r in cached_calls) / sum(r["promptTokens"] for r in cached_calls), 4)
@@ -1546,7 +1708,7 @@ class _CellRun:
             "failures": dict(sorted(Counter(r["failure"] for r in failed).items())),
             "failureExamples": {k: list(v) for k, v in sorted(self.failure_examples.items())},
             "served": {"models": dict(served_models), "fingerprints": dict(fingerprints),
-                       "withoutFingerprint": sum(1 for r in answered if not r.get("fingerprint")),
+                       "withoutFingerprint": sum(1 for r in answered_all if not r.get("fingerprint")),
                        "requiredModel": required,
                        "matchesInstrument": bool(answered) and set(served_models) == {required}},
             "server": server,
@@ -1555,6 +1717,12 @@ class _CellRun:
             "proxies": self._proxy_summary(),
             "internalErrors": list(self.errors) + ([f"{unjoined} stream threads did not stop"] if unjoined else []),
         }
+        if settings.repair:
+            repair = repair_summary(every)
+            repair["entriesPerSecondWithRepair"] = (_round(time_weighted_rate(every, window_start, window_end, valid), 2)
+                                                    if measured else None)
+            summary["repair"] = repair
+            summary["invalidOutputShareAfterRepair"] = repair["afterRepair"]["share"]
         return summary
 
     def _proxy_summary(self) -> dict[str, Any] | None:
@@ -1811,7 +1979,7 @@ class CapacityProbe:
                 "maxTokensRule": f"max({rule['floor']}, {rule['perItem']} * items)",
                 "maxTokens": {str(n): C.max_tokens(n, TIER) for n in sorted({c[1] for c in self.settings.grid_cells()})},
                 "requestTimeoutSeconds": self.settings.request_timeout,
-                "instrumentTimeoutSeconds": request.get("timeoutSeconds"), "repairPass": False,
+                "instrumentTimeoutSeconds": request.get("timeoutSeconds"), "repairPass": self.settings.repair,
                 "abstractCut": C.abstract_cut()}
 
     def _synthetic_record(self) -> dict[str, Any]:
@@ -2128,6 +2296,7 @@ def assess_cell(cell: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]
     out.update({"entriesPerSecond": entries.get("perSecond"), "entriesPerSecondCompleted": entries.get("perSecondCompleted"),
                 "measuredSeconds": timing.get("measuredSeconds"), "p95Seconds": latency.get("p95"),
                 "invalidOutputShare": cell.get("invalidOutputShare"), "transportFailureShare": cell.get("transportFailureShare"),
+                "invalidOutputShareAfterRepair": cell.get("invalidOutputShareAfterRepair"),
                 "promptTokensPerEntry": tokens.get("promptPerEntry"), "outputTokensPerEntry": tokens.get("completionPerEntry"),
                 "servedModels": sorted(served.get("models") or {})})
     required_model = served.get("requiredModel") or C.instrument().manifest["requiredModel"]["served"]
@@ -2223,8 +2392,14 @@ def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str,
         return {**base, "assessment": assessment, "passes": None,
                 "line": f"{head} not assessed - {name}: {assessment['reason']}.{side}"}
     passes = assessment["rate"] >= target
-    quality = (assessment["invalidOutputShare"] is not None and assessment["invalidOutputShare"] <= 0.01
-               and (assessment["transportFailureShare"] or 0) <= 0.005)
+    # The census's 1 % limit applies after its one repair pass: with --repair that share decides, otherwise the first
+    # calls' share stands in for it.
+    repaired = decisive.get("repair") is not None
+    invalid = assessment.get("invalidOutputShareAfterRepair") if repaired else assessment["invalidOutputShare"]
+    quality = (invalid is not None and invalid <= 0.01 and (assessment["transportFailureShare"] or 0) <= 0.005)
+    invalid_text = (f"{_percent(assessment['invalidOutputShare'], 2)} before and "
+                    f"{_percent(assessment.get('invalidOutputShareAfterRepair'), 2)} after the repair pass"
+                    if repaired else _percent(assessment["invalidOutputShare"], 2))
     timing = decisive.get("timing") or {}
     window = f" over a {assessment['measuredSeconds']:g} s steady-state window"
     stopped = window
@@ -2237,11 +2412,12 @@ def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str,
                    f"still open; completed calls {_num(assessment['entriesPerSecondCompleted'], 1)} entries/s)")
     model = ", ".join(assessment["servedModels"])
     line = (f"{head} {'PASS' if passes else 'FAIL'} - {name}: {assessment['rate']:.1f} entries/s{stopped}; invalid outputs "
-            f"{_percent(assessment['invalidOutputShare'], 2)}, transport failures "
+            f"{invalid_text}, transport failures "
             f"{_percent(assessment['transportFailureShare'], 2)} ({'within' if quality else 'outside'} the census limits "
             f"of 1 % and 0.5 %); {_tokens_note(assessment, settings)}; served model `{model}`"
             + ("." if passes else "; the author decides.") + side)
-    return {**base, "assessment": assessment, "passes": passes, "withinQualityLimits": quality, "line": line}
+    return {**base, "assessment": assessment, "passes": passes, "withinQualityLimits": quality,
+            "qualityBasis": "after the repair pass" if repaired else "first calls", "line": line}
 
 
 def allowed_concurrency(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
@@ -2288,7 +2464,9 @@ def render_markdown(report: dict[str, Any]) -> str:
               f"- Endpoint: {endpoint['baseUrl']} (metrics: {endpoint.get('metricsUrl') or 'not configured'}); "
               f"requested model `{request['model']}`",
               f"- Requests: temperature {request['temperature']:g}, reasoning {request['reasoningEffort']}, "
-              f"stream off, max_tokens = {request['maxTokensRule']}, first calls only (no repair pass)",
+              f"stream off, max_tokens = {request['maxTokensRule']}, "
+              + ("first calls and the census's repair pass (--repair)" if request.get("repairPass")
+                 else "first calls only (no repair pass)"),
               f"- Synthetic entries: seed {report['synthetic']['seed']}, profile "
               f"{_cell(profile_source.get('path') or profile_source.get('source') or 'built-in')}, instrument digest "
               f"`{report['instrument']['digest'][:16]}`",
@@ -2342,6 +2520,27 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"{_num((srv.get('waiting') or {}).get('max'), 0)} | {_percent((srv.get('kvCacheUsage') or {}).get('max'))} | "
             f"{shared} | {_num(client.get('rssMaxMB'), 0)} | {client.get('connectionsOpened')} | "
             f"{_cell(models)} / {_cell(fingerprints)} |")
+    repaired = [cell for cell in report.get("cells", []) if cell["state"] != "skipped" and cell.get("repair")]
+    if repaired:
+        lines += ["", "Invalid outputs before and after the repair pass, by the items of the batch's first call (decided "
+                      "entries; open: the repair call got no answer or was not sent):",
+                  "| Cell | Items/call | Entries (answered first calls) | Invalid before | Share before | Decided | "
+                  "Invalid after | Share after | Open |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for cell in repaired:
+            before, after = cell["repair"]["beforeRepair"], cell["repair"]["afterRepair"]
+            for bucket in [*before["byItemsPerCall"], "all"]:
+                b = before if bucket == "all" else before["byItemsPerCall"][bucket]
+                a = after if bucket == "all" else after["byItemsPerCall"][bucket]
+                lines.append(f"| {cell['cell']} | {bucket} | {b['entries']} | {b['invalid']} | {_percent(b['share'], 2)} | "
+                             f"{a['decided']} | {a['invalid']} | {_percent(a['share'], 2)} | {a['open']} |")
+        for cell in repaired:
+            calls = cell["repair"]["calls"]
+            lines.append(f"- {cell['cell']} repair calls: {calls['sent']} sent for {cell['repair']['batchesNeedingRepair']} "
+                         f"batches ({calls['answered']} answered, {calls['failed']} failed, {calls['abandoned']} cut off, "
+                         f"{calls['notSent']} not sent), {calls['items']} items, {calls['recovered']} recovered, "
+                         f"{calls['stillWithoutLine']} still without a parseable line; entries/s with repair calls "
+                         f"{_num(cell['repair'].get('entriesPerSecondWithRepair'), 2)}")
     examples = [f"- {cell['cell']} {failure}: {_cell(kept[0]['detail']) or '(empty body)'}"
                 for cell in report.get("cells", []) if cell["state"] != "skipped"
                 for failure, kept in (cell.get("failureExamples") or {}).items() if kept]
@@ -2372,7 +2571,10 @@ def render_plan(plan: dict[str, Any]) -> str:
              f"instrument {plan['instrument']['id']} {plan['instrument']['digest'][:16]}, {plan['instrument']['tier']} tier; "
              f"model {request['model']}",
              f"requests: temperature {request['temperature']:g}, reasoning {request['reasoningEffort']}, stream off, "
-             f"max_tokens = {request['maxTokensRule']}; first calls only",
+             f"max_tokens = {request['maxTokensRule']}; "
+             + ("first calls and the census's repair pass (--repair: one repair call per batch whose first call left "
+                "labels without a parseable line, built by the census runner)" if request.get("repairPass")
+                else "first calls only"),
              f"endpoint: {plan['endpoint']['baseUrl'] or '(no --base-url)'} (not contacted); metrics: "
              f"{plan['endpoint']['metricsUrl'] or 'not configured'}",
              f"synthetic entries: seed {plan['synthetic']['seed']}, profile {source.get('path') or source.get('source')}; "
@@ -2489,6 +2691,10 @@ def add_commands(families: Any, register: Callable[..., None]) -> None:
                            help="departure from the expected tokens per entry that warns and normalises (default 0.2)")
     probe.add_argument("--seed", type=int, default=1, help="seed of the synthetic entries (default 1)")
     probe.add_argument("--journal", default=DEFAULT_JOURNAL, help="journal parameter of the system prompt")
+    probe.add_argument("--repair", action="store_true",
+                       help="also send the census's one repair call for every batch whose first call left labels without "
+                            "a parseable line (or failed), built by the census runner, and report invalid outputs before "
+                            "and after the repair pass, overall and by items per call (1, 2-9, 10-39, 40)")
     probe.add_argument("--output", help="new or empty directory for the report, markdown table and call log")
     probe.add_argument("--dry-run", action="store_true", help="print the grid, request sizes and expected load; send nothing")
     register(probe, "capacity_probe", "command", "operator", state_required=False)
@@ -2521,7 +2727,7 @@ def settings_from_args(args: Any) -> ProbeSettings:
         shared_tolerance=args.shared_tolerance, allowed_streams=args.allowed_streams, target_rate=args.target_rate,
         expect_output_tokens=args.expect_output_tokens, expect_prompt_tokens=args.expect_prompt_tokens,
         expect_tolerance=args.expect_tolerance, profile=profile, profile_expected=expected, profile_source=source,
-        seed=args.seed, journal=args.journal)
+        seed=args.seed, journal=args.journal, repair=bool(getattr(args, "repair", False)))
 
 
 def _stderr(line: str) -> None:
@@ -2552,6 +2758,7 @@ def profile_command(args: Any) -> Any:
 
 
 __all__ = ["CapacityProbe", "ProbeSettings", "SyntheticCorpus", "ConnectionPool", "AbortMonitor", "classify_response",
+           "build_repair_request", "repair_summary", "item_bucket",
            "parse_prometheus", "server_load", "time_weighted_rate", "completed_rate", "percentile", "ordered_grid",
            "parse_cells", "build_request", "render_markdown", "render_plan", "exit_criterion", "allowed_concurrency",
            "server_verdict", "assess_cell", "above_allowed_reason", "profile_from_database", "load_profile",

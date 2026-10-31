@@ -54,9 +54,18 @@ class MockJudge:
         self.chat_connections, self.chat_authorization, self.other_authorization = set(), set(), []
         self.bodies: list[str] = []
         self.payloads: list[dict] = []
+        self.drop_first_labels: set[str] = set()     # left out of first calls only (a repair call answers them)
+        self.never_labels: set[str] = set()          # never answered
+        self.repair_requests: list[dict] = []
 
     def answer(self, k: int, payload: dict) -> tuple[str, str]:
-        labels = re.findall(r"^### id=(.+)$", payload["messages"][1]["content"], flags=re.M)
+        user = payload["messages"][1]["content"]
+        labels = re.findall(r"^### id=(.+)$", user, flags=re.M)
+        repair = user.split("\n")[1] == C.repair_note()
+        if repair:
+            self.repair_requests.append(payload)
+        labels = [label for label in labels if label not in self.never_labels
+                  and (repair or label not in self.drop_first_labels)]
         if self.empty_every and k % self.empty_every == 0:
             self.empty += 1
             return "", "stop"
@@ -859,6 +868,148 @@ class OutputTests(ProbeCase):
         unknown = P.allowed_concurrency({"cells": cells, "server": {"shared": None}}, settings)
         self.assertIn("cannot show that the server is not shared", unknown["line"])
         self.assertIn("no metrics endpoint", P.allowed_concurrency({"cells": cells, "server": {}}, P.ProbeSettings())["line"])
+
+
+class RepairTests(ProbeCase):
+    """--repair: the census's own repair call per batch, and invalid outputs before and after it by items per call."""
+
+    def test_the_repair_pass_is_the_census_runners_and_counts_invalid_outputs_before_and_after(self):
+        from ocsl_review.census_runner import ITEM_BUCKETS
+        self.judge.drop_first_labels, self.judge.never_labels = {"7", "40"}, {"13"}
+        report = self.probe("2x40", metrics=False, repair=True, cell_seconds=0.8)
+        self.assertTrue(report["request"]["repairPass"])
+        cell = report["cells"][0]
+        calls = self.calls()
+        firsts = {r["batch"]: r for r in calls if r["kind"] == "first"}
+        repairs = {r["batch"]: r for r in calls if r["kind"] == "repair"}
+        self.assertTrue(firsts and repairs)
+        self.assertEqual(set(calls[0]) - {"kind"}, set(next(iter(firsts.values()))) - {"kind"})
+        corpus = P.cell_corpus(self.settings("2x40", repair=True), 2, 40)
+        for index, repair in repairs.items():
+            batch = corpus.batch(40, index)
+            first_labels = [item["label"] for item in batch.items]
+            left = [label for label in first_labels if label in {"7", "40", "13"}]
+            self.assertEqual(firsts[index]["missing"], len(left))
+            self.assertEqual((len(left), len(first_labels)), (repair["items"], repair["firstItems"]))
+            # The very body the census runner builds for this batch's repair call.
+            payload, body, labels = P.build_repair_request(
+                batch, first_labels, [label for label in first_labels if label not in left], journal=P.DEFAULT_JOURNAL,
+                model=MODEL)
+            self.assertEqual(hashlib.sha256(body).hexdigest(), repair["bodySha256"])
+            self.assertEqual(left, labels)
+            self.assertEqual(C.repair_note(), payload["messages"][1]["content"].split("\n")[1])
+            self.assertEqual(C.max_tokens(len(left)), payload["max_tokens"])
+            self.assertEqual(1 if "13" in left else 0, repair["missing"])
+        for payload in self.judge.repair_requests:
+            self.assertTrue(set(re.findall(r"^### id=(.+)$", payload["messages"][1]["content"], flags=re.M))
+                            <= {"7", "40", "13"})
+        self.assertEqual(sum(1 for r in firsts.values() if r["missing"]), len(repairs) + cell["repair"]["calls"]["notSent"])
+        before, after = cell["repair"]["beforeRepair"], cell["repair"]["afterRepair"]
+        answered = [r for r in firsts.values() if r["outcome"] == "answered"]
+        self.assertEqual(sum(r["items"] for r in answered), before["entries"])
+        self.assertEqual(sum(r["missing"] for r in answered), before["invalid"])
+        self.assertEqual(cell["invalidOutputShare"], before["share"])
+        self.assertEqual(cell["entries"]["answered"], before["entries"], "the first calls' statistics are E0's")
+        self.assertEqual(sum(r["missing"] for r in repairs.values() if r["outcome"] == "answered"), after["invalid"])
+        self.assertEqual(after["share"], cell["invalidOutputShareAfterRepair"])
+        self.assertLess(after["share"], before["share"])
+        self.assertEqual([name for name, _, _ in ITEM_BUCKETS], list(after["byItemsPerCall"]))
+        by_items = {}
+        for index, first in firsts.items():
+            if first["outcome"] == "answered":
+                by_items.setdefault(P.item_bucket(first["items"]), []).append(first)
+        for name, rows in by_items.items():
+            self.assertEqual(sum(r["items"] for r in rows), before["byItemsPerCall"][name]["entries"])
+        self.assertGreater(before["byItemsPerCall"]["40"]["entries"], 0)
+        self.assertEqual(before["entries"], after["decided"] + after["open"])
+        self.assertEqual(len(repairs), cell["repair"]["calls"]["sent"])
+        self.assertEqual(cell["calls"]["sent"], len(firsts), "repair calls are counted apart")
+        verdict = report["exitCriterion"]
+        if verdict.get("assessment") and verdict["assessment"].get("eligible"):
+            self.assertIn("after the repair pass", verdict["line"])
+            self.assertEqual("after the repair pass", verdict["qualityBasis"])
+        markdown = (self.output / P.MARKDOWN_NAME).read_text()
+        self.assertIn("first calls and the census's repair pass (--repair)", markdown)
+        self.assertIn("Invalid outputs before and after the repair pass", markdown)
+        self.assertRegex(markdown, r"\| 2x40 \| 40 \| \d+ \|")
+
+    def test_a_failed_first_call_is_repaired_in_full_and_an_unanswered_repair_leaves_labels_open(self):
+        self.judge.fail_every = 3
+        report = self.probe("2x5", metrics=False, repair=True, abort_failure_share=1.0)
+        cell = report["cells"][0]
+        calls = self.calls()
+        firsts = {r["batch"]: r for r in calls if r["kind"] == "first"}
+        repairs = {r["batch"]: r for r in calls if r["kind"] == "repair"}
+        failed = [index for index, r in firsts.items() if r["outcome"] == "failed"]
+        self.assertTrue(failed)
+        for index in failed:
+            if index in repairs:
+                self.assertEqual(firsts[index]["items"], repairs[index]["items"], "every label of a failed first call")
+        after = cell["repair"]["afterRepair"]
+        unanswered = sum(firsts[i]["items"] for i in failed if repairs.get(i, {}).get("outcome") != "answered")
+        self.assertEqual(unanswered, after["open"])
+        self.assertEqual(0, after["invalid"])
+        self.assertEqual(sum(r["items"] for r in firsts.values()), after["decided"] + after["open"])
+
+    def test_without_repair_the_probe_sends_first_calls_only(self):
+        self.judge.drop_first_labels = {"2"}
+        report = self.probe("2x5", metrics=False)
+        self.assertFalse(report["request"]["repairPass"])
+        self.assertNotIn("repair", report["cells"][0])
+        self.assertNotIn("invalidOutputShareAfterRepair", report["cells"][0])
+        self.assertEqual([], self.judge.repair_requests)
+        self.assertTrue(all("kind" not in record for record in self.calls()))
+        self.assertIn("first calls only (no repair pass)", (self.output / P.MARKDOWN_NAME).read_text())
+
+    def test_repair_summary_joins_first_and_repair_calls_by_batch(self):
+        first = lambda batch, items, outcome="answered", missing=0: {
+            "batch": batch, "kind": "first", "items": items, "outcome": outcome, "missing": missing}
+        repair = lambda batch, items, outcome="answered", missing=0: {
+            "batch": batch, "kind": "repair", "items": items, "outcome": outcome, "missing": missing,
+            "valid": items - missing, "seconds": 0.5}
+        summary = P.repair_summary([
+            first(0, 40, missing=3), repair(0, 3, missing=1),          # repaired, one label still invalid
+            first(1, 40),                                               # nothing to repair
+            first(2, 12, missing=2), repair(2, 2, "failed"),            # the repair call got no answer: open
+            first(3, 1, "failed"), repair(3, 1),                        # a failed first call, repaired in full
+            first(4, 5, "failed"),                                      # failed, no repair sent: open
+            first(5, 7, missing=1),                                     # needed a repair that was not sent: open
+            first(6, 40, "abandoned"),                                  # cut off: open, never decided
+        ])
+        before, after = summary["beforeRepair"], summary["afterRepair"]
+        self.assertEqual({"entries": 80, "invalid": 3, "share": 0.0375}, {k: before["byItemsPerCall"]["40"][k]
+                                                                         for k in ("entries", "invalid", "share")})
+        self.assertEqual((80, 1, 40), (after["byItemsPerCall"]["40"]["decided"], after["byItemsPerCall"]["40"]["invalid"],
+                                       after["byItemsPerCall"]["40"]["open"]))
+        self.assertEqual((10, 0, 2), tuple(after["byItemsPerCall"]["10-39"][k] for k in ("decided", "invalid", "open")))
+        self.assertEqual((1, 0, 0), tuple(after["byItemsPerCall"]["1"][k] for k in ("decided", "invalid", "open")))
+        self.assertEqual((6, 0, 6), tuple(after["byItemsPerCall"]["2-9"][k] for k in ("decided", "invalid", "open")))
+        self.assertEqual((99, 6), (before["entries"], before["invalid"]))
+        self.assertEqual((97, 1, 48), (after["decided"], after["invalid"], after["open"]))
+        self.assertEqual(round(1 / 97, 5), after["share"])
+        self.assertEqual(5, summary["batchesNeedingRepair"])
+        self.assertEqual({"sent": 3, "answered": 2, "failed": 1, "notSent": 2, "recovered": 3},
+                         {k: summary["calls"][k] for k in ("sent", "answered", "failed", "notSent", "recovered")})
+
+    def test_the_exit_line_applies_the_census_limit_after_the_repair_pass(self):
+        settings = P.ProbeSettings(repair=True)
+        cell = decision_cell("60x40", 56.2, invalid=0.0321)
+        cell["repair"] = {"afterRepair": {"share": 0.004}}
+        cell["invalidOutputShareAfterRepair"] = 0.004
+        verdict = P.exit_criterion({"cells": [cell]}, settings)
+        self.assertTrue(verdict["withinQualityLimits"])
+        self.assertIn("invalid outputs 3.21 % before and 0.40 % after the repair pass", verdict["line"])
+        cell["invalidOutputShareAfterRepair"] = 0.0125
+        verdict = P.exit_criterion({"cells": [cell]}, settings)
+        self.assertFalse(verdict["withinQualityLimits"])
+        self.assertIn("outside the census limits", verdict["line"])
+
+    def test_the_command_line_takes_repair(self):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = main(["capacity", "probe", "--dry-run", "--repair", "--cells", "60x40"])
+        self.assertEqual(0, code)
+        self.assertIn("first calls and the census's repair pass (--repair", out.getvalue())
 
 
 class SharedServerTests(ProbeCase):

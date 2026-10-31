@@ -28,6 +28,10 @@ ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIA
 ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIABLE \
   --metrics-url "$JUDGE_METRICS_URL" --cells 60x40 --cell-seconds 900 --output probes/judge-60x40
 
+# The deciding cell with the census's repair pass: invalid outputs before and after it, by items per call.
+ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIABLE \
+  --cells 60x40 --cell-seconds 900 --repair --output probes/judge-60x40-repair
+
 # With sizes and expected tokens per entry measured on a study's own public inputs (after its pilot).
 ocsl-review capacity profile --database work/census.sqlite3 --output probes/profile.json
 ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIABLE \
@@ -64,14 +68,16 @@ to `--drain-seconds` each; the dry run prints the estimate.
 | `--journal` | a synthetic name | the system prompt's journal parameter |
 | `--seed` | 1 | seed of the synthetic entries |
 | `--proxy-pid` | none | process whose resident memory is sampled with the server load (repeatable) |
+| `--repair` | off | also send the census's one repair call per batch and report invalid outputs before and after the [repair pass](#repair-pass---repair) |
 
 ## What it sends
 
 Every request is the instrument's first abstract-tier call for one batch,
 built by `citation_census`: the system prompt with the journal parameter, the
 per-batch user content, temperature 0, reasoning effort `none`,
-`max_tokens = max(3000, 700 * items)` and streaming off. The probe sends no
-repair pass. The request body bytes are recorded by sha256 per call.
+`max_tokens = max(3000, 700 * items)` and streaming off. Without `--repair`
+the probe sends no repair pass. The request body bytes are recorded by sha256
+per call.
 
 The entries are synthetic and deterministic: every value derives from the
 seed, the cell, the entry's position and the size profile, built from a fixed
@@ -274,6 +280,45 @@ the server is not shared does the report say that the author may allow more
 and name the best cell above it with the instrument's geometry (exploratory
 geometries are named apart).
 
+## Repair pass (`--repair`)
+
+The census's limit of 1 % invalid outputs applies after its one repair pass,
+which the first calls alone cannot show. With `--repair`, each stream sends,
+right after the first call of a batch that left labels without a parseable
+line, the census's repair call for that batch: the same selection and builder
+the census runner uses (`census_runner.repair_items` and `abstract_call` with
+kind `repair`), so the open labels in batch order, the instrument's repair
+note as the second line of the user message and `max_tokens` for the repair
+call's own size. A first call that failed is repaired with every label, as in
+the census; an empty completion leaves every label open for the repair call.
+No repair call is sent once an abort rule fired or the cell is cutting its
+calls off; such a batch's labels stay open.
+
+Each cell then carries a `repair` block and `invalidOutputShareAfterRepair`:
+
+- `beforeRepair`: labels the answered first calls left without a parseable
+  line, over the entries they carried (equal to `invalidOutputShare`);
+- `afterRepair`: labels still without one once the batch's repair call was
+  answered, over the entries decided, which is how the census gates count
+  them; `open` counts the labels of batches whose repair call got no answer or
+  was not sent, undecided as in the census and never counted as valid or
+  invalid;
+- both by the items of the batch's first call, in the census gates' buckets
+  `1`, `2-9`, `10-39` and `40` (a 40-item cell carries full batches and each
+  review's remainder batch);
+- `calls`: repair calls sent, answered, failed, cut off and not sent, their
+  items, the labels they recovered and those still without a line, tokens and
+  latency; `entriesPerSecondWithRepair` adds the recovered entries to the rate.
+
+Every first-call statistic (rates, latency, tokens, transport failures, the
+window) stays the first calls' own, so cells with and without `--repair`
+compare; the repair calls still take their stream's time, count for the
+concurrency, the server counters, the served model and the abort rules, and
+appear in `calls.jsonl` with `kind: repair` (`kind: first` for first calls).
+The markdown adds a table of both shares by items per call, and the exit line
+reads "invalid outputs X before and Y after the repair pass" and applies the
+census limit to Y.
+
 ## Exit criterion
 
 Only one cell decides: the instrument's own geometry (40 items per call, the
@@ -355,8 +400,11 @@ duration estimate. `--json` prints the plan as JSON.
 
 ## Differences from a census run
 
-- First calls only: the census repairs labels without a parseable line once,
-  so its invalid share is at most the probe's.
+- First calls only, unless `--repair`: the census repairs labels without a
+  parseable line once, so its invalid share is at most the probe's first-call
+  share; `--repair` measures it after the census's own repair call. A repair
+  call the judge refuses (HTTP 400, 413 or 422) leaves the probe's labels open,
+  where the census counts them invalid.
 - One attempt per call: the census makes up to three attempts with backoff, so
   the probe's transport failures per call bound the census's from above.
 - The census counts an empty completion, and a refusal of the request itself
@@ -381,6 +429,8 @@ instrument's builders, connection reuse, rates, the steady-state window
 (checked against a processor-sharing simulation, where stopping at the window's
 end reads high and the probe's window does not), abort rules, invalid outputs,
 the shared-server checks, cells above the allowed concurrency, the decision
-rules, profiles from a census database, the report shape and that the key
+rules, profiles from a census database, the repair pass (`RepairTests`: the
+repair calls' bodies equal the census runner's, shares before and after by
+items per call, failed and unanswered repairs), the report shape and that the key
 never reaches the report, the call log or the output streams, in whole or in
 part.
