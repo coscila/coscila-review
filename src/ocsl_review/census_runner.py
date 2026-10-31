@@ -447,6 +447,33 @@ def writer_lock(database: Path) -> int:
     return descriptor
 
 
+# ----------------------------------------------------------------------------- the abstract tier's calls of one batch
+ABSTRACT_CALL_KINDS = ("first", "repair")
+
+
+def abstract_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, kind: str, model: str,
+                  cut: Any = True) -> dict[str, Any]:
+    """The request of one abstract-tier call of a batch, as the census sends it.
+
+    The first call carries the whole batch; the repair call carries the items ``repair_items`` selects, with the
+    instrument's repair note. ``ocsl-review capacity probe --repair`` builds its repair calls here too, so the share
+    of invalid outputs it measures after the repair pass is the census's own.
+    """
+    if kind not in ABSTRACT_CALL_KINDS:
+        raise ValidationError(f"an abstract-tier call is first or repair, not {kind!r}")
+    messages = (C.build_abstract_messages(items, title, journal, cut=cut) if kind == "first"
+                else C.build_repair_messages(items, title, journal, cut=cut))
+    return C.request_payload(messages, model=model, items=len(items), tier="abstract")
+
+
+def repair_items(batch: Sequence[dict[str, Any]], open_labels: Iterable[str],
+                 answered: Iterable[str]) -> list[dict[str, Any]]:
+    """The items of a batch's one repair call: the open labels the first call left without a parseable line (every
+    open label when the first call failed), in batch order; empty when nothing is left to repair."""
+    wanted, got = set(open_labels), set(answered)
+    return [item for item in batch if item["label"] in wanted and item["label"] not in got]
+
+
 class CensusRun:
     """A census run over one working scores database (one writing process at a time)."""
 
@@ -974,12 +1001,10 @@ class CensusRun:
                 # A fidelity failure or a halted broker: nothing more is sent and the open labels stay open.
                 answered, stopped = False, True
                 break
-            sub = batch if kind == "first" else [it for it in batch if it["label"] in open_labels and it["label"] not in got]
+            sub = batch if kind == "first" else repair_items(batch, open_labels, got)
             if not sub:
                 break
-            messages = (C.build_abstract_messages(sub, title, journal, cut=cut) if kind == "first"
-                        else C.build_repair_messages(sub, title, journal, cut=cut))
-            payload = C.request_payload(messages, model=self.request_model, items=len(sub), tier="abstract")
+            payload = abstract_call(sub, title, journal, kind=kind, model=self.request_model, cut=cut)
             result = self._call(payload, tier="abstract", journal=journal, doi=doi, variant=variant, batch=batch_index,
                                 kind=kind, items=len(sub))
             labels = [it["label"] for it in sub]
