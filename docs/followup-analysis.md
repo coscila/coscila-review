@@ -158,7 +158,8 @@ The retraction-lag model, rule `retraction-lag@1`.
 ## followup estimands [--b <replicates>] [--bootstrap-seed <seed>]
 
 The protocol's estimands, by journal, by year and by status where the estimand's `by` names them (the cross of the
-named breakdowns, with all-journal and all-year margins).
+named breakdowns, with all-journal and all-year margins). Journal and status cells form the protocol's full grid; a year
+cell without any unit is not written.
 
 | Estimand | Numerator | Denominator |
 |---|---|---|

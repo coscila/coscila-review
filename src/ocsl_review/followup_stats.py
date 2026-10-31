@@ -408,6 +408,8 @@ def after_notice_share(connection: sqlite3.Connection, rows: Sequence[Mapping[st
         selected = [row for row in rows if status is None or row["status"] == status]
         for journal, year in _cells(selected, journals, by_year=True):
             cell = [row for row in selected if _in_cell(row, journal, year)]
+            if year is not None and not cell:
+                continue
             decidable = [row for row in cell if row["after_notice"] is not None]
             # One scope for the lag model and the cited-after-notice estimand: equal B and seed give equal intervals.
             scope_parts = ("after-notice", slugs.get(journal, ALL), year if year is not None else ALL, status or ALL)

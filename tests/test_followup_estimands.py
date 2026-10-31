@@ -218,6 +218,14 @@ class EstimandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "positive"):
             followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=0, bootstrap_seed=None))
 
+    def test_year_cells_without_units_are_not_written(self):
+        self.assertIn(f"followup.sole-or-essential.{SLUG_B}.2022.share", self.values)
+        self.assertIn("followup.sole-or-essential.all.2021.share", self.values)
+        self.assertNotIn(f"followup.sole-or-essential.{SLUG_B}.2021.share", self.values)
+        self.assertEqual({}, self.coverage("sole-or-essential", JB, "2021"))
+        self.assertIn(f"followup.sole-or-essential.{SLUG_B}.all.share", self.values)
+        self.assertIn("followup.sole-or-essential.expression-of-concern.all.all.share", self.values)
+
     def test_only_declared_breakdowns_and_estimands_are_written(self):
         protocol = estimands_protocol()
         protocol["estimands"] = [declared("sole-or-essential", by=["journal"])]

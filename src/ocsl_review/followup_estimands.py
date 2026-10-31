@@ -6,7 +6,7 @@ cross of the named breakdowns, with ``all`` margins), as a Hajek-weighted share 
 realised inclusion probability, and a percentile bootstrap that resamples reviews with replacement within journal
 (replicates and seed from the protocol unless ``--b`` / ``--bootstrap-seed`` override them; one scope tuple per
 estimand and cell). Units without a verdict never enter a numerator or a denominator: each goes to ``fu_coverage``
-with its reason. Abstract silence and failed downloads are reasons, never "unsupported".
+with its reason. Journal and status cells form the protocol's full grid; a year cell without any unit is not written. Abstract silence and failed downloads are reasons, never "unsupported".
 
 | Id | Numerator | Denominator | Units |
 |---|---|---|---|
@@ -275,6 +275,8 @@ def compute(connection: sqlite3.Connection, protocol: Mapping[str, Any], declare
     rows = 0
     for journal, year, status in _cells(units, journals, statuses, by, spec.status_cells):
         cell = [unit for unit in units if _in(unit, journal, year, status)]
+        if year is not None and not cell:
+            continue
         assessable = [unit for unit in cell if unit.reason is None]
         clusters: dict[str, dict[tuple[str, str], list[float]]] = defaultdict(dict)
         for unit in assessable:
@@ -288,14 +290,14 @@ def compute(connection: sqlite3.Connection, protocol: Mapping[str, Any], declare
         scope_parts = (spec.scope_label, *cell_scope) if spec.scope_label else ("followup", estimand, *cell_scope)
         boot = cluster_ratio_bootstrap(groups, b=b, seed=seed, scope_parts=scope_parts, levels=len(levels))
         denominator = sum(unit.weight for unit in assessable)
+        extra = spec.detail(cell) if spec.detail else {}
         for index, (level, test) in enumerate(levels):
             detail = {"estimand": estimand, "level": level, "status": status,
                       "levelRole": "numerator" if level else None, "statusRole": "subpopulation" if status else None,
                       "numerator": declared["numerator"], "denominator": declared["denominator"],
                       "by": by, "weights": WEIGHTS, "interval": INTERVAL, "b": b, "seed": seed,
                       "scope": list(scope_parts), "replicates": boot["replicates"], "reviews": boot["clusters"],
-                      **({"labelSource": declared["labelSource"]} if declared.get("labelSource") else {}),
-                      **(spec.detail(cell) if spec.detail else {})}
+                      **({"labelSource": declared["labelSource"]} if declared.get("labelSource") else {}), **extra}
             rows += write_share_rows(
                 connection, estimand=estimand, qualifiers=[level, status], journal=journal,
                 slug=slugs.get(journal, ALL), year=year, stratum=stratum,
@@ -331,6 +333,8 @@ def distortion(connection: sqlite3.Connection, protocol: Mapping[str, Any], decl
     rows = 0
     for journal, year, status in _cells(units, journals, statuses, by, True):
         cell = [unit for unit in units if _in(unit, journal, year, status)]
+        if year is not None and not cell:
+            continue
         detail = {"estimand": "distortion-type", "status": status, "numerator": declared["numerator"],
                   "denominator": declared["denominator"], "labelSource": declared.get("labelSource") or "adjudication",
                   "labels": list(DISTORTION_LABELS), "awaitingLabels": len(cell), "b": b, "seed": seed,
