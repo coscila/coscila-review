@@ -360,7 +360,10 @@ def traverse(connection: Any, scholarly: Any, *, sources: Sequence[str], widen: 
                                                               "targets": len(chosen)})
     united = connection.execute("SELECT COUNT(*) FROM (SELECT DISTINCT target_doi, citing_key FROM fu_citedby_edges)"
                                 ).fetchone()[0]
-    return {"targets": len(chosen), "widened": widen, "sources": list(sources),
+    dependency_rows = connection.execute("SELECT COUNT(*) FROM fu_dependency").fetchone()[0]
+    notes = [] if widen or dependency_rows else ["no dependency rows: run followup dependency first, or --widen"]
+    return {"targets": len(chosen), "widened": widen, "sources": list(sources), "dependencyRows": dependency_rows,
+            "notes": notes,
             "states": {source: dict(sorted(count.items())) for source, count in states.items()}, "edges": found,
             "graphEdges": rows, "unitedCitingWorks": united, "dataset": dataset, "requests": recorder.summary()}
 

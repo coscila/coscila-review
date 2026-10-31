@@ -166,6 +166,15 @@ class CitedByTests(unittest.TestCase):
         self.assertEqual(["10.5555/fu.review.a2", "10.5555/fu.review.b1"], narrow)
         self.assertEqual(["10.5555/fu.review.a1", "10.5555/fu.review.a2", "10.5555/fu.review.b1"], wide)
 
+    def test_a_branch_without_dependency_rows_says_so(self):
+        with self.branch.writing() as connection:
+            connection.execute("DELETE FROM fu_dependency")
+        result = self.traverse(F.FixtureTransport(routes()))
+        self.assertEqual((0, 0), (result["targets"], result["dependencyRows"]))
+        self.assertTrue(result["notes"])
+        widened = self.traverse(F.FixtureTransport(routes()), widen=True)
+        self.assertEqual((3, []), (widened["targets"], widened["notes"]))
+
     def test_records_sharing_an_identifier_carry_one_key(self):
         edges = [CitedByEdge("t", "pmid:1", "europe-pmc", "r", "x", citing_pmid="1"),
                  CitedByEdge("t", "openalex:W1", "openalex", "r", "x", citing_pmid="1", citing_doi="10.1/a",

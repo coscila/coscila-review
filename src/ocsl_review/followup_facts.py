@@ -334,6 +334,8 @@ def export_facts(database: Path, output: Path, *, code_revision: str | None = No
     branch = FollowupBranch(Path(database))
     output = Path(output)
     target = output / "facts.sqlite3"
+    if output.exists() and not output.is_dir():
+        raise ValidationError("the facts output is not a directory; export into a new directory")
     if target.exists() or (output / "facts.json").exists():
         raise ValidationError("a facts export already exists there; export into a new directory")
     report = branch.verify(deep=True)

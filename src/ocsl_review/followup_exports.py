@@ -356,7 +356,7 @@ def write_claims_database(path: Path, rows: Sequence[Mapping[str, Any]], connect
 def export(database: Path, output: Path, *, allow_entitled_text: bool = False) -> dict[str, Any]:
     branch = FollowupBranch(Path(database))
     output = Path(output)
-    if output.exists() and any(output.iterdir()):
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValidationError("the export directory is not empty; export into a new directory")
     report = branch.verify(deep=True)
     if not report["ok"]:
