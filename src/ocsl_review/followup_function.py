@@ -10,8 +10,9 @@ documents, read-only, named by their sha256 as the census stored them) the revie
 own extraction, the citing unit whose sentence digest matches is found and its neighbours are taken; otherwise they are
 empty strings, as the instrument's evidence policy says.
 
-This module also holds the unit selection the judging commands share (strata, the pilot subsample, the seeded
-replicate draw), the marker of a locus, the review documents and the judge checks.
+This module also holds the unit selection the support and function commands share (strata, the pilot subsample, the
+replicate units of ``followup_strata.replicate_keys``, which every judging command uses), the marker of a locus, the
+review documents and the judge checks.
 """
 from __future__ import annotations
 
@@ -31,22 +32,17 @@ INSTRUMENT_ID = "citation-function@1"
 TIER = "locus"
 SCOPE_STRATA = ("S0", "S1", "S2", "S3")
 MARK = re.compile(r"⟨([^ ⟩]+)⟩")
-REPLICATE_RULE = "sha256('<protocol seed>:replicate:<locus id>') read as a fraction below the protocol's replicate share"
 
 
 # ----------------------------------------------------------------------------- unit selection
-def replicate_draw(seed: int, locus: str) -> float:
-    """A fraction in [0, 1) fixed by the protocol seed and the locus id (the replicate selection rule)."""
-    return int(hashlib.sha256(f"{seed}:replicate:{locus}".encode("utf-8")).hexdigest()[:16], 16) / float(1 << 64)
-
-
 def select_units(connection: Any, strata: Sequence[str], *, scope: str = "all", variant: str = "primary",
-                 protocol: Mapping[str, Any] | None = None, include_cocited_of_pilot: bool = False
-                 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+                 protocol: Mapping[str, Any] | None = None, include_cocited_of_pilot: bool = False,
+                 instrument_id: str | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Frame units of the given strata (document order), restricted to the pilot or drawn for the replicate.
 
     ``include_cocited_of_pilot`` adds, in the pilot scope, the co-cited loci of pilot anchors (the dependency of a
-    pilot anchor needs their verdicts).
+    pilot anchor needs their verdicts). The replicate units are ``followup_strata.replicate_keys`` of the units in
+    scope with the instrument id as its scope, as for every judging command.
     """
     if scope not in ("all", "pilot"):
         raise ValidationError("--scope is pilot or all")
@@ -68,12 +64,17 @@ def select_units(connection: Any, strata: Sequence[str], *, scope: str = "all", 
         rows = [row for row in rows if row["locus_id"] in pilots]
         selection["pilotUnits"] = len(rows)
     if variant == "replicate":
+        from .followup_strata import REPLICATE_RULE, replicate_keys
         share = ((((protocol or {}).get("strata") or {}).get("replicate") or {}).get("share"))
         seed = (protocol or {}).get("seed")
         if share is None or seed is None:
             raise ValidationError("the protocol declares no replicate share and seed")
-        rows = [row for row in rows if replicate_draw(int(seed), row["locus_id"]) < float(share)]
-        selection.update(replicateRule=REPLICATE_RULE, seed=seed, share=share, replicateUnits=len(rows))
+        if not instrument_id:
+            raise ValidationError("a replicate selection needs the instrument id as its scope")
+        keep = set(replicate_keys(protocol, [row["locus_id"] for row in rows], scope_parts=(instrument_id,)))
+        rows = [row for row in rows if row["locus_id"] in keep]
+        selection.update(replicateRule=REPLICATE_RULE, replicateScope=[instrument_id], seed=seed, share=share,
+                         replicateUnits=len(rows))
     return rows, selection
 
 
@@ -347,7 +348,8 @@ def run_function(connection: Any, branch: FollowupBranch, judge: Any, policy: An
     prepare_judge(judge, instrument, TIER)
     documents = documents or ReviewDocuments(None)
     everything, _ = select_units(connection, SCOPE_STRATA)
-    units, selection = select_units(connection, SCOPE_STRATA, scope=scope, variant=variant, protocol=protocol)
+    units, selection = select_units(connection, SCOPE_STRATA, scope=scope, variant=variant, protocol=protocol,
+                                    instrument_id=instrument.id)
     items, blocked, methods = function_items(connection, branch, units, documents)
     blocks = block_new(connection, instrument, TIER, blocked, variant=variant)
     sendable = [item for item in items if not public_only or item["provenance"] == "public"]

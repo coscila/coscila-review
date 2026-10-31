@@ -564,7 +564,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     documents = documents or ReviewDocuments(None)
     everything, _ = select_units(connection, TIER_STRATA[tier])
     units, selection = select_units(connection, TIER_STRATA[tier], scope=scope, variant=variant, protocol=protocol,
-                                    include_cocited_of_pilot=True)
+                                    include_cocited_of_pilot=True, instrument_id=instrument.id)
     reasons: dict[str, str] = {}
     blocked: list[tuple[str, str, str]] = []
     sentences: dict[str, str] = {}

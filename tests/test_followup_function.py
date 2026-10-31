@@ -15,7 +15,7 @@ from unittest import mock
 
 import followup_fixtures as F
 from ocsl_review import followup_function as FN
-from ocsl_review import instruments, scores_db
+from ocsl_review import followup_strata, instruments, scores_db
 from ocsl_review.cli import main
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.followup_branch import FollowupBranch
@@ -189,10 +189,12 @@ class FunctionTests(unittest.TestCase):
         result = self.run_function(branch, judge, scope="pilot")
         self.assertEqual((2, 2), (result["selection"]["pilotUnits"], result["sent"]))
         replicate = self.run_function(branch, judge, variant="replicate")
-        drawn = [name for name in ("a1/1", "a2/1", "a2/2", "b1/1", "b1/2", "a1/4", "a2/3")
-                 if FN.replicate_draw(F.PROTOCOL["seed"], locus(name)) < 0.5]
-        self.assertEqual(len(drawn), replicate["selection"]["replicateUnits"])
-        self.assertEqual(FN.REPLICATE_RULE, replicate["selection"]["replicateRule"])
+        units = [locus(name) for name in ("a1/1", "a2/1", "a2/2", "b1/1", "b1/2", "a1/4", "a2/3")]
+        drawn = followup_strata.replicate_keys(F.PROTOCOL, units, scope_parts=(FN.INSTRUMENT_ID,))
+        self.assertEqual(4, len(drawn), "the ceiling of the protocol's share of the units in scope")
+        self.assertEqual((len(drawn), followup_strata.REPLICATE_RULE, [FN.INSTRUMENT_ID]),
+                         (replicate["selection"]["replicateUnits"], replicate["selection"]["replicateRule"],
+                          replicate["selection"]["replicateScope"]))
         with closing(branch.connect()) as connection:
             variants = dict(connection.execute("SELECT variant, COUNT(*) FROM fu_judgments WHERE outcome='accepted' "
                                                "GROUP BY variant").fetchall())

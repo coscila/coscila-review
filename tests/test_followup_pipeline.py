@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import followup_fixtures as F
-from ocsl_review import followup_estimands, followup_net
+from ocsl_review import followup_estimands, followup_net, followup_strata
 from ocsl_review.claim_check import ConfidentialPolicy
 from ocsl_review.cli import main
 from ocsl_review.followup_branch import FollowupBranch
@@ -153,6 +153,13 @@ class PipelineTests(unittest.TestCase):
         full_text = {**support_routes(), FULL_TEXT.format("PMC900004"): (200, PLAIN_FULL_TEXT)}
         self.invoke("support", *database, "--tier", "full-text", "--europe-pmc", *JUDGE, routes=full_text)
         self.invoke("function", *database, *JUDGE)
+        # every judging command draws its replicate units with the one rule of the strata module
+        functions = [row["locus_id"] for row in self.rows("SELECT DISTINCT locus_id FROM fu_strata WHERE stratum IN "
+                                                          "('S0','S1','S2','S3')")]
+        replicate = self.invoke("function", *database, *JUDGE, "--variant", "replicate")
+        self.assertEqual((followup_strata.REPLICATE_RULE, len(followup_strata.replicate_keys(
+            pipeline_protocol(), functions, scope_parts=("citation-function@1",)))),
+            (replicate["selection"]["replicateRule"], replicate["selection"]["replicateUnits"]))
         self.invoke("dependency", *database)
         dependency = {row["locus_id"]: row["class"] for row in self.rows("SELECT locus_id, class FROM fu_dependency")}
         self.assertEqual({lid(JA, A1, "1"): "essential", lid(JA, A2, "1"): "sole", lid(JA, A2, "2"): "sole",

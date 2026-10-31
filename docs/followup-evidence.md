@@ -82,8 +82,10 @@ Options: `--store DIR --store-root ROOT`, `--provider-cache FILE`, `--europe-pmc
 
 citation-support@2 runs unchanged, one item per call, on the units of S0, S1, S2, S3 and the co-cited loci at either
 tier. `--scope pilot` takes the pilot units and the co-cited loci of pilot anchors; `--variant replicate` takes the
-units whose `sha256('<protocol seed>:replicate:<locus id>')`, read as a fraction, lies below the protocol's replicate
-share (the result records the rule; replicate verdicts stay in the judgment ledger and never replace a primary row);
+replicate units every judging command draws (`followup_strata.replicate_keys`): of the units in scope, the ceiling of
+the protocol's replicate share times their number, ranked by the sha256 of the protocol seed, the instrument id and
+the locus id (the result records the rule; replicate verdicts stay in the judgment ledger and never replace a primary
+row);
 `--public-only` sends only public items; `--limit` sends at most that many items. Items already accepted under the
 same instrument digest, tier and variant are skipped, so a run resumes where it stopped.
 

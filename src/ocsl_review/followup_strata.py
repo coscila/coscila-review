@@ -152,6 +152,10 @@ def share_count(share: Any, n: int) -> int:
     return min(n, math.ceil(exact(share) * n))
 
 
+REPLICATE_RULE = ("the first ceil(share x n) of the n units in scope, ranked by sha256 of the protocol seed, "
+                  "'replicate', the instrument id and the unit key (strata.replicate.share)")
+
+
 def replicate_keys(protocol: Mapping[str, Any], keys: Iterable[str], *, scope_parts: Sequence[Any] = ()) -> list[str]:
     """The blind-replicate subsample of ``keys`` (protocol seed and strata.replicate.share), in the given order.
 
