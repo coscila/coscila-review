@@ -451,8 +451,9 @@ def check_records(lines) -> dict:
             "passing": sum(row["passing"] for row in journals.values()), "journals": journals}
 
 
-def run_record_check(path: Path, report: Path | None = None) -> dict:
-    """check_records over a record file, with the file's sha256 and the instrument and interpreter that rebuilt it."""
+def run_record_check(path: Path, report: Path | None = None, *, echo: bool = True) -> dict:
+    """check_records over a record file, with the file's sha256 and the instrument and interpreter that rebuilt it;
+    the report goes to standard error (unless ``echo`` is false) and to ``report``."""
     data = Path(path).read_bytes()
     result = check_records(data.decode("utf-8").splitlines())
     result.update({"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -461,7 +462,8 @@ def run_record_check(path: Path, report: Path | None = None) -> dict:
                    "instrument": {"id": C.INSTRUMENT_ID, "digest": C.instrument().digest},
                    "python": platform.python_version()})
     text = json.dumps(result, indent=2, sort_keys=True)
-    print(text, file=sys.stderr)
+    if echo:
+        print(text, file=sys.stderr)
     if report is not None:
         Path(report).parent.mkdir(parents=True, exist_ok=True)
         Path(report).write_text(text + "\n", encoding="utf-8")
@@ -516,7 +518,7 @@ class RecordCheckTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path, report = Path(folder) / "records.jsonl", Path(folder) / "out" / "fidelity.json"
             path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
-            result = run_record_check(path, report)
+            result = run_record_check(path, report, echo=False)
             self.assertEqual(result, json.loads(report.read_text()))
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), result["recordFile"]["sha256"])
         self.assertTrue(result["ok"], result["problems"])
