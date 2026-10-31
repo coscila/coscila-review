@@ -42,6 +42,21 @@ def item_key(item: Mapping[str, Any]) -> str:
     return item["id"]
 
 
+def build_item(key: str, *, marker: str, citing_sentence: str, context_before: str = "", context_after: str = "",
+               section: str = "", title: str = "", year: Any = None, provenance: str) -> dict[str, Any]:
+    """One item with the declared fields only (and its provenance, which routes it and is never sent)."""
+    if provenance not in ("public", "entitled"):
+        raise ItemError("invalid_item", f"item {key}: provenance must be public or entitled")
+    cited: dict[str, Any] = {"title": title or ""}
+    if isinstance(year, int) and not isinstance(year, bool):
+        cited["year"] = year
+    elif isinstance(year, str) and year.strip().isdigit():
+        cited["year"] = int(year.strip())
+    return {"id": key, "marker": marker, "citingSentence": citing_sentence, "contextBefore": context_before or "",
+            "contextAfter": context_after or "", "section": section or "", "citedWork": cited,
+            "provenance": provenance}
+
+
 def build_messages(items: Sequence[Mapping[str, Any]], tier: str = TIER) -> list[dict[str, str]]:
     if tier != TIER:
         raise ItemError("invalid_tier", f"{INSTRUMENT_ID} has the single tier {TIER}")
