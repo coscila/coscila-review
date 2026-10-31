@@ -339,6 +339,14 @@ class NumericCommandTests(unittest.TestCase):
 
 
 class InstrumentRuleTests(unittest.TestCase):
+    def test_the_bundle_is_active_with_its_validator_pinned(self):
+        from ocsl_review import instruments
+        instrument = instruments.load("numeric-check@1")
+        self.assertEqual("active", instrument.manifest["status"])
+        self.assertEqual(instrument.module_digests()["validator"], instrument.manifest["validator"]["sha256"])
+        self.assertTrue(instruments.verify(instrument)["ok"])
+        self.assertIn("table values", instrument.tier("claim")["evidencePolicy"]["neverSent"])
+
     def test_parses_must_be_written_in_the_sentence(self):
         item = {"id": "locus-3", "marker": "⟨R3⟩", "provenance": "public",
                 "citingSentence": "The disease caused 12.5 thousand deaths in Exampleland in 2019 ⟨R3⟩ .",

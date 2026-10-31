@@ -2,7 +2,7 @@
   "id": "claim-match@1",
   "name": "claim-match",
   "version": 1,
-  "status": "deferred",
+  "status": "active",
   "description": "Second-generation claim matching: whether a sentence of a later article that cites a review restates one of the review's claims and cites the review for it. Candidates come from BM25 retrieval over the later article's sentences that cite the review; the judge confirms each candidate with an exact quote and explicit abstention.",
   "unit": "a pair of an original claim (an S1 locus) and one candidate sentence of a citing article",
   "files": {
@@ -81,7 +81,8 @@
   },
   "validator": {
     "id": "claim-match-items@1",
-    "module": "ocsl_review.claim_match"
+    "module": "ocsl_review.claim_match",
+    "sha256": "b3d18dacec3501c3db6f7f1ae893e93e836d98a425dec051b7e18f6620c3ee2f"
   },
   "builder": {
     "module": "ocsl_review.followup_items"
@@ -109,6 +110,6 @@
   },
   "notes": [
     "No validation set measures this instrument's precision; its matches are model measurements.",
-    "Draft: status deferred until the follow-up protocol is frozen; the validator digest is pinned then."
+    "Candidates come from BM25 retrieval with receipts; sentences beyond the protocol's cut-off are recorded as not judged, never as different claims."
   ]
 }

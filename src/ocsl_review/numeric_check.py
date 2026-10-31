@@ -70,7 +70,7 @@ def _rules(item: Mapping[str, Any], output: Mapping[str, Any]) -> None:
     sentence = str(item.get("citingSentence", ""))
     if output["valueText"] not in sentence:
         raise ItemError("invalid_value", "valueText is absent from the citing sentence", retryable=True)
-    if output["condition"].strip() != "all" and not _written(output["condition"], sentence):
+    if output["condition"].strip().casefold() != "all" and not _written(output["condition"], sentence):
         raise ItemError("invalid_parse", "the condition is neither written in the sentence nor all", retryable=True)
     if output["geography"].strip() and not _written(output["geography"], sentence):
         raise ItemError("invalid_parse", "the geography is not written in the sentence", retryable=True)

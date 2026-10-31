@@ -273,6 +273,17 @@ class SecondGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "second-generation"):
             followup_secondgen.run_second_gen(without, stages=["sample"])
 
+    def test_the_bundle_is_active_with_its_validator_pinned(self):
+        from ocsl_review import claim_match, instruments
+        instrument = instruments.load("claim-match@1")
+        self.assertEqual("active", instrument.manifest["status"])
+        self.assertEqual(instrument.module_digests()["validator"], instrument.manifest["validator"]["sha256"])
+        self.assertTrue(instruments.verify(instrument)["ok"])
+        self.assertTrue(claim_match.propagates({"match": "same-claim", "reliance": "cites-review-for-claim"}))
+        self.assertFalse(claim_match.propagates({"match": "same-claim", "reliance": "unclear"}))
+        self.assertEqual({"match": None, "reliance": None, "assessable": 0, "reason": "abstained", "quote": None},
+                         claim_match.row({"match": "abstain", "reliance": "unclear", "quote": "", "abstainReason": "x"}))
+
     def test_the_command_line_runs_every_stage(self):
         branch = self.branch()
         from ocsl_review.cli import main
