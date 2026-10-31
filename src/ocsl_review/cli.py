@@ -119,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state", help="operator-owned mutable state root")
     parser.add_argument("--ocsl-repo", help="OC Science Lab deployment checkout")
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument(
+        "--result-file",
+        help="also write the exit code and the JSON result (or the class of the error) to this file, atomically "
+        "(format ocsl-review-result-v1); a Study Run's executor reads it after the command ended",
+    )
     families = _subcommands(parser, "family")
 
     catalog = families.add_parser("catalog", help="validate tracked catalogs and schemas")
@@ -430,7 +435,7 @@ def _normalize_globals(argv: Sequence[str]) -> list[str]:
     extracted: list[str] = []
     remainder: list[str] = []
     index = 0
-    options_with_values = {"--home", "--state", "--ocsl-repo"}
+    options_with_values = {"--home", "--state", "--ocsl-repo", "--result-file"}
     while index < len(argv):
         token = argv[index]
         if token == "--":
@@ -471,11 +476,63 @@ def _emit(value: Any, *, as_json: bool) -> None:
     print(rendered)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    raw = list(sys.argv[1:] if argv is None else argv)
+RESULT_FORMAT = "ocsl-review-result-v1"
+_RESULT_MESSAGE_LIMIT = 2000
+
+
+def _result_file_argument(argv: Sequence[str]) -> str | None:
+    """The value of the global --result-file, read before parsing so that even a refused command line leaves a result."""
+    for index, token in enumerate(argv):
+        if token == "--":
+            return None
+        if token == "--result-file":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if token.startswith("--result-file="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _write_result(path: str, *, exit_code: int, command: list[str], result: Any, error: dict[str, str] | None) -> None:
+    """Write the ocsl-review-result-v1 record next to its final name, fsync it and rename it into place."""
+    from datetime import datetime, timezone
+
+    record = {
+        "format": RESULT_FORMAT,
+        "exitCode": exit_code,
+        "command": command,
+        "result": result,
+        "error": error,
+        "finishedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    }
+    text = json.dumps(record, sort_keys=True, ensure_ascii=False, default=lambda item: str(item)) + "\n"
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _run(raw: list[str], outcome: dict[str, Any], *, keep_exit: bool) -> int:
+    def failed(kind: str, exc: BaseException) -> None:
+        outcome["error"] = {"kind": kind, "message": str(exc)[:_RESULT_MESSAGE_LIMIT]}
+
     parser = build_parser()
     try:
         args = parser.parse_args(_normalize_globals(raw))
+        outcome["command"] = [
+            str(item)
+            for item in (getattr(args, "family", None), getattr(args, "command", None)
+                         or getattr(args, "study_command", None) or getattr(args, "instrument_command", None)
+                         or getattr(args, "corpus_command", None))
+            if item
+        ]
         trust = getattr(args, "_trust", READ_ONLY)
         if trust == OPERATOR:
             command = " ".join(
@@ -505,26 +562,57 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sys.stderr.write(result.stderr)
             return result.returncode
         if result is not None:
+            outcome["result"] = result
             _emit(result, as_json=bool(getattr(args, "json", False)))
         return 0
+    except SystemExit as exc:
+        # argparse refused the command line (2), or --help / --version (0). Without a result file the exit stays
+        # what it always was.
+        if not keep_exit:
+            raise
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 2)
+        if code != 0:
+            outcome["error"] = {"kind": "usage", "message": "the command line was refused"}
+        return code
     except TrustBoundaryError as exc:
+        failed("trust", exc)
         print(f"trust boundary: {exc}", file=sys.stderr)
         return EXIT_TRUST
     except ConfidentialityError as exc:
+        failed("policy", exc)
         print(f"confidentiality policy: {exc}", file=sys.stderr)
         return EXIT_POLICY
     except ValidationError as exc:
+        failed("validation", exc)
         print(f"validation: {exc}", file=sys.stderr)
         return EXIT_VALIDATION
     except ReviewError as exc:
+        failed("usage", exc)
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
+        failed("interrupted", exc)
         print("interrupted", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 - stable CLI boundary
+        failed("runtime", exc)
         print(f"runtime failure: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_RUNTIME
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    result_file = _result_file_argument(raw)
+    outcome: dict[str, Any] = {"result": None, "error": None, "command": []}
+    code = _run(raw, outcome, keep_exit=result_file is not None)
+    if result_file:
+        try:
+            _write_result(result_file, exit_code=code, command=outcome["command"], result=outcome["result"],
+                          error=outcome["error"])
+        except OSError as exc:
+            print(f"result file: {exc}", file=sys.stderr)
+            return code or EXIT_RUNTIME
+    return code
 
 
 if __name__ == "__main__":
