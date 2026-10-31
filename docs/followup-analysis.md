@@ -15,8 +15,9 @@ status-resolve -> hotspots -> strata --freeze -> support, function, dependency, 
                -> numeric -> second-gen -> lag -> estimands -> facts
 ```
 
-`numeric` and `second-gen` are judging commands: they refuse a branch whose strata are not frozen, take the study
-commands' judge options (`--model`, `--base-url`, `--api-key-env`, `--broker-socket`, `--broker-worker`,
+`lag` and `estimands` read the frozen strata and refuse a branch without a freeze; `hotspots` and `strata` refuse one
+with a freeze. `numeric` and `second-gen` are judging commands: they refuse a branch whose strata are not frozen, take
+the study commands' judge options (`--model`, `--base-url`, `--api-key-env`, `--broker-socket`, `--broker-worker`,
 `--concurrency`, `--on-premises`, `--policy`, `--transport-retries`, `--transport-cooldown`, `--variant`, `--scope`,
 `--public-only`, `--limit`) and require `--model` to be the protocol's pinned served model. Entitled text reaches only
 judges the operator's policy lists as on premises; every item carries its provenance class (public or entitled), which
