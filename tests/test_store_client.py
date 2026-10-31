@@ -138,7 +138,8 @@ class StoreClientTests(unittest.TestCase):
         repo = self.study()
         client = repo.store_client
         first = client.adopt_for_identifiers({"doi": "10.1234/example"})
-        self.assertEqual(first["documents"], 2)
+        # The retained provider record only: the legacy abstract column of the earlier study is not in the projection.
+        self.assertEqual(first["documents"], 1)
         self.assertIsNone(client.adopt_for_identifiers({"doi": "10.1234/example"}))
         self.assertIsNone(client.adopt_for_identifiers({"doi": "10.1234/absent"}))
         repo.library.verify()

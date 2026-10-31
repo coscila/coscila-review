@@ -6,10 +6,14 @@ interprets it: works and identifiers, source documents and sections with their
 bytes, and provider records stay; every work observation (all ``legacy.*``
 properties among them: scores, loci, attempts, summaries and bibliography rows),
 assessment, model receipt, citation locus, bibliography entry, study selection,
-task queue and fact is dropped. The only derived table is a neutral
-retained-source index (DOI, capture digest, media type, route, capture date)
-built from the legacy review manifests, which is how retained review captures
-are found again.
+task queue and fact is dropped. Every document an earlier study imported or
+selected (providers ``legacy*``: legacy abstract columns, the full texts an
+earlier run fetched for its own escalations, audited excerpts) is dropped with
+its sections, the raw legacy table shards behind them are withheld, and so are
+retrievals that hold no bytes (failure records of an earlier acquisition). The
+only derived table is a neutral retained-source index (DOI, capture digest,
+media type, route; no capture date) built from the legacy review manifests,
+which is how retained review captures are found again.
 
 The rules are deny-by-default and digested into the projection. The source
 store is opened read-only and immutable, its database and manifest are checked
@@ -54,10 +58,19 @@ KEPT_TABLES = ("corpora", "works", "work_identifiers", "source_artifacts", "retr
 # Artifact kinds whose bytes may enter the projection; all other kinds are withheld.
 ALWAYS_KINDS = ("source-document", "provider-document", "raw-source", "raw-provider-response",
                 "raw-publisher-source", "acquisition-receipt", "identity-reconciliation", "title-resolution")
-# Archived legacy evidence kinds, kept only when a kept row refers to them.
-REFERENCED_KINDS = ("legacy-original-source", "legacy-provider-response", "legacy-evidence-shard")
-# Documents whose provenance is a judged-sample selection (membership correlates with legacy verdicts).
-DENIED_PROVIDERS = ("legacy-audit-excerpt",)
+# Archived legacy evidence kinds, kept only when a kept row refers to them: retained review captures (through the
+# retained-source index only) and retained provider responses (Europe PMC records of kept documents). Raw legacy
+# table shards (legacy-evidence-shard: whole rows of an earlier study's works table, with its source paths) are
+# never kept.
+REFERENCED_KINDS = ("legacy-original-source", "legacy-provider-response")
+# Kinds a kept document, identifier, retrieval or section may point to: retained provider responses only. A review
+# capture stays reachable through the retained-source index alone, so no row records which cited works an earlier
+# study fetched.
+ROW_REFERENCED_KINDS = ("legacy-provider-response",)
+# Documents an earlier study imported or selected (membership correlates with its verdicts and escalations): every
+# provider that starts with this prefix (legacy:<column>, legacy-original-source, legacy-audit-excerpt).
+DENIED_PROVIDER_PREFIX = "legacy"
+DENIED_PROVIDERS = ("legacy-audit-excerpt", "legacy-original-source")
 DENIED_DOCUMENT_KEYS = ("selectionManifestSha256", "selectionLine", "legacySourceClaim", "sourceDatabaseSha256")
 WORK_METADATA_KEYS = (
     "abstract", "abstractSections", "authors", "container", "containerAliases", "creators", "date", "doi",
@@ -90,7 +103,7 @@ CREATE TABLE retained_sources (
   capture_sha256 TEXT NOT NULL REFERENCES source_artifacts(sha256),
   media_type TEXT NOT NULL,
   route TEXT NOT NULL CHECK(route IN ('jats','html','pdf','text')),
-  captured_at TEXT NOT NULL,
+  captured_at TEXT CHECK(captured_at IS NULL),
   PRIMARY KEY(doi, capture_sha256)
 );
 CREATE INDEX retained_sources_by_capture ON retained_sources(capture_sha256);
@@ -102,14 +115,23 @@ RULES = {
     "keptTables": list(KEPT_TABLES),
     "alwaysKinds": list(ALWAYS_KINDS),
     "referencedKinds": list(REFERENCED_KINDS),
+    "rowReferencedKinds": list(ROW_REFERENCED_KINDS),
     "deniedDocumentProviders": list(DENIED_PROVIDERS),
+    "deniedDocumentProviderPrefix": DENIED_PROVIDER_PREFIX,
     "deniedDocumentMetadataKeys": list(DENIED_DOCUMENT_KEYS),
     "workMetadataKeys": list(WORK_METADATA_KEYS),
+    "retrievals": "artifact-backed only",
     "retainedIndex": {"from": REVIEW_MANIFEST, "routes": ROUTES,
-                      "fields": ["doi", "capture_sha256", "media_type", "route", "captured_at"]},
+                      "fields": ["doi", "capture_sha256", "media_type", "route"], "capturedAt": None},
     "vocabulary": {name: pattern.decode() for name, pattern in VOCABULARY.items()},
 }
 RULES_SHA256 = hashlib.sha256(canonical(RULES).encode()).hexdigest()
+
+
+def denied_provider(provider) -> bool:
+    """A document provider of an earlier study's imports or selections (never kept)."""
+    value = str(provider or "")
+    return value.startswith(DENIED_PROVIDER_PREFIX) or value in DENIED_PROVIDERS
 
 
 def vocabulary_hits(data: bytes) -> list[str]:
@@ -214,12 +236,31 @@ def removed_rows(connection: sqlite3.Connection, schema: str = "main") -> dict[s
             if count:
                 found[f"table:{table}"] = count
     allowed = ALWAYS_KINDS + REFERENCED_KINDS
+    row_kinds = tuple(kind for kind in REFERENCED_KINDS if kind not in ROW_REFERENCED_KINDS)
+    prefix = DENIED_PROVIDER_PREFIX + "%"
     checks = {
         "artifact-kind": (f"SELECT count(*) FROM {schema}.source_artifacts WHERE artifact_kind NOT IN ({_marks(allowed)})",
                           allowed),
-        "document-provider": (f"SELECT count(*) FROM {schema}.corpus_documents WHERE provider IN "
-                              f"({_marks(DENIED_PROVIDERS)})", DENIED_PROVIDERS),
+        "document-provider": (f"SELECT count(*) FROM {schema}.corpus_documents WHERE provider LIKE ? OR provider IN "
+                              f"({_marks(DENIED_PROVIDERS)})", (prefix, *DENIED_PROVIDERS)),
         "legacy-property": (f"SELECT count(*) FROM {schema}.work_observations WHERE property LIKE 'legacy.%'", ()),
+        # A review capture is reachable through the retained-source index only: no document, section, identifier or
+        # retrieval may point to a legacy source, and no legacy source may stand outside the index.
+        "legacy-source-row": (
+            f"SELECT (SELECT count(*) FROM {schema}.corpus_documents d JOIN {schema}.source_artifacts a "
+            f"ON a.sha256=d.artifact_sha256 WHERE a.artifact_kind IN ({_marks(row_kinds)}))"
+            f" + (SELECT count(*) FROM {schema}.source_sections s JOIN {schema}.source_artifacts a "
+            f"ON a.sha256=s.artifact_sha256 WHERE a.artifact_kind IN ({_marks(row_kinds)}))"
+            f" + (SELECT count(*) FROM {schema}.work_identifiers i JOIN {schema}.source_artifacts a "
+            f"ON a.sha256=i.verified_by_sha256 WHERE a.artifact_kind IN ({_marks(row_kinds)}))"
+            f" + (SELECT count(*) FROM {schema}.retrievals r JOIN {schema}.source_artifacts a "
+            f"ON a.sha256=r.artifact_sha256 WHERE a.artifact_kind IN ({_marks(row_kinds)}))",
+            row_kinds * 4),
+        "unindexed-legacy-source": (
+            f"SELECT count(*) FROM {schema}.source_artifacts a WHERE a.artifact_kind IN ({_marks(row_kinds)}) AND NOT "
+            f"EXISTS (SELECT 1 FROM {schema}.retained_sources r WHERE r.capture_sha256=a.sha256)", row_kinds),
+        "retrieval-without-bytes": (f"SELECT count(*) FROM {schema}.retrievals WHERE artifact_sha256 IS NULL", ()),
+        "capture-date": (f"SELECT count(*) FROM {schema}.retained_sources WHERE captured_at IS NOT NULL", ()),
     }
     for name, (sql, params) in checks.items():
         count = connection.execute(sql, params).fetchone()[0]
@@ -378,12 +419,13 @@ def _retained_index(connection, report, page):
                 if not doi or item.get("state") != "retained" or not SHA256.fullmatch(digest) or media not in ROUTES:
                     report["retainedIndex"]["skipped"] += 1
                     continue
-                artifact = connection.execute("SELECT artifact_kind, created_at FROM src.source_artifacts WHERE sha256=?",
+                artifact = connection.execute("SELECT artifact_kind FROM src.source_artifacts WHERE sha256=?",
                                               (digest,)).fetchone()
                 if artifact is None or artifact[0] not in ALWAYS_KINDS + REFERENCED_KINDS:
                     report["retainedIndex"]["skipped"] += 1
                     continue
-                records.append((doi, digest, media, ROUTES[media], artifact[1]))
+                # No capture date: when an earlier acquisition captured a review is no evidence of the review.
+                records.append((doi, digest, media, ROUTES[media], None))
         connection.executemany("INSERT OR IGNORE INTO main.retained_sources VALUES (?,?,?,?,?)", records)
         connection.commit()
         report["retainedIndex"]["rows"] = connection.execute("SELECT count(*) FROM main.retained_sources").fetchone()[0]
@@ -391,13 +433,14 @@ def _retained_index(connection, report, page):
 
 def _keep_set(connection):
     """Artifacts whose bytes the projection keeps (temp.keep); everything else is withheld."""
-    referenced = REFERENCED_KINDS
+    referenced = ROW_REFERENCED_KINDS
     connection.executescript("DROP TABLE IF EXISTS temp.keep; CREATE TEMP TABLE keep(sha256 TEXT PRIMARY KEY) WITHOUT ROWID;")
     connection.execute(f"INSERT OR IGNORE INTO temp.keep SELECT sha256 FROM src.source_artifacts "
                        f"WHERE artifact_kind IN ({_marks(ALWAYS_KINDS)})", ALWAYS_KINDS)
     statements = (
         f"SELECT d.artifact_sha256 FROM src.corpus_documents d JOIN src.source_artifacts a ON a.sha256=d.artifact_sha256 "
-        f"WHERE d.provider NOT IN ({_marks(DENIED_PROVIDERS)}) AND a.artifact_kind IN ({_marks(referenced)})",
+        f"WHERE d.provider NOT LIKE ? AND d.provider NOT IN ({_marks(DENIED_PROVIDERS)}) "
+        f"AND a.artifact_kind IN ({_marks(referenced)})",
         f"SELECT r.capture_sha256 FROM main.retained_sources r",
         f"SELECT i.verified_by_sha256 FROM src.work_identifiers i JOIN src.source_artifacts a ON a.sha256=i.verified_by_sha256 "
         f"WHERE a.artifact_kind IN ({_marks(referenced)})",
@@ -407,9 +450,16 @@ def _keep_set(connection):
         f"WHERE a.artifact_kind IN ({_marks(referenced)}) AND NOT EXISTS (SELECT 1 FROM src.corpus_documents d "
         f"WHERE d.work_id=s.work_id AND d.artifact_sha256=s.artifact_sha256)",
     )
-    params = ((*DENIED_PROVIDERS, *referenced), (), referenced, referenced, referenced)
+    params = ((DENIED_PROVIDER_PREFIX + "%", *DENIED_PROVIDERS, *referenced), (), referenced, referenced, referenced)
     for sql, values in zip(statements, params):
         connection.execute("INSERT OR IGNORE INTO temp.keep " + sql, values)
+    # Rows (documents, sections, identifiers, retrievals) may point only to kept artifacts outside the index-only kinds:
+    # a retained review capture is bytes behind the retained-source index, never a row of its own.
+    index_only = tuple(kind for kind in REFERENCED_KINDS if kind not in ROW_REFERENCED_KINDS)
+    connection.executescript("DROP TABLE IF EXISTS temp.rowkeep; "
+                             "CREATE TEMP TABLE rowkeep(sha256 TEXT PRIMARY KEY) WITHOUT ROWID;")
+    connection.execute(f"INSERT INTO temp.rowkeep SELECT k.sha256 FROM temp.keep k JOIN src.source_artifacts a "
+                       f"ON a.sha256=k.sha256 WHERE a.artifact_kind NOT IN ({_marks(index_only)})", index_only)
     connection.commit()
 
 
@@ -427,9 +477,11 @@ def _rows(connection, report, page):
                                [(w, t, y, _work_metadata(m, report)) for w, t, y, m in rows])
         connection.commit()
     connection.execute("INSERT INTO main.work_identifiers SELECT i.* FROM src.work_identifiers i "
-                       "WHERE i.verified_by_sha256 IN (SELECT sha256 FROM temp.keep) ORDER BY i.scheme, i.value")
-    connection.execute("INSERT INTO main.retrievals SELECT r.* FROM src.retrievals r WHERE r.artifact_sha256 IS NULL "
-                       "OR r.artifact_sha256 IN (SELECT sha256 FROM temp.keep) ORDER BY r.retrieval_id")
+                       "WHERE i.verified_by_sha256 IN (SELECT sha256 FROM temp.rowkeep) ORDER BY i.scheme, i.value")
+    # Only retrievals that hold kept bytes: a retrieval without bytes is a failure record of an earlier acquisition,
+    # which says which works it tried to fetch and when.
+    connection.execute("INSERT INTO main.retrievals SELECT r.* FROM src.retrievals r "
+                       "WHERE r.artifact_sha256 IN (SELECT sha256 FROM temp.rowkeep) ORDER BY r.retrieval_id")
     connection.commit()
     last = ""
     columns = "document_id,work_id,artifact_sha256,evidence_tier,source_url,provider,complete,metadata_json,created_at"
@@ -438,15 +490,15 @@ def _rows(connection, report, page):
         last = rows[-1][0]
         kept = []
         for row in rows:
-            if row[5] in DENIED_PROVIDERS or not connection.execute(
-                    "SELECT 1 FROM temp.keep WHERE sha256=?", (row[2],)).fetchone():
+            if denied_provider(row[5]) or not connection.execute(
+                    "SELECT 1 FROM temp.rowkeep WHERE sha256=?", (row[2],)).fetchone():
                 continue
             kept.append((*row[:7], canonical(_scrub(json.loads(row[7]), withheld)), row[8]))
         connection.executemany(f"INSERT INTO main.corpus_documents({columns}) VALUES (?,?,?,?,?,?,?,?,?)", kept)
         connection.commit()
     connection.execute(
         "INSERT INTO main.source_sections SELECT s.* FROM src.source_sections s "
-        "WHERE s.artifact_sha256 IN (SELECT sha256 FROM temp.keep) AND ("
+        "WHERE s.artifact_sha256 IN (SELECT sha256 FROM temp.rowkeep) AND ("
         "EXISTS (SELECT 1 FROM main.corpus_documents d WHERE d.work_id=s.work_id AND d.artifact_sha256=s.artifact_sha256) "
         "OR NOT EXISTS (SELECT 1 FROM src.corpus_documents d WHERE d.work_id=s.work_id AND d.artifact_sha256=s.artifact_sha256)) "
         "ORDER BY s.rowid")
