@@ -208,6 +208,18 @@ class FunctionTests(unittest.TestCase):
         self.assertEqual(("⟨b⟩", "bibliography-order"),
                          FN.resolve_marker("Text ⟨a⟩ ⟨b⟩ .", "ref-2", [(1, "ref-1"), (2, "ref-2")]))
 
+    def test_the_bundle_is_active_with_its_validator_pinned(self):
+        instrument = instruments.load("citation-function@1")
+        self.assertEqual("active", instrument.manifest["status"])
+        self.assertEqual(instruments.module_digest("ocsl_review.citation_function"),
+                         instrument.manifest["validator"]["sha256"])
+        self.assertTrue(instruments.verify(instrument)["ok"])
+        policy = instrument.tier("locus")["evidencePolicy"]
+        self.assertIn("matched by the citing sentence's digest", policy["neighbours"])
+        self.assertIn("empty when they are not available", instrument.text("systemPrompt"))
+        exported = instruments.broker_bundle("citation-function@1")
+        self.assertEqual(instrument.text("systemPrompt"), exported["bundle"]["systemPrompt"])
+
     def test_the_judge_must_serve_the_protocols_model(self):
         branch = self.branch()
         with branch.writing() as connection:

@@ -2,13 +2,13 @@
   "id": "citation-function@1",
   "name": "citation-function",
   "version": 1,
-  "status": "deferred",
+  "status": "active",
   "description": "Citation function per locus: whether a review relies on a cited work, cites it as background, cites it critically, or notes that it was retracted, corrected or subject to an expression of concern. Judged from the citing sentence and its neighbours, with an exact quote and explicit abstention. The judge never sees the cited work's status, the stratum or any support verdict.",
   "unit": "one marker occurrence of one bibliography entry (a locus of the parent census)",
   "files": {
     "systemPrompt": {
       "path": "system-prompt.txt",
-      "sha256": "49aad864c4cb9a1202c668d9f15356acd2dc84a14b12cadfe53f9e46a49c2455",
+      "sha256": "4ccf4ce2db8ccd5da1070f7cc11db96b317cc5cec6f03901bdf7f8e003fe1406",
       "mediaType": "text/plain; charset=utf-8"
     },
     "outputSchema": {
@@ -22,6 +22,7 @@
       "population": "loci of the frozen follow-up strata",
       "evidencePolicy": {
         "evidence": "the citing sentence with the named work's marker, the sentences before and after it in the same citing unit, the section trail, and the cited work's title and year",
+        "neighbours": "the sentences before and after the citing sentence come from the parent census's review document, re-extracted with the census's own extraction and matched by the citing sentence's digest; without the document they are empty strings",
         "neverSent": [
           "status of the cited work",
           "stratum",
@@ -79,7 +80,8 @@
   },
   "validator": {
     "id": "citation-function-items@1",
-    "module": "ocsl_review.citation_function"
+    "module": "ocsl_review.citation_function",
+    "sha256": "035eda7462520f64521d4ce08a605edb38e1fdc61d273551292e4b462caa41f8"
   },
   "builder": {
     "module": "ocsl_review.followup_items"
@@ -108,6 +110,6 @@
   },
   "notes": [
     "No validation set measures this instrument's precision; its classes are model measurements.",
-    "Draft: status deferred until the follow-up protocol is frozen; the validator digest is pinned then."
+    "Active with its validator digest pinned; the served model is pinned per analysis by the follow-up protocol (model.served)."
   ]
 }
