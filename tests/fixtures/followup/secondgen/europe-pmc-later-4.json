@@ -1,0 +1,21 @@
+{
+ "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
+ "version": "6.9",
+ "hitCount": 1,
+ "resultList": {
+  "result": [
+   {
+    "id": "9200004",
+    "source": "MED",
+    "pmid": "9200004",
+    "doi": "10.5555/fu.later.4",
+    "title": "A later synthetic article 4",
+    "authorString": "Example A",
+    "pubYear": "2024",
+    "isOpenAccess": "Y",
+    "inEPMC": "Y",
+    "pmcid": "PMC9100004"
+   }
+  ]
+ }
+}

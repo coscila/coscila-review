@@ -34,6 +34,9 @@ def add_commands(commands: Any, register: Any) -> None:
         "numeric", help="numeric-check@1 parse of S3 claims and the deterministic comparison with a table source")
     parsers["numeric"].add_argument("--tables", required=True,
                                     help="table source (a pinned dataset version; synthetic or licence-verified)")
+    parsers["numeric"].add_argument("--allow-synthetic-tables", action="store_true",
+                                    help="accept a table source whose licensing is synthetic (tests only, never a "
+                                         "study run)")
     parsers["second-gen"] = commands.add_parser(
         "second-gen", help="sample citing articles, acquire them, rank candidate sentences (BM25), confirm (claim-match@1)")
     parsers["second-gen"].add_argument("--stage", choices=("sample", "acquire", "candidates", "judge", "all"),

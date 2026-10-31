@@ -6,10 +6,14 @@ instrument (``followup_secondgen`` with ``retrieval``); the judge only confirms 
 
     {"id": "<anchor locus>|<sentence id>", "originalClaim": "...", "originalReview": "<review title>",
      "candidateSentence": "... ⟨B7⟩ ...", "candidateMarker": "⟨B7⟩", "candidateSection": "Introduction"}
+
+Status, dependency class, verdicts and identifiers are never part of an item. Every decision except an abstention
+quotes the candidate sentence exactly, and the quote must hold words, not only markers.
 """
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +24,8 @@ INSTRUMENT_ID = "claim-match@1"
 TIER = "pair"
 MATCHES = ("same-claim", "related-claim", "different-claim")
 RELIANCES = ("cites-review-for-claim", "cites-review-otherwise", "unclear")
+PROPAGATION = ("same-claim", "cites-review-for-claim")
+_MARKERS = re.compile(r"⟨[^ ⟩]+⟩")
 FIELDS = ("id", "originalClaim", "originalReview", "candidateSentence", "candidateMarker", "candidateSection")
 REQUIRED = ("id", "originalClaim", "candidateSentence", "candidateMarker")
 
@@ -57,7 +63,22 @@ def _rules(item: Mapping[str, Any], output: Mapping[str, Any]) -> None:
     if output["abstainReason"].strip():
         raise ItemError("invalid_reason", "only an abstention carries an abstainReason", retryable=True)
     followup_items.require_quote(item, output, allowed=("candidateSentence",), field_key=None)
+    if not re.search(r"\w", _MARKERS.sub(" ", output["quote"])):
+        raise ItemError("invalid_quote", "the quote must hold words of the candidate, not only markers", retryable=True)
 
 
 def validate_response(items: Sequence[Mapping[str, Any]], text: Any) -> dict[str, Any]:
     return followup_items.validate_response(items, text, item_schema=item_schema(), rules=_rules)
+
+
+def row(output: Mapping[str, Any]) -> dict[str, Any]:
+    """fu_secondgen_matches columns of an accepted output (an abstention is unassessable with reason ``abstained``)."""
+    if output["match"] == "abstain":
+        return {"match": None, "reliance": None, "assessable": 0, "reason": "abstained", "quote": None}
+    return {"match": output["match"], "reliance": output["reliance"], "assessable": 1, "reason": None,
+            "quote": output["quote"]}
+
+
+def propagates(row_or_output: Mapping[str, Any]) -> bool:
+    """A confirmed restatement: the same claim, citing the review for it."""
+    return (row_or_output.get("match"), row_or_output.get("reliance")) == PROPAGATION

@@ -1,12 +1,28 @@
 {
  "format": "ocsl-followup-tables-v1",
+ "name": "synthetic-statistics-tables",
  "license": "Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content",
  "licensing": "synthetic",
  "source": "synthetic statistics tables for tests",
  "declaredVersion": "synthetic-tables-1",
+ "synonyms": {
+  "version": "synthetic-synonyms-1",
+  "condition": {
+   "all": [
+    "the disease",
+    "disease"
+   ]
+  },
+  "geography": {
+   "Exampleland": [
+    "Republic of Exampleland"
+   ]
+  }
+ },
  "reports": [
   {
    "reportKey": "synthetic-disease-statistics",
+   "title": "Synthetic disease statistics report",
    "identifiers": {
     "doi": [
      "10.5555/fu.work.report"
@@ -44,6 +60,15 @@
        "value": 7300,
        "unit": "deaths",
        "locator": "table 3"
+      },
+      {
+       "condition": "all",
+       "metric": "survival",
+       "geography": "Exampleland",
+       "year": 2019,
+       "value": 64.5,
+       "unit": "percent",
+       "locator": "table 4"
       }
      ]
     },

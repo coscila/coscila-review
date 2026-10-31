@@ -7,6 +7,10 @@ instrument (``followup_numeric``), so a table source can change without a new in
 
     {"id": "<locus id>", "marker": "⟨R3⟩", "citingSentence": "... ⟨R3⟩ ...",
      "citedWork": {"title": "...", "year": 2020}}
+
+Table values are never part of an item. A parse is checked against the sentence it comes from: valueText and the
+quote occur exactly, the quote contains valueText, and the condition (unless "all"), the geography and the year are
+written in the sentence (case aside), so a parse cannot carry a figure, place or year the sentence does not state.
 """
 from __future__ import annotations
 
@@ -66,10 +70,31 @@ def _rules(item: Mapping[str, Any], output: Mapping[str, Any]) -> None:
     sentence = str(item.get("citingSentence", ""))
     if output["valueText"] not in sentence:
         raise ItemError("invalid_value", "valueText is absent from the citing sentence", retryable=True)
+    if output["condition"].strip().casefold() != "all" and not _written(output["condition"], sentence):
+        raise ItemError("invalid_parse", "the condition is neither written in the sentence nor all", retryable=True)
+    if output["geography"].strip() and not _written(output["geography"], sentence):
+        raise ItemError("invalid_parse", "the geography is not written in the sentence", retryable=True)
+    if output["year"] is not None and str(output["year"]) not in sentence:
+        raise ItemError("invalid_parse", "the year is not written in the sentence", retryable=True)
     followup_items.require_quote(item, output, allowed=("citingSentence",), field_key=None)
     if output["valueText"] not in output["quote"]:
         raise ItemError("invalid_quote", "the quote must contain valueText", retryable=True)
 
 
+def _written(value: str, sentence: str) -> bool:
+    return " ".join(value.split()).casefold() in " ".join(sentence.split()).casefold()
+
+
 def validate_response(items: Sequence[Mapping[str, Any]], text: Any) -> dict[str, Any]:
     return followup_items.validate_response(items, text, item_schema=item_schema(), rules=_rules)
+
+
+def parse_fields(output: Mapping[str, Any]) -> dict[str, Any]:
+    """fu_numeric parse columns of an accepted output (empty strings stored as NULL)."""
+    decision = output["decision"]
+    epidemiological = 1 if decision == "parsed" else 0 if decision == "not-epidemiological" else None
+    return {"epidemiological": epidemiological,
+            **{column: (output[field] or None) if decision == "parsed" else None for column, field in
+               (("condition", "condition"), ("metric", "metric"), ("geography", "geography"),
+                ("value_text", "valueText"), ("unit", "unit"), ("quote", "quote"))},
+            "year": output["year"] if decision == "parsed" else None}

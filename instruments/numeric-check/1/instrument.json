@@ -2,13 +2,13 @@
   "id": "numeric-check@1",
   "name": "numeric-check",
   "version": 1,
-  "status": "deferred",
+  "status": "active",
   "description": "Numeric check of a statistic claim: the judge parses what the citing sentence states (condition, metric, geography, reference year, the number as written and its unit) with an exact quote; a deterministic comparison against a pinned table source of the cited statistics report then classifies the claim (consistent, number absent or different, wrong geography, wrong edition, non-epidemiological).",
   "unit": "one marker occurrence of a statistics-report citation (an S3 locus)",
   "files": {
     "systemPrompt": {
       "path": "system-prompt.txt",
-      "sha256": "d0061580cba0000bacc8c9a7e2c53363456c2a80065888e35d779df0e9c9e25b",
+      "sha256": "68f5af514281d15c6202aed1ff87f69b191a33f73567da7fceeb9c4b1073b633",
       "mediaType": "text/plain; charset=utf-8"
     },
     "outputSchema": {
@@ -78,7 +78,8 @@
   },
   "validator": {
     "id": "numeric-check-items@1",
-    "module": "ocsl_review.numeric_check"
+    "module": "ocsl_review.numeric_check",
+    "sha256": "16950b1f7708cd4f1063e15fe95e8b9be7a5ea056df8d62088bc4696fe123e96"
   },
   "builder": {
     "module": "ocsl_review.followup_items"
@@ -107,6 +108,6 @@
   },
   "notes": [
     "Statistics-report tables are a pluggable, pinned dataset; licensed tables are read only after their licensing is verified, and the protocol drops S3 otherwise.",
-    "Draft: status deferred until the follow-up protocol is frozen; the validator digest is pinned then."
+    "A parse takes the condition, geography and year from the citing sentence; the comparison numeric-comparison@1 is deterministic and runs outside the model call."
   ]
 }
