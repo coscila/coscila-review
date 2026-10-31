@@ -317,6 +317,27 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
     return retry, []
 
 
+def prepare_judge(judge: Any, instrument: Any, tier: str) -> None:
+    """Let a judge that needs it check the instrument before any call (the broker judge checks that its verbatim
+    bundle is installed and granted); every judging command calls this before its first item is sent."""
+    prepare = getattr(judge, "prepare", None)
+    if callable(prepare):
+        prepare(instrument, tier)
+
+
+def judge_summary(judge: Any) -> dict[str, Any]:
+    """Name and location of the judge, and the reason a broker judge halted its transport (a fidelity stop)."""
+    return {"name": getattr(judge, "name", "judge"), "location": getattr(judge, "location", ""),
+            "stopped": getattr(judge, "stopped", None)}
+
+
+def close_judge(judge: Any) -> None:
+    """Close a judge that holds a connection (the broker judge's transport) when its command ends."""
+    close = getattr(judge, "close", None)
+    if callable(close):
+        close()
+
+
 def block_items(connection: sqlite3.Connection, instrument: Any, tier: str, items: Sequence[tuple[str, str, str]], *,
                 variant: str = "primary") -> int:
     """Record items that are never sent (key, code, message), for example a redacted citing sentence."""

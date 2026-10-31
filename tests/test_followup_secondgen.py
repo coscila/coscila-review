@@ -18,7 +18,7 @@ from unittest import mock
 import followup_fixtures as F
 from ocsl_review import followup_net, followup_secondgen, followup_strata
 from ocsl_review.claim_check import ConfidentialPolicy
-from ocsl_review.errors import ValidationError
+from ocsl_review.errors import ReviewError, ValidationError
 from ocsl_review.followup_branch import read_artifact
 from ocsl_review.followup_model import CitedByEdge
 from test_followup_strata import A1, A2, B1, frozen_branch, lid
@@ -299,6 +299,43 @@ class SecondGenerationTests(unittest.TestCase):
         self.assertFalse(claim_match.propagates({"match": "same-claim", "reliance": "unclear"}))
         self.assertEqual({"match": None, "reliance": None, "assessable": 0, "reason": "abstained", "quote": None},
                          claim_match.row({"match": "abstain", "reliance": "unclear", "quote": "", "abstainReason": "x"}))
+
+    def test_the_judge_is_prepared_before_any_stage_and_closed_when_the_command_ends(self):
+        branch = self.branch()
+        events = []
+        transport = self.transport
+
+        class Lifecycle(F.ScriptedJudge):
+            stopped = None
+
+            def prepare(self, instrument, tier):
+                events.append(("prepare", instrument.id, len(self.requests), len(transport.requests)))
+
+            def close(self):
+                events.append(("close", len(self.requests)))
+        judge = Lifecycle(answer)
+        from ocsl_review.cli import main
+        target = self.root / "second-gen-lifecycle.json"
+        with mock.patch("ocsl_review.followup_net.client", return_value=self.client), \
+                mock.patch("ocsl_review.followup_secondgen.judge_from_args",
+                           return_value=(judge, ConfidentialPolicy("public-literature"))):
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                code = main(["--result-file", str(target), "followup", "second-gen", "--database", str(branch.path),
+                             "--model", F.MODEL, "--base-url", "http://judge.example/v1"])
+        record = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(0, code, record)
+        # prepared before the first provider request and the first judge call, closed after the last call
+        self.assertEqual([("prepare", "claim-match@1", 0, 0), ("close", len(judge.requests))], events)
+        self.assertEqual({"name": judge.name, "location": "on-prem", "stopped": None},
+                         record["result"]["judge"]["judge"])
+
+        class Refusing(F.ScriptedJudge):
+            def prepare(self, instrument, tier):
+                raise ReviewError("the bundle is not installed on the broker")
+        refusing = Refusing(answer)
+        with self.assertRaisesRegex(ReviewError, "not installed"):
+            self.run_stages(self.branch(), judge=refusing)
+        self.assertEqual([], refusing.requests)
 
     def test_the_command_line_runs_every_stage(self):
         branch = self.branch()

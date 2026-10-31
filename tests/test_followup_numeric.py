@@ -16,7 +16,7 @@ from unittest import mock
 import followup_fixtures as F
 from ocsl_review import followup_numeric, followup_tables, numeric_check
 from ocsl_review.claim_check import ConfidentialPolicy
-from ocsl_review.errors import ConfidentialityError, ValidationError
+from ocsl_review.errors import ConfidentialityError, ReviewError, ValidationError
 from ocsl_review.followup_model import WorkRef
 from ocsl_review.followup_numeric import ClaimValue, normalize_value
 from test_followup_strata import A1, A2, B1, frozen_branch, lid, protocol_with, synthetic_parent
@@ -336,6 +336,41 @@ class NumericCommandTests(unittest.TestCase):
         record = json.loads(target.read_text(encoding="utf-8"))
         self.assertNotEqual(0, code)
         self.assertEqual("validation", record["error"]["kind"])
+
+
+    def test_the_judge_is_prepared_before_any_call_and_closed_when_the_command_ends(self):
+        branch = self.branch(text=True)
+        events = []
+
+        class Lifecycle(F.ScriptedJudge):
+            stopped = None
+
+            def prepare(self, instrument, tier):
+                events.append(("prepare", instrument.id, len(self.requests)))
+
+            def close(self):
+                events.append(("close", len(self.requests)))
+        judge = Lifecycle(answer)
+        from ocsl_review.cli import main
+        target = self.root / "numeric-lifecycle.json"
+        with mock.patch("ocsl_review.followup_numeric.judge_from_args",
+                        return_value=(judge, ConfidentialPolicy("public-literature"))):
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                code = main(["--result-file", str(target), "followup", "numeric", "--database", str(branch.path),
+                             "--tables", str(TABLES), "--allow-synthetic-tables", "--model", F.MODEL,
+                             "--base-url", "http://judge.example/v1"])
+        record = json.loads(target.read_text(encoding="utf-8"))
+        self.assertEqual(0, code, record)
+        self.assertEqual([("prepare", "numeric-check@1", 0), ("close", len(judge.requests))], events)
+        self.assertEqual({"name": judge.name, "location": "on-prem", "stopped": None}, record["result"]["judge"])
+
+        class Refusing(F.ScriptedJudge):
+            def prepare(self, instrument, tier):
+                raise ReviewError("the bundle is not installed on the broker")
+        refusing = Refusing(answer)
+        with self.assertRaisesRegex(ReviewError, "not installed"):
+            self.run_numeric(self.branch(text=True), refusing)
+        self.assertEqual([], refusing.requests)
 
 
 class InstrumentRuleTests(unittest.TestCase):

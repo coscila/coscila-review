@@ -25,6 +25,7 @@ from typing import Any, Mapping, Sequence
 
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, require_freeze
+from .followup_judge import close_judge, judge_summary, prepare_judge
 from .followup_model import sentence_digest
 from .followup_schema import UNASSESSABLE
 
@@ -222,13 +223,6 @@ def check_model(model: str | None, protocol: Mapping[str, Any] | None) -> str:
     return model
 
 
-def prepare_judge(judge: Any, instrument: Any, tier: str) -> None:
-    """Let a judge that needs it check the instrument before any call (the broker judge checks its bundle)."""
-    prepare = getattr(judge, "prepare", None)
-    if callable(prepare):
-        prepare(instrument, tier)
-
-
 def existing_blocks(connection: Any, digest: str, tier: str, variant: str) -> set[str]:
     return {row[0] for row in connection.execute(
         "SELECT DISTINCT item_key FROM fu_judgments WHERE instrument_digest=? AND tier=? AND variant=? AND "
@@ -374,18 +368,6 @@ def run_function(connection: Any, branch: FollowupBranch, judge: Any, policy: An
             "withheldEntitled": len(items) - len(sendable), "blocked": dict(Counter(code for _, code, _ in blocked)),
             "blockedRecorded": blocks, "markers": dict(methods), "contexts": dict(documents.counts), "run": summary,
             "rows": dict(sorted(rows.items())), "judge": judge_summary(judge)}
-
-
-def judge_summary(judge: Any) -> dict[str, Any]:
-    """Name and location of the judge, and the reason a broker judge halted its transport (a fidelity stop)."""
-    return {"name": getattr(judge, "name", "judge"), "location": getattr(judge, "location", ""),
-            "stopped": getattr(judge, "stopped", None)}
-
-
-def close_judge(judge: Any) -> None:
-    close = getattr(judge, "close", None)
-    if callable(close):
-        close()
 
 
 def cmd_function(args: Any) -> dict[str, Any]:

@@ -36,7 +36,8 @@ from . import followup_tables, numeric_check
 from .census_extraction import MARK_PATTERN, marker_name
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, register_dataset, require_freeze
-from .followup_judge import accepted, block_items, judge_from_args, run_items
+from .followup_judge import (accepted, block_items, close_judge, judge_from_args, judge_summary, prepare_judge,
+                             run_items)
 from .followup_model import NUMERIC_RULE, TableCell, WorkRef, canonical
 from .followup_strata import protocol_of, replicate_keys
 
@@ -348,6 +349,7 @@ def run_numeric(branch: FollowupBranch, tables: Path, *, judge: Any, policy: Any
                                    declared_version=source.declared_version, sha256=source.sha256,
                                    rows=described["cells"], file_name=Path(tables).name, detail=described)
         instrument = numeric_check.instrument()
+        prepare_judge(judge, instrument, TIER)
         units = numeric_units(connection, branch)
         selected = numeric_units(connection, branch, pilot_only=True) if scope == "pilot" else units
         blocked = [(unit["locus_id"], unit["reason"], "the citing sentence is not available")
@@ -367,14 +369,17 @@ def run_numeric(branch: FollowupBranch, tables: Path, *, judge: Any, policy: Any
         rows = write_rows(connection, units, source, dataset, instrument) if variant == "primary" else None
     return {"database": str(branch.path), "rule": RULE, "tableSource": dataset, "licensing": source.licensing,
             "units": len(units), "sent": len(items), "blocked": len(blocked), "newlyBlocked": newly_blocked,
-            "judging": summary, "rows": rows}
+            "judging": summary, "rows": rows, "judge": judge_summary(judge)}
 
 
 def cmd_numeric(args: Any) -> dict[str, Any]:
     from .census_runner import code_revision
     judge, policy = judge_from_args(args)
-    return run_numeric(FollowupBranch(Path(args.database)), Path(args.tables), judge=judge, policy=policy,
-                       model=args.model, allow_synthetic=bool(getattr(args, "allow_synthetic_tables", False)),
-                       variant=args.variant, scope=args.scope, public_only=bool(args.public_only), limit=args.limit,
-                       concurrency=args.concurrency, transport_retries=args.transport_retries,
-                       cooldown=args.transport_cooldown, code_revision=code_revision())
+    try:
+        return run_numeric(FollowupBranch(Path(args.database)), Path(args.tables), judge=judge, policy=policy,
+                           model=args.model, allow_synthetic=bool(getattr(args, "allow_synthetic_tables", False)),
+                           variant=args.variant, scope=args.scope, public_only=bool(args.public_only),
+                           limit=args.limit, concurrency=args.concurrency, transport_retries=args.transport_retries,
+                           cooldown=args.transport_cooldown, code_revision=code_revision())
+    finally:
+        close_judge(judge)

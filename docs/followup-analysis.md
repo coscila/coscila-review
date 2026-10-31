@@ -21,7 +21,9 @@ the study commands' judge options (`--model`, `--base-url`, `--api-key-env`, `--
 `--concurrency`, `--on-premises`, `--policy`, `--transport-retries`, `--transport-cooldown`, `--variant`, `--scope`,
 `--public-only`, `--limit`) and require `--model` to be the protocol's pinned served model. Entitled text reaches only
 judges the operator's policy lists as on premises; every item carries its provenance class (public or entitled), which
-is never sent.
+is never sent. As in the evidence commands, the judge is prepared before any call or download (a broker judge checks
+that the instrument's verbatim bundle is installed and granted), closed when the command ends, and named in the
+result with the reason a broker judge stopped, if it did (`judge`).
 
 ## followup hotspots
 

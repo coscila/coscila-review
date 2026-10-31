@@ -37,7 +37,7 @@ from xml.etree import ElementTree
 from . import census_extraction, claim_match
 from .errors import ConfidentialityError, ProviderError, ReviewError, ValidationError
 from .followup_branch import FollowupBranch, now, read_artifact, require_freeze, store_artifact
-from .followup_judge import accepted, judge_from_args, run_items
+from .followup_judge import accepted, close_judge, judge_from_args, judge_summary, prepare_judge, run_items
 from .followup_model import canonical, digest
 from .followup_net import record_request
 from .followup_strata import protocol_of, replicate_keys, seeded_sample
@@ -449,7 +449,7 @@ def confirm(connection: sqlite3.Connection, branch: FollowupBranch, protocol: Ma
                         concurrency=concurrency, code_revision=code_revision, transport_retries=transport_retries,
                         cooldown=cooldown, sleep=sleep)
     applied = refresh_matches(connection, instrument) if variant == "primary" else None
-    return {"sent": len(items), "judging": summary, "verdictsApplied": applied}
+    return {"sent": len(items), "judging": summary, "verdictsApplied": applied, "judge": judge_summary(judge_)}
 
 
 # ----------------------------------------------------------------------------- command
@@ -469,6 +469,8 @@ def run_second_gen(branch: FollowupBranch, *, stages: Sequence[str] = STAGES, cl
         if "judge" in stages and model != protocol["model"]["served"]:
             raise ValidationError("--model must be the served model the protocol pins (model.served)")
         instrument = claim_match.instrument()
+        if "judge" in stages:
+            prepare_judge(judge_, instrument, TIER)
         if "sample" in stages:
             result["sample"] = sample(connection, protocol)
         anchor_ids = [row["locus_id"] for row in anchors(connection, pilot_only=True)] if scope == "pilot" else None
@@ -493,8 +495,12 @@ def cmd_second_gen(args: Any) -> dict[str, Any]:
         client = followup_net.client(workspace=Path(args.workspace) if getattr(args, "workspace", None) else None)
     if "judge" in stages:
         judge_, policy = judge_from_args(args)
-    return run_second_gen(FollowupBranch(Path(args.database)), stages=stages, client=client, judge_=judge_,
-                          policy=policy, model=getattr(args, "model", None), scope=args.scope, variant=args.variant,
-                          public_only=bool(args.public_only), limit=args.limit, concurrency=args.concurrency,
-                          transport_retries=args.transport_retries, cooldown=args.transport_cooldown,
-                          code_revision=code_revision())
+    try:
+        return run_second_gen(FollowupBranch(Path(args.database)), stages=stages, client=client, judge_=judge_,
+                              policy=policy, model=getattr(args, "model", None), scope=args.scope,
+                              variant=args.variant, public_only=bool(args.public_only), limit=args.limit,
+                              concurrency=args.concurrency, transport_retries=args.transport_retries,
+                              cooldown=args.transport_cooldown, code_revision=code_revision())
+    finally:
+        if judge_ is not None:
+            close_judge(judge_)
