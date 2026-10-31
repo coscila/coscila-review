@@ -211,7 +211,11 @@ class SecondGenerationTests(unittest.TestCase):
         self.assertTrue(branch.verify()["ok"], branch.verify()["problems"])
 
     def test_sentences_beyond_k_are_not_judged_and_never_different(self):
-        branch = self.branch(second_generation_protocol(edges=4, k=1))
+        protocol = second_generation_protocol(edges=4, k=1)
+        protocol["estimands"].append({"id": "second-generation", "numerator": "restating sentences",
+                                      "denominator": "judged sentences", "by": ["journal"],
+                                      "weights": "realised-inclusion-probability"})
+        branch = self.branch(protocol)
         judge = F.ScriptedJudge(answer)
         result = self.run_stages(branch, judge=judge)
         matches = {row["sentence_id"]: row for row in self.table(branch, "fu_secondgen_matches")}
@@ -223,6 +227,18 @@ class SecondGenerationTests(unittest.TestCase):
         self.assertEqual([RESTATING], [item["candidateSentence"] for messages, _ in judge.requests
                                        for item in F.items_of(messages)])
         self.assertEqual(1, result["candidates"]["notJudgedBeyondK"])
+        from types import SimpleNamespace
+        from ocsl_review import followup_estimands
+        followup_estimands.cmd_estimands(SimpleNamespace(database=str(branch.path), b=50, bootstrap_seed=None))
+        with closing(branch.connect()) as connection:
+            coverage = {(row["state"], row["reason"]): row["units"] for row in connection.execute(
+                "SELECT * FROM fu_coverage WHERE estimand='second-generation' AND journal='*' AND year='*'")}
+            share = connection.execute("SELECT value FROM fu_estimates WHERE key=?",
+                                       ("followup.second-generation.all.all.share",)).fetchone()[0]
+        self.assertEqual({("assessable", "-"): 1, ("unassessable", "not-judged"): 1,
+                          ("unassessable", "no-open-full-text"): 1, ("unassessable", "citation-not-located"): 2,
+                          ("unassessable", "fetch-failed"): 1}, coverage)
+        self.assertEqual(1.0, share)
 
     def test_items_carry_only_the_declared_fields_and_routing(self):
         branch = self.branch()
