@@ -200,6 +200,14 @@ class FunctionTests(unittest.TestCase):
         self.assertEqual(2, sum(1 for row in self.rows(branch).values() if row["class"] == "relies"),
                          "replicate verdicts never replace the primary rows")
 
+    def test_units_follow_the_census_extraction(self):
+        from ocsl_review.census_extraction import extract_review
+        units = FN.review_unit_sentences(REVIEW_A1, html=False)
+        loci = [locus_ for entry in extract_review(REVIEW_A1)["entries"] for locus_ in entry.loci]
+        self.assertEqual(5, len(loci))
+        for locus_ in loci:
+            self.assertIn(locus_.sentence, units[locus_.unit], "the census's unit index finds its own sentence")
+
     def test_markers_of_the_named_work(self):
         self.assertEqual(("⟨B7⟩", "target"), FN.resolve_marker("Text ⟨B3⟩ ⟨B7⟩ .", "B7", [(1, "B3"), (2, "B7")]))
         self.assertEqual(("⟨CR7⟩", "target"), FN.resolve_marker("Text ⟨CR3⟩ ⟨CR7⟩ .", "ref-CR7", []))
