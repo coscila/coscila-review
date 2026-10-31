@@ -153,20 +153,25 @@ operator command; it refuses to run inside a chat workspace) builds a store
 that keeps evidence and drops every interpretation (`store_projection.py`):
 
 - **kept:** works (bibliographic metadata keys only), work identifiers,
-  retrievals, source documents and sections, and the bytes of provider records,
-  source documents, raw sources and archived original sources; archived legacy
-  source kinds only when a kept row refers to them;
+  retrievals that hold bytes, source documents and sections of providers other
+  than `legacy*`, and the bytes of provider records, source documents and raw
+  sources; retained provider responses only when a kept row refers to them,
+  and retained review captures only through the index below;
 - **dropped:** every work observation (all `legacy.*` properties: scores, loci,
   attempts, summaries, bibliography rows and review manifests), assessments,
   model receipts, citation loci, bibliography entries, study selections and
   review states, task queues and batches, imports, processing state, facts,
-  runs and analyses, documents whose provenance is a judged-sample selection,
-  and the bytes of every other artifact kind (model requests and responses,
+  runs and analyses; every document an earlier study imported or selected
+  (providers `legacy*`: legacy abstract columns, full texts it fetched for its
+  own escalations, audited excerpts) with its sections; retrievals without
+  bytes (failure records of an earlier acquisition); and the bytes of every
+  other artifact kind (raw legacy table shards, model requests and responses,
   task inputs, legacy databases and import records, among others);
 - **derived:** `retained_sources(doi, capture_sha256, media_type, route,
   captured_at)`, a neutral index of retained review captures built from the
   legacy review manifests (route is derived from the media type; `captured_at`
-  is the time the capture entered the source store). It holds nothing else.
+  is always empty, since when an earlier acquisition captured a review is no
+  evidence of it). It holds nothing else.
 
 The rules are deny-by-default and digested into the projection
 (`store_meta.rules_sha256` and the manifest's `store` block). The source store
@@ -180,8 +185,9 @@ The build fails closed, and `ocsl-review store verify --store DIR` repeats the
 gate on any projection:
 
 - the removed-row query must return no rows: no row in any dropped table, no
-  `legacy.*` property, no withheld artifact kind and no denied document
-  provenance;
+  `legacy.*` property, no withheld artifact kind, no `legacy*` document, no
+  row pointing to a retained review capture and no capture outside the index,
+  no retrieval without bytes and no capture date;
 - every reference must resolve (SQLite foreign key check);
 - no kept text, and with `--level deep` no kept byte, may contain legacy verdict
   vocabulary (three-class labels, score columns, verdict fields, compact

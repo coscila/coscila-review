@@ -439,10 +439,13 @@ class CitedWorkTests(CacheTestCase):
 
     def test_full_text_caches_stand_in_only_for_live_downloads_and_never_offer_earlier_selections(self):
         caches = self.caches()
-        # The store holds a full text an earlier census selected for its own escalation; it is never a candidate.
+        # The source store held a full text an earlier census selected for its own escalation; the label-free
+        # projection drops it (with every legacy document), and a full-text lookup never offers it.
         store = caches.store
         work_id, _ = store.find_work({"doi": "10.5555/w9"})
-        self.assertIn("legacy-original-source", {document["provider"] for document in store.documents(work_id, "full-text")})
+        if work_id is not None:
+            self.assertNotIn("legacy-original-source",
+                             {document["provider"] for document in store.documents(work_id, "full-text")})
         self.assertEqual((None, []), caches.full_text({"doi": "10.5555/w9", "pmcid": "PMC900009"}))
         self.assertIsNotNone(caches.full_text({"doi": "10.5555/w7", "pmcid": "PMC900007"})[0])   # a Europe PMC document
         run = self.run_census()

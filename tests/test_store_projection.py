@@ -35,7 +35,15 @@ class ProjectionTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory()
         cls.root = Path(cls.directory.name)
         cls.stats = benchmark.generate(cls.root, "store", scale=0.0005, progress=lambda event: None)
-        CorpusRepository(cls.root, "store").library.snapshot("snapshot")
+        repo = CorpusRepository(cls.root, "store")
+        with repo.connect(write=True) as connection:
+            # A failure record of an earlier acquisition: no bytes, but it says which work was tried and when.
+            work = connection.execute("SELECT work_id FROM works ORDER BY work_id LIMIT 1").fetchone()[0]
+            connection.execute("INSERT INTO retrievals VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               ("retrieval-failed-earlier", work, None, "legacy-escalation-fetch",
+                                "https://example.invalid/fulltext", "2026-09-01T00:00:00Z", 404, "unavailable",
+                                None, "earlier escalation fetch"))
+        repo.library.snapshot("snapshot")
         cls.source = cls.root / "snapshot"
         cls.before = tree_state(cls.source)
         cls.receipt = build_projection(cls.source, cls.root / "projection", workers=2)
@@ -71,6 +79,7 @@ class ProjectionTests(unittest.TestCase):
     def test_evidence_is_kept_and_only_a_neutral_retained_source_index_is_derived(self):
         reviews = self.stats["sizes"]["reviews"]
         rows = self.query("SELECT doi, capture_sha256, media_type, route, captured_at FROM retained_sources ORDER BY doi")
+        self.assertTrue(all(captured is None for *_, captured in rows))
         self.assertEqual(len(rows), reviews)
         columns = [r[1] for r in self.query("PRAGMA table_info(retained_sources)")]
         self.assertEqual(columns, ["doi", "capture_sha256", "media_type", "route", "captured_at"])
@@ -81,20 +90,31 @@ class ProjectionTests(unittest.TestCase):
         kept = self.receipt["kept"]
         self.assertEqual(kept["works"], self.stats["sizes"]["reviews"] + self.stats["sizes"]["cited_works"])
         self.assertEqual(kept["work_identifiers"], self.stats["sizes"]["cited_works"])
+        # Artifact-backed acquisitions only: the earlier failure record (no bytes) is dropped.
         self.assertEqual(kept["retrievals"], self.stats["sizes"]["cited_works"])
-        self.assertEqual(self.receipt["dropped"]["corpus_documents"], self.stats["sizes"]["audit_excerpts"])
-        self.assertEqual(self.query("SELECT count(*) FROM corpus_documents WHERE provider='legacy-audit-excerpt'"), [(0,)])
+        self.assertEqual(self.query("SELECT count(*) FROM retrievals WHERE artifact_sha256 IS NULL"), [(0,)])
+        # Every document an earlier study imported or selected is dropped with its sections: legacy abstract columns,
+        # the full texts it fetched for its own escalations (works.local_path) and audited excerpts.
+        self.assertEqual(self.receipt["dropped"]["corpus_documents"],
+                         self.stats["sizes"]["audit_excerpts"] + self.stats["sizes"]["legacy_abstracts"]
+                         + self.stats["sizes"]["full_texts"])
+        self.assertEqual(self.query("SELECT count(*) FROM corpus_documents WHERE provider LIKE 'legacy%'"), [(0,)])
+        self.assertEqual(self.query("SELECT count(*) FROM source_sections s JOIN source_artifacts a "
+                                    "ON a.sha256=s.artifact_sha256 WHERE a.artifact_kind IN "
+                                    "('legacy-original-source','legacy-evidence-shard')"), [(0,)])
         for (metadata,) in self.query("SELECT metadata_json FROM works"):
             self.assertFalse({"stratum", "label"} & set(json.loads(metadata)))
-        for (metadata,) in self.query("SELECT metadata_json FROM corpus_documents WHERE provider='legacy:epmc'"):
-            value = json.loads(metadata)
-            self.assertNotIn("sourceDatabaseSha256", value)
-            self.assertEqual(value["completenessBasis"], "legacy-field-only-unverified")
         kinds = {kind for (kind,) in self.query("SELECT DISTINCT artifact_kind FROM source_artifacts")}
         self.assertTrue(kinds <= set(store_projection.ALWAYS_KINDS + store_projection.REFERENCED_KINDS))
         for withheld in ("legacy-original-database", "legacy-fulltext-selection-manifest", "worker-response",
-                         "task-input", "legacy-assessment-record"):
+                         "task-input", "legacy-assessment-record", "legacy-evidence-shard"):
             self.assertIn(withheld, self.receipt["withheldArtifactKinds"])
+        # The only legacy sources left are the retained review captures, reachable through the index alone, and the
+        # index carries no capture date.
+        self.assertEqual(self.query("SELECT count(*) FROM source_artifacts a WHERE a.artifact_kind='legacy-original-source' "
+                                    "AND NOT EXISTS (SELECT 1 FROM retained_sources r WHERE r.capture_sha256=a.sha256)"),
+                         [(0,)])
+        self.assertEqual(self.query("SELECT count(*) FROM retained_sources WHERE captured_at IS NOT NULL"), [(0,)])
         self.assertEqual(self.query("SELECT count(*) FROM source_sections s WHERE NOT EXISTS "
                                     "(SELECT 1 FROM source_artifacts a WHERE a.sha256=s.artifact_sha256)"), [(0,)])
 
