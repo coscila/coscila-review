@@ -200,6 +200,37 @@ class PipelineTests(unittest.TestCase):
                 self.assertNotIn("@", json.dumps(request["params"]))
                 self.assertNotIn("mailto", request["target"])
 
+    def test_a_pilot_run_reaches_the_pilot_units_and_the_full_run_judges_no_item_twice(self):
+        database = ("--database", str(self.database))
+        self.invoke("init", *database, "--parent", str(self.census["parent"]), "--parent-text",
+                    str(self.census["text"]), "--protocol", str(self.protocol))
+        self.invoke("status-import", *database, "--csv", str(RW_CSV), "--declared-version", "synthetic-snapshot")
+        self.invoke("status-fetch", *database, routes=status_routes())
+        self.invoke("status-resolve", *database)
+        self.invoke("hotspots", *database)
+        self.invoke("strata", *database, "--freeze")
+        pilot = {row["locus_id"] for row in self.rows("SELECT locus_id FROM fu_strata WHERE pilot=1")}
+        cocited = {row["locus_id"] for row in self.rows(
+            "SELECT locus_id FROM fu_cocited WHERE anchor_locus_id IN (SELECT locus_id FROM fu_strata WHERE pilot=1)")}
+        self.assertTrue(pilot)
+        full_text = {**support_routes(), FULL_TEXT.format("PMC900004"): (200, PLAIN_FULL_TEXT)}
+        steps = (("support", ("--tier", "abstract"), support_routes(), pilot | cocited),
+                 ("support", ("--tier", "full-text", "--europe-pmc"), full_text, pilot | cocited),
+                 ("function", (), None, pilot))
+        for verb, options, routes, reached in steps:
+            before = len(self.judge.requests)
+            self.invoke(verb, *database, *options, *JUDGE, "--scope", "pilot", routes=routes)
+            sent = {item["id"].split("|")[0] for messages, _ in self.judge.requests[before:]
+                    for item in json.loads(messages[1]["content"])["items"]}
+            self.assertTrue(sent, verb)
+            self.assertLessEqual(sent, reached, verb)
+            self.invoke(verb, *database, *options, *JUDGE, routes=routes)
+        judged = [(json.loads(messages[1]["content"]).get("evidenceTier"), item["id"])
+                  for messages, _ in self.judge.requests for item in json.loads(messages[1]["content"])["items"]]
+        self.assertEqual(len(judged), len(set(judged)), "the full run judges again no item the pilot judged")
+        self.invoke("dependency", *database)
+        self.invoke("gates", *database)
+
 
 if __name__ == "__main__":
     unittest.main()
