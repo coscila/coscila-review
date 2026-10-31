@@ -55,6 +55,8 @@ PRECISION = {"year": 1, "month": 2, "day": 3}
 SOURCE_RANK = {name: rank for rank, name in enumerate(
     ("crossref:retraction-watch", "crossref:publisher", "crossref", RW_SOURCE, "pubmed", "europe-pmc"))}
 CROSSREF_ROWS = 100
+RESOLVE_CHUNK = 500
+WRITE_BATCH = 5000
 MONTHS = {name: number for number, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
@@ -549,7 +551,13 @@ def import_retraction_watch(connection: Any, path: Path, declared_version: str, 
                                    (snapshot_id,)).fetchone()[0]
     observations: list[StatusObservation] = []
     counts: Counter = Counter()
+    written = total = works = 0
     for work in cited_works(connection):
+        works += 1
+        if len(observations) >= WRITE_BATCH:
+            written += write_observations(connection, observations)
+            total += len(observations)
+            observations = []
         doi, pmid = normal_doi(work.doi), normal_pmid(work.pmid)
         if not doi and not pmid:
             observations.append(_unknown(work, RW_SOURCE, NOTICE_KINDS, snapshot_id, "no-identifier",
@@ -572,10 +580,10 @@ def import_retraction_watch(connection: Any, path: Path, declared_version: str, 
                 date_precision="day" if date else None, receipt_sha256=sha,
                 detail={"recordId": notice.get("recordId"), "reasons": notice.get("reasons") or []}))
             counts[status] += 1
-    written = write_observations(connection, observations)
+    written += write_observations(connection, observations)
+    total += len(observations)
     return {"snapshot": snapshot_id, "sha256": sha, "rows": dataset.version.rows, "declaredVersion": declared_version,
-            "works": len({observation.work_key for observation in observations}), "observations": len(observations),
-            "written": written, "statuses": dict(sorted(counts.items()))}
+            "works": works, "observations": total, "written": written, "statuses": dict(sorted(counts.items()))}
 
 
 # ----------------------------------------------------------------------------- live status snapshot
@@ -594,7 +602,7 @@ def fetch_status(connection: Any, scholarly: Any, *, sources: Sequence[str], lim
                  snapshot: str | None = None, lock: Any = None, commit_every: int = 200,
                  notice_dates: bool = True) -> dict[str, Any]:
     """One status snapshot: every cited work asked at each live source (one thread per source, so each host keeps
-    its own interval). ``snapshot`` continues an earlier snapshot: pairs of work and source that already answered
+    its own interval). ``snapshot`` continues a snapshot this branch started: pairs of work and source that answered
     in it are skipped, failed ones are asked again."""
     unknown = sorted(set(sources) - set(SOURCES))
     if unknown or not sources:
@@ -763,31 +771,36 @@ def resolve_status(connection: Any, *, snapshots: Sequence[str] | None = None,
             raise ValidationError(f"no observations belong to snapshot {snapshot_id}")
     allowed = set(((protocol or {}).get("status") or {}).get("sources") or (*LIVE_SOURCES, RW_SOURCE))
     resolution = "+".join(chosen) if chosen else "no-snapshot"
-    by_work: dict[str, list[StatusObservation]] = defaultdict(list)
-    if chosen:
-        marks = ",".join("?" for _ in chosen)
-        for row in connection.execute(f"SELECT * FROM fu_status_observations WHERE snapshot_id IN ({marks}) "
-                                      "ORDER BY work_key, observation_id", chosen):
-            if protocol_source(row["source"]) in allowed:
-                by_work[row["work_key"]].append(_observation(row))
     resolved_at = now()
-    rows, counts, decided = [], Counter(), Counter()
+    counts, decided, reinstated = Counter(), Counter(), 0
     works = cited_works(connection)
-    for work in works:
-        result = resolve_work(work.work_key, by_work.get(work.work_key, []), snapshot_id=resolution,
-                              resolved_at=resolved_at)
-        counts[result.status] += 1
-        if result.decided_by:
-            decided[result.decided_by] += 1
-        rows.append((result.work_key, result.status, int(result.reinstated), result.notice_doi, result.notice_date,
-                     result.date_precision, result.decided_by, canonical(list(result.sources)),
-                     canonical(list(result.unknown_kinds)), result.checked_at, result.snapshot_id,
-                     result.rule_version, resolved_at))
-    connection.executemany("INSERT OR REPLACE INTO fu_work_status VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    for start in range(0, len(works), RESOLVE_CHUNK):
+        chunk = works[start:start + RESOLVE_CHUNK]
+        by_work: dict[str, list[StatusObservation]] = defaultdict(list)
+        if chosen:
+            work_marks, snapshot_marks = ",".join("?" for _ in chunk), ",".join("?" for _ in chosen)
+            for row in connection.execute(
+                    f"SELECT * FROM fu_status_observations WHERE work_key IN ({work_marks}) AND snapshot_id IN "
+                    f"({snapshot_marks}) ORDER BY work_key, observation_id",
+                    [work.work_key for work in chunk] + chosen):
+                if protocol_source(row["source"]) in allowed:
+                    by_work[row["work_key"]].append(_observation(row))
+        rows = []
+        for work in chunk:
+            result = resolve_work(work.work_key, by_work.get(work.work_key, []), snapshot_id=resolution,
+                                  resolved_at=resolved_at)
+            counts[result.status] += 1
+            reinstated += int(result.reinstated)
+            if result.decided_by:
+                decided[result.decided_by] += 1
+            rows.append((result.work_key, result.status, int(result.reinstated), result.notice_doi,
+                         result.notice_date, result.date_precision, result.decided_by,
+                         canonical(list(result.sources)), canonical(list(result.unknown_kinds)), result.checked_at,
+                         result.snapshot_id, result.rule_version, resolved_at))
+        connection.executemany("INSERT OR REPLACE INTO fu_work_status VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     agreement = census_flag_agreement(connection)
     return {"rule": STATUS_RULE, "snapshots": chosen, "works": len(works), "statuses": dict(sorted(counts.items())),
-            "reinstated": sum(row[2] for row in rows), "decidedBy": dict(sorted(decided.items())),
-            "censusRetractedFlag": agreement}
+            "reinstated": reinstated, "decidedBy": dict(sorted(decided.items())), "censusRetractedFlag": agreement}
 
 
 def census_flag_agreement(connection: Any) -> dict[str, Any]:
