@@ -317,6 +317,22 @@ class AbstractTierTests(RunnerTestCase):
         positions = {r["label"]: r["position"] for r in self.rows("SELECT label, position FROM history WHERE outcome='accepted'")}
         self.assertEqual((1, 2), (positions["2"], positions["9"]))
 
+    def test_the_repair_call_is_built_from_the_open_labels_in_batch_order(self):
+        from ocsl_review.census_runner import abstract_call, repair_items
+        batch = [{"label": label, "citing_passages": [{"sentence": "S %s." % label}], "cited_work": {"title": "T"},
+                  "abstract": "A"} for label in ("1", "2", "3", "9")]
+        self.assertEqual(["2", "9"], [it["label"] for it in repair_items(batch, ["9", "2", "3"], ["3"])])
+        self.assertEqual([], repair_items(batch, ["1"], ["1"]))
+        self.assertEqual(4, len(repair_items(batch, [it["label"] for it in batch], [])), "a failed first call repairs all")
+        sub = repair_items(batch, ["2", "9"], [])
+        payload = abstract_call(sub, "Review", JOURNAL, kind="repair", model=MODEL)
+        self.assertEqual(C.request_payload(C.build_repair_messages(sub, "Review", JOURNAL), model=MODEL, items=2),
+                         payload)
+        self.assertEqual(C.request_payload(C.build_abstract_messages(batch, "Review", JOURNAL), model=MODEL, items=4),
+                         abstract_call(batch, "Review", JOURNAL, kind="first", model=MODEL))
+        with self.assertRaises(ValidationError):
+            abstract_call(batch, "Review", JOURNAL, kind="second", model=MODEL)
+
     def test_invalid_after_repair(self):
         self.judge.never = {"3"}
         run = self.run_census()
