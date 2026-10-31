@@ -128,6 +128,71 @@ class SkillCatalogTests(ReviewPathsTestCase):
         self.assertTrue(changed.read_text(encoding="utf-8").endswith("local edit\n"))
         self.assertTrue(skills.manifest_path(self.paths).is_file())
 
+    def copied_home(self) -> Path:
+        """A companion source tree of its own (skills and the catalogs they name), so a test can change the source."""
+        home = Path(self.temporary.name) / "home"
+        for name in ("skills", "environments", "mcp"):
+            shutil.copytree(ROOT / name, home / name)
+        return home
+
+    def test_stale_installation_fails_verification_and_a_repeated_install_refreshes_it(self) -> None:
+        home = self.copied_home()
+        paths = Paths(home=home, state=self.state, lab_repo=None)
+        source = home / "skills" / "ocsl-review-router"
+        withdrawn = source / "references" / "withdrawn.md"
+        withdrawn.parent.mkdir()
+        withdrawn.write_text("text a later scrub removes from the source\n", encoding="utf-8")
+        target = self.native / "ocsl-review-router"
+        target.mkdir(parents=True)
+        (target / "local.txt").write_text("native-original", encoding="utf-8")
+        skills.install_skill_set(paths, self.roots)
+        self.assertTrue(skills.verify_skill_installation(paths)["ok"])
+        self.assertTrue((self.codex / "ocsl-review-router" / "references" / "withdrawn.md").is_file())
+
+        # The scrub: the source changes and drops a reference file; the installed copies still hold the old text.
+        (source / "SKILL.md").write_text(
+            (source / "SKILL.md").read_text(encoding="utf-8") + "\nchanged in the source\n", encoding="utf-8"
+        )
+        withdrawn.unlink()
+        withdrawn.parent.rmdir()
+        report = skills.verify_skill_installation(paths)
+        self.assertFalse(report["ok"])
+        self.assertEqual(
+            {str(self.native.resolve() / "ocsl-review-router"), str(self.codex.resolve() / "ocsl-review-router")},
+            {entry["target"] for entry in report["stale"]},
+        )
+        self.assertIn("integrate refresh", report["reason"])
+        # Integrity alone (what uninstall needs) still holds for a stale copy.
+        self.assertTrue(skills.verify_skill_installation(paths, check_source=False)["ok"])
+
+        again = skills.install_skill_set(paths, self.roots)
+        self.assertTrue(again["reused"])
+        self.assertEqual(2, len(again["refreshed"]))
+        for root in (self.native, self.codex):
+            installed = root / "ocsl-review-router"
+            self.assertTrue((installed / "SKILL.md").read_text(encoding="utf-8").endswith("changed in the source\n"))
+            self.assertFalse((installed / "references").exists())
+            owner = json.loads((installed / skills.OWNER_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(skills.tree_digest(source), owner["sourceDigest"])
+        self.assertTrue(skills.verify_skill_installation(paths)["ok"])
+        self.assertEqual([], skills.refresh_skill_set(paths)["refreshed"])
+
+        # The pre-install node is still what uninstall restores.
+        skills.uninstall_skill_set(paths)
+        self.assertEqual("native-original", (target / "local.txt").read_text(encoding="utf-8"))
+
+    def test_refresh_refuses_an_installed_copy_edited_after_installation(self) -> None:
+        home = self.copied_home()
+        paths = Paths(home=home, state=self.state, lab_repo=None)
+        skills.install_skill_set(paths, self.roots)
+        source = home / "skills" / "ocsl-review-router" / "SKILL.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\nnew source\n", encoding="utf-8")
+        edited = self.codex / "ocsl-review-router" / "SKILL.md"
+        edited.write_text(edited.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValidationError, "edited after installation"):
+            skills.refresh_skill_set(paths)
+        self.assertTrue(edited.read_text(encoding="utf-8").endswith("local edit\n"))
+
     def test_skill_roots_cannot_overlap_protected_source_or_state(self) -> None:
         # Bio and lab siblings keep their old names on the lab host and use the coscila-* names in development clones;
         # both may exist at once and every one is protected.
@@ -386,6 +451,46 @@ class IntegrationTests(ReviewPathsTestCase):
         self.mcp_config.write_text(json.dumps(active), encoding="utf-8")
         with self.assertRaisesRegex(ValidationError, "installed MCP entry changed"):
             integration.uninstall_integration(self.paths, stage_timeout=30)
+
+    def test_stale_integration_fails_verify_and_integrate_refresh_brings_it_up_to_date(self) -> None:
+        home = Path(self.temporary.name) / "home"
+        for name in ("skills", "environments", "mcp"):
+            shutil.copytree(ROOT / name, home / name)
+        self.paths = Paths(home=home, state=self.state, lab_repo=self.lab)
+        self.install()
+        self.assertTrue(integration.verify_integration(self.paths)["ok"])
+        source = home / "skills" / "ocsl-review-reference-analysis" / "SKILL.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\nscrubbed source\n", encoding="utf-8")
+
+        stale = integration.verify_integration(self.paths)
+        self.assertFalse(stale["ok"])
+        self.assertIn("stale", stale["reason"])
+        with self.assertRaisesRegex(ValidationError, "integrate refresh"):
+            skills.refresh_skill_set(self.paths)
+
+        refreshed = integration.refresh_integration(self.paths)
+        self.assertEqual(2, len(refreshed["refreshed"]))
+        self.assertTrue(integration.verify_integration(self.paths)["ok"])
+        for root in (self.native, self.codex):
+            self.assertTrue(
+                (root / "ocsl-review-reference-analysis" / "SKILL.md")
+                .read_text(encoding="utf-8")
+                .endswith("scrubbed source\n")
+            )
+        state = json.loads(integration.install_state_path(self.paths).read_text(encoding="utf-8"))
+        self.assertEqual(
+            integration.sha256_file(skills.manifest_path(self.paths)), state["skillManifest"]["sha256"]
+        )
+        # A repeated install refreshes as well, and a stale installation can always be uninstalled.
+        source.write_text(source.read_text(encoding="utf-8") + "\nonce more\n", encoding="utf-8")
+        again = self.install()
+        self.assertTrue(again["reused"])
+        self.assertEqual(2, len(again["refreshed"]))
+        source.write_text(source.read_text(encoding="utf-8") + "\nstale again\n", encoding="utf-8")
+        self.assertFalse(integration.verify_integration(self.paths)["ok"])
+        result = integration.uninstall_integration(self.paths, stage_timeout=30)
+        self.assertFalse(result["reused"])
+        self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
 
     def test_stage_timeout_environment_is_honored_when_cli_value_is_absent(self) -> None:
         args = SimpleNamespace(

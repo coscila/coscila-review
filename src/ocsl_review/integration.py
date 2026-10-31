@@ -432,7 +432,11 @@ def _validate_install_state(state: Mapping[str, Any]) -> None:
         raise ValidationError("install state has invalid skill manifest identity")
 
 
-def _verify_active_state(paths: Any, state: Mapping[str, Any]) -> dict[str, Any]:
+def _verify_active_state(
+    paths: Any, state: Mapping[str, Any], *, check_source: bool = True
+) -> dict[str, Any]:
+    """Integrity of the active installation; with check_source also that the installed skills match the current
+    companion source (a stale copy fails verification and doctor, and `integrate refresh` brings it up to date)."""
     _validate_install_state(state)
     skill_manifest = Path(state["skillManifest"]["path"])
     if (
@@ -440,7 +444,7 @@ def _verify_active_state(paths: Any, state: Mapping[str, Any]) -> dict[str, Any]
         or sha256_file(skill_manifest) != state["skillManifest"]["sha256"]
     ):
         raise ValidationError("installed skill manifest is absent or changed")
-    skill_check = skills.verify_skill_installation(paths)
+    skill_check = skills.verify_skill_installation(paths, check_source=check_source)
     if not skill_check.get("ok"):
         raise ValidationError(skill_check.get("reason", "skill installation verification failed"))
     mcp = state["mcp"]
@@ -517,10 +521,10 @@ def install_integration(
     state_path = install_state_path(paths)
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        verification = _verify_active_state(paths, state)
+        _verify_active_state(paths, state, check_source=False)
         requested_entries = _normalize_mcp_entries(mcp_entries)
         requested_roots = {role: Path(root).resolve() for role, root in skill_roots.items()}
-        root_check = skills.verify_skill_installation(paths, requested_roots)
+        root_check = skills.verify_skill_installation(paths, requested_roots, check_source=False)
         if not root_check.get("ok"):
             raise ValidationError(root_check.get("reason", "requested skill roots differ"))
         if Path(state["mcp"]["configPath"]).resolve() != Path(mcp_config).resolve():
@@ -536,7 +540,16 @@ def install_integration(
             raise ValidationError("active installation uses different owned MCP entries")
         if state["staging"] != {"argv": list(stage_argv), "cwd": str(stage_cwd)}:
             raise ValidationError("active installation uses a different staging command or cwd")
-        return {"installed": True, "reused": True, "verification": verification}
+        # A repeated install brings skills copied from an older companion source up to date (a companion update only
+        # moves the checkout), so the installed copies never keep text the source no longer has.
+        refreshed = refresh_integration(paths)
+        verification = _verify_active_state(paths, json.loads(state_path.read_text(encoding="utf-8")))
+        return {
+            "installed": True,
+            "reused": True,
+            "refreshed": refreshed["refreshed"],
+            "verification": verification,
+        }
     if skills.manifest_path(paths).exists():
         raise ReviewError(
             "a standalone review-skill installation already exists; remove it before integration"
@@ -597,6 +610,30 @@ def install_integration(
         raise ReviewError(f"integration install failed: {exc}{detail}") from exc
 
 
+def refresh_integration(paths: Any) -> dict[str, Any]:
+    """Re-copy installed skills whose companion source changed and record the new skill manifest in the state.
+
+    MCP entries and staging are untouched (they name commands and paths, not skill text). Refuses an installation
+    whose skills or MCP entries were edited after installation.
+    """
+    state_path = install_state_path(paths)
+    if not state_path.is_file():
+        raise ValidationError("review integration is not installed; nothing to refresh")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    _verify_active_state(paths, state, check_source=False)
+    result = skills.refresh_skill_set(paths, integrated=True)
+    if result["refreshed"]:
+        skill_manifest = Path(state["skillManifest"]["path"])
+        state["skillManifest"] = {
+            "path": str(skill_manifest),
+            "sha256": sha256_file(skill_manifest),
+        }
+        _validate_install_state(state)
+        atomic_json(state_path, state, mode=0o600)
+    _verify_active_state(paths, state)
+    return {"refreshed": result["refreshed"], "state": str(state_path)}
+
+
 def verify_integration(paths: Any) -> dict[str, Any]:
     state_path = install_state_path(paths)
     if not state_path.is_file():
@@ -620,7 +657,8 @@ def uninstall_integration(paths: Any, *, stage_timeout: float = 900) -> dict[str
     if not state_path.exists():
         return {"uninstalled": True, "reused": True}
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    _verify_active_state(paths, state)
+    # A stale installation (older source) can always be removed: only edits after installation block an uninstall.
+    _verify_active_state(paths, state, check_source=False)
     mcp = state["mcp"]
     current_raw, restored_config, restore_exact_original = _config_with_previous_owned(mcp)
     backup_path = Path(mcp["backupPath"])
@@ -712,6 +750,10 @@ def cmd_status(args: Any) -> dict[str, Any]:
 
 def cmd_verify(args: Any) -> dict[str, Any]:
     return verify_integration(args.paths)
+
+
+def cmd_refresh(args: Any) -> dict[str, Any]:
+    return refresh_integration(args.paths)
 
 
 def cmd_uninstall(args: Any) -> dict[str, Any]:

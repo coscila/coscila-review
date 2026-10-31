@@ -84,5 +84,9 @@ def cmd_verify(args: Any) -> dict[str, Any]:
     return result
 
 
+def cmd_refresh(args: Any) -> dict[str, Any]:
+    return integration.cmd_refresh(args)
+
+
 def cmd_uninstall(args: Any) -> dict[str, Any]:
     return integration.cmd_uninstall(args)
