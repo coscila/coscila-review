@@ -37,7 +37,9 @@ protocol after the strata are frozen.
 ## Order of work
 
 1. `followup init`: branch the frozen census (read-only, never copied) with the
-   signed-off protocol; `followup verify` must pass.
+   signed-off protocol; `followup verify` must pass. Add the private copy that
+   keeps entitled citing sentences (`--parent-text`) only when those sentences
+   are judged on premises.
 2. Status: `followup status-import` (the Retraction Watch CSV snapshot as a
    dataset input), `followup status-fetch` (Crossref, PubMed, Europe PMC) and
    `followup status-resolve`, which gives every cited work one status row with
@@ -48,7 +50,11 @@ protocol after the strata are frozen.
 4. Judging, smoke test and pilot first (`--limit`, `--scope pilot`): `followup
    support --tier abstract`, `followup support --tier full-text`, `followup
    function`, and `followup numeric` only when the protocol records verified
-   table licensing. Then `followup dependency`.
+   table licensing. Then `followup dependency`. Give support and function the
+   census's review documents (`--documents`) so the judge sees the sentences
+   around each citing sentence. Support runs on a judge called directly; the
+   other judging commands may use the broker socket. The replicate
+   (`--variant replicate`) follows the primary run of each judging command.
 5. Propagation: `followup citedby`, then `followup second-gen`.
 6. `followup lag`, `followup estimands`, `followup gates`, `followup facts`,
    `followup verify-facts` and `followup export`.

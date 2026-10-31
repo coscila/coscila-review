@@ -31,7 +31,9 @@ The protocol (`schemas/followup-protocol.schema.json`) holds parameters only: th
 definitions and their parameters, the instruments, the pinned on-premises judge, the estimands with their numerators
 and denominators, the rules and the gates. Sizes and rates are measured from the run's own data. `followup strata
 --freeze` writes the strata, their sizes, the estimands and the denominators into the protocol digest; judging
-commands refuse a branch without a freeze, and `followup gates` checks that no judge call predates it.
+commands refuse a branch without a freeze, and `followup gates` checks that no judge call predates it. What decides
+the strata (`followup status-resolve`, `followup hotspots`, `followup strata`) refuses to run again after the freeze;
+dependency, cited-by traversal, the lag model and the estimands need it.
 
 ## Strata
 
@@ -69,6 +71,19 @@ that answered, otherwise `unknown`.
 The follow-up instruments run at temperature zero with reasoning off, send their messages verbatim, validate every
 quote against the field it names, and repair invalid outputs once. `ocsl-review instruments export` prints their broker
 bundles. Entitled text reaches only judges the operator's policy lists as on premises.
+
+## Runs
+
+Every judging command (`support`, `function`, `numeric`, `second-gen`) takes `--limit` for a smoke test, `--scope
+pilot` for the frozen pilot subsample and `--variant replicate` for the blind replicate. The replicate units of every
+judging command follow one rule (`followup_strata.replicate_keys`): of the units in scope, the ceiling of the
+protocol's replicate share times their number, ranked by the sha256 of the protocol seed, the instrument id and the
+unit key. Replicate verdicts stay in the judgment ledger and never replace a primary row. A judging command resumes
+where it stopped: items already accepted under the same instrument digest, tier and variant are skipped, and items
+of calls without a response are sent again in further passes. The follow-up instruments can run through the run
+principal's broker socket, one verbatim bundle job per call; citation-support@2 has no verbatim bundle and runs on a
+judge called directly. With the census's review documents (`--documents`), the support and function judges also see
+the sentences around each citing sentence; without them the neighbouring sentences are empty.
 
 ## Rules
 
