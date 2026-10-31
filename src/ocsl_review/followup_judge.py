@@ -181,8 +181,13 @@ def _request_bytes(judge: Any, messages: list[dict[str, str]], settings: Mapping
 def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[Mapping[str, Any]], judge: Any, *,
               tier: str, model: str, policy: ConfidentialPolicy | None = None, module: Any = None,
               variant: str = "primary", concurrency: int = 1, code_revision: str | None = None,
-              study_bundle: str | None = None) -> dict[str, Any]:
-    """Judge ``items`` (dicts with ``id`` and ``provenance``) with one instrument tier; see the module docstring."""
+              study_bundle: str | None = None, transport_retries: int = 0, cooldown: float = 0.0,
+              sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    """Judge ``items`` (dicts with ``id`` and ``provenance``) with one instrument tier; see the module docstring.
+
+    Items of calls that got no response stay open; ``transport_retries`` further passes send them again, the first
+    after ``cooldown`` seconds and each next one after twice as long. ``summary["open"]`` counts what is left.
+    """
     policy = policy or ConfidentialPolicy("public-literature")
     module = module or module_for(instrument)
     plan = plan_for(instrument, tier)
@@ -202,7 +207,7 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
     summary: dict[str, Any] = {"instrument": instrument.id, "digest": instrument_digest, "tier": tier,
                                "variant": variant, "items": len(items), "skipped": len(items) - len(pending),
                                "calls": 0, "repairCalls": 0, "accepted": 0, "rejected": 0, "failedCalls": 0,
-                               "stopped": None}
+                               "passes": 0, "open": 0, "stopped": None}
     queue: deque[tuple[list[dict[str, Any]], str]] = deque(
         (pending[start:start + plan.items_per_call], "first") for start in range(0, len(pending), plan.items_per_call))
     in_flight: dict[Future, tuple[list[dict[str, Any]], str, list[dict[str, str]], dict[str, Any], str]] = {}
@@ -210,30 +215,44 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
     def call(messages: list[dict[str, str]], settings: dict[str, Any]) -> Any:
         return judge.complete(messages, settings=settings)
 
+    left_open: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, int(concurrency))) as pool:
-        while queue or in_flight:
-            while queue and len(in_flight) < max(1, int(concurrency)) and summary["stopped"] is None:
-                batch, kind = queue.popleft()
-                messages = module.build_messages([_sendable(item) for item in batch], tier)
-                settings = plan.settings(len(batch))
-                in_flight[pool.submit(call, messages, settings)] = (batch, kind, messages, settings, now())
-            if not in_flight:
+        while True:
+            while queue or in_flight:
+                while queue and len(in_flight) < max(1, int(concurrency)) and summary["stopped"] is None:
+                    batch, kind = queue.popleft()
+                    messages = module.build_messages([_sendable(item) for item in batch], tier)
+                    settings = plan.settings(len(batch))
+                    in_flight[pool.submit(call, messages, settings)] = (batch, kind, messages, settings, now())
+                if not in_flight:
+                    break
+                finished, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
+                for future in finished:
+                    batch, kind, messages, settings, started = in_flight.pop(future)
+                    retry, failed = _record(connection, instrument, plan, judge, policy, model, batch, kind, messages,
+                                            settings, started, future, summary, module=module, variant=variant,
+                                            code_revision=code_revision, study_bundle=study_bundle)
+                    left_open.extend(failed)
+                    if retry and kind == "first" and plan.repair_passes > 0 and summary["stopped"] is None:
+                        queue.append((retry, "repair"))
+                connection.commit()
+            if not left_open or summary["stopped"] is not None or summary["passes"] >= max(0, int(transport_retries)):
                 break
-            finished, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)
-            for future in finished:
-                batch, kind, messages, settings, started = in_flight.pop(future)
-                retry = _record(connection, instrument, plan, judge, policy, model, batch, kind, messages, settings,
-                                started, future, summary, module=module, variant=variant,
-                                code_revision=code_revision, study_bundle=study_bundle)
-                if retry and kind == "first" and plan.repair_passes > 0 and summary["stopped"] is None:
-                    queue.append((retry, "repair"))
-            connection.commit()
+            sleep(float(cooldown) * (2 ** summary["passes"]))
+            summary["passes"] += 1
+            again, left_open = left_open, []
+            queue.extend((again[start:start + plan.items_per_call], "first")
+                         for start in range(0, len(again), plan.items_per_call))
+    decided = {row[0] for row in connection.execute(
+        "SELECT DISTINCT item_key FROM fu_judgments WHERE instrument_digest=? AND tier=? AND variant=? AND outcome IN "
+        "('accepted','rejected')", (instrument_digest, tier, variant))}
+    summary["open"] = sum(1 for item in pending if item["id"] not in decided)
     return summary
 
 
 def _record(connection, instrument, plan, judge, policy, model, batch, kind, messages, settings, started, future,
-            summary, *, module, variant, code_revision, study_bundle) -> list[dict[str, Any]]:
-    """Write the receipt and judgments of one finished call; returns the items to repair."""
+            summary, *, module, variant, code_revision, study_bundle) -> tuple[list, list]:
+    """Write the receipt and judgments of one finished call; returns the items to repair and the items left open."""
     request = _request_bytes(judge, messages, settings)
     request_sha = store_artifact(connection, request, "judge-request", "application/json")
     item_keys = [item["id"] for item in batch]
@@ -266,7 +285,7 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
     summary["calls" if kind == "first" else "repairCalls"] += 1
     if outcome != "completed":
         summary["failedCalls"] += 1
-        return []
+        return [], (list(batch) if outcome == "failed" else [])
     result = module.validate_response([_sendable(item) for item in batch], reply.text)
     created = now()
     retry = []
@@ -288,7 +307,7 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
         summary["rejected"] += 1
         if failure.get("retryable"):
             retry.append(item)
-    return retry
+    return retry, []
 
 
 def block_items(connection: sqlite3.Connection, instrument: Any, tier: str, items: Sequence[tuple[str, str, str]], *,

@@ -124,6 +124,28 @@ class RunnerTests(unittest.TestCase):
         summary = self.run_function(F.ScriptedJudge(fail))
         self.assertEqual((1, 0), (summary["failedCalls"], summary["accepted"]))
 
+    def test_further_passes_send_items_left_open_by_failed_calls(self):
+        attempts = []
+
+        def flaky(messages, settings):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise ReviewError("judge HTTP 502")
+            return answer_with(FUNCTION["response"])(messages, settings)
+        waits = []
+        with self.branch.writing() as connection:
+            summary = run_items(connection, self.instrument, FUNCTION["items"], F.ScriptedJudge(flaky), tier="locus",
+                                model=F.MODEL, transport_retries=2, cooldown=3.0, sleep=waits.append)
+        self.assertEqual((2, 1, 1, 0), (summary["accepted"], summary["failedCalls"], summary["passes"], summary["open"]))
+        self.assertEqual([3.0], waits)
+        def down(messages, settings):
+            raise ReviewError("judge HTTP 503")
+        with self.branch.writing() as connection:
+            summary = run_items(connection, instruments.load("citation-function@1"),
+                                [{**FUNCTION["items"][0], "id": "locus-9"}], F.ScriptedJudge(down), tier="locus",
+                                model=F.MODEL, transport_retries=1, cooldown=1.0, sleep=waits.append)
+        self.assertEqual((0, 2, 1, 1), (summary["accepted"], summary["failedCalls"], summary["passes"], summary["open"]))
+
     def test_items_need_ids_and_provenance(self):
         judge = F.ScriptedJudge(answer_with(FUNCTION["response"]))
         with self.assertRaisesRegex(ValidationError, "provenance"):
