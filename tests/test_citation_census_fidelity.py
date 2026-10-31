@@ -14,15 +14,29 @@ messagesSha256, the sha256 of the JSON message list) adds a check against a
 private record set. Every digest a record carries must match the rebuilt call;
 a record whose user digest is the digest of an empty string holds no rebuilt
 prompt and is counted as unusable, never as a pass, and the check needs at least
-one usable record. Records for each journal have to come from that journal's
-own recorded calls. This paragraph stays out of the lab-facing documentation.
+one usable record for every journal it holds. Records for each journal have to
+come from that journal's own recorded calls. The check reports, per journal, the
+records, the usable and passing ones, the failing ones by digest, the usable ones
+by items per call and those with a cut abstract or a repair note, plus the sha256
+of the record file; it goes to standard error and, with
+OCSL_REVIEW_CENSUS_FIDELITY_REPORT set, to that file (counts and journal names
+only, never record content). It runs offline:
+
+    PYTHONPATH=src python -m unittest discover -s tests \
+        -p test_citation_census_fidelity.py -k PrivateRecordTests -v
+
+This paragraph stays out of the lab-facing documentation.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import platform
+import sys
+import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ocsl_review import citation_census as C
@@ -359,23 +373,99 @@ EMPTY_SHA256 = sha("")
 DIGESTS = ("systemSha256", "userSha256", "messagesSha256")
 
 
-def check_record(record: dict) -> str:
-    """'checked' when every digest a record carries matches the rebuilt call; 'unusable' for an empty recorded prompt.
+def record_outcome(record: dict) -> tuple[str, list[str]]:
+    """('unusable', []) for an empty recorded prompt, else ('pass' or 'fail', the digests that differ).
 
     A record carries any of systemSha256, userSha256 and messagesSha256 (sha256 of the JSON message list,
     ensure_ascii=False). A user digest equal to the digest of the empty string means that no prompt was
     rebuilt when the record was made; such a record cannot check anything and is counted apart.
     """
     if record.get("userSha256") == EMPTY_SHA256:
-        return "unusable"
+        return "unusable", []
     if not any(record.get(name) for name in DIGESTS):
         raise AssertionError("a fidelity record carries no digest")
     messages = C.build_abstract_messages(record["items"], record["title"], record["journal"], note=record.get("note", ""))
     digests = C.digests(messages)
-    for name in DIGESTS:
-        if record.get(name) and record[name] != digests[name]:
-            raise AssertionError(f"{name} differs for a recorded {record['journal']} call")
+    differs = [name for name in DIGESTS if record.get(name) and record[name] != digests[name]]
+    return ("fail" if differs else "pass"), differs
+
+
+def check_record(record: dict) -> str:
+    """'checked' when every digest a record carries matches the rebuilt call; 'unusable' for an empty recorded prompt."""
+    outcome, differs = record_outcome(record)
+    if outcome == "unusable":
+        return "unusable"
+    if differs:
+        raise AssertionError(f"{differs[0]} differs for a recorded {record['journal']} call")
     return "checked"
+
+
+ITEM_BUCKETS = (("1", 1, 1), ("2-9", 2, 9), ("10-39", 10, 39), ("40", 40, None))
+
+
+def _bucket(items: int) -> str:
+    return next((name for name, low, high in ITEM_BUCKETS if items >= low and (high is None or items <= high)), "other")
+
+
+def check_records(lines) -> dict:
+    """The per-journal fidelity report of a record set (counts and journal names only, never record content)."""
+    journals: dict[str, dict] = {}
+    cut, repair_note = C.abstract_cut(), C.repair_note()
+    for line in lines:
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        row = journals.setdefault(str(record.get("journal")), {
+            "records": 0, "unusable": 0, "usable": 0, "passing": 0, "failing": 0,
+            "failingBy": {name: 0 for name in DIGESTS},
+            "usableByItemsPerCall": {name: 0 for name, _, _ in ITEM_BUCKETS},
+            "usableWithCutAbstract": 0, "usableRepairCalls": 0})
+        row["records"] += 1
+        outcome, differs = record_outcome(record)
+        if outcome == "unusable":
+            row["unusable"] += 1
+            continue
+        row["usable"] += 1
+        items = record.get("items") or []
+        bucket = _bucket(len(items))
+        row["usableByItemsPerCall"][bucket] = row["usableByItemsPerCall"].get(bucket, 0) + 1
+        if any(len((item.get("abstract") or "").strip().replace("\n", " ")) > cut for item in items):
+            row["usableWithCutAbstract"] += 1
+        if record.get("note") == repair_note:
+            row["usableRepairCalls"] += 1
+        if outcome == "pass":
+            row["passing"] += 1
+        else:
+            row["failing"] += 1
+            for name in differs:
+                row["failingBy"][name] += 1
+    problems = [f"{journal}: {row['failing']} of {row['usable']} usable records differ"
+                for journal, row in sorted(journals.items()) if row["failing"]]
+    problems += [f"{journal}: no usable record ({row['unusable']} unusable)"
+                 for journal, row in sorted(journals.items()) if not row["usable"]]
+    if not journals:
+        problems.append("the record set holds no record")
+    return {"format": "ocsl-census-fidelity-check@1", "ok": not problems, "problems": problems,
+            "records": sum(row["records"] for row in journals.values()),
+            "usable": sum(row["usable"] for row in journals.values()),
+            "passing": sum(row["passing"] for row in journals.values()), "journals": journals}
+
+
+def run_record_check(path: Path, report: Path | None = None) -> dict:
+    """check_records over a record file, with the file's sha256 and the instrument and interpreter that rebuilt it."""
+    data = Path(path).read_bytes()
+    result = check_records(data.decode("utf-8").splitlines())
+    result.update({"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "recordFile": {"name": Path(path).name, "bytes": len(data),
+                                  "sha256": hashlib.sha256(data).hexdigest()},
+                   "instrument": {"id": C.INSTRUMENT_ID, "digest": C.instrument().digest},
+                   "python": platform.python_version()})
+    text = json.dumps(result, indent=2, sort_keys=True)
+    print(text, file=sys.stderr)
+    if report is not None:
+        Path(report).parent.mkdir(parents=True, exist_ok=True)
+        Path(report).write_text(text + "\n", encoding="utf-8")
+    return result
 
 
 class RecordCheckTests(unittest.TestCase):
@@ -400,18 +490,71 @@ class RecordCheckTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_record(dict(self.base))
 
+    def synthetic_record_set(self) -> list[dict]:
+        """Records of two journals built from the synthetic fixture: batches of 1, 3, 12 and 40 items, one with a cut
+        abstract, one repair call, and one unusable record per journal."""
+        items = load("judge_items.json")["papers"][0]["items"]
+        long = {**items[0], "abstract": "Synthetic abstract sentence. " * 200}
+        records = []
+        for journal in ("Frontiers in Oncology", "Nature Reviews Clinical Oncology"):
+            for size in (1, 3, 12, 40):
+                batch = items[:size]
+                records.append({"title": REVIEW_TITLE, "journal": journal, "items": batch,
+                                **C.digests(C.build_abstract_messages(batch, REVIEW_TITLE, journal))})
+            cut = [long, *items[1:3]]
+            records.append({"title": REVIEW_TITLE, "journal": journal, "items": cut,
+                            "messagesSha256": C.digests(C.build_abstract_messages(cut, REVIEW_TITLE, journal))["messagesSha256"]})
+            repair = items[3:5]
+            records.append({"title": REVIEW_TITLE, "journal": journal, "items": repair, "note": C.repair_note(),
+                            "userSha256": C.digests(C.build_repair_messages(repair, REVIEW_TITLE, journal))["userSha256"]})
+            records.append({"title": REVIEW_TITLE, "journal": journal, "items": items[:2], "userSha256": EMPTY_SHA256,
+                            "systemSha256": SYSTEM[journal]})
+        return records
+
+    def test_a_synthetic_record_set_is_reported_per_journal_offline(self):
+        records = self.synthetic_record_set()
+        with tempfile.TemporaryDirectory() as folder:
+            path, report = Path(folder) / "records.jsonl", Path(folder) / "out" / "fidelity.json"
+            path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+            result = run_record_check(path, report)
+            self.assertEqual(result, json.loads(report.read_text()))
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), result["recordFile"]["sha256"])
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual((14, 12, 12), (result["records"], result["usable"], result["passing"]))
+        cut = sum(1 for r in records if r["journal"] == "Frontiers in Oncology" and r.get("userSha256") != EMPTY_SHA256
+                  and any(len(item["abstract"] or "") > C.abstract_cut() for item in r["items"]))
+        self.assertGreater(cut, 0)
+        for journal in ("Frontiers in Oncology", "Nature Reviews Clinical Oncology"):
+            row = result["journals"][journal]
+            self.assertEqual({"records": 7, "unusable": 1, "usable": 6, "passing": 6, "failing": 0},
+                             {k: row[k] for k in ("records", "unusable", "usable", "passing", "failing")})
+            self.assertEqual({"1": 1, "2-9": 3, "10-39": 1, "40": 1}, row["usableByItemsPerCall"])
+            self.assertEqual((cut, 1), (row["usableWithCutAbstract"], row["usableRepairCalls"]))
+        self.assertNotIn(REVIEW_TITLE, json.dumps(result), "the report carries no record content")
+
+    def test_a_record_that_differs_or_a_journal_without_usable_records_fails_the_check(self):
+        records = self.synthetic_record_set()
+        records[0] = {**records[0], "userSha256": "0" * 64}
+        result = check_records(json.dumps(r) for r in records)
+        self.assertFalse(result["ok"])
+        self.assertEqual(1, result["journals"]["Frontiers in Oncology"]["failingBy"]["userSha256"])
+        self.assertIn("Frontiers in Oncology: 1 of 6 usable records differ", result["problems"])
+        only_unusable = [r for r in self.synthetic_record_set() if r.get("userSha256") == EMPTY_SHA256]
+        result = check_records(json.dumps(r) for r in only_unusable)
+        self.assertFalse(result["ok"])
+        self.assertIn("Nature Reviews Clinical Oncology: no usable record (1 unusable)", result["problems"])
+        self.assertFalse(check_records([])["ok"])
+
 
 @unittest.skipUnless(os.environ.get("OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"), "private fidelity records not configured")
 class PrivateRecordTests(unittest.TestCase):
-    """JSONL records {"title", "journal", "items", "note", and digests: see check_record} from a private fixture."""
+    """JSONL records {"title", "journal", "items", "note", and digests: see record_outcome} from a private fixture."""
 
     def test_private_records(self):
-        path = Path(os.environ["OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"])
-        outcomes = {"checked": 0, "unusable": 0}
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                outcomes[check_record(json.loads(line))] += 1
-        self.assertGreater(outcomes["checked"], 0, outcomes)
+        report = os.environ.get("OCSL_REVIEW_CENSUS_FIDELITY_REPORT")
+        result = run_record_check(Path(os.environ["OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"]),
+                                  Path(report) if report else None)
+        self.assertTrue(result["ok"], result["problems"])
 
 
 if __name__ == "__main__":
