@@ -454,11 +454,18 @@ def check_records(lines) -> dict:
 def run_record_check(path: Path, report: Path | None = None, *, echo: bool = True) -> dict:
     """check_records over a record file, with the file's sha256 and the instrument and interpreter that rebuilt it;
     the report goes to standard error (unless ``echo`` is false) and to ``report``."""
-    data = Path(path).read_bytes()
-    result = check_records(data.decode("utf-8").splitlines())
+    digest, size = hashlib.sha256(), 0
+
+    def lines():                                    # streamed: a full record set runs to some hundred megabytes
+        nonlocal size
+        with Path(path).open("rb") as handle:
+            for raw in handle:
+                digest.update(raw)
+                size += len(raw)
+                yield raw.decode("utf-8")
+    result = check_records(lines())
     result.update({"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "recordFile": {"name": Path(path).name, "bytes": len(data),
-                                  "sha256": hashlib.sha256(data).hexdigest()},
+                   "recordFile": {"name": Path(path).name, "bytes": size, "sha256": digest.hexdigest()},
                    "instrument": {"id": C.INSTRUMENT_ID, "digest": C.instrument().digest},
                    "python": platform.python_version()})
     text = json.dumps(result, indent=2, sort_keys=True)
