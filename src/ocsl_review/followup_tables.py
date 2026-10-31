@@ -52,7 +52,7 @@ def fold(text: Any) -> str:
     """Comparison form of a label: casefolded, typographic punctuation normalised, spacing collapsed, edges trimmed of
     punctuation, and a leading article dropped."""
     value = str(text or "")
-    for old, new in (("’", "'"), ("‘", "'"), ("“", '"'), ("”", '"'), ("–", "-"), ("—", "-"), (" ", " ")):
+    for old, new in (("’", "'"), ("‘", "'"), ("“", '"'), ("”", '"'), ("–", "-"), ("—", "-"), ("\u00a0", " ")):
         value = value.replace(old, new)
     value = " ".join(value.casefold().split()).strip(" .,;:!?\"'()[]")
     return value[4:] if value.startswith("the ") else value

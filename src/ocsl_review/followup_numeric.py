@@ -45,7 +45,7 @@ TIER = numeric_check.TIER
 SCALES = {"thousand": 3, "million": 6, "billion": 9}
 ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
             "ninth": 9, "tenth": 10}
-_SPACES = str.maketrans({" ": " ", " ": " ", " ": " ", " ": " ", "−": "-", "–": "-"})
+_SPACES = str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2007": " ", "−": "-", "–": "-"})
 _NUMBER = re.compile(r"(?<![\w.,])(-?)(\d(?:[\d,.]|\s(?=\d{3}(?!\d)))*)")
 _ORDINAL_DIGITS = re.compile(r"^\s*(\d+)(?:st|nd|rd|th)\b", re.IGNORECASE)
 

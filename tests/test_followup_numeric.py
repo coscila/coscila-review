@@ -71,7 +71,7 @@ class NumberTests(unittest.TestCase):
     def test_value_text_is_normalised_with_its_stated_precision(self):
         cases = {
             "12.5 thousand": ClaimValue(Decimal("12.5"), 1, 3), "12,500": ClaimValue(Decimal("12500"), 0),
-            "12 500": ClaimValue(Decimal("12500"), 0), "12 500": ClaimValue(Decimal("12500"), 0),
+            "12 500": ClaimValue(Decimal("12500"), 0), "12\u00a0500": ClaimValue(Decimal("12500"), 0),
             "3,4 %": ClaimValue(Decimal("3.4"), 1, 0, True), "1.234,5": ClaimValue(Decimal("1234.5"), 1),
             "1,234.5": ClaimValue(Decimal("1234.5"), 1), "0.125": ClaimValue(Decimal("0.125"), 3),
             "1.234.567": ClaimValue(Decimal("1234567"), 0), "1.5 billion": ClaimValue(Decimal("1.5"), 1, 9),

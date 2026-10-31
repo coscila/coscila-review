@@ -42,10 +42,10 @@ from .followup_model import canonical, digest
 from .followup_net import record_request
 from .followup_strata import protocol_of, replicate_keys, seeded_sample
 from .retrieval import EvidenceIndex, EvidenceUnit, normalise_identifier
+from .scholarly import EUROPE_PMC
 
 STAGES = ("sample", "acquire", "candidates", "judge")
 TIER = claim_match.TIER
-EUROPE_PMC = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 LOOKUP = "second-generation-lookup"
 FULL_TEXT = "second-generation-full-text"
 DONE = ("obtained", "no-open-full-text", "citation-not-located")
