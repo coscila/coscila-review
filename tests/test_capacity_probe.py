@@ -1085,8 +1085,11 @@ class SecretTests(ProbeCase):
                     self.assertNotIn(fragment, text)
         detail = json.loads(texts[P.REPORT_NAME])["cells"][0]["failureExamples"]["http-401"][0]["detail"]
         self.assertEqual(("e" * 182 + " Bearer [redacted]")[:P.DETAIL_CHARACTERS], detail)
-        self.assertEqual("ab[redacted]", P.redact_key("ab" + key[5:17], key))
-        self.assertEqual("ab" + key[5:12] + "z", P.redact_key("ab" + key[5:12] + "z", key))   # 7 characters stay
+        # The prefix "ab" must not continue the key's own characters, or the redacted fragment rightly grows by one
+        # (a random key whose fifth character is "b" did, about once in sixteen runs).
+        prefix = "ab" if key[4] != "b" else "ax"
+        self.assertEqual(prefix + "[redacted]", P.redact_key(prefix + key[5:17], key))
+        self.assertEqual(prefix + key[5:12] + "z", P.redact_key(prefix + key[5:12] + "z", key))   # 7 characters stay
 
     def test_refusals_never_echo_the_key(self):
         key = "probe-key-" + secrets.token_hex(16)
