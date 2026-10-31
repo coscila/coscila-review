@@ -116,6 +116,96 @@ for _length, _digests in {
     51: {"eae3d450ca367e62d119f56da83d611e6f5239d32ba2746dd08e8a72ecbcc531"},
 }.items():
     FORBIDDEN.setdefault(int(_length), set()).update(_digests)
+# Locale and spacing variants: the decimal-comma forms of every percentage, band, interval and ratio figure above
+# (with and without the space before the percent sign), the no-space forms of the bands, and every separator form of
+# the distinctive counts (none, comma, period, space and thin space, the bare forms of the counts that lacked them
+# among them). Bare whole-number percentages such as "16 %" or "8 %" are left out on purpose: they occur in any
+# literature and would make every scan fail. A three-digit count has no separator form and is too common bare. The
+# scanners fold no-break and thin spaces into a space, so the thin-space digests matter only to a reader that hashes
+# raw text.
+for _length, _digests in {
+    4: {"5b33003a928495b97792ac286d477b54dd20eb773c74ae2fb3653bc5950ad6dd",
+        "79b130bc38e970edf25be2bb3cecd3227db25e0d9201346c71557d09ef6557cc",
+        "7d1ccdfe7b15088f75affb300b4f370c68b3959384dafc65dfd2931b3ed2b58a",
+        "e2aabeaac667528d2d6cccc7bf1e93fc2881914a2625aa218bace5a7634e38df"},
+    5: {"1933753858a65e892538005879e535e767318ae22c18252e0c509d32b362b6a0",
+        "1fd0e70370d3ce3d2b2e97a871f98ac708f0242ae0d31970274d281f5f1d3061",
+        "3157acbe755094cbd3cd5073b189ec69942160c050bed0128077b36bab5b0684",
+        "3b5db5a596152bc479df712e7aefc6a65fbe90c916f067b516c7e3bcf60487ff",
+        "4521a5408f9a3f5897b540e1eae0071a36d84a412fbefb7dc9aaaf24ac24cd19",
+        "56d04302692da5e01fbbf57e189f31b64439b130e3921333b97d27c88508c910",
+        "63fd4c8aa416c95e8a0f87c22d26b5204c3e2c7e16e38e7ef4c4e3a5b6f5a784",
+        "64867ccef48fb76438c68827873ceef8924ecc79a5752aed07204a48f1f18adc",
+        "6d5887a6e360da476dc4fda8b5a023802485976fb77008d7fcdaa0471cfe9844",
+        "748a9fd311cef8b015e1f9ed5d86277a35ffb72fac883349dcd12c7b02e69f0a",
+        "749f1bf1d60d4e083bf3823f04d0446168a796ae01c4f1aa6f8fc6d188011fb3",
+        "752b90c4000480a7224e10308a39f39a44552f9cc81809630950e28a711d75c6",
+        "77cd9a9a89488f38ec43fef869ac73411b02f2e1d81117ac4974c4521da3c626",
+        "85a77ee85b4bb4e1f45c53e66b90cc55a70c6b3f194ee9642ee20b1832338ce8",
+        "8d4fbf8f632bc239812d177844db82469945304b3c8853eb45daa4236b20fc90",
+        "a817d518ac48afbf9a17b579daab6ea3c3d41365324d96e0172be16e1a7d8375",
+        "a9a57d9089b470ac89fe75db94f4be4e929ef84bed62ce10bf09bee77f151064",
+        "b35db775173c9b651a7c42c419b421a0c20ba72e70f09a659401b0889d081b0d",
+        "b422ce36c66e420a9d6d56d455712412821bd1d9df19fed57b98ee788cbe7dc9",
+        "b43923ee71fb8e609f50be1cc34625181eb6cb0890e8a3dfa4f2801d630fe45a",
+        "b8e3b46ba16356267374f6d7fa0185cb8d2e999d07f87934a8a95105ad0235c0",
+        "b8f54e6ae200ba25ab07bbdab1c35f246b7bb886af79bd621608d35d1fa8567c",
+        "d9a5fe2ea745a737bf4396ee5aeed4834cf019613bc210e1dc03bbe88de7be08",
+        "debd9ec9a0a37e35d0ae3a99cacc610f897e50c8288188acdac613877082da25",
+        "e290abc8edd2d13b2b3d73900682f45fe52621f8fd9317ba70d7d0e5a4426089"},
+    6: {"1b62b330060e680a4dc1e99423d12b532a7a3332908522ef799fa6b5c51899ad",
+        "3dc9a3c5704d3aff33aa952ec3f4d995a9360fd7ae449847a0a368b882d3eda1",
+        "5374c68e5c83f2655f59b2b5efda644a8be682b6cbf84e3085152fae183ecf38",
+        "7134c5de947b64ac10f25eb33b5425d512042a2e28f8bf68a074c940df8afe51",
+        "7284a2f79b1405fbb2632f0cbf7d84a53173b34c8e44d626810890b150163622",
+        "7c395f859b5168762b6a44d7f7830d76d17444371809160142d980b176ba0b85",
+        "7fd8022dff43558fb58739f8f9594df52d6074414db4c6b59b54c64152c18b47",
+        "919b65c1b7c320ccc85562475117449c0eb2e05fcc51ca3d00ae43fed0391e84",
+        "aebbd5906f185b63fd3c9233f3f8301e539239c7df963c5982445d634235ac38",
+        "b5aff7f81f3c6da0ffc7bf2d7b4b029a15be4c26a3f13abf7c6b1e81f8b29797",
+        "b727a554491e2f4a797bcf4bac8c996cdc997a1b76ea5c41525a5c77edcf7a68",
+        "db7eef30e81a52de5f7cb5f0db7b087973d45e70e75edf5c57e948e9fab75041",
+        "fe530e18c7508d5b275ec2ec44d893e8b52e781652685d923c77d00169d97ec2"},
+    7: {"2c89ba451a4e253ceeae47220e04f0841c8e37e0768d829b35976c6b148d7a67",
+        "35ab4dadf3b65b9b93553e96140b165ec5e0777197e3f4eb399e98e69cd8df74",
+        "6204401fcadafcc065d80caf46ebf17470654c7537590750a91762dd734591b9",
+        "7a97f29939ff0dd7fdf755be60d85001978b2a4fe1738057fcd58161d17f6a23",
+        "805b8bda9b3c5f2ad50a24eca3f05083d32a54e57e3eb982817de126c7a9fce6",
+        "881fd4c3c3da5dddf55211691759de74a8aa1bc9bcf0eecf57d2cfc728ca18d7",
+        "9978bcbbde3ed1b96939a94a676dfb7ad5a9771431d7510fd0d6ab7ca5b2d32a",
+        "adae7fb2271aa60afa9d44363d5be1be7ed1b872af33e735a8afb8396cd2e254",
+        "b3fc9ce779d95b0024ca57dafdfc14c97fb712f36042ea5908f05532c4740d11",
+        "c47d610b0d6422de1dabf9b5d38e7300c60e48309e88ae5ef34603a5367cb034",
+        "cdff45137d15259f9e393179e9e8b8de9610f06b2f2211accee3b56dfb86df3a"},
+    8: {"2c1da5d4c44fb7dcd50d23b7486e374f6475579210516f5d96f30c6b04bdc44f",
+        "fd57aa550a02daed53c7490c47f7a0353fd33ab9fa490e148af8be973cb72b33"},
+    9: {"4c847dd1bcd9909e59b67000147b3676297fce7283492bc027af2bdad526d31f",
+        "65b7b28c92453dbfbacec50c7d799f5bf5e436da99b99ed5e01b08791f9c4435",
+        "8080a4067400c1c8d31d96b9c9f0ff9826e3df2fada69d8ea3e6fe78f5d59f04",
+        "97df374a8095375f2a929590cd07ed0bf472ef00c9ef17737f3414fe8599e128",
+        "b232599af1b5d756470f55748af2ded47822e3d694032e3c75648d2bf925296c",
+        "be09835489965d4d74ff8d4ddf6c5091de79654ce7ccfec2311b509c08ff4fe5",
+        "cbfd95bd5a0d21b67951f32926246ec85d8220992d9a5308325342f6e35dc4e8",
+        "ea957e805be52702f09d42a53e66cb8bbd9bf7afba9d4e570d0560767031819c",
+        "f4f34e8d41dc0eb1bdafb368da76b3b7d8fa1952effd41bbeb86e76f80cbfcb4"},
+    10: {"53296370dc9ec0a96c0fd4a212a865f65ea1a4b969b5953caad37f2be3295a35",
+         "7a3014813c09b431831ef4a51b1273cc52510b9976311054aafe1806810a8ebd",
+         "91caada049bd96dd86d0aa91510e2e6f544ee2375a6f72c0fb7497ef7ef355f8"},
+    11: {"3af9d65593904463222ef4194529ed2551e4c6aac04b26655212df7badf79c26"},
+}.items():
+    FORBIDDEN.setdefault(_length, set()).update(_digests)
+# The same digest list is pinned in coscila (scripts/ops/leakage-tokens.ts, from packages/lab) and coscila-writing
+# (tests/test_blindness.py): sha256 of the sorted digests joined by newlines, and their number. A change to one table
+# changes this fingerprint, so all three copies change together.
+TABLE_FINGERPRINT = "af696c1f0ed8242f5271fc5f6867e20b64a833d15121a881b7d2443962d6b51a"
+TABLE_SIZE = 150
+
+
+def table_fingerprint(table) -> tuple[str, int]:
+    digests = sorted({digest for group in table.values() for digest in group})
+    return hashlib.sha256("\n".join(digests).encode("ascii")).hexdigest(), len(digests)
+
+
 # Everything the lab sees: skills (with their assets and references), instruments, prompts, docs and the
 # modules that build prompts or runtime output.
 LAB_FACING = ["skills", "instruments", "prompts", "docs", "README.md", "schemas/instrument.schema.json",
@@ -333,6 +423,13 @@ class BlindnessTests(unittest.TestCase):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 for phrase in phrases:
                     self.assertNotIn(phrase, text)
+
+    def test_token_table_is_the_digest_list_of_the_lab_and_writing_copies(self):
+        self.assertEqual((TABLE_FINGERPRINT, TABLE_SIZE), table_fingerprint(FORBIDDEN))
+        for length, digests in FORBIDDEN.items():
+            for digest in digests:
+                self.assertRegex(digest, r"^[0-9a-f]{64}$")
+            self.assertGreaterEqual(length, 4)
 
     def test_scanner_detects_tokens_at_word_starts_only(self):
         table = {5: {hashlib.sha256(b"7.7 %").hexdigest()}}
