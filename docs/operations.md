@@ -31,8 +31,8 @@ selects machine-readable output. The command families are:
 catalog validate
 bootstrap
 doctor
-integrate install|status|verify|uninstall
-skills list|show|validate|install|uninstall
+integrate install|status|verify|refresh|uninstall
+skills list|show|validate|install|refresh|uninstall
 repos list|path|verify|sync|update
 standards list|path|verify|sync
 env list|build|ensure|run|fork|describe|verify
@@ -228,9 +228,22 @@ longer describes it.
 
 ### Updating an existing installation
 
-`integrate install` is idempotent, not an upgrade command: reusing an active
-installation does not refresh its skill files from a changed source checkout.
-For an update, validate and test the merged source, then preserve private
+Installed skill copies record the digest of the source they were copied from.
+`integrate verify` (and therefore `doctor`) fails while any installed copy was
+made from an older source, so a checkout update that only moves the companion
+never leaves agents reading superseded skill text unnoticed. After a companion
+update, `integrate refresh` re-copies exactly the skills whose source changed
+(MCP entries and staging stay as they are) and records the new skill manifest;
+a repeated `integrate install` with the same values does the same. Neither
+overwrites an installed copy edited after installation.
+
+```bash
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate refresh
+"$OCSL_REVIEW_HOME/bin/ocsl-review" integrate verify --live --strict
+```
+
+For a larger update (changed MCP entries, staging or environments), validate
+and test the merged source, then preserve private
 backups of the current skill mirrors, ownership records, MCP source and staged
 configuration, runtime environment, and current template pointers.
 

@@ -378,7 +378,15 @@ def install_skill_set(
     if manifest_file.exists():
         existing = json.loads(manifest_file.read_text(encoding="utf-8"))
         _manifest_matches_installation(existing, normalized_roots)
-        return {"installed": True, "reused": True, "manifest": str(manifest_file)}
+        # A repeated install brings the installed copies up to the current source: a companion update only moves the
+        # checkout, so copies made from an older source would otherwise keep their old text.
+        refreshed = refresh_skill_set(paths)
+        return {
+            "installed": True,
+            "reused": True,
+            "refreshed": refreshed["refreshed"],
+            "manifest": str(manifest_file),
+        }
 
     install_id = installation_id or uuid.uuid4().hex
     paths.integration.mkdir(parents=True, exist_ok=True)
@@ -469,9 +477,36 @@ def install_skill_set(
         raise
 
 
+def stale_skill_entries(paths: Any, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Installed copies whose recorded source digest differs from the companion's current skill source."""
+    stale: list[dict[str, Any]] = []
+    current: dict[str, str] = {}
+    for root_record in manifest.get("roots", []):
+        for entry in root_record.get("skills", []):
+            skill_id = str(entry.get("id"))
+            if skill_id not in current:
+                source = paths.home / "skills" / skill_id
+                current[skill_id] = tree_digest(source) if source.is_dir() else ""
+            if entry.get("sourceDigest") != current[skill_id]:
+                stale.append(
+                    {
+                        "id": skill_id,
+                        "target": str(entry.get("target")),
+                        "installedSourceDigest": entry.get("sourceDigest"),
+                        "currentSourceDigest": current[skill_id] or None,
+                    }
+                )
+    return stale
+
+
 def verify_skill_installation(
-    paths: Any, roots: Mapping[str, Path] | None = None
+    paths: Any,
+    roots: Mapping[str, Path] | None = None,
+    *,
+    check_source: bool = True,
 ) -> dict[str, Any]:
+    """Check the installed copies: unedited since installation and, unless check_source is false, made from the
+    companion's current skill source (a stale copy keeps text the source no longer has)."""
     manifest_file = manifest_path(paths)
     if not manifest_file.is_file():
         return {"ok": False, "installed": False, "reason": "skill manifest is absent"}
@@ -489,12 +524,117 @@ def verify_skill_installation(
                         )
     except ValidationError as exc:
         return {"ok": False, "installed": True, "reason": str(exc)}
+    if check_source:
+        stale = stale_skill_entries(paths, manifest)
+        if stale:
+            names = sorted({entry["id"] for entry in stale})
+            return {
+                "ok": False,
+                "installed": True,
+                "stale": stale,
+                "reason": (
+                    "installed skills are stale (made from an older companion source): "
+                    + ", ".join(names)
+                    + "; refresh them with `ocsl-review integrate refresh` (or `ocsl-review skills refresh`)"
+                ),
+            }
     return {
         "ok": True,
         "installed": True,
         "installationId": manifest.get("installationId"),
         "roots": [record.get("root") for record in manifest.get("roots", [])],
     }
+
+
+INTEGRATION_STATE_NAME = "install-state.json"
+
+
+def refresh_skill_set(paths: Any, *, integrated: bool = False) -> dict[str, Any]:
+    """Re-copy every installed skill whose source changed since installation, in place and with rollback.
+
+    The pre-install backups stay as recorded, so uninstall still restores what stood there before the first install.
+    An installed copy edited after installation is refused, never overwritten. Skills a deployment integration owns
+    are refreshed through `integrate refresh`, which also records the new skill manifest in the integration state.
+    """
+    manifest_file = manifest_path(paths)
+    if not manifest_file.is_file():
+        raise ValidationError("skills are not installed; nothing to refresh")
+    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    for root_record in manifest.get("roots", []):
+        for entry in root_record.get("skills", []):
+            target = Path(entry["target"])
+            if _node_manifest(target) != entry.get("installedManifest"):
+                raise ValidationError(
+                    f"refusing to refresh a skill edited after installation: {target}"
+                )
+    stale_targets = {entry["target"] for entry in stale_skill_entries(paths, manifest)}
+    if not stale_targets:
+        return {"refreshed": [], "manifest": str(manifest_file)}
+    if not integrated and (paths.integration / INTEGRATION_STATE_NAME).exists():
+        raise ValidationError(
+            "these skills belong to a deployment integration; refresh them with `ocsl-review integrate refresh`"
+        )
+    install_id = str(manifest.get("installationId"))
+    refresh_id = uuid.uuid4().hex
+    aside_root = paths.integration / "backups" / f"refresh-{refresh_id}"
+    replaced: list[tuple[Path, Path]] = []
+    staged: list[Path] = []
+    refreshed: list[str] = []
+    try:
+        for root_record in manifest.get("roots", []):
+            for entry in root_record.get("skills", []):
+                if entry["target"] not in stale_targets:
+                    continue
+                skill_id = str(entry["id"])
+                source = paths.home / "skills" / skill_id
+                target = Path(entry["target"])
+                stage = target.parent / f".ocsl-review-stage-{refresh_id}-{skill_id}"
+                if stage.exists() or stage.is_symlink():
+                    raise ValidationError(f"staging path already exists: {stage}")
+                shutil.copytree(source, stage, symlinks=True, copy_function=shutil.copy2)
+                staged.append(stage)
+                source_digest = tree_digest(source)
+                atomic_json(
+                    stage / OWNER_FILE,
+                    {
+                        "schemaVersion": 1,
+                        "installationId": install_id,
+                        "skillId": skill_id,
+                        "sourceDigest": source_digest,
+                    },
+                )
+                installed_manifest = _node_manifest(stage)
+                aside = aside_root / f"{len(replaced):03d}-{skill_id}"
+                aside.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, aside)
+                replaced.append((target, aside))
+                os.replace(stage, target)
+                staged.remove(stage)
+                if _node_manifest(target) != installed_manifest:
+                    raise ValidationError(f"refreshed copy failed verification: {target}")
+                entry["sourceDigest"] = source_digest
+                entry["installedManifest"] = installed_manifest
+                refreshed.append(str(target))
+        manifest["refreshedAt"] = datetime.now(UTC).isoformat()
+        atomic_json(manifest_file, manifest, mode=0o600)
+    except Exception:
+        for stage in staged:
+            _remove_node(stage)
+        rollback_errors: list[str] = []
+        for target, aside in reversed(replaced):
+            try:
+                _remove_node(target)
+                os.replace(aside, target)
+            except Exception as exc:  # noqa: BLE001
+                rollback_errors.append(f"{target}: {exc}")
+        if rollback_errors:
+            raise ReviewError(
+                "skill refresh failed and rollback was incomplete: " + "; ".join(rollback_errors)
+            )
+        raise
+    for _, aside in replaced:
+        _remove_node(aside)
+    return {"refreshed": refreshed, "manifest": str(manifest_file)}
 
 
 def uninstall_skill_set(paths: Any) -> dict[str, Any]:
@@ -571,6 +711,10 @@ def cmd_validate(args: Any) -> dict[str, Any]:
 
 def cmd_install(args: Any) -> dict[str, Any]:
     return install_skill_set(args.paths, resolve_skill_roots(args))
+
+
+def cmd_refresh(args: Any) -> dict[str, Any]:
+    return refresh_skill_set(args.paths)
 
 
 def cmd_uninstall(args: Any) -> dict[str, Any]:

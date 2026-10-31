@@ -177,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="generated deployment MCP config; required for legacy install records",
     )
     _set(verify, "lifecycle", "cmd_verify", READ_ONLY, state_required=True)
+    refresh = integrate_commands.add_parser(
+        "refresh", help="re-copy installed skills whose companion source changed (after a companion update)"
+    )
+    _set(refresh, "lifecycle", "cmd_refresh", OPERATOR, state_required=True)
     uninstall = integrate_commands.add_parser("uninstall")
     uninstall.add_argument("--stage-timeout", type=float, default=None)
     _set(uninstall, "lifecycle", "cmd_uninstall", OPERATOR, state_required=True)
@@ -190,7 +194,11 @@ def build_parser() -> argparse.ArgumentParser:
     _set(skill_show, "skills", "cmd_show", READ_ONLY, state_required=False)
     skill_validate = skill_commands.add_parser("validate")
     _set(skill_validate, "skills", "cmd_validate", READ_ONLY, state_required=False)
-    for command, function in (("install", "cmd_install"), ("uninstall", "cmd_uninstall")):
+    for command, function in (
+        ("install", "cmd_install"),
+        ("refresh", "cmd_refresh"),
+        ("uninstall", "cmd_uninstall"),
+    ):
         selected = skill_commands.add_parser(command)
         if command == "install":
             selected.add_argument("--native-skills-root")
