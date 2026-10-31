@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coscila/coscila-review/instruments/numeric-check/1/output.schema.json",
+  "title": "numeric-check@1 parse response",
+  "description": "One object with exactly one output item per input item. The validator also checks that valueText and the quote occur exactly in the citing sentence. The comparison with the statistics tables is deterministic and outside the model call.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "decision", "condition", "metric", "geography", "year", "valueText", "unit", "quote",
+                     "rationale", "abstainReason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "decision": {"enum": ["parsed", "not-epidemiological", "abstain"]},
+          "condition": {"type": "string", "maxLength": 200},
+          "metric": {"enum": ["incidence-count", "incidence-rate", "mortality-count", "mortality-rate", "prevalence",
+                              "survival", "rank", "trend", "other", ""]},
+          "geography": {"type": "string", "maxLength": 200},
+          "year": {"type": ["integer", "null"], "minimum": 1800, "maximum": 2200},
+          "valueText": {"type": "string", "maxLength": 120},
+          "unit": {"type": "string", "maxLength": 80},
+          "quote": {"type": "string", "maxLength": 600},
+          "rationale": {"type": "string", "minLength": 1, "maxLength": 600},
+          "abstainReason": {"type": "string", "maxLength": 300}
+        }
+      }
+    }
+  }
+}

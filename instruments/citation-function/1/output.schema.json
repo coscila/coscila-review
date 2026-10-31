@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coscila/coscila-review/instruments/citation-function/1/output.schema.json",
+  "title": "citation-function@1 response",
+  "description": "One object with exactly one output item per input item. The validator also checks that each quote occurs exactly in the field it names.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "function", "quote", "quoteField", "rationale", "abstainReason"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "function": {"enum": ["relies", "background", "critical", "notes-retraction", "abstain"]},
+          "quote": {"type": "string", "maxLength": 600},
+          "quoteField": {"enum": ["citingSentence", "contextBefore", "contextAfter", ""]},
+          "rationale": {"type": "string", "minLength": 1, "maxLength": 600},
+          "abstainReason": {"type": "string", "maxLength": 300}
+        }
+      }
+    }
+  }
+}
