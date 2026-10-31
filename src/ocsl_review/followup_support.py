@@ -417,27 +417,6 @@ def acquire_all(connection: Any, acquirer: Acquirer, tier: str, works: Sequence[
 
 
 # ----------------------------------------------------------------------------- tasks
-class SupportItems:
-    """citation-support@2 as ``followup_judge.SupportModule`` runs it; a response its validator cannot read at all
-    rejects every item of the call (retryable) instead of ending the run."""
-
-    def __init__(self):
-        from .followup_judge import SupportModule
-        self.inner = SupportModule()
-
-    def build_messages(self, items: Sequence[Mapping[str, Any]], tier: str) -> list[dict[str, str]]:
-        return self.inner.build_messages(items, tier)
-
-    def validate_response(self, items: Sequence[Mapping[str, Any]], text: Any) -> dict[str, Any]:
-        from .corpus_assessment import AssessmentError
-        try:
-            return self.inner.validate_response(items, text)
-        except AssessmentError as error:
-            return {"accepted": {}, "unexpected": [], "unidentifiedItems": 0,
-                    "rejected": {item["id"]: {"code": error.code, "message": str(error), "retryable": error.retryable}
-                                 for item in items}}
-
-
 class WindowIndex:
     """A retrieval index of one work's evidence units (temporary, closed after the work's loci)."""
 
@@ -627,7 +606,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     sendable = [item for item in items if not public_only or item["provenance"] == "public"]
     options = {"sleep": sleep} if sleep is not None else {}
     summary = run_items(connection, instrument, sendable, judge, tier=tier, model=model, policy=policy,
-                        module=SupportItems(), variant=variant, concurrency=concurrency, code_revision=code_revision,
+                        variant=variant, concurrency=concurrency, code_revision=code_revision,
                         transport_retries=transport_retries, cooldown=cooldown, **options) if sendable else {
         "instrument": instrument.id, "digest": instrument.digest, "items": 0, "calls": 0, "accepted": 0,
         "rejected": 0, "failedCalls": 0, "open": 0, "stopped": None}

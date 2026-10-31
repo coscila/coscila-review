@@ -98,15 +98,22 @@ class FollowupHttpJudge:
 
 
 class SupportModule:
-    """citation-support@2 unchanged: the corpus_assessment planner and validator."""
+    """citation-support@2 unchanged: the corpus_assessment planner and validator. A response the validator cannot
+    read at all (not JSON, no items array) rejects every item of its call, retryable as the validator says, instead
+    of ending the run."""
 
     def build_messages(self, items: Sequence[Mapping[str, Any]], tier: str) -> list[dict[str, str]]:
         from .corpus_assessment import build_messages
         return build_messages([dict(item) for item in items], tier)
 
     def validate_response(self, items: Sequence[Mapping[str, Any]], text: Any) -> dict[str, Any]:
-        from .corpus_assessment import AssessmentValidator
-        return AssessmentValidator().validate_response([dict(item) for item in items], text)
+        from .corpus_assessment import AssessmentError, AssessmentValidator
+        try:
+            return AssessmentValidator().validate_response([dict(item) for item in items], text)
+        except AssessmentError as error:
+            return {"accepted": {}, "unexpected": [], "unidentifiedItems": 0,
+                    "rejected": {item["id"]: {"code": error.code, "message": str(error), "retryable": error.retryable}
+                                 for item in items}}
 
 
 def module_for(instrument: Any) -> Any:

@@ -291,6 +291,23 @@ class SupportTests(unittest.TestCase):
         self.run_support(no_text, F.ScriptedJudge(quoting()))
         self.assertIn("text-redacted", {row["reason"] for row in self.rows(no_text, "abstract").values()})
 
+    def test_an_unreadable_response_rejects_its_items_and_the_run_goes_on(self):
+        branch = self.branch()
+        unreadable = locus("a1/1")
+
+        def answer(messages, settings):
+            item = json.loads(messages[1]["content"])["items"][0]
+            return "not a JSON response" if item["id"].startswith(unreadable) else quoting()(messages, settings)
+        result = self.run_support(branch, F.ScriptedJudge(answer))
+        # the unreadable response and its repair are rejected; every other item of the run is accepted
+        self.assertEqual((4, 2, 1), (result["run"]["accepted"], result["run"]["rejected"],
+                                     result["run"]["repairCalls"]))
+        self.assertEqual("invalid-output", self.rows(branch, "abstract")[unreadable]["reason"])
+        with closing(branch.connect()) as connection:
+            codes = {row[0] for row in connection.execute("SELECT error_code FROM fu_judgments WHERE item_key=?",
+                                                          (unreadable + "|abstract",))}
+        self.assertEqual({"invalid_json"}, codes)
+
     def test_a_run_resumes_after_calls_without_a_response(self):
         branch = self.branch()
 
