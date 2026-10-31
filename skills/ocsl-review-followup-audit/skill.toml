@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+schema_version = 1
+id = "ocsl-review-followup-audit"
+title = "Compromised-evidence dependency audit"
+summary = "Branch a frozen citation census and audit which review claims rest on cited works with a dated retraction, expression of concern or correction, or on works cited systematically without support, and how those claims propagate."
+primary_environment = "review-literature"
+secondary_environments = ["review-statistics"]
+mcps = ["ocsl_review_catalog", "ocsl_scholar"]
+outputs = ["work/followup/followup.sqlite3", "results/followup/facts.json", "results/followup/facts.sqlite3", "results/followup/exports/manifest.json"]
+confidential_by_default = true

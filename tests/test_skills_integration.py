@@ -63,7 +63,7 @@ class ReviewPathsTestCase(unittest.TestCase):
 class SkillCatalogTests(ReviewPathsTestCase):
     def test_catalog_and_all_runtime_contracts_validate(self) -> None:
         result = skills.validate_catalog(self.paths)
-        self.assertEqual(22, result["skills"])
+        self.assertEqual(23, result["skills"])
         self.assertEqual(
             {
                 "review-core",

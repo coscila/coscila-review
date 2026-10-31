@@ -15,7 +15,7 @@ oc-science-lab-bio/      bioinformatics capabilities, when installed
 oc-science-lab-review/   manuscript review and literature verification
 ```
 
-Installation is additive. It mirrors twenty-two `ocsl-review-*` skills into
+Installation is additive. It mirrors twenty-three `ocsl-review-*` skills into
 configured global skill roots and adds only `ocsl_review_catalog` and
 `ocsl_scholar` to deployment MCP configuration. It does not require tracked
 changes in either sibling repository.

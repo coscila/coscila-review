@@ -39,6 +39,7 @@ REQUIRED_SKILLS = (
     "ocsl-review-revision-response",
     "ocsl-review-calibration",
     "ocsl-review-environments",
+    "ocsl-review-followup-audit",
 )
 ENVIRONMENT_IDS = {
     "review-core",
