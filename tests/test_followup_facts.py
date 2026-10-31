@@ -84,7 +84,7 @@ def populated_branch(root: Path, census: dict, name: str) -> FollowupBranch:
                            (locus("a1/3"),))
         connection.execute("INSERT INTO fu_secondgen_matches VALUES(?, 'sentence-1', 'doi:10.5555/fu.later.1', 1, "
                            "2.5, 'same-claim', 'cites-review-for-claim', 1, NULL, 'repeats the association', NULL, "
-                           "1.0)", (locus("a2/2"),))
+                           "1.0)", (locus("a1/1"),))
         connection.execute("INSERT INTO fu_estimates VALUES('compromised-share.journal-a.all.retracted.share', 0.25, "
                            "'compromised-share', ?, NULL, 'S1', 2.0, 8.0, 8, ?)",
                            (F.JOURNAL_A, json.dumps({"b": 200, "seed": 13, "interval": "percentile"})))
