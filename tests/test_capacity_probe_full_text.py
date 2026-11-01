@@ -21,7 +21,7 @@ from ocsl_review import capacity_probe as P
 from ocsl_review import citation_census as C
 from ocsl_review import study_cli
 from ocsl_review.census_inputs import SEARCH
-from ocsl_review.census_runner import CensusRun, HttpChatTransport, full_text_call
+from ocsl_review.census_runner import CensusRun, HttpChatTransport
 from ocsl_review.cli import main
 from ocsl_review.corpus_seed import import_legacy_evidence
 from ocsl_review.corpus_store import CorpusRepository
