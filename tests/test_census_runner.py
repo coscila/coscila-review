@@ -863,6 +863,17 @@ class RetryableFetchTests(RunnerTestCase):
             europe_pmc_fetcher(spacing=0, opener=opener_for(cut), sleep=sleeps.append)("PMC1")
         recovered = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled, Response()), sleep=sleeps.append)
         self.assertEqual(b"<article/>", recovered("PMC1"))
+        # Every request names the census inputs' User-Agent and asks for XML; no contact address is sent.
+        sent = []
+
+        def recording(request, timeout=None):
+            sent.append(request)
+            return Response()
+        europe_pmc_fetcher(spacing=0, opener=recording, sleep=sleeps.append)("PMC7")
+        self.assertEqual("https://www.ebi.ac.uk/europepmc/webservices/rest/PMC7/fullTextXML", sent[0].full_url)
+        self.assertEqual({"Accept": "application/xml", "User-agent": "ocsl-review census inputs"},
+                         dict(sent[0].header_items()))
+        self.assertNotIn("@", json.dumps(dict(sent[0].header_items())))
 
 
 class ReadOnlyStatusTests(RunnerTestCase):
