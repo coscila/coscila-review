@@ -40,6 +40,9 @@ def add_commands(commands: Any, register: Any) -> None:
     parsers["status-fetch"].add_argument("--limit", type=int, help="at most this many works (a smoke test)")
     parsers["status-fetch"].add_argument("--workspace", help="workspace whose egress ledger records the requests")
     parsers["status-fetch"].add_argument("--snapshot", help="continue this status snapshot instead of starting one")
+    parsers["status-fetch"].add_argument("--continue", dest="continue_open", action="store_true",
+                                         help="continue the latest snapshot that did not finish (a fixed Study Run "
+                                              "step passes it; a new snapshot starts when none is open)")
     parsers["status-resolve"] = commands.add_parser(
         "status-resolve", help="one status row (source and date) for every cited work of the parent census")
     parsers["status-resolve"].add_argument("--snapshot", action="append",

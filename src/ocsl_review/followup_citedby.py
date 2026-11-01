@@ -30,6 +30,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from . import followup_net
 from .errors import ProviderError, ValidationError
 from .followup_branch import FollowupBranch, now, register_dataset, require_freeze
 from .followup_model import CitedByEdge, CitedByResult, TargetRef, canonical
@@ -347,7 +348,13 @@ def traverse(connection: Any, scholarly: Any, *, sources: Sequence[str], widen: 
         chosen = chosen[:limit]
     states: dict[str, Counter] = {source: Counter() for source in sources}
     found: dict[str, int] = {source: 0 for source in sources}
-    for target in chosen:
+    throttled: dict[str, int] = {}
+    for position, target in enumerate(chosen):
+        hot = [source for source in sources if followup_net.throttled(scholarly, source)]
+        if hot:
+            # A provider throttled every recent request: stop the traversal (a later run traverses again).
+            throttled = {source: len(chosen) - position for source in hot}
+            break
         results = [adapter.citing(target) for adapter in adapters]
         write_target(connection, target, results)
         for result in results:
@@ -362,10 +369,16 @@ def traverse(connection: Any, scholarly: Any, *, sources: Sequence[str], widen: 
                                 ).fetchone()[0]
     dependency_rows = connection.execute("SELECT COUNT(*) FROM fu_dependency").fetchone()[0]
     notes = [] if widen or dependency_rows else ["no dependency rows: run followup dependency first, or --widen"]
-    return {"targets": len(chosen), "widened": widen, "sources": list(sources), "dependencyRows": dependency_rows,
-            "notes": notes,
-            "states": {source: dict(sorted(count.items())) for source, count in states.items()}, "edges": found,
-            "graphEdges": rows, "unitedCitingWorks": united, "dataset": dataset, "requests": recorder.summary()}
+    result = {"targets": len(chosen), "widened": widen, "sources": list(sources), "dependencyRows": dependency_rows,
+              "notes": notes,
+              "states": {source: dict(sorted(count.items())) for source, count in states.items()}, "edges": found,
+              "graphEdges": rows, "unitedCitingWorks": united, "dataset": dataset, "requests": recorder.summary(),
+              "state": "completed"}
+    if throttled:
+        left = ", ".join(f"{source}: {count} targets" for source, count in sorted(throttled.items()))
+        result.update(state="paused", throttled=throttled,
+                      reason=f"transport: provider throttled ({left} not traversed); run citedby again to resume")
+    return result
 
 
 def cmd_citedby(args: Any) -> dict[str, Any]:

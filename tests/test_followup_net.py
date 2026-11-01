@@ -65,6 +65,53 @@ class NetworkBaseTests(unittest.TestCase):
         self.assertEqual([0.4, 0.4], slept)
         self.assertEqual(4, len(inner.requests))
 
+    def test_a_throttling_host_pushes_its_next_slot_by_retry_after_and_bulk_loops_can_stop(self):
+        """A sustained HTTP 429 with Retry-After: 60: after the scholarly transport's own bounded retries, the host's
+        next request waits for the server's Retry-After, and after a run of throttles the host counts as throttled."""
+        import email.message
+        import urllib.error
+        from ocsl_review import scholarly
+        from ocsl_review.errors import ProviderError
+        clock, sleeps, sent = [1000.0], [], []
+
+        def sleep(seconds):
+            sleeps.append(round(seconds, 2))
+            clock[0] += seconds
+
+        def throttle(request, *, timeout, allow_cross_origin=False, authorize_url=None):
+            sent.append(round(clock[0], 2))
+            headers = email.message.Message()
+            headers["Retry-After"] = "60"
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", headers, None)
+        inner = scholarly.HttpTransport(user_agent="ocsl-review/0.1 (test)", sleep=sleep, monotonic=lambda: clock[0])
+        spaced = followup_net.SpacedTransport(inner, clock=lambda: clock[0], sleep=sleep)
+        client = type("Client", (), {"transport": spaced})()
+        with mock.patch("ocsl_review.scholarly.open_public_https", side_effect=throttle):
+            for index in range(followup_net.MAX_CONSECUTIVE_THROTTLES):
+                self.assertFalse(followup_net.throttled(client, "crossref"))
+                with self.assertRaises(ProviderError):
+                    spaced.get(f"https://api.crossref.org/works/10.5555/w{index}")
+        self.assertTrue(followup_net.throttled(client, "crossref"))
+        self.assertTrue(followup_net.throttled(client, "api.crossref.org"))
+        self.assertFalse(followup_net.throttled(client, "europe-pmc"))
+        self.assertEqual(followup_net.MAX_CONSECUTIVE_THROTTLES, spaced.consecutive_throttles("api.crossref.org"))
+        # every later work's first request waited the server's 60 seconds after the previous throttle
+        attempts = len(sent) // followup_net.MAX_CONSECUTIVE_THROTTLES
+        firsts = sent[::attempts]
+        self.assertTrue(all(later - earlier >= 60 for earlier, later in zip(firsts, firsts[1:])), (firsts, sleeps))
+        # an answer resets the host's run of throttles; without a Retry-After the backoff doubles
+        ok = followup_net.SpacedTransport(F.FixtureTransport({"https://api.crossref.org/": (200, "status/crossref-work-plain.json")}),
+                                          clock=lambda: clock[0], sleep=sleep)
+        ok._throttles["api.crossref.org"] = 3
+        ok.get("https://api.crossref.org/works/10.5555/x")
+        self.assertEqual(0, ok.consecutive_throttles("api.crossref.org"))
+        failing = followup_net.SpacedTransport(F.FixtureTransport({"https://api.crossref.org/": (429, b"{}")}),
+                                               clock=lambda: clock[0], sleep=sleep)
+        for expected in (5.0, 10.0):
+            with self.assertRaises(ProviderError):
+                failing.get("https://api.crossref.org/works/10.5555/y")
+            self.assertAlmostEqual(clock[0] + expected, failing._next["api.crossref.org"])
+
     def test_receipts_drop_contact_and_key_parameters(self):
         with tempfile.TemporaryDirectory() as directory:
             census = F.make_parent(Path(directory))

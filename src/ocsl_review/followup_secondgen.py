@@ -208,10 +208,14 @@ def acquire(connection: sqlite3.Connection, client: Any, anchor_ids: Sequence[st
         f"SELECT DISTINCT citing_key FROM fu_secondgen_sample WHERE {condition}", params)})
     known = dict(connection.execute("SELECT citing_key, outcome FROM fu_secondgen_documents").fetchall())
     outcomes: dict[str, int] = {}
-    fetched = 0
-    for citing_key in needed:
+    fetched = throttled = 0
+    for position, citing_key in enumerate(needed):
         if known.get(citing_key) in DONE:
             continue
+        if throttled_host(client, "europe-pmc"):
+            # Europe PMC throttled every recent request: the rest is fetched by the next run.
+            throttled = sum(1 for key in needed[position:] if known.get(key) not in DONE)
+            break
         identifiers: dict[str, str | None] = {"doi": None, "pmid": None, "pmcid": None}
         for doi, pmid, pmcid in connection.execute("SELECT citing_doi, citing_pmid, citing_pmcid FROM fu_citedby_edges "
                                                    "WHERE citing_key=? ORDER BY edge_id", (citing_key,)):
@@ -231,7 +235,13 @@ def acquire(connection: sqlite3.Connection, client: Any, anchor_ids: Sequence[st
              result["outcome"], result.get("request_id"), now(), canonical(result.get("detail") or {})))
         outcomes[result["outcome"]] = outcomes.get(result["outcome"], 0) + 1
         connection.commit()
-    return {"citingWorks": len(needed), "fetched": fetched, "outcomes": dict(sorted(outcomes.items()))}
+    return {"citingWorks": len(needed), "fetched": fetched, "outcomes": dict(sorted(outcomes.items())),
+            **({"throttled": throttled} if throttled else {})}
+
+
+def throttled_host(client: Any, host: str) -> bool:
+    from .followup_net import throttled
+    return throttled(client, host)
 
 
 # ----------------------------------------------------------------------------- candidates
@@ -492,7 +502,12 @@ def run_second_gen(branch: FollowupBranch, *, stages: Sequence[str] = STAGES, cl
                                 sleep=sleep, code_revision=code_revision)
             summary = confirmed.pop("run")
             result.update(confirm=confirmed, run=summary, judge=judge_summary(judge_))
-    return {**result, **step_result(summary, judge_ if summary is not None else None)}
+    outcome = {**result, **step_result(summary, judge_ if summary is not None else None)}
+    left = (result.get("acquire") or {}).get("throttled")
+    if left and outcome["state"] == "completed":
+        outcome.update(state="paused", reason=f"transport: provider throttled (www.ebi.ac.uk: {left} later articles "
+                                              "not acquired); run the command again to resume")
+    return outcome
 
 
 def cmd_second_gen(args: Any) -> dict[str, Any]:

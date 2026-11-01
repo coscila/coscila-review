@@ -55,6 +55,15 @@ EVIDENCE_REASONS = {
 }
 
 
+def throttle_pause(fetched: Mapping[str, int]) -> dict[str, Any]:
+    """A paused result when acquisition stopped at a throttling provider (the works left are fetched next run)."""
+    left = fetched.get("throttled:not-acquired", 0)
+    if not left:
+        return {}
+    return {"state": "paused", "reason": f"transport: provider throttled (www.ebi.ac.uk: {left} works not acquired); "
+                                         "run the command again to resume"}
+
+
 def support_settings(protocol: Mapping[str, Any] | None, tier: str) -> dict[str, Any]:
     """The predeclared request settings of citation-support@2 at one tier (``instruments.supportSettings``).
 
@@ -72,6 +81,11 @@ def support_settings(protocol: Mapping[str, Any] | None, tier: str) -> dict[str,
 def make_client(workspace: Path | None = None) -> Any:
     from . import followup_net
     return followup_net.client(workspace=workspace)
+
+
+def followup_net_throttled(scholarly: Any, host: str) -> bool:
+    from . import followup_net
+    return followup_net.throttled(scholarly, host)
 
 
 def retrieval_parameters() -> tuple[int, int]:
@@ -415,11 +429,17 @@ def acquire_all(connection: Any, acquirer: Acquirer, tier: str, works: Sequence[
     wanted = [work for work in works
               if needs_acquisition(known.get(work["work_key"]), retry_failed=retry_failed, routes=routes)]
     counts: Counter = Counter()
+    scholarly = getattr(acquirer.session, "scholarly", None)
 
-    def one(work: Mapping[str, Any]) -> Evidence:
+    def one(work: Mapping[str, Any]) -> Evidence | None:
+        if scholarly is not None and followup_net_throttled(scholarly, "europe-pmc"):
+            return None         # Europe PMC throttled every recent request: left for the next run
         return acquirer.acquire(tier, work)
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
         for evidence in pool.map(one, wanted):
+            if evidence is None:
+                counts["throttled:not-acquired"] += 1
+                continue
             if lock is not None:
                 with lock:
                     store_evidence(connection, evidence)
@@ -637,7 +657,8 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
             "contexts": dict(documents.counts), "retrieval": {"k": k, "maxEvidenceCharacters": window},
             "requestSettings": {"tier": tier, **request_settings, "source": "protocol instruments.supportSettings"},
             "requests": session.recorder.summary() if session else {}, "run": summary,
-            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge)}
+            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge),
+            **throttle_pause(fetched)}
 
 
 def cmd_support(args: Any) -> dict[str, Any]:

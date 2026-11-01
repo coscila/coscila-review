@@ -607,18 +607,41 @@ def protocol_live_sources(protocol: Mapping[str, Any] | None) -> list[str]:
     return [source for source in LIVE_SOURCES if source in listed]
 
 
+class StatusFetchFailed(RuntimeError):
+    """An unexpected failure of a status fetch (a runtime failure, never a refusal): the snapshot stays open and
+    ``status-fetch --continue`` resumes it."""
+
+
+def open_snapshot(connection: Any) -> str | None:
+    """The latest live status snapshot that was never registered as a dataset version (a fetch that stopped)."""
+    registered = {row[0] for row in connection.execute(
+        "SELECT declared_version FROM fu_datasets WHERE kind='status-snapshot'")}
+    for (snapshot_id,) in connection.execute(
+            "SELECT DISTINCT snapshot_id FROM fu_status_observations WHERE source!=? AND snapshot_id LIKE 'status-%' "
+            "ORDER BY snapshot_id DESC", (RW_SOURCE,)):
+        if snapshot_id not in registered:
+            return snapshot_id
+    return None
+
+
 def fetch_status(connection: Any, scholarly: Any, *, sources: Sequence[str], limit: int | None = None,
                  snapshot: str | None = None, lock: Any = None, commit_every: int = 200,
-                 notice_dates: bool = True) -> dict[str, Any]:
+                 notice_dates: bool = True, continue_open: bool = False) -> dict[str, Any]:
     """One status snapshot: every cited work asked at each live source (one thread per source, so each host keeps
-    its own interval). ``snapshot`` continues a snapshot this branch started: pairs of work and source that answered
-    in it are skipped, failed ones are asked again."""
+    its own interval). ``snapshot`` continues a snapshot this branch started, ``continue_open`` the latest one that
+    never finished: pairs of work and source that answered in it are skipped, failed ones are asked again. A source
+    whose host throttles repeatedly stops (``followup_net.throttled``); the snapshot is registered as a dataset version
+    only when every source finished, otherwise the result is paused and ``--continue`` resumes it."""
     unknown = sorted(set(sources) - set(SOURCES))
     if unknown or not sources:
         raise ValidationError("status sources are crossref, pubmed and europe-pmc" + (
             f" (unknown: {', '.join(unknown)})" if unknown else ""))
     if limit is not None and limit < 1:
         raise ValidationError("--limit must be positive")
+    if snapshot is not None and continue_open:
+        raise ValidationError("give --snapshot or --continue, not both")
+    if continue_open:
+        snapshot = open_snapshot(connection)
     if snapshot is not None:
         if not re.fullmatch(r"status-\d{8}T\d{12}Z", snapshot):
             raise ValidationError("a status snapshot id looks like status-YYYYmmddTHHMMSSffffffZ")
@@ -643,13 +666,19 @@ def fetch_status(connection: Any, scholarly: Any, *, sources: Sequence[str], lim
     written = [0]
     errors: list[BaseException] = []
     stop = threading.Event()
+    throttled: dict[str, int] = {}
 
     def run(source: str) -> None:
         adapter = (SOURCES[source](session, notice_dates=notice_dates) if source == "pubmed"
                    else SOURCES[source](session))
         since = 0
-        for work in queues[source]:
+        for position, work in enumerate(queues[source]):
             if stop.is_set():
+                return
+            if followup_net.throttled(scholarly, source):
+                # The host throttled every recent request: stop asking it; --continue resumes from here.
+                with lock:
+                    throttled[source] = len(queues[source]) - position
                 return
             observations = adapter.observe(work, snapshot_id=snapshot_id)
             with lock:
@@ -678,23 +707,30 @@ def fetch_status(connection: Any, scholarly: Any, *, sources: Sequence[str], lim
     if errors:
         if isinstance(errors[0], ReviewError):
             raise errors[0]
-        raise ReviewError(f"status fetch stopped: {type(errors[0]).__name__}: {errors[0]}") from errors[0]
+        raise StatusFetchFailed(f"status fetch stopped: {type(errors[0]).__name__}: {errors[0]}; the snapshot "
+                                f"{snapshot_id} stays open (status-fetch --continue)") from errors[0]
     sha, rows = snapshot_digest(connection, snapshot_id)
+    result = {"snapshot": snapshot_id, "continued": snapshot is not None, "sources": list(sources),
+              "works": {source: len(queue) for source, queue in queues.items()}, "observationsWritten": written[0],
+              "observations": {source: dict(sorted(count.items())) for source, count in counts.items()},
+              "requests": recorder.summary(), "snapshotRows": rows}
+    if throttled:
+        left = ", ".join(f"{source}: {count} works" for source, count in sorted(throttled.items()))
+        return {**result, "dataset": None, "throttled": dict(sorted(throttled.items())), "state": "paused",
+                "reason": f"transport: provider throttled ({left} not asked); run status-fetch --continue to resume "
+                          "the snapshot"}
     dataset = register_dataset(connection, kind="status-snapshot", name="status-observations",
                                declared_version=snapshot_id, sha256=sha, rows=rows,
                                detail={"sources": list(sources), "limit": limit, "continued": snapshot is not None})
-    return {"snapshot": snapshot_id, "dataset": dataset, "continued": snapshot is not None, "sources": list(sources),
-            "works": {source: len(queue) for source, queue in queues.items()}, "observationsWritten": written[0],
-            "observations": {source: dict(sorted(count.items())) for source, count in counts.items()},
-            "requests": recorder.summary(), "snapshotRows": rows}
+    return {**result, "dataset": dataset, "state": "completed"}
 
 
 # ----------------------------------------------------------------------------- status-resolution@1
 def default_snapshots(connection: Any) -> list[str]:
-    """The latest live status snapshot and the latest Retraction Watch snapshot import."""
+    """The latest finished (registered) live status snapshot and the latest Retraction Watch snapshot import."""
     chosen = []
-    live = connection.execute("SELECT MAX(snapshot_id) FROM fu_status_observations WHERE source!=? AND snapshot_id "
-                              "LIKE 'status-%'", (RW_SOURCE,)).fetchone()[0]
+    live = connection.execute("SELECT MAX(declared_version) FROM fu_datasets WHERE kind='status-snapshot'"
+                              ).fetchone()[0]
     if live:
         chosen.append(live)
     imported = connection.execute("SELECT dataset_id FROM fu_datasets WHERE kind=? ORDER BY registered_at DESC, "
@@ -859,7 +895,8 @@ def cmd_fetch(args: Any) -> dict[str, Any]:
     scholarly = make_client(workspace)
     with branch.writing() as connection:
         return fetch_status(connection, scholarly, sources=sources, limit=getattr(args, "limit", None),
-                            snapshot=getattr(args, "snapshot", None))
+                            snapshot=getattr(args, "snapshot", None),
+                            continue_open=bool(getattr(args, "continue_open", False)))
 
 
 def cmd_resolve(args: Any) -> dict[str, Any]:

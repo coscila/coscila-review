@@ -382,6 +382,34 @@ class SnapshotTests(StatusTestCase):
         with self.assertRaisesRegex(ValidationError, "no observations"):
             self.fetch(transport, snapshot="status-20200101T000000000000Z")
 
+    def test_a_throttled_source_stops_and_continue_resumes_the_open_snapshot(self):
+        throttling = F.FixtureTransport({"https://api.crossref.org/": (429, b"{}"), **status_routes()})
+        first = self.fetch(throttling)
+        self.assertEqual(("paused", None), (first["state"], first["dataset"]))
+        self.assertTrue(first["reason"].startswith("transport: provider throttled (crossref: "))
+        crossref = [request for request in throttling.requests if "api.crossref.org" in request["url"]]
+        # three works were asked (two requests each) before the run of five throttles stopped the source
+        self.assertEqual((6, len(F.WORKS) - 3), (len(crossref), first["throttled"]["crossref"]))
+        with self.branch.writing() as connection:
+            self.assertEqual(first["snapshot"], S.open_snapshot(connection))
+            self.assertEqual([], [row[0] for row in connection.execute(
+                "SELECT dataset_id FROM fu_datasets WHERE kind='status-snapshot'")])
+            continued = S.fetch_status(connection, client(F.FixtureTransport(status_routes())),
+                                       sources=["crossref", "pubmed", "europe-pmc"], continue_open=True)
+            self.assertIsNone(S.open_snapshot(connection))
+        self.assertEqual((first["snapshot"], "completed", True), (continued["snapshot"], continued["state"],
+                                                                  continued["continued"]))
+        self.assertEqual(len(F.WORKS), continued["works"]["crossref"])
+        self.assertTrue(continued["dataset"])
+
+    def test_an_unexpected_failure_is_a_runtime_failure_and_leaves_the_snapshot_open(self):
+        def broken(work, *, snapshot_id):
+            raise KeyError("boom")
+        with mock.patch.object(S.EuropePmcStatus, "observe", side_effect=broken), self.branch.writing() as connection:
+            with self.assertRaises(S.StatusFetchFailed) as raised:
+                S.fetch_status(connection, client(F.FixtureTransport(status_routes())), sources=["europe-pmc"])
+        self.assertNotIsInstance(raised.exception, S.ReviewError)
+
     def test_resolution_is_refused_after_the_freeze(self):
         with self.branch.writing() as connection:
             S.import_retraction_watch(connection, RW_CSV, "synthetic-snapshot", protocol=F.protocol())

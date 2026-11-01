@@ -7,16 +7,24 @@ Accept header and a User-Agent without any contact address (``fulltext.open_publ
 per-host minimum interval for bulk traversal and never passes a contact identity: the only contact the client knows is
 the operator's ``OCSL_REVIEW_CONTACT_EMAIL``, read by ScholarlyClient itself, and nothing here infers one.
 
+Bulk traversal backs off when a provider throttles: a request that ends in HTTP 429 or 503 (after the scholarly
+transport's own bounded retries) pushes that host's next request slot forward by the server's Retry-After, or by a
+capped exponential backoff without one, and counts a consecutive throttle for the host. The bulk loops (status fetch,
+cited-by traversal, evidence and second-generation acquisition) stop asking a host after ``MAX_CONSECUTIVE_THROTTLES``
+throttles in a row and report the works left; running the command again continues where it stopped.
+
 ``record_request`` keeps a receipt of each provider response in the branch with contact and key parameters removed
 from the recorded parameters, so receipts never carry an identity.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 import urllib.parse
 from typing import Any, Callable, Mapping
 
+from .errors import ProviderError
 from .followup_branch import now, store_artifact
 from .followup_model import canonical, digest
 
@@ -29,6 +37,14 @@ DEFAULT_SPACING = {
     "api.openalex.org": 0.2,
 }
 FALLBACK_SPACING = 0.5
+# Throttling: HTTP statuses that mean "slow down", the backoff without a Retry-After (base seconds, doubling per
+# consecutive throttle), the most a host's next slot is pushed, and the run of throttles after which a loop stops.
+THROTTLE_STATUSES = frozenset({429, 503})
+BACKOFF_SECONDS = 5.0
+MAX_BACKOFF_SECONDS = 600.0
+MAX_CONSECUTIVE_THROTTLES = 5
+HOSTS = {"crossref": "api.crossref.org", "pubmed": "eutils.ncbi.nlm.nih.gov", "europe-pmc": "www.ebi.ac.uk",
+         "openalex": "api.openalex.org"}
 # Query parameters that identify a person or carry a credential; they are sent only as the scholarly client decides
 # and never recorded.
 PRIVATE_PARAMS = frozenset({"mailto", "email", "api_key", "apikey", "key", "token", "access_token"})
@@ -43,7 +59,39 @@ class SpacedTransport:
         self.spacing = {**DEFAULT_SPACING, **dict(spacing or {})}
         self.clock, self.sleep = clock, sleep
         self._next: dict[str, float] = {}
+        self._throttles: dict[str, int] = {}
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _host(url: str) -> str:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+    def consecutive_throttles(self, host: str) -> int:
+        with self._lock:
+            return self._throttles.get(host.lower(), 0)
+
+    def _outcome(self, url: str, error: BaseException | None) -> None:
+        """After a request: a throttle pushes the host's next slot forward and counts; any other outcome resets."""
+        host = self._host(url)
+        match = re.search(r"provider HTTP (\d{3})", str(error)) if error is not None else None
+        if match is None or int(match.group(1)) not in THROTTLE_STATUSES:
+            with self._lock:
+                self._throttles.pop(host, None)
+            return
+        headers = getattr(error.__cause__, "headers", None)
+        requested = None
+        if headers is not None:
+            from .scholarly import HttpTransport
+            try:
+                requested = HttpTransport._retry_after_seconds(headers)
+            except (AttributeError, TypeError, ValueError):
+                requested = None
+        with self._lock:
+            count = self._throttles.get(host, 0) + 1
+            self._throttles[host] = count
+            delay = requested if requested is not None else BACKOFF_SECONDS * 2 ** (count - 1)
+            delay = min(max(float(delay), 0.0), MAX_BACKOFF_SECONDS)
+            self._next[host] = max(self._next.get(host, 0.0), self.clock() + delay)
 
     def _reserve(self, url: str) -> None:
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
@@ -55,14 +103,22 @@ class SpacedTransport:
         if delay > 0:
             self.sleep(delay)
 
-    def get(self, url: str, **kwargs: Any) -> Any:
+    def _send(self, url: str, send: Callable[[], Any]) -> Any:
         self._reserve(url)
-        return self.inner.get(url, **kwargs)
+        try:
+            response = send()
+        except ProviderError as error:
+            self._outcome(url, error)
+            raise
+        self._outcome(url, None)
+        return response
+
+    def get(self, url: str, **kwargs: Any) -> Any:
+        return self._send(url, lambda: self.inner.get(url, **kwargs))
 
     def get_document(self, url: str, **kwargs: Any) -> Any:
-        self._reserve(url)
         getter = getattr(self.inner, "get_document", None)
-        return getter(url, **kwargs) if getter else self.inner.get(url, **kwargs)
+        return self._send(url, lambda: getter(url, **kwargs) if getter else self.inner.get(url, **kwargs))
 
     @property
     def user_agent(self) -> str | None:
@@ -79,6 +135,15 @@ def client(*, workspace: Any = None, plan: Any = None, transport: Any = None,
     scholarly = ScholarlyClient(plan=plan, workspace=workspace, transport=transport)
     scholarly.transport = SpacedTransport(scholarly.transport, spacing, sleep=sleep)
     return scholarly
+
+
+def throttled(scholarly: Any, host: str) -> bool:
+    """A bulk loop stops asking ``host`` (a host name or a source name of ``HOSTS``) once its last
+    MAX_CONSECUTIVE_THROTTLES requests were all throttled."""
+    counter = getattr(getattr(scholarly, "transport", None), "consecutive_throttles", None)
+    if not callable(counter):
+        return False
+    return counter(HOSTS.get(host, host)) >= MAX_CONSECUTIVE_THROTTLES
 
 
 def public_params(params: Mapping[str, Any] | None) -> dict[str, Any]:
