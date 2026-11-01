@@ -158,7 +158,13 @@ class Plan:
         return value
 
 
-def plan_for(instrument: Any, tier: str) -> Plan:
+def plan_for(instrument: Any, tier: str, settings: Mapping[str, Any] | None = None) -> Plan:
+    """The geometry and request settings of one instrument tier.
+
+    ``settings`` (the protocol's predeclared ``reasoningEffort`` and optional ``temperature``) applies only to a bundle
+    that declares no reasoning effort of its own (citation-support@2); a bundle's declared settings always win and are
+    never overridden.
+    """
     spec = instrument.tier(tier)
     geometry = spec["geometry"]["itemsPerCall"]
     if isinstance(geometry, int):
@@ -169,8 +175,16 @@ def plan_for(instrument: Any, tier: str) -> Plan:
     request = spec.get("request") or {}
     rule = request.get("maxOutputTokens") if isinstance(request.get("maxOutputTokens"), dict) else None
     floor, per_item = (int(rule["floor"]), int(rule["perItem"])) if rule else (3000, 700)
-    return Plan(instrument.id, tier, per_call, floor, per_item, float(request.get("temperature", 0) or 0),
-                request.get("reasoningEffort"), int((spec.get("repair") or {}).get("passes", 1 if not rule else 0)))
+    temperature = float(request.get("temperature", 0) or 0)
+    reasoning = request.get("reasoningEffort")
+    if settings:
+        if reasoning:
+            raise ValidationError(f"{instrument.id} declares its own request settings; the protocol sets none for it")
+        reasoning = settings.get("reasoningEffort")
+        if settings.get("temperature") is not None:
+            temperature = float(settings["temperature"])
+    return Plan(instrument.id, tier, per_call, floor, per_item, temperature, reasoning,
+                int((spec.get("repair") or {}).get("passes", 1 if not rule else 0)))
 
 
 def entitled_allowed(policy: ConfidentialPolicy, judge: Any) -> bool:
@@ -201,7 +215,8 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
               tier: str, model: str, policy: ConfidentialPolicy | None = None, module: Any = None,
               variant: str = "primary", concurrency: int = 1, code_revision: str | None = None,
               study_bundle: str | None = None, transport_retries: int = 0, cooldown: float = 0.0,
-              sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+              sleep: Callable[[float], None] = time.sleep,
+              request_settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Judge ``items`` (dicts with ``id`` and ``provenance``) with one instrument tier; see the module docstring.
 
     Items of calls that got no response stay open; ``transport_retries`` further passes send them again, the first
@@ -209,7 +224,7 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
     """
     policy = policy or ConfidentialPolicy("public-literature")
     module = module or module_for(instrument)
-    plan = plan_for(instrument, tier)
+    plan = plan_for(instrument, tier, request_settings)
     if not model:
         raise ValidationError("give the pinned served model (the protocol's model.served)")
     keys = [item.get("id") for item in items]
@@ -230,8 +245,10 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
     instrument_digest = instrument.digest
     done = set(accepted(connection, instrument_digest, tier, variant))
     pending = [dict(item) for item in items if item["id"] not in done]
+    request = {key: value for key, value in plan.settings(1).items() if key != "max_tokens"}
     summary: dict[str, Any] = {"instrument": instrument.id, "digest": instrument_digest, "tier": tier,
-                               "variant": variant, "items": len(items), "skipped": len(items) - len(pending),
+                               "variant": variant, "request": request, "items": len(items),
+                               "skipped": len(items) - len(pending),
                                "calls": 0, "repairCalls": 0, "accepted": 0, "rejected": 0, "failedCalls": 0,
                                "passes": 0, "open": 0, "stopped": None}
     queue: deque[tuple[list[dict[str, Any]], str]] = deque(

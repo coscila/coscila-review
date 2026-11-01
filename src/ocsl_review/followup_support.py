@@ -55,6 +55,20 @@ EVIDENCE_REASONS = {
 }
 
 
+def support_settings(protocol: Mapping[str, Any] | None, tier: str) -> dict[str, Any]:
+    """The predeclared request settings of citation-support@2 at one tier (``instruments.supportSettings``).
+
+    citation-support@2 declares no reasoning effort and must stay unchanged, so the protocol predeclares it: the
+    setting is explicit, frozen with the protocol and recorded with every request body and its settings digest.
+    """
+    settings = ((((protocol or {}).get("instruments") or {}).get("supportSettings") or {}).get(tier))
+    if not settings or not settings.get("reasoningEffort"):
+        raise ValidationError(f"the protocol declares no request settings for citation-support@2 at the {tier} tier "
+                              "(instruments.supportSettings with reasoningEffort): the reasoning setting must be "
+                              "explicit before any support call")
+    return dict(settings)
+
+
 def make_client(workspace: Path | None = None) -> Any:
     from . import followup_net
     return followup_net.client(workspace=workspace)
@@ -539,6 +553,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     protocol = branch.protocol()
     check_model(model, protocol)
     instrument = instruments.load(INSTRUMENT_ID)
+    request_settings = support_settings(protocol, tier)
     prepare_judge(judge, instrument, tier)
     documents = documents or ReviewDocuments(None)
     everything, _ = select_units(connection, TIER_STRATA[tier])
@@ -607,7 +622,8 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     options = {"sleep": sleep} if sleep is not None else {}
     summary = run_items(connection, instrument, sendable, judge, tier=tier, model=model, policy=policy,
                         variant=variant, concurrency=concurrency, code_revision=code_revision,
-                        transport_retries=transport_retries, cooldown=cooldown, **options) if sendable else {
+                        transport_retries=transport_retries, cooldown=cooldown, request_settings=request_settings,
+                        **options) if sendable else {
         "instrument": instrument.id, "digest": instrument.digest, "items": 0, "calls": 0, "accepted": 0,
         "rejected": 0, "failedCalls": 0, "open": 0, "stopped": None}
     rows: Counter = Counter()
@@ -618,6 +634,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
             "withheldEntitled": len(items) - len(sendable), "blocked": dict(Counter(code for _, code, _ in blocked)),
             "blockedRecorded": blocks, "evidence": dict(sorted(fetched.items())), "unsent": dict(unsent),
             "contexts": dict(documents.counts), "retrieval": {"k": k, "maxEvidenceCharacters": window},
+            "requestSettings": {"tier": tier, **request_settings, "source": "protocol instruments.supportSettings"},
             "requests": session.recorder.summary() if session else {}, "run": summary,
             "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge)}
 

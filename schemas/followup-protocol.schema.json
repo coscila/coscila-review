@@ -105,7 +105,16 @@
         "function": {"const": "citation-function@1"},
         "numeric": {"const": "numeric-check@1"},
         "match": {"const": "claim-match@1"},
-        "digests": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+        "digests": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "description": "registry digests the run must use, keyed by instrument id; checked before any call"},
+        "supportSettings": {
+          "type": "object", "additionalProperties": false, "required": ["abstract", "full-text"],
+          "description": "request settings of citation-support@2, which declares none: predeclared here so the reasoning setting of each tier is explicit, frozen and recorded with every request",
+          "properties": {
+            "abstract": {"$ref": "#/$defs/requestSettings"},
+            "full-text": {"$ref": "#/$defs/requestSettings"}
+          }
+        }
       }
     },
     "model": {
@@ -146,5 +155,14 @@
       }
     },
     "gates": {"type": "array", "uniqueItems": true, "items": {"enum": ["smoke", "pilot", "capacity", "production", "replicate"]}}
+  },
+  "$defs": {
+    "requestSettings": {
+      "type": "object", "additionalProperties": false, "required": ["reasoningEffort"],
+      "properties": {
+        "reasoningEffort": {"enum": ["none", "low", "medium", "high"]},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2}
+      }
+    }
   }
 }

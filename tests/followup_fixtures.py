@@ -135,7 +135,9 @@ PROTOCOL: dict[str, Any] = {
         "replicate": {"share": 0.5},
     },
     "instruments": {"support": "citation-support@2", "function": "citation-function@1", "numeric": "numeric-check@1",
-                    "match": "claim-match@1"},
+                    "match": "claim-match@1",
+                    "supportSettings": {"abstract": {"reasoningEffort": "none"},
+                                        "full-text": {"reasoningEffort": "low"}}},
     "model": {"served": MODEL, "location": "on-premises"},
     "secondGeneration": {"edges": 2, "k": 3, "sources": ["europe-pmc", "openalex"]},
     "estimands": [

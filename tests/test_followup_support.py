@@ -19,8 +19,8 @@ from ocsl_review import followup_net, followup_support as SP
 from ocsl_review.census_inputs import InputCaches
 from ocsl_review.cli import main
 from ocsl_review.corpus_acquisition import CorpusResponseCache
-from ocsl_review.errors import ConfidentialityError, ReviewError
-from ocsl_review.followup_branch import FollowupBranch
+from ocsl_review.errors import ConfidentialityError, ReviewError, ValidationError
+from ocsl_review.followup_branch import FollowupBranch, read_artifact
 from ocsl_review.scholarly import RawResponse
 from ocsl_review.store_client import ProviderCache
 
@@ -119,11 +119,11 @@ class SupportTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def branch(self, *, text=False, pilot=()):
+    def branch(self, *, text=False, pilot=(), protocol=None):
         type(self).count += 1
         path = self.root / f"branch-{self.count}.sqlite3"
         FollowupBranch.create(path, self.census["parent"], parent_text=self.census["text"] if text else None,
-                              protocol=F.protocol())
+                              protocol=protocol or F.protocol())
         branch = FollowupBranch(path)
         with branch.writing() as connection:
             insert_frame(connection, pilot=pilot)
@@ -290,6 +290,35 @@ class SupportTests(unittest.TestCase):
         no_text = self.branch()
         self.run_support(no_text, F.ScriptedJudge(quoting()))
         self.assertIn("text-redacted", {row["reason"] for row in self.rows(no_text, "abstract").values()})
+
+    def test_the_protocol_predeclares_the_reasoning_setting_of_each_tier(self):
+        """citation-support@2 declares no request settings: the protocol's instruments.supportSettings supplies the
+        reasoning effort of each tier, which every request carries and the result reports; without it nothing is
+        sent."""
+        branch = self.branch()
+        judge = F.ScriptedJudge(quoting())
+        result = self.run_support(branch, judge)
+        self.assertEqual({"none"}, {settings["reasoning_effort"] for _, settings in judge.requests})
+        self.assertEqual(("abstract", "none"), (result["requestSettings"]["tier"],
+                                                result["requestSettings"]["reasoningEffort"]))
+        self.assertEqual("none", result["run"]["request"]["reasoning_effort"])
+        with closing(branch.connect()) as connection:
+            body = json.loads(read_artifact(connection, connection.execute(
+                "SELECT request_sha256 FROM fu_calls LIMIT 1").fetchone()[0]))
+        self.assertEqual(("none", 0.0), (body["reasoning_effort"], body["temperature"]))
+        full = F.ScriptedJudge(quoting())
+        self.run_support(branch, full, tier="full-text", europe_pmc=True)
+        self.assertEqual({"low"}, {settings["reasoning_effort"] for _, settings in full.requests})
+        protocol = F.protocol()
+        del protocol["instruments"]["supportSettings"]
+        silent = F.ScriptedJudge(quoting())
+        with self.assertRaisesRegex(ValidationError, "supportSettings"):
+            self.run_support(self.branch(protocol=protocol), silent)
+        self.assertEqual([], silent.requests)
+        from ocsl_review import instruments
+        from ocsl_review.followup_judge import plan_for
+        with self.assertRaisesRegex(ValidationError, "declares its own request settings"):
+            plan_for(instruments.load("citation-function@1"), "locus", {"reasoningEffort": "high"})
 
     def test_an_unreadable_response_rejects_its_items_and_the_run_goes_on(self):
         branch = self.branch()
