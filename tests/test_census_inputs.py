@@ -1002,6 +1002,51 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertFalse(checks["populationUnchangedSinceComparison"])
         self.assertFalse(checks["everyEnumeratedReviewInStudyOrExcluded"])
 
+    def test_settling_reviews_a_run_cannot_prepare_completes_the_population(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        # One review is prepared; one whose abstract lookups failed in transport cannot be; one is not in the input.
+        failed = json.loads(json.dumps(rows[1]))
+        first = sorted(failed["works"])[0]
+        failed["works"][first]["europePmcOutcome"] = "europe-pmc-failed"
+        source = manifest.parent / "settle.jsonl"
+        source.write_text(json.dumps(rows[0]) + "\n" + json.dumps(failed) + "\n")
+        run = self.run_census()
+        with self.assertRaisesRegex(ValidationError, "needs a fresh enumeration"):
+            prepare(run, source, caches=caches, settle=True)
+        out = prepare(run, source, caches=caches, enumeration=enumeration, settle=True)
+        self.assertEqual({"prepared": 1, "skipped-abstract-lookup-failed": 1}, out["states"])
+        self.assertEqual({"absent-from-input": 1, "skipped-abstract-lookup-failed": 1}, out["settled"])
+        reviews = {row["doi"]: row for row in self.rows("SELECT doi, provenance, provenance_class, extraction_json, "
+                                                         "abstract_state, full_text_state, stratum FROM reviews")}
+        self.assertEqual({JATS_REVIEW, HTML_REVIEW, CACHED_REVIEW}, set(reviews))
+        for doi, state in ((HTML_REVIEW, "skipped-abstract-lookup-failed"), (CACHED_REVIEW, "absent-from-input")):
+            row = reviews[doi]
+            self.assertEqual(("unavailable", "unavailable", "completed", "completed"),
+                             (row["provenance"], row["provenance_class"], row["abstract_state"], row["full_text_state"]))
+            self.assertEqual(state, json.loads(row["extraction_json"])["notPrepared"]["state"])
+        # The settled review keeps the enumeration's own attributes.
+        self.assertEqual("Systematic Review", reviews[HTML_REVIEW]["stratum"])
+        self.assertIn("cited work(s) failed", json.loads(reviews[HTML_REVIEW]["extraction_json"])["notPrepared"]["reason"])
+        # Preparing again settles nothing more.
+        again = prepare(run, source, caches=caches, enumeration=enumeration, settle=True)
+        self.assertEqual({}, again["settled"])
+        run.close()
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        verdict = gates(status, require_fresh_enumeration=True)["checks"]
+        for name in ("everyEnumeratedReviewInStudyOrExcluded", "reviewsAcquiredThroughLiveRoutes",
+                     "everyReviewHasAcquisitionProvenance", "reviewsComeFromTheEnumeration", "freshEnumerationPinned"):
+            self.assertTrue(verdict[name], name)
+        self.assertEqual((3, 0, 0), (status["enumeration"]["inStudy"], status["enumeration"]["excluded"],
+                                     status["enumeration"]["unexplained"]))
+        self.assertEqual(2, status["inputChecks"]["reviewsSettledAsNotPrepared"])
+        # The command line: settling needs a fresh enumeration.
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = main(["study", "prepare", "--database", str(self.database), "--seed", "1234", "--input", str(source),
+                         "--settle-unprepared"])
+        self.assertNotEqual(0, code)
+
     def test_fresh_inputs_are_derived_in_the_run_never_carried(self):
         manifest, enumeration, caches, rows = self.fresh_inputs()
         jats = rows[0]

@@ -800,6 +800,35 @@ class CensusRun:
             self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
         return {"doi": doi, "state": "unavailable", "reason": reason[:500]}
 
+    def record_not_prepared(self, review: Mapping[str, Any], state: str, reason: str,
+                            claimed: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """An enumerated review this run cannot prepare, settled in coverage as unavailable with its reason.
+
+        Only for a study pinned to a fresh enumeration (``study prepare --settle-unprepared``): ``review`` is the
+        enumeration's own row (journal, doi, stratum, first online, year), so the population stays the enumerated one.
+        The review is then in the study as unavailable (``extraction_json`` names why it was not prepared, its
+        provenance record is marked ``settled``), so the population is complete and the facts count it among the
+        unavailable reviews of its journal, never as judged.
+        """
+        journal, doi = review.get("journal"), normal_doi(review.get("doi"))
+        if not journal or not doi:
+            raise ValidationError("a settled review needs journal and doi")
+        with self.lock:
+            if self.connection.execute("SELECT 1 FROM reviews WHERE journal=? AND doi=?", (journal, doi)).fetchone():
+                return {"doi": doi, "state": "already-prepared"}
+            order = self.connection.execute("SELECT COALESCE(MAX(review_order), -1) + 1 FROM reviews").fetchone()[0]
+        detail = {"settled": True, "state": state, "reason": reason[:500], **({"claimed": dict(claimed)} if claimed else {})}
+        item = provenance_row(review_item_id(journal, doi), "review", "unavailable", detail, journal=journal, doi=doi)
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, provenance_class,"
+                " extraction_json, review_order, abstract_state, full_text_state, provenance)"
+                " VALUES(?,?,?,?,?,?,?,'unavailable',?,?,'completed','completed','unavailable')",
+                (journal, doi, None, None, review.get("year"), review.get("first_online"), review.get("stratum"),
+                 canonical({"notPrepared": {"state": state, "reason": reason[:500]}}), order))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
+        return {"doi": doi, "state": "settled-unavailable", "settledFrom": state, "reason": reason[:500]}
+
     # ------------------------------------------------------------------ abstract tier
     def _items(self, journal: str, doi: str) -> list[dict[str, Any]]:
         items = []
@@ -1975,9 +2004,13 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
             "fullTextCacheHitsWithoutLiveRetrieval": c.execute(
                 "SELECT COUNT(*) FROM input_provenance WHERE kind='full-text' AND provenance LIKE 'cache-hit-%' AND "
                 "COALESCE(json_extract(detail_json, '$.liveRetrieval'), 0) != 1").fetchone()[0],
+            # A review the run settled as not prepared (study prepare --settle-unprepared) was never acquired.
             "reviewsAcquiredWithoutLiveRoute": c.execute(
-                f"SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND provenance != 'supplied' AND {live_route} != 1"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND provenance != 'supplied' AND {live_route} != 1 "
+                "AND COALESCE(json_extract(detail_json, '$.settled'), 0) != 1").fetchone()[0],
+            "reviewsSettledAsNotPrepared": c.execute(
+                "SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND "
+                "COALESCE(json_extract(detail_json, '$.settled'), 0) = 1").fetchone()[0],
             "suppliedIdentityMaps": c.execute("SELECT COUNT(*) FROM citations WHERE map_method='supplied'").fetchone()[0],
             "suppliedCountries": c.execute("SELECT COUNT(*) FROM reviews WHERE country_source='supplied'").fetchone()[0],
             "worksWithoutDerivation": c.execute(f"SELECT COUNT(*) FROM works WHERE NOT ({derived})").fetchone()[0],
