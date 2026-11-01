@@ -451,38 +451,57 @@ class DryRunTests(FullTextCase):
 class EuropePmcTests(FullTextCase):
     def test_the_census_fetcher_is_the_default_with_its_headers(self):
         seen = []
+        recorded = Path(__file__).resolve().parent / "fixtures" / "europe_pmc" / "search-pmcid-not-open-access.json"
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            """Europe PMC as it answers: fullTextXML for the open-access subset and HTTP 500 for every other PMCID
+            (an empty body when XML is asked for); the search's lite record of the PMCID says which it is."""
+
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):
-                seen.append((self.path, self.headers.get("User-Agent"), self.headers.get("Accept")))
-                pmcid = self.path.strip("/").split("/")[0]
-                if not open_access(pmcid):
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                body = full_text_xml(pmcid, work_doi(int(pmcid[3]), int(pmcid[4:])))
-                self.send_response(200)
+            def answer(self, status, body=b""):
+                self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("User-Agent"), self.headers.get("Accept")))
+                if self.path.startswith("/search?"):
+                    pmcid = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)["query"][0].split(":", 1)[1]
+                    data = json.loads(recorded.read_bytes())
+                    data["resultList"]["result"][0].update(pmcid=pmcid, isOpenAccess="Y" if open_access(pmcid) else "N")
+                    return self.answer(200, json.dumps(data).encode())
+                pmcid = self.path.strip("/").split("/")[0]
+                if not open_access(pmcid):
+                    return self.answer(500)
+                self.answer(200, full_text_xml(pmcid, work_doi(int(pmcid[3]), int(pmcid[4:]))))
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        url = "http://127.0.0.1:%d/%%s/fullTextXML" % server.server_address[1]
-        with mock.patch.object(study_cli, "EUROPE_PMC_FULL_TEXT", url):
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        with mock.patch.object(study_cli, "EUROPE_PMC_FULL_TEXT", base + "/%s/fullTextXML"), \
+                mock.patch.object(study_cli, "EUROPE_PMC_SEARCH", base + "/search"):
             probe = P.CapacityProbe(self.full_text_settings(review_prefixes=(PREFIX + "2",)), environ={},
                                     lookup=Search())
             self.output = self.root / "default-fetcher"
             report = probe.run(self.output)
         self.assertEqual("completed", report["state"])
-        self.assertEqual({("ocsl-review census inputs", "application/xml")}, {(agent, accept) for _, agent, accept in seen})
-        self.assertNotIn("PMC2001/fullTextXML", " ".join(path for path, _, _ in seen))
-        self.assertEqual(len(seen), report["fullTextInputs"]["fullTexts"]["fetched"]
-                         + report["fullTextInputs"]["fullTexts"]["absent"])
+        full_texts = [(path, agent, accept) for path, agent, accept in seen if path.endswith("/fullTextXML")]
+        searches = [(path, agent, accept) for path, agent, accept in seen if path.startswith("/search?")]
+        self.assertEqual({("ocsl-review census inputs", "application/xml")},
+                         {(agent, accept) for _, agent, accept in full_texts})
+        self.assertEqual({("ocsl-review census inputs", "application/json")},
+                         {(agent, accept) for _, agent, accept in searches})
+        self.assertNotIn("PMC2001/fullTextXML", " ".join(path for path, _, _ in full_texts))
+        texts = report["fullTextInputs"]["fullTexts"]
+        self.assertEqual(len(full_texts), texts["fetched"] + texts["absent"])
+        # A PMCID outside the open-access subset is a definitive miss after one record check, never a transient failure.
+        self.assertEqual((len(searches), 0), (texts["absent"], texts.get("transient", 0)))
+        self.assertGreater(texts["absent"], 0)
+        self.assertEqual(0, report["fullTextInputs"]["entries"]["transient"])
 
 
 if __name__ == "__main__":

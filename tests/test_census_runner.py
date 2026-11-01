@@ -875,6 +875,148 @@ class RetryableFetchTests(RunnerTestCase):
                          dict(sent[0].header_items()))
         self.assertNotIn("@", json.dumps(dict(sent[0].header_items())))
 
+    def test_a_server_error_for_a_pmcid_outside_the_open_access_subset_is_a_definitive_miss(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # Europe PMC answers fullTextXML with HTTP 500 for every PMCID outside its open-access subset (recorded body);
+        # its own record of the PMCID tells such a miss from an outage.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001", "PMC999999999", "PMC7"}, records={"PMC7": "Y"})
+        sleeps = []
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleeps.append)
+        self.assertIsNone(fetch("PMC2000001"))
+        self.assertEqual(["fullTextXML PMC2000001", "search PMC2000001"], europe_pmc.log)
+        self.assertEqual([], sleeps, "a miss is never retried")
+        search = europe_pmc.requests[1]
+        self.assertEqual(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PMCID%3APMC2000001&format=json"
+            "&resultType=lite&pageSize=5", search.full_url)
+        self.assertEqual({"Accept": "application/json", "User-agent": "ocsl-review census inputs"},
+                         dict(search.header_items()))
+        self.assertNotIn("@", search.full_url + json.dumps(dict(search.header_items())))
+        # No record of the PMCID at all: a miss as well.
+        self.assertIsNone(fetch("PMC999999999"))
+        # A PMCID Europe PMC lists as open access: the server error is an outage, retried and then left open.
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC lists it as open access"):
+            fetch("PMC7")
+        self.assertEqual(["fullTextXML PMC7", "search PMC7", "fullTextXML PMC7", "fullTextXML PMC7"], europe_pmc.log)
+        self.assertEqual([2.0, 5.0], sleeps)
+        # A search that fails concludes nothing: the entry stays open too.
+        down = EuropePmcStandIn(server_errors={"PMC2000001"}, search_status=503)
+        with self.assertRaisesRegex(RetryableFetch, r"PMC2000001: HTTP 500; its Europe PMC record could not be checked"):
+            europe_pmc_fetcher(spacing=0, opener=down, sleep=lambda seconds: None)("PMC2000001")
+        self.assertEqual(4, len(down.log))
+        # An outage that clears: the record says open access, the next attempt serves the full text.
+        flaky = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
+                                 errors_before_success=1)
+        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=flaky, sleep=lambda seconds: None)("PMC7"))
+
+    def test_full_text_completes_when_cited_works_have_no_open_access_full_text(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        # Escalated works 5, 7 and 15 carry a PMCID: 5 is open access, 7 is outside the subset, 15 has no record.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
+                                      server_errors={"PMC900007", "PMC900015"}, records={"PMC900007": "N"})
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+                                   cooldown=0)
+        self.assertEqual(("completed", 1, 0, 1), (result["state"], result["retrieved"], result["fetchRetries"],
+                                                 result["passes"]))
+        self.assertEqual({"PMC900007", "PMC900015"}, {pmcid for pmcid, in self.rows_of(
+            "SELECT w.pmcid FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
+            "WHERE c.ft_retrieval='fetch-failed' AND c.ft_provenance='unavailable'")})
+        self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+        self.assertEqual(sorted(["fullTextXML PMC900005", "fullTextXML PMC900007", "search PMC900007",
+                                 "fullTextXML PMC900015", "search PMC900015"]), sorted(europe_pmc.log))
+
+    def test_a_europe_pmc_outage_keeps_full_text_entries_open(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC900005", "PMC900007", "PMC900015"},
+                                      records={"PMC900005": "Y", "PMC900007": "Y", "PMC900015": "Y"})
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+                                   transport_retries=0, cooldown=0)
+        self.assertEqual(("paused", 3), (result["state"], result["fetchRetries"]))
+        # The three entries with a PMCID stay open; only the two without one are settled (no-pmcid).
+        self.assertEqual([("no-pmcid", 2)], self.rows_of(
+            "SELECT ft_retrieval, COUNT(*) FROM citations WHERE ft_retrieval IS NOT NULL GROUP BY 1"))
+        self.assertEqual("pending", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+
+    def rows_of(self, sql, *params):
+        with closing(sqlite3.connect(self.database)) as c:
+            return [tuple(r) for r in c.execute(sql, params)]
+
+
+EUROPE_PMC_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "europe_pmc"
+
+
+class EuropePmcStandIn:
+    """A urlopen stand-in for Europe PMC, from answers recorded on 2026-11-01 with the census inputs' User-Agent.
+
+    fullTextXML serves ``full_texts``; for ``server_errors`` it answers HTTP 500 with the recorded body (Europe PMC's
+    answer for every PMCID outside its open-access subset, also during an outage); anything else is a 404. The search
+    answers ``PMCID:<id>`` with the recorded lite record, its ``isOpenAccess`` from ``records``, and the recorded
+    zero-hit answer for a PMCID without a record; ``search_status`` makes the search itself fail.
+    """
+
+    def __init__(self, *, full_texts=None, server_errors=(), records=None, search_status=200, errors_before_success=None):
+        self.full_texts, self.server_errors, self.records = dict(full_texts or {}), set(server_errors), dict(records or {})
+        self.search_status, self.errors_left = search_status, errors_before_success
+        self.requests, self.log = [], []
+        self.lock = threading.Lock()
+
+    def __call__(self, request, timeout=None):
+        import io
+        import urllib.error
+        import urllib.parse
+        url = request.full_url
+        with self.lock:
+            self.requests.append(request)
+        if url.endswith("/fullTextXML"):
+            pmcid = url.rsplit("/", 2)[1]
+            with self.lock:
+                self.log.append("fullTextXML " + pmcid)
+                failing = pmcid in self.server_errors and (self.errors_left is None or self.errors_left > 0)
+                if failing and self.errors_left is not None:
+                    self.errors_left -= 1
+            if failing:
+                body = (EUROPE_PMC_FIXTURES / "fulltextxml-500-not-open-access.json").read_bytes()
+                raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, io.BytesIO(body))
+            if pmcid in self.full_texts:
+                return EuropePmcResponse(self.full_texts[pmcid])
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["query"][0]
+        pmcid = query.split(":", 1)[1]
+        with self.lock:
+            self.log.append("search " + pmcid)
+        if self.search_status != 200:
+            raise urllib.error.HTTPError(url, self.search_status, "Service Unavailable", {}, io.BytesIO(b""))
+        if pmcid not in self.records and pmcid != "PMC2000001":
+            return EuropePmcResponse((EUROPE_PMC_FIXTURES / "search-pmcid-no-record.json").read_bytes())
+        answer = json.loads((EUROPE_PMC_FIXTURES / "search-pmcid-not-open-access.json").read_bytes())
+        record = answer["resultList"]["result"][0]
+        record["pmcid"] = pmcid
+        record["isOpenAccess"] = self.records.get(pmcid, record["isOpenAccess"])
+        return EuropePmcResponse(json.dumps(answer).encode())
+
+
+class EuropePmcResponse:
+    status = 200
+
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
+
 
 class ReadOnlyStatusTests(RunnerTestCase):
     def test_status_and_gates_read_without_writing(self):
