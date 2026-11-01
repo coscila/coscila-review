@@ -16,6 +16,7 @@ import copy
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from io import StringIO
@@ -108,7 +109,8 @@ def daemon_request(bundle: dict, item: object, model: str) -> dict:
 
 class DaemonBroker:
     """A run principal's socket over installed verbatim bundles (``exported`` records of instruments.broker_bundle);
-    every job has one item and settles at once."""
+    every job has one item and settles at once. Requests are served one at a time, as the judging commands submit
+    their calls from several threads."""
 
     def __init__(self, exported=(), *, worker_model=MODEL, served=None, answer=None):
         self.installed = {record["digest"]: record["bundle"] for record in exported}
@@ -118,8 +120,13 @@ class DaemonBroker:
         self.keys: dict[str, str] = {}
         self.sent: list[tuple[str, dict]] = []          # (broker digest, request the daemon sent)
         self.refused: list[str] = []
+        self.lock = threading.Lock()
 
     def request(self, method, route, payload=None):
+        with self.lock:
+            return self._request(method, route, payload)
+
+    def _request(self, method, route, payload=None):
         if method == "GET" and route == "/configs":
             return {"authorization": {"principalId": "run-principal-support", "kind": "run", "state": "active",
                                       "runId": "run-support-1", "instruments": list(self.installed)},
