@@ -718,6 +718,26 @@ class FreshEnumerationTests(CacheTestCase):
         self.addCleanup(run.close)
         return run
 
+    def test_enumerating_again_returns_the_finished_enumeration_or_starts_over(self):
+        manifest, result, requests = self.enumerate()
+        get, _ = self.provider()
+        # The same spec again (a step submitted again after its process stopped): the finished enumeration, its kept
+        # pages verified, and no new search.
+        again = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
+        self.assertEqual((True, result["records"], result["groups"]), (again["alreadyEnumerated"], again["records"],
+                                                                       again["groups"]))
+        # Another spec into the same output is refused.
+        other = json.loads(json.dumps(self.SPEC))
+        other["window"]["until"] = "2021-12-31"
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            enumerate_reviews(other, manifest, get, code_revision="test")
+        # A manifest without its receipt (stopped before it finished) is enumerated again.
+        Path(str(manifest) + ".receipt.json").unlink()
+        restarted = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
+        self.assertNotIn("alreadyEnumerated", restarted)
+        self.assertEqual(result["records"], restarted["records"])
+        load_enumeration(Path(restarted["receipt"]))
+
     def test_enumeration_keeps_its_pages_and_verifies_them(self):
         manifest, result, requests = self.enumerate()
         self.assertEqual(3, result["records"])
@@ -731,8 +751,8 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual(3, len(enumeration.reviews))
         self.assertEqual(1, json.loads(receipt.read_text())["groups"][0]["withoutDoi"])
         self.assertEqual(QUERY_RULE, json.loads(receipt.read_text())["queryRule"])
-        with self.assertRaisesRegex(ValidationError, "already exists"):
-            enumerate_reviews(self.SPEC, manifest, self.provider()[0])
+        # Enumerating the same spec again returns the finished enumeration (see the test above).
+        self.assertTrue(enumerate_reviews(self.SPEC, manifest, self.provider()[0])["alreadyEnumerated"])
         page = next(Path(str(manifest) + ".pages").iterdir())
         page.chmod(0o644)
         page.write_bytes(page.read_bytes() + b" ")
@@ -835,7 +855,10 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual(0, status["inputChecks"]["abstractsWithoutLookup"])
         self.assertEqual({"sha256": enumeration.sha256, "reviews": 3, "inStudy": 3, "notInStudy": 0, "excluded": 0,
                           "unexplained": 0, "reviewsOutsideEnumeration": 0, "queryRule": QUERY_RULE},
-                         {k: v for k, v in status["enumeration"].items() if k != "populationSha256"})
+                         {k: v for k, v in status["enumeration"].items() if k not in ("populationSha256", "settled")})
+        self.assertEqual((0, None), (status["enumeration"]["settled"]["total"],
+                                     status["enumeration"]["settled"]["maxPercent"]))
+        self.assertTrue(verdict["settledReviewsWithinBound"])
         stored = manifest.parent / "stored.csv"
         with stored.open("w", newline="") as handle:
             writer = csv.writer(handle)
@@ -877,6 +900,19 @@ class FreshEnumerationTests(CacheTestCase):
         run.close()
         final = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
         self.assertTrue(final["runComplete"])
+        # The same comparison again returns what it recorded, also when the earlier process stopped between recording
+        # it and renaming its report into place; another stored manifest under the label is refused.
+        again = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
+        self.assertEqual((True, final["reportSha256"], final["totals"]), (again["alreadyRecorded"], again["reportSha256"],
+                                                                           again["totals"]))
+        (manifest.parent / "final.json").rename(manifest.parent / ".final.json.incoming")
+        renamed = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
+        self.assertEqual(final["byJournal"], renamed["byJournal"])
+        self.assertTrue((manifest.parent / "final.json").is_file())
+        other = manifest.parent / "other-stored.txt"
+        other.write_text(JATS_REVIEW + "\n")
+        with self.assertRaisesRegex(ValidationError, "already recorded"):
+            record_comparison(self.database, other, manifest.parent / "final.json", label="final")
         with closing(scores_db.open_readonly(self.database)) as connection:
             status = census_status(connection)
         checks = gates(status, require_fresh_enumeration=True)["checks"]
@@ -1001,6 +1037,93 @@ class FreshEnumerationTests(CacheTestCase):
             checks = gates(census_status(connection), require_fresh_enumeration=True)["checks"]
         self.assertFalse(checks["populationUnchangedSinceComparison"])
         self.assertFalse(checks["everyEnumeratedReviewInStudyOrExcluded"])
+
+    def test_settling_reviews_a_run_cannot_prepare_completes_the_population(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        # One review is prepared; one whose abstract lookups failed in transport cannot be; one is not in the input.
+        failed = json.loads(json.dumps(rows[1]))
+        first = sorted(failed["works"])[0]
+        failed["works"][first]["europePmcOutcome"] = "europe-pmc-failed"
+        source = manifest.parent / "settle.jsonl"
+        source.write_text(json.dumps(rows[0]) + "\n" + json.dumps(failed) + "\n")
+        run = self.run_census()
+        with self.assertRaisesRegex(ValidationError, "needs a fresh enumeration"):
+            prepare(run, source, caches=caches, settle=True)
+        out = prepare(run, source, caches=caches, enumeration=enumeration, settle=True)
+        self.assertEqual({"prepared": 1, "skipped-abstract-lookup-failed": 1}, out["states"])
+        self.assertEqual({"absent-from-input": 1, "skipped-abstract-lookup-failed": 1}, out["settled"])
+        reviews = {row["doi"]: row for row in self.rows("SELECT doi, provenance, provenance_class, extraction_json, "
+                                                         "abstract_state, full_text_state, stratum FROM reviews")}
+        self.assertEqual({JATS_REVIEW, HTML_REVIEW, CACHED_REVIEW}, set(reviews))
+        for doi, state in ((HTML_REVIEW, "skipped-abstract-lookup-failed"), (CACHED_REVIEW, "absent-from-input")):
+            row = reviews[doi]
+            self.assertEqual(("unavailable", "unavailable", "completed", "completed"),
+                             (row["provenance"], row["provenance_class"], row["abstract_state"], row["full_text_state"]))
+            self.assertEqual(state, json.loads(row["extraction_json"])["notPrepared"]["state"])
+        # The settled review keeps the enumeration's own attributes.
+        self.assertEqual("Systematic Review", reviews[HTML_REVIEW]["stratum"])
+        self.assertIn("cited work(s) failed", json.loads(reviews[HTML_REVIEW]["extraction_json"])["notPrepared"]["reason"])
+        # Preparing again settles nothing more.
+        again = prepare(run, source, caches=caches, enumeration=enumeration, settle=True)
+        self.assertEqual({}, again["settled"])
+        run.close()
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            status = census_status(connection)
+        verdict = gates(status, require_fresh_enumeration=True)["checks"]
+        for name in ("everyEnumeratedReviewInStudyOrExcluded", "reviewsAcquiredThroughLiveRoutes",
+                     "everyReviewHasAcquisitionProvenance", "reviewsComeFromTheEnumeration", "freshEnumerationPinned"):
+            self.assertTrue(verdict[name], name)
+        self.assertEqual((3, 0, 0), (status["enumeration"]["inStudy"], status["enumeration"]["excluded"],
+                                     status["enumeration"]["unexplained"]))
+        self.assertEqual(2, status["inputChecks"]["reviewsSettledAsNotPrepared"])
+        # Settled reviews without a pinned bound never pass the bound check.
+        self.assertFalse(verdict["settledReviewsWithinBound"])
+        self.assertEqual((2, None, {"absent-from-input": 1, "skipped-abstract-lookup-failed": 1}),
+                         (status["enumeration"]["settled"]["total"], status["enumeration"]["settled"]["maxPercent"],
+                          status["enumeration"]["settled"]["byReason"]))
+        # The command line: settling needs a fresh enumeration.
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = main(["study", "prepare", "--database", str(self.database), "--seed", "1234", "--input", str(source),
+                         "--settle-unprepared"])
+        self.assertNotEqual(0, code)
+
+    def test_the_settled_share_stays_within_the_protocols_bound(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        source = manifest.parent / "bound.jsonl"
+        source.write_text(json.dumps(rows[0]) + "\n")       # two of three enumerated reviews are not in the input
+        outcomes = {}
+        for percent in (50.0, 100.0):
+            database = self.root / f"bound-{percent:g}.sqlite3"
+            run = self.census(database)
+            out = prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=percent)
+            self.assertEqual({"absent-from-input": 2}, out["settled"])
+            # A later prepare repeats the bound and never changes it.
+            prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=percent)
+            with self.assertRaisesRegex(ValidationError, "never changed"):
+                prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=10)
+            run.close()
+            with closing(scores_db.open_readonly(database)) as connection:
+                status = census_status(connection)
+            outcomes[percent] = gates(status, require_fresh_enumeration=True)
+            settled = status["enumeration"]["settled"]
+            self.assertEqual((2, percent), (settled["total"], settled["maxPercent"]))
+            # The journal of the prepared review settled one of two; the other journal settled its only review.
+            self.assertEqual({JOURNAL: {"settled": 1, "enumerated": 2, "share": 0.5},
+                              SECOND: {"settled": 1, "enumerated": 1, "share": 1.0}}, settled["byJournal"])
+        self.assertFalse(outcomes[50.0]["checks"]["settledReviewsWithinBound"])
+        self.assertTrue(outcomes[100.0]["checks"]["settledReviewsWithinBound"])
+        self.assertTrue(any("the protocol's bound is 50 %" in note for note in outcomes[50.0]["notes"]))
+        # A bound belongs to settling, from code and from the command line.
+        run = self.census(self.root / "no-settle.sqlite3")
+        with self.assertRaisesRegex(ValidationError, "belongs to settling"):
+            prepare(run, source, caches=caches, enumeration=enumeration, max_settled_percent=5)
+        run.close()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = main(["study", "prepare", "--database", str(self.root / "cli.sqlite3"), "--seed", "1234", "--input",
+                         str(source), "--require-fresh-enumeration", "--enumeration", str(manifest) + ".receipt.json",
+                         "--max-settled-percent", "5"])
+        self.assertNotEqual(0, code)
 
     def test_fresh_inputs_are_derived_in_the_run_never_carried(self):
         manifest, enumeration, caches, rows = self.fresh_inputs()

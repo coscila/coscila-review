@@ -556,16 +556,63 @@ def redact_entitled(connection: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
+def freeze_source_state(connection: sqlite3.Connection) -> str:
+    """A digest of what a freeze copies from a working database: the append-only receipts and verdict history, the
+    provenance, evidence and population tables (row counts and their last row), the reviews by state and the run
+    metadata. A freeze leaves all of these as they were, so a frozen copy that records this digest is exactly the copy
+    a new freeze of the same database would write."""
+    parts: dict[str, Any] = {}
+    for table in ("calls", "call_transport", "history", "input_provenance", "evidence", "enumeration", "exclusions",
+                  "manifest_comparisons"):
+        if has_table(connection, table):
+            parts[table] = list(connection.execute(f"SELECT COUNT(*), MAX(rowid) FROM {table}").fetchone())
+    parts["reviews"] = [list(row) for row in connection.execute(
+        "SELECT abstract_state, full_text_state, COUNT(*) FROM reviews GROUP BY 1, 2 ORDER BY 1, 2")]
+    parts["meta"] = [list(row) for row in connection.execute("SELECT key, value FROM meta ORDER BY key")]
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _frozen_already(output: Path, source_state: str, *, keep_text: bool, allow_incomplete: bool) -> dict[str, Any] | None:
+    """The result of a freeze already written to ``output`` from this very database state with these options, or None."""
+    try:
+        with closing(open_frozen(output)) as frozen:
+            meta = {row[0]: row[1] for row in frozen.execute("SELECT key, value FROM meta")}
+            scored = {"reviews": frozen.execute("SELECT COUNT(*) FROM review_scores").fetchone()[0],
+                      "works": frozen.execute("SELECT COUNT(*) FROM work_scores").fetchone()[0]}
+    except sqlite3.DatabaseError:
+        return None
+    complete = meta.get("complete") == "1"
+    if (meta.get("frozen") != "1" or meta.get("sourceState") != source_state
+            or meta.get("evidenceTextKept") != ("1" if keep_text else "0") or (not complete and not allow_incomplete)):
+        return None
+    try:
+        redacted = json.loads(meta.get("redaction") or "{}")
+    except ValueError:
+        redacted = {}
+    return {"path": str(output), "sha256": file_sha256(output), "bytes": output.stat().st_size, "evidenceTextKept": keep_text,
+            "entitledTextRedacted": redacted, "complete": complete,
+            "incomplete": [problem for problem in (meta.get("incompleteReason") or "").split("; ") if problem],
+            "scored": scored, "alreadyFrozen": True}
+
+
 def freeze(source: Path, output: Path, *, keep_text: bool = False, allow_incomplete: bool = False) -> dict[str, Any]:
     """Write the closed scores database: rollback journal, no WAL, read-only, evidence and entitled text removed.
 
     A paused run or a run with pending reviews is refused unless ``allow_incomplete``, which is then recorded
     in the frozen metadata (``complete`` = 0) so facts export refuses it too unless told otherwise.
+
+    The copy is written beside ``output`` and renamed into place once it is complete, so ``output`` never holds a
+    partial copy. Freezing again into an existing ``output`` returns that copy when it records this database's state
+    and the same options (a step submitted again after its process stopped), and is refused otherwise.
     """
     output = Path(output)
-    if output.exists():
-        raise ValidationError("frozen scores database already exists; freeze into a new path")
     with closing(connect(Path(source))) as connection:
+        source_state = freeze_source_state(connection)
+        if output.exists():
+            existing = _frozen_already(output, source_state, keep_text=keep_text, allow_incomplete=allow_incomplete)
+            if existing is None:
+                raise ValidationError("frozen scores database already exists; freeze into a new path")
+            return existing
         state = completeness(connection)
         if not state["complete"] and not allow_incomplete:
             raise ValidationError("census run is incomplete: " + "; ".join(state["problems"])
@@ -574,9 +621,12 @@ def freeze(source: Path, output: Path, *, keep_text: bool = False, allow_incompl
         aggregate_reviews(connection)
         scores = write_scores(connection)
         connection.commit()
-        connection.execute("VACUUM INTO ?", (str(output),))
+        temporary = output.with_name("." + output.name + ".incoming")
+        for leftover in (temporary, *(Path(str(temporary) + suffix) for suffix in ("-wal", "-shm", "-journal"))):
+            leftover.unlink(missing_ok=True)        # a copy an earlier, stopped freeze left unfinished
+        connection.execute("VACUUM INTO ?", (str(temporary),))
     redacted: dict[str, int] = {}
-    with closing(sqlite3.connect(output)) as frozen:
+    with closing(sqlite3.connect(temporary)) as frozen:
         frozen.execute("PRAGMA journal_mode=DELETE")
         for table in EXECUTION_TABLES:          # in-flight execution state, never part of the closed database
             if has_table(frozen, table):
@@ -588,14 +638,16 @@ def freeze(source: Path, output: Path, *, keep_text: bool = False, allow_incompl
                      "entitledTextRedacted": "0" if keep_text else "1",
                      "redaction": json.dumps(redacted, sort_keys=True),
                      "complete": "1" if state["complete"] else "0",
-                     "incompleteReason": "; ".join(state["problems"])}
+                     "incompleteReason": "; ".join(state["problems"]),
+                     "sourceState": source_state}
         frozen.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)", sorted(meta_rows.items()))
         frozen.commit()
         frozen.execute("VACUUM")
     for suffix in ("-wal", "-shm", "-journal"):
-        if Path(str(output) + suffix).exists():
+        if Path(str(temporary) + suffix).exists():
             raise ValidationError("frozen scores database left a journal behind")
-    os.chmod(output, 0o444)
+    os.chmod(temporary, 0o444)
+    os.replace(temporary, output)
     return {"path": str(output), "sha256": file_sha256(output), "bytes": output.stat().st_size, "evidenceTextKept": keep_text,
             "entitledTextRedacted": redacted, "complete": state["complete"], "incomplete": state["problems"],
             "scored": scores}

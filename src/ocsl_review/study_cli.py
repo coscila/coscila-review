@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import json
 import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -27,6 +29,17 @@ from typing import Any
 from .errors import ValidationError
 
 EUROPE_PMC_FULL_TEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/%s/fullTextXML"
+# The search the census's abstracts step uses; the full-text fetcher asks it for one PMCID's record after a server error
+# and, when it finds none, for that PMCID and a sentinel PMCID together.
+EUROPE_PMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+# How far apart the first and the deciding joint answer that show Europe PMC's index without a PMCID (the sentinel's
+# record and none of the PMCID) must be before they decide a miss: longer than one fetch with its retries, so the
+# deciding answer comes from a later pass of the same invocation, a cooldown later.
+NO_RECORD_SECONDS = 60.0
+# The sentinel the full-text fetcher names beside such a PMCID when it has seen no other PMCID in Europe PMC's index:
+# a 1922 issue of Public Health Reports that Europe PMC has indexed since 2009 (its lite record, outside the
+# open-access subset, is the recorded answer in tests/fixtures/europe_pmc). A sentinel needs a record, not a full text.
+NO_RECORD_FALLBACK_SENTINEL = "PMC2000001"
 
 
 def add_commands(families, register):
@@ -94,6 +107,15 @@ def add_commands(families, register):
             command.add_argument("--require-fresh-enumeration", action="store_true",
                                  help="prepare only reviews of a verified live enumeration, acquired with provenance")
             command.add_argument("--enumeration", help="enumeration receipt (<manifest>.receipt.json) of study enumerate")
+            command.add_argument("--settle-unprepared", action="store_true",
+                                 help="with --require-fresh-enumeration: record every enumerated review this prepare "
+                                      "cannot prepare, and every enumerated review missing from the input, in coverage as "
+                                      "unavailable with its reason, so the population is complete (the last prepare of "
+                                      "a study, after every acquisition and abstracts pass)")
+            command.add_argument("--max-settled-percent", type=float,
+                                 help="with --settle-unprepared: the protocol's bound on settled reviews, in percent of "
+                                      "the enumerated reviews, overall and in every journal; pinned in the study, and "
+                                      "the gates check settledReviewsWithinBound holds it")
         if name == "abstracts":
             command.add_argument("--input", required=True, help="JSONL review records")
             command.add_argument("--output", required=True, help="JSONL review records with Europe PMC abstracts")
@@ -125,7 +147,9 @@ def add_commands(families, register):
             command.add_argument("--transport-cooldown", type=float, default=60.0,
                                  help="seconds before the first further pass (doubling for each next pass)")
         if name == "judge":
-            command.add_argument("--limit", type=int)
+            command.add_argument("--limit", type=int, help="judge only the next LIMIT pending reviews")
+            command.add_argument("--journal", help="judge only pending reviews of this journal (its label in the study), "
+                                                   "with --limit the next LIMIT of them")
         if name == "full-text":
             command.add_argument("--europe-pmc", action="store_true",
                                  help="fetch Europe PMC fullTextXML by PMCID (required with --store or --provider-cache)")
@@ -221,41 +245,190 @@ def _caches(args):
 
 
 def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tuple[float, ...] = (2.0, 5.0, 10.0),
-                       opener: Any = None, sleep: Any = time.sleep):
+                       opener: Any = None, sleep: Any = time.sleep, clock: Any = None):
     """Fetch fullTextXML by PMCID; each fetching thread pauses ``spacing`` seconds between its requests.
 
-    A 404 or another definitive client error means there is no open-access full text (None). Throttling
-    (429), server errors, timeouts and dropped connections are retried with backoff and then raise
-    ``RetryableFetch``, so the entry stays open for the next run instead of becoming a failed retrieval.
+    A 404, a 410 or another definitive client error means there is no open-access full text (None). Europe PMC serves
+    fullTextXML for its open-access subset only and answers every other PMCID (free-to-read articles and author
+    manuscripts included) with HTTP 500, not 404. So a server error (and a 401 or 403 from the service's edge, or a
+    200 with an empty body) is checked once per fetch against Europe PMC's own record of the PMCID (``PMCID:<id>`` on
+    the search the census's abstracts step uses), at the census's spacing:
+
+    - a record whose ``isOpenAccess`` is ``N`` (outside the open-access subset) is a definitive miss (None);
+    - a record whose ``isOpenAccess`` is ``Y`` makes the error an outage, retried with backoff;
+    - an answer that concludes nothing (a failed or unreadable search, hits without the PMCID, a matching record
+      without ``isOpenAccess`` Y or N) leaves the error transient;
+    - no record at all (hitCount 0) contradicts the record the PMCID came from, and an empty or rebuilding index
+      answers the same, so on its own it concludes nothing. In a fetch that was not throttled it is followed by one
+      search for the PMCID and a sentinel together (``PMCID:<id> OR PMCID:<sentinel>``). An answer that returns the
+      sentinel's own record and none of the PMCID, every hit on its page, shows a non-empty index without the PMCID
+      (one answer, so one state of the index, speaks for both). The first such answer starts the PMCID's absence,
+      and one at least ``NO_RECORD_SECONDS`` later (normally from a later pass of the same invocation) makes it a
+      definitive miss, so both ends of the span show a non-empty index without the PMCID. A zero-hit answer, an
+      answer without the sentinel, a failed search and a throttled fetch neither start nor confirm the span; the
+      PMCID's own record (in the joint answer too) or full text starts it over. An empty index, one that answers some
+      searches from an empty copy, and one rebuilt in place whose partial copy answers fewer than two such searches
+      that far apart close nothing. The sentinel is the newest other PMCID this fetcher saw in the index (a full text
+      it served, or a search that returned that PMCID's own record), else ``NO_RECORD_FALLBACK_SENTINEL``.
+
+    Throttling (408, 425, 429), timeouts and dropped connections get no record check. Whatever stays undecided
+    after the last attempt raises ``RetryableFetch``, so the entry stays open for the next pass instead of becoming
+    a failed retrieval. After a definitive miss ``fetch.miss_reason(pmcid)`` names why in the fetching thread
+    (``census_runner.FULL_TEXT_MISS_REASONS``: notFound, notOpenAccess, noRecord), so the census counts its entries
+    without a full text by reason. The fetching threads share the absences and sentinels, which last as long as the
+    fetcher (one ``study full-text`` invocation). Every request names the census inputs' User-Agent and asks for XML
+    (the record check for JSON); it carries identifiers only (no contact address, no credentials, no cookies), as the
+    census's other Europe PMC requests do.
     """
+    from .census_inputs import USER_AGENT
     from .census_runner import RetryableFetch
     state = threading.local()
+    monotonic = clock or time.monotonic
+    headers = {"Accept": "application/xml", "User-Agent": USER_AGENT}
+    search_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    notes = {"open-access": "; Europe PMC lists it as open access",
+             "no-record": "; Europe PMC's search found no record of it, not confirmed",
+             None: "; its Europe PMC record could not be checked"}
+    throttling = (408, 425, 429)
+    lock = threading.Lock()
+    absent_since: dict[str, float] = {}     # PMCID -> its first joint answer without it, since it was last seen
+    sentinels: list[str] = []               # the last two PMCIDs seen in Europe PMC's index, the newest first
+
+    def pace() -> None:
+        wait = getattr(state, "last", 0.0) + spacing - monotonic()
+        if wait > 0:
+            sleep(wait)
+        state.last = monotonic()
+
+    def seen(pmcid: str) -> None:
+        """``pmcid`` is in Europe PMC's index: a sentinel for other PMCIDs, and any absence of it is over."""
+        with lock:
+            absent_since.pop(pmcid, None)
+            sentinels[:] = [pmcid, *[other for other in sentinels if other != pmcid][:1]]
+
+    def search(query: str, page_size: int) -> tuple[int, list[Any]] | None:
+        """One paced search of Europe PMC: its hitCount and the page's results, or None for a failed or unreadable
+        answer."""
+        pace()
+        parameters = urllib.parse.urlencode({"query": query, "format": "json", "resultType": "lite",
+                                             "pageSize": page_size})
+        request = urllib.request.Request(EUROPE_PMC_SEARCH + "?" + parameters, headers=search_headers)
+        try:
+            with (opener or urllib.request.urlopen)(request, timeout=90) as response:
+                if getattr(response, "status", 200) != 200:
+                    return None
+                answer = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+            return None
+        listing = answer.get("resultList") if isinstance(answer, dict) else None
+        results = listing.get("result") if isinstance(listing, dict) else None
+        if not isinstance(results, list) or not isinstance(answer.get("hitCount"), int):
+            return None
+        return answer["hitCount"], results
+
+    def record_of(pmcid: str) -> str | None:
+        """Europe PMC's record of ``pmcid``: "open-access" or "not-open-access" when a matching record says
+        ``isOpenAccess`` Y (any of them) or N (all of them), "listed" for matching records without either, "no-record"
+        when the search found nothing (hitCount 0), and None when the answer concludes nothing."""
+        answer = search(f"PMCID:{pmcid}", 5)
+        if answer is None:
+            return None
+        hits, results = answer
+        records = [record for record in results
+                   if isinstance(record, dict) and str(record.get("pmcid") or "").upper() == pmcid.upper()]
+        if not records:
+            return "no-record" if hits == 0 and not results else None
+        seen(pmcid)
+        flags = {record.get("isOpenAccess") for record in records}
+        if "Y" in flags:
+            return "open-access"
+        return "not-open-access" if flags == {"N"} else "listed"
+
+    def absent_for(pmcid: str) -> float:
+        """Seconds since the first joint answer that showed Europe PMC's index without ``pmcid`` since it was last
+        seen there (0 at that answer). Called only on such an answer (``index_answers``)."""
+        now = monotonic()
+        with lock:
+            return now - absent_since.setdefault(pmcid, now)
+
+    def index_answers(target: str) -> bool:
+        """Whether Europe PMC's index answers while it lacks ``target``: one search for ``target`` and a sentinel
+        together returns the sentinel's own record and none of ``target``, every hit on its page. The sentinel is the
+        newest PMCID other than ``target`` seen in the index, else NO_RECORD_FALLBACK_SENTINEL (no sentinel, and no
+        search, when that is ``target``). A record of ``target`` in the answer ends its absence. Only such an answer
+        starts or confirms ``target``'s absence."""
+        with lock:
+            sentinel = next((pmcid for pmcid in sentinels if pmcid.upper() != target.upper()), None)
+        if sentinel is None and target.upper() != NO_RECORD_FALLBACK_SENTINEL:
+            sentinel = NO_RECORD_FALLBACK_SENTINEL
+        if sentinel is None:
+            return False
+        answer = search(f"PMCID:{target} OR PMCID:{sentinel}", 10)
+        if answer is None:
+            return False
+        hits, results = answer
+        listed = {str(record.get("pmcid") or "").upper() for record in results if isinstance(record, dict)}
+        if target.upper() in listed:
+            seen(target)
+            return False
+        if sentinel.upper() not in listed or hits > len(results):
+            return False
+        seen(sentinel)
+        return True
+
+    def miss(pmcid: str, reason: str) -> None:
+        state.miss = (pmcid, reason)
+        return None
 
     def fetch(pmcid: str) -> bytes | None:
-        error = "no attempt"
-        for attempt in range(max(1, attempts)):
-            wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
-            if wait > 0:
-                sleep(wait)
-            state.last = time.monotonic()
+        state.miss = None
+        error, note, checked, throttled = "no attempt", "", False, False
+        tries = max(1, attempts)
+        for attempt in range(tries):
+            last = attempt + 1 >= tries
+            pace()
+            request = urllib.request.Request(EUROPE_PMC_FULL_TEXT % pmcid, headers=headers)
+            status, body = None, b""
             try:
-                with (opener or urllib.request.urlopen)(EUROPE_PMC_FULL_TEXT % pmcid, timeout=90) as response:
+                with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     body = response.read()
                     status = getattr(response, "status", 200)
-                if status == 200:
-                    return body if body.strip() else None
-                if status in (404, 410):
-                    return None
-                error = f"HTTP {status}"
             except urllib.error.HTTPError as failure:
-                if failure.code in (404, 410) or (400 <= failure.code < 500 and failure.code not in (408, 425, 429)):
-                    return None
-                error = f"HTTP {failure.code}"
+                status = failure.code
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as failure:
                 error = type(failure).__name__
-            if attempt + 1 < attempts:
+            if status == 200 and body.strip():
+                seen(pmcid)
+                return body
+            if status is not None:
+                error = "HTTP 200 with an empty body" if status == 200 else f"HTTP {status}"
+                throttled = throttled or status in throttling
+                if 400 <= status < 500 and status not in (401, 403, *throttling):
+                    return miss(pmcid, "notFound")
+                checkable = status == 200 or status in (401, 403) or 500 <= status < 600
+                if checkable and not checked:
+                    # A PMCID outside the open-access subset gets a server error, not 404: Europe PMC's record decides
+                    # whether this is a miss or an outage. No record at all is checked, in a fetch that was not
+                    # throttled, with one search that must find the sentinel's record and still none of the PMCID: the
+                    # first such answer starts the absence, one NO_RECORD_SECONDS later decides.
+                    checked = True
+                    listed = record_of(pmcid)
+                    if listed == "not-open-access":
+                        return miss(pmcid, "notOpenAccess")
+                    if listed == "no-record" and not throttled and index_answers(pmcid):
+                        if absent_for(pmcid) >= NO_RECORD_SECONDS:
+                            return miss(pmcid, "noRecord")
+                    note = notes.get(listed, notes[None])
+            if not last:
                 sleep(backoff[min(attempt, len(backoff) - 1)])
-        raise RetryableFetch(f"{pmcid}: {error}")
+        raise RetryableFetch(f"{pmcid}: {error}{note}")
+
+    def miss_reason(pmcid: str) -> str | None:
+        """Why this thread's last fetch of ``pmcid`` found no open-access full text, or None."""
+        last = getattr(state, "miss", None)
+        return last[1] if last and last[0] == pmcid else None
+
+    fetch.miss_reason = miss_reason
     return fetch
 
 
@@ -355,6 +528,24 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
         checks["enumerationQueriesPopulationLevel"] = enumeration.get("queryRule") == QUERY_RULE
         if require_fresh_enumeration:
             checks["everyEnumeratedReviewInStudyOrExcluded"] = enumeration.get("unexplained", 1) == 0
+        # Settled reviews (prepare --settle-unprepared) stay within the protocol's pinned bound, overall and in every
+        # journal: a systematic failure (a missed journal route, a cache the prepare was not given, an outage of both
+        # abstract passes) can then never complete as an apparently valid census. Nothing settled passes; settled
+        # reviews without a pinned bound do not.
+        settled = enumeration.get("settled") or {}
+        bound = settled.get("maxPercent")
+        limit = None if bound is None else bound / 100
+        checks["settledReviewsWithinBound"] = not settled.get("total") or (
+            limit is not None and (settled.get("share") or 0) <= limit
+            and all((cell.get("share") or 0) <= limit for cell in (settled.get("byJournal") or {}).values()))
+        if settled.get("total"):
+            notes.append(f"{settled['total']} enumerated reviews were settled as unavailable ("
+                         + ", ".join(f"{reason}: {count}" for reason, count in (settled.get("byReason") or {}).items())
+                         + "); by journal " + ", ".join(
+                             f"{journal} {cell['settled']}/{cell['enumerated']}"
+                             for journal, cell in (settled.get("byJournal") or {}).items())
+                         + (f"; the protocol's bound is {bound:g} %" if bound is not None else
+                            "; no bound was pinned (study prepare --max-settled-percent)"))
         if enumeration.get("excluded"):
             notes.append(f"{enumeration['excluded']} enumerated reviews are excluded by the protocol, each with a recorded reason")
         if enumeration.get("unexplained"):
@@ -459,17 +650,44 @@ def _gate(record: dict[str, Any], enumeration: Any, excluded: frozenset = frozen
     return None
 
 
-def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = None) -> dict[str, Any]:
+def pin_settle_bound(connection: Any, percent: float) -> None:
+    """Pin the protocol's bound on settled reviews (percent of the enumerated reviews, overall and per journal) once;
+    a later prepare may repeat it but never change it."""
+    from . import scores_db
+    if not isinstance(percent, (int, float)) or isinstance(percent, bool) or not 0 <= percent <= 100:
+        raise ValidationError("--max-settled-percent is a percentage from 0 to 100")
+    value = repr(float(percent))
+    pinned = scores_db.meta(connection).get("settleMaxPercent")
+    if pinned is not None and float(pinned) != float(percent):
+        raise ValidationError(f"the study is pinned to settling at most {float(pinned):g} % of its enumerated reviews; "
+                              "a protocol bound is never changed during a study")
+    if pinned is None:
+        with connection:
+            scores_db.set_meta(connection, {"settleMaxPercent": value})
+
+
+def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = None,
+            settle: bool = False, max_settled_percent: float | None = None) -> dict[str, Any]:
     """Prepare reviews one record at a time; a review that cannot be read or extracted is recorded, not fatal.
 
     With ``caches`` the study pins its byte caches and every cache-hit claim is re-checked against them. With
     ``enumeration`` (a verified fresh enumeration) only enumerated reviews acquired with provenance are prepared,
-    and a cache-hit claim that cannot be re-checked is refused.
+    and a cache-hit claim that cannot be re-checked is refused. With ``settle`` (only with ``enumeration``) every
+    enumerated review still neither in the study nor excluded afterwards, whether this input skipped it or does not
+    hold it, is recorded in coverage as unavailable with the reason it was not prepared (``record_not_prepared``):
+    the population is then complete, and the study reports those reviews as unavailable instead of failing its
+    completeness at the end of a run whose acquisition cannot run again. ``max_settled_percent`` pins the protocol's
+    bound on settled reviews, which the gates check ``settledReviewsWithinBound`` holds the study to.
     """
     from . import scores_db
-    from .census_inputs import review_provenance, verify_claim
+    from .census_inputs import normal_doi, review_provenance, verify_claim
     from .census_runner import iter_records, read_document, read_table_pages
     from .census_works import works_mismatch
+    if settle and enumeration is None:
+        raise ValidationError("settling unprepared reviews needs a fresh enumeration (--require-fresh-enumeration "
+                              "with --enumeration)")
+    if max_settled_percent is not None and not settle:
+        raise ValidationError("a bound on settled reviews belongs to settling them (--settle-unprepared)")
     if enumeration is None and scores_db.meta(run.connection).get("enumerationSha256"):
         raise ValidationError("this study is pinned to a fresh enumeration; prepare with --require-fresh-enumeration "
                               "and --enumeration naming its receipt (nothing is imported from other manifests)")
@@ -478,10 +696,13 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
                               "prepared after it")
     if enumeration is not None:
         run.pin_enumeration(enumeration)
+    if max_settled_percent is not None:
+        pin_settle_bound(run.connection, max_settled_percent)
     run.pin_inputs(caches)
     excluded = frozenset((row[0], row[1]) for row in run.connection.execute("SELECT journal, doi FROM exclusions"))
     counts: dict[str, int] = {}
     problems = []
+    skipped: dict[tuple[Any, Any], tuple[str, str, Any]] = {}
     for record in iter_records(source):
         result = _gate(record, enumeration, excluded)
         if result is None:
@@ -511,7 +732,27 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
         counts[result["state"]] = counts.get(result["state"], 0) + 1
         if result["state"] not in ("prepared", "already-prepared"):
             problems.append(result)
+        if str(result["state"]).startswith("skipped-") and result["state"] != "skipped-excluded":
+            acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), dict) else None
+            reason = (f"the Europe PMC lookup of {len(result['works'])} cited work(s) failed"
+                      if result.get("works") else str(result.get("reason") or result.get("next") or result["state"]))
+            skipped.setdefault((record.get("journal"), normal_doi(record.get("doi"))),
+                               (result["state"], reason, acquisition))
+    settled: dict[str, int] = {}
+    if settle:
+        rows = run.connection.execute(
+            "SELECT journal, doi, stratum, first_online, year FROM enumeration e WHERE NOT EXISTS (SELECT 1 FROM reviews r "
+            "WHERE r.journal=e.journal AND r.doi=e.doi) AND NOT EXISTS (SELECT 1 FROM exclusions x WHERE "
+            "x.journal=e.journal AND x.doi=e.doi) ORDER BY journal, doi").fetchall()
+        for journal, doi, stratum, first_online, year in rows:
+            state, reason, claimed = skipped.get((journal, doi)) or (
+                "absent-from-input", "the enumerated review is not in the prepared input", None)
+            outcome = run.record_not_prepared({"journal": journal, "doi": doi, "stratum": stratum,
+                                               "first_online": first_online, "year": year}, state, reason, claimed)
+            if outcome["state"] == "settled-unavailable":
+                settled[state] = settled.get(state, 0) + 1
     return {"prepared": counts.get("prepared", 0), "states": counts, "problems": problems,
+            **({"settled": dict(sorted(settled.items()))} if settle else {}),
             "inputs": (caches.describe() if caches is not None else None),
             "enumeration": ({"sha256": enumeration.sha256, "reviews": len(enumeration.reviews)}
                             if enumeration is not None else None)}
@@ -557,13 +798,19 @@ def command(args) -> Any:
             raise ValidationError("--require-fresh-enumeration needs --enumeration with the receipt of study enumerate")
         if args.enumeration and not args.require_fresh_enumeration:
             raise ValidationError("--enumeration is read only with --require-fresh-enumeration")
+        if args.settle_unprepared and not args.require_fresh_enumeration:
+            raise ValidationError("--settle-unprepared settles enumerated reviews: give --require-fresh-enumeration "
+                                  "and --enumeration")
+        if args.max_settled_percent is not None and not args.settle_unprepared:
+            raise ValidationError("--max-settled-percent bounds the reviews --settle-unprepared settles; give both")
         enumeration = load_enumeration(Path(args.enumeration)) if args.require_fresh_enumeration else None
         caches = _caches(args)
         try:
             run = _run(args)
             try:
                 bundle = run.pin_study_bundle(args.study_bundle) if args.study_bundle else None
-                result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration)
+                result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration,
+                                 settle=args.settle_unprepared, max_settled_percent=args.max_settled_percent)
                 return {**result, "studyBundle": bundle or ({"studyBundleSha256": run.study_bundle}
                                                             if run.study_bundle else None)}
             finally:
@@ -580,7 +827,7 @@ def command(args) -> Any:
         passes = {"transport_retries": args.transport_retries, "cooldown": args.transport_cooldown}
         try:
             if action == "judge":
-                return run.run_abstract(limit=args.limit, **passes)
+                return run.run_abstract(limit=args.limit, journal=args.journal, **passes)
             if action == "full-text":
                 caches = _caches(args)
                 if caches is not None and not args.europe_pmc:

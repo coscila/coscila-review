@@ -134,7 +134,8 @@ every cited work the abstract of one provider, Europe PMC `resultType=core`, 40
 DOIs per query with a PMID fallback, and records the outcome per work
 (`europePmcOutcome`: `europe-pmc-core`, `europe-pmc-core-pmid`,
 `europe-pmc-no-abstract`, `europe-pmc-no-hit`, `europe-pmc-failed`,
-`no-identifier`); requests carry identifiers only. A Europe PMC abstract
+`no-identifier`); requests carry identifiers only and name the census inputs'
+User-Agent. A Europe PMC abstract
 replaces whatever a work carried; where Europe PMC definitively has none, an
 abstract supplied from another provider is kept as a recorded fallback
 (`abstractSource` `fallback:<provider>`, outside the Europe-PMC-only ladder).
@@ -277,7 +278,61 @@ retrieval a cache hit only stands in for a download the run makes for every
 escalated work (`liveRetrieval` in the source's provenance record). Only Europe
 PMC documents are candidates. Each escalated entry records `ft_provenance`: the
 class of the source behind its window, or `unavailable` when no window was
-sent.
+sent. Live fullTextXML requests name the census inputs' User-Agent and ask for
+XML; like every other census request they carry identifiers only. Each fetch
+thread (`--fetch-workers`, 4 by default) spaces its requests 0.4 s apart and
+retries throttling and server errors with backoff. Europe PMC serves
+fullTextXML for its open-access subset only and answers every other PMCID
+(free-to-read articles and author manuscripts included) with HTTP 500, not 404.
+A server error (and a 401 or 403 from the service's edge, or a 200 without a
+body) is therefore checked against Europe PMC's record of the PMCID
+(`PMCID:<id>` on the search `study abstracts` uses, JSON, the same User-Agent,
+at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
+a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
+without that field, hits that list other PMCIDs only, or a search without a
+usable answer keep the error transient. Each fetch checks the record once. No
+record at all (zero hits) contradicts the Europe PMC record the PMCID came from,
+and an empty or rebuilding search index answers the same, so one such answer
+concludes nothing. In a fetch that was not throttled it is followed by one
+search for the PMCID and a sentinel together (`PMCID:<id> OR PMCID:<sentinel>`),
+and only an answer that returns the sentinel's own record and none of the PMCID,
+with every hit on its page, counts: one answer, so one state of the index, shows
+a non-empty index without the PMCID. The fetcher (one per `study full-text`
+invocation, shared by its fetch threads) remembers the first such answer for
+each PMCID, and the PMCID is a definitive miss when another such answer comes at
+least 60 s later, which normally takes a later pass of the same invocation (the
+first further pass starts a `--transport-cooldown` of 60 s after the one
+before). Both ends of the span thus show a non-empty index without the PMCID. A
+zero-hit answer, an answer without the sentinel, a failed search (a server
+error, throttling, a timeout) and a throttled fetch neither start nor confirm
+it, and the PMCID's own record (in a joint answer too) or full text starts it
+over. The sentinel is the newest other PMCID the fetcher saw in Europe PMC's
+index during the invocation (a full text it served, or a search that returned
+that PMCID's own record); a fetcher that has seen none names PMC2000001, a 1922
+record Europe PMC has indexed since 2009 (a sentinel needs a record, not a full
+text). An empty index therefore closes nothing, nor does one that answers some
+searches from an empty copy, nor one rebuilt in place (empty, then partial, then
+full) whose partial copy answers fewer than two of the PMCID's joint searches
+60 s apart. What can still close an open-access PMCID whose fullTextXML keeps
+failing is a copy of the index that holds the sentinel and lacks the PMCID in
+two joint answers at least 60 s apart, with neither the PMCID's record nor its
+full text seen in between: a rebuild whose partial phase lasts across two
+fetches of the PMCID (a minute or more within one invocation, as long as the gap
+between passes when many entries are open), or a replica without the PMCID's
+record that answers both. Within one invocation that cannot be told from a
+withdrawn record. With `--transport-retries 0`, or cooldowns far below 60 s, a
+PMCID without any record stays open instead. A 404, a 410 or another client
+error is Europe PMC's own definitive answer; throttling (408, 425, 429),
+timeouts and dropped connections get no record check. Each `study full-text`
+result counts the escalated entries that invocation closed without a window by
+reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`, `noRecord`, `notFound`
+(404, 410 or another client error), `entitledBlocked` and `other` (an unreadable
+fullTextXML, no live retrieval, a fetcher that names no reason). `noRecord`
+should stay 0, because every PMCID of the census comes from a Europe PMC record;
+a non-zero count means that two searches at least 60 s apart each held another
+PMCID's record but not theirs (a withdrawn record, or a copy of the index that
+lacked them that long), and `--retry-failed` reopens those entries (with every
+other `fetch-failed` entry).
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
@@ -308,13 +363,18 @@ manifest comes only after the census is complete:
 ocsl-review study enumerate --spec protocol/enumeration.json --output study/enumeration.jsonl
 ocsl-review study acquire --input study/enumeration.jsonl --output study/reviews.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
-ocsl-review study works --input study/reviews.jsonl --output study/reviews.works.jsonl
+# one bounded retry pass on its own output: acquisitions that failed transiently are tried again
+ocsl-review study acquire --input study/reviews.jsonl --output study/reviews.retry.jsonl \
+  --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
+ocsl-review study works --input study/reviews.retry.jsonl --output study/reviews.works.jsonl
 ocsl-review study abstracts --input study/reviews.works.jsonl --output study/reviews.works.abstracts.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE"
-ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.jsonl \
+# one bounded retry pass of the lookups that failed in transport
+ocsl-review study abstracts --input study/reviews.works.abstracts.jsonl --output study/reviews.works.abstracts.retry.jsonl \
+  --store "$STORE" --provider-cache "$PROVIDER_CACHE"
+ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.retry.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" \
-  --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json
-ocsl-review study exclude --database work/census.sqlite3 --input protocol/exclusions.jsonl   # if the protocol excludes any
+  --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json --settle-unprepared
 ocsl-review study gates --database work/census.sqlite3 --require-fresh-enumeration
 # after the census is complete, only if the protocol predeclares a comparison:
 ocsl-review study compare-manifest --database work/census.sqlite3 --stored "$COMPARISON_MANIFEST" \
@@ -372,6 +432,36 @@ recorded reason: `study exclude --input FILE` reads JSON lines of `journal`,
 population with reviews neither in the study nor excluded as incomplete (a
 study with no reviews, or only a pilot, is no completed run).
 
+**Reviews a run cannot prepare.** `study prepare` skips a record it cannot
+prepare now (an acquisition or an abstract lookup that failed in transport, a
+cache claim it cannot re-check, works it cannot derive again) and keeps it out
+of the database, so that a later acquisition or abstracts pass can still bring
+it in. When no such pass follows (the last prepare of a study whose acquisition
+ran once, as in a Study Run), `--settle-unprepared` records every enumerated
+review still neither in the study nor excluded, whether the input skipped it or
+does not hold it, in coverage as unavailable, with the enumeration's own
+stratum, year and first-online date and the reason it was not prepared
+(`extraction_json.notPrepared`, its provenance record marked `settled`); the
+result lists them by reason under `settled`, `study status` counts them
+(`inputChecks.reviewsSettledAsNotPrepared`), and the facts count them among the
+unavailable reviews of their journal, never as judged. A settled review was
+never acquired, so the live-route check leaves it out. Settling is bounded by
+the protocol: `--max-settled-percent P` (only with `--settle-unprepared`) pins
+P, the largest share of the enumerated reviews that may be settled, overall and
+in every journal (a later prepare may repeat it, never change it). `study
+status` reports the settled reviews under `enumeration.settled` (overall, per
+journal with its enumerated reviews and share, per reason, and the pinned
+bound), and `study gates` checks `settledReviewsWithinBound`: nothing settled,
+or a pinned bound that the overall share and every journal's share stay within.
+Settled reviews without a pinned bound fail it. A systematic failure, such as a
+journal acquired without its live route, a prepare not given a cache the
+acquisition used, or Europe PMC unreachable during both abstract passes, then
+stops the gate that checks it instead of completing as an apparently valid
+census. An exclusion list
+written before the run cannot know the fresh population, and `study exclude`
+refuses a review already in the study: a protocol frozen before a fresh
+enumeration names its exclusions as part of its queries, or none.
+
 `study gates --require-fresh-enumeration` adds checks that the enumeration is
 pinned with its query rule, that no review lies outside it and every enumerated
 review is in the study or excluded, that every review has acquisition
@@ -403,7 +493,11 @@ report, and nothing of the stored manifest enters the study.
 Before a census commits to a concurrency, `ocsl-review capacity probe` measures
 the entries per second the judge sustains with this instrument's own requests
 over synthetic entries, and whether the judge serves other clients
-([capacity probe](capacity-probe.md)).
+([capacity probe](capacity-probe.md)). `capacity probe --tier full-text`
+measures the full-text tier with its own calls over real loci from the study's
+literature-evidence@2 store: the share of entries without a parseable verdict
+(the full-text tier has no repair pass), tokens per entry and entries per
+second.
 
 ```bash
 ocsl-review study acquire --input inputs/manifest.jsonl --output inputs/reviews.jsonl --store "$STORE" \
@@ -426,8 +520,35 @@ ocsl-review study facts --scores results/scores.sqlite3 --output results/facts \
 ocsl-review study verify-facts --facts results/facts/facts.json
 ```
 
+`study judge --limit N` judges the next N pending reviews in enumeration
+order; with `--journal LABEL` only reviews of that journal, so a small gate can
+judge some reviews of every journal (one judge step per journal). A journal
+label no review of the study carries is refused. The judge result reports
+`throughput`, the entries per second of the invocation's steady state: from
+the first batch's start to the last batch's start of a pass that had more
+batches than streams (after that the pass drains), each batch's decided
+entries spread over its own duration and counted where it overlaps that window
+(`basis: steady-state`, with the window's `seconds` and the time-weighted
+`entries`). The drain at the end, a slow or hung call (one stream of many while
+it lasts), the cooldown before a further pass and the process start do not
+lower it. A pass with no more batches than streams has no steady state; its
+rate is then its decided entries over the time it had batches in flight
+(`basis: busy`).
+
 Runs are resumable per batch; receipts are written per call, and one process
-writes a database at a time (a lock beside it refuses a second writer). A call
+writes a database at a time (a lock beside it refuses a second writer).
+`study enumerate`, `freeze`, `facts` and `compare-manifest` never overwrite
+an output, but the same command submitted again after its process stopped
+returns what it finished: `enumerate` the enumeration whose receipt (written
+last, atomically) names the same spec, its kept pages verified; `freeze` a
+copy (renamed into place once complete) that records the same working-database
+state and options; `facts` an export whose `facts.json` (written last) names
+the same frozen scores, journals and bootstrap; `compare-manifest` the
+comparison recorded under its label from the same stored manifest and
+enumeration, renaming its report into place if the earlier process stopped
+first. Anything else in the way is refused, and an unfinished enumeration
+(a manifest without its receipt) or facts export (a database without its
+`facts.json`) is written again. A call
 that gets no response after its transport attempts leaves its entries open,
 never invalid: an entry is invalid only when a response arrived (a completion,
 an empty completion, or a refusal of the request itself: HTTP 400, 413 or 422,
@@ -438,8 +559,11 @@ batches get no response at all, the pass stops dispatching; open entries are
 retried in further passes after a growing cooldown (`--transport-retries`,
 `--transport-cooldown`), and the run then pauses as `paused:transport` until
 the next invocation. In the full-text tier, throttled or failed fetches (429,
-server errors, timeouts, dropped connections) keep their entries open the same
-way; a 404 is a failed retrieval, and `--retry-failed` reopens those. `replicate`
+server errors of a PMCID Europe PMC lists as open access or whose record could
+not be checked, timeouts, dropped connections) keep their entries open the same
+way; a 404, and a server error for a PMCID outside the open-access subset or
+without a record in two checks, is a failed retrieval, and `--retry-failed`
+reopens those. `replicate`
 re-runs whole primary batches, unchanged, in a sample stratified by journal and
 first-online year and allocated in proportion to judged entries; its verdicts go
 to the history as variant `replicate`, and the estimands report category and

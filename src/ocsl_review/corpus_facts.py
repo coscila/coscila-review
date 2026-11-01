@@ -424,8 +424,16 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
                  code_revision: str | None = None, allow_incomplete: bool = False) -> dict[str, Any]:
     scores_path, output = Path(scores_path), Path(output)
     database = output / "facts.sqlite3"
-    if database.exists() or (output / "facts.json").exists():
-        raise ValidationError("facts export already exists; export into a new directory")
+    bundle_path = output / "facts.json"
+    if bundle_path.exists():
+        # facts.json is written last: the export finished. The same export again (a step submitted again after its
+        # process stopped) returns it; anything else is refused.
+        existing = _exported_already(bundle_path, database, scores_path, journals, b=b, seed=seed)
+        if existing is None:
+            raise ValidationError("facts export already exists; export into a new directory")
+        return existing
+    for leftover in (database, *(Path(str(database) + suffix) for suffix in ("-wal", "-shm", "-journal"))):
+        leftover.unlink(missing_ok=True)        # an export stopped before its facts.json: written again
     with closing(scores_db.open_frozen(scores_path)) as frozen:
         meta = scores_db.meta(frozen)
         if meta.get("frozen") != "1":
@@ -501,9 +509,32 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
               "provenance": {"format": "ocsl-census-facts-v1", "journals": list(journals), "inputs": inputs,
                              "codeRevision": revision, "bootstrap": {"b": b, "seed": seed},
                              "interpretation": "Model measurements on a predeclared instrument, not human-labelled truth"}}
-    (output / "facts.json").write_text(json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
-    return {"facts": str(output / "facts.json"), "database": str(database), "databaseSha256": database_sha,
+    partial = output / ".facts.json.incoming"
+    partial.write_text(json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(partial, bundle_path)
+    return {"facts": str(bundle_path), "database": str(database), "databaseSha256": database_sha,
             "count": len(facts), "report": report}
+
+
+def _exported_already(bundle_path: Path, database: Path, scores_path: Path, journals: Sequence[str], *, b: int,
+                      seed: int) -> dict[str, Any] | None:
+    """The result of a facts export already written from these frozen scores, journals and bootstrap, or None."""
+    try:
+        data = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    provenance = data.get("provenance") if isinstance(data, dict) else None
+    facts = data.get("facts") if isinstance(data, dict) else None
+    if not isinstance(provenance, dict) or not isinstance(facts, dict) or not database.is_file():
+        return None
+    if (provenance.get("journals") != list(journals) or provenance.get("bootstrap") != {"b": b, "seed": seed}
+            or (provenance.get("inputs") or {}).get("scoresSha256") != scores_db.file_sha256(scores_path)):
+        return None
+    database_sha = scores_db.file_sha256(database)
+    if any(((fact or {}).get("source") or {}).get("sha256") != database_sha for fact in facts.values()):
+        return None
+    return {"facts": str(bundle_path), "database": str(database), "databaseSha256": database_sha, "count": len(facts),
+            "alreadyExported": True}
 
 
 def _pinned_inputs(meta: Mapping[str, str]) -> dict[str, str | None]:

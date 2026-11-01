@@ -119,6 +119,17 @@ class RetryableFetch(ReviewError):
     """A full-text fetch failed transiently (throttling, server error, timeout); the entry stays open."""
 
 
+# Why a full-text fetcher found no open-access full text (study_cli.europe_pmc_fetcher's ``miss_reason``): Europe PMC
+# answered fullTextXML with 404, 410 or another definitive client error; its record of the PMCID says the work is
+# outside the open-access subset; or its search found no record of the PMCID at all, and two searches for the PMCID
+# and another PMCID together, at least 60 s apart (study_cli.NO_RECORD_SECONDS), each found the other's record only.
+FULL_TEXT_MISS_REASONS = ("notFound", "notOpenAccess", "noRecord")
+# Escalated entries one full-text invocation closed without a window, by reason (``withoutFullText`` of its result):
+# the cited work has no PMCID; the fetcher's reasons above; entitled text for a judge that is not on premises; any
+# other failed retrieval (an unreadable fullTextXML, no live retrieval, a fetcher that names no reason).
+WITHOUT_FULL_TEXT = ("noPmcid", *FULL_TEXT_MISS_REASONS, "entitledBlocked", "other")
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -447,12 +458,94 @@ def writer_lock(database: Path) -> int:
     return descriptor
 
 
+# ----------------------------------------------------------------------------- the abstract tier's calls of one batch
+ABSTRACT_CALL_KINDS = ("first", "repair")
+
+
+def abstract_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, kind: str, model: str,
+                  cut: Any = True) -> dict[str, Any]:
+    """The request of one abstract-tier call of a batch, as the census sends it.
+
+    The first call carries the whole batch; the repair call carries the items ``repair_items`` selects, with the
+    instrument's repair note. ``ocsl-review capacity probe --repair`` builds its repair calls here too, so the share
+    of invalid outputs it measures after the repair pass is the census's own.
+    """
+    if kind not in ABSTRACT_CALL_KINDS:
+        raise ValidationError(f"an abstract-tier call is first or repair, not {kind!r}")
+    messages = (C.build_abstract_messages(items, title, journal, cut=cut) if kind == "first"
+                else C.build_repair_messages(items, title, journal, cut=cut))
+    return C.request_payload(messages, model=model, items=len(items), tier="abstract")
+
+
+def full_text_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, model: str) -> dict[str, Any]:
+    """The request of one full-text call, as the census sends it.
+
+    ``items`` are up to the tier's five retrieved entries of one review (a review's last call carries its remainder),
+    each with its claim-targeted window in the FULL TEXT field; reasoning effort and ``max_tokens`` come from the
+    instrument's full-text tier. citation-census@1 has no repair pass at this tier. ``ocsl-review capacity probe
+    --tier full-text`` builds its calls here too, so the shares it measures are those of the census's own requests.
+    """
+    messages = C.build_full_text_messages(items, title, journal)
+    return C.request_payload(messages, model=model, items=len(items), tier="full-text")
+
+
+def steady_throughput(passes: Sequence[Sequence[tuple[float, float, int]]], streams: int) -> dict[str, Any] | None:
+    """Entries per second of a judge step in its steady state: what a capacity gate measures.
+
+    ``passes`` holds, for each scheduling pass of the step, every batch as (start, end, entries it decided) on one
+    monotonic clock. A pass with more batches than streams ran saturated from its first batch's start until its last
+    batch's start: after that no stream takes new work and the pass drains. That interval is its steady window. Each
+    batch's entries are spread evenly over its own duration and counted where it overlaps the window (a time-weighted
+    rate, as the capacity probe measures it). So neither the drain at the end, nor a single slow or hung call (one
+    stream of many while it lasts), nor the cooldown before a further pass, nor the job's sandbox start and broker
+    checks lower the rate. A step whose passes never saturated (no more batches than streams) has no steady state:
+    its rate is its entries over the time its passes had batches in flight (``basis: busy``). None when nothing was
+    decided.
+    """
+    window_entries = window_seconds = busy_seconds = 0.0
+    busy_entries = batches = 0
+    for timings in passes:
+        if not timings:
+            continue
+        batches += len(timings)
+        first = min(start for start, _, _ in timings)
+        last = max(start for start, _, _ in timings)
+        busy_entries += sum(entries for _, _, entries in timings)
+        busy_seconds += max(end for _, end, _ in timings) - first
+        if len(timings) <= streams or last <= first:
+            continue
+        window_seconds += last - first
+        for start, end, entries in timings:
+            if not entries:
+                continue
+            if end > start:
+                window_entries += entries * max(0.0, min(end, last) - max(start, first)) / (end - start)
+            elif first <= end <= last:
+                window_entries += entries
+    if window_seconds > 0:
+        return {"basis": "steady-state", "entries": round(window_entries, 3), "seconds": round(window_seconds, 3),
+                "entriesPerSecond": round(window_entries / window_seconds, 3), "batches": batches, "streams": streams}
+    if busy_entries > 0 and busy_seconds > 0:
+        return {"basis": "busy", "entries": busy_entries, "seconds": round(busy_seconds, 3),
+                "entriesPerSecond": round(busy_entries / busy_seconds, 3), "batches": batches, "streams": streams}
+    return None
+
+
+def repair_items(batch: Sequence[dict[str, Any]], open_labels: Iterable[str],
+                 answered: Iterable[str]) -> list[dict[str, Any]]:
+    """The items of a batch's one repair call: the open labels the first call left without a parseable line (every
+    open label when the first call failed), in batch order; empty when nothing is left to repair."""
+    wanted, got = set(open_labels), set(answered)
+    return [item for item in batch if item["label"] in wanted and item["label"] not in got]
+
+
 class CensusRun:
     """A census run over one working scores database (one writing process at a time)."""
 
     def __init__(self, database: Path, *, seed: int, transport: Any = None, request_model: str | None = None,
                  concurrency: int = 60, run_id: str | None = None, sleep: Callable[[float], None] = time.sleep,
-                 revision: str | None = None, breaker: int | None = None):
+                 revision: str | None = None, breaker: int | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValidationError("the census protocol seed must be an integer")
         if not 1 <= concurrency <= 1024:
@@ -461,11 +554,15 @@ class CensusRun:
         self.required_model = self.instrument.manifest["requiredModel"]["served"]
         self.request_model = request_model or self.required_model
         self.transport, self.concurrency, self.sleep = transport, concurrency, sleep
+        # The batches' start and end times of the abstract tier (steady_throughput), on one monotonic clock.
+        self.clock = clock
         # Consecutive batches or calls without any response before a pass stops dispatching (an outage).
         self.breaker = breaker or max(4, concurrency)
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
         self.input_caches: Any = None
+        # Escalated entries closed without a full text by the current full-text invocation, by WITHOUT_FULL_TEXT reason.
+        self._without_full_text: dict[str, int] = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
         self._fidelity: list[str] = []
         self._digests: dict[tuple[str, str], str] = {}
         self._writer = writer_lock(Path(database))
@@ -773,6 +870,35 @@ class CensusRun:
             self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
         return {"doi": doi, "state": "unavailable", "reason": reason[:500]}
 
+    def record_not_prepared(self, review: Mapping[str, Any], state: str, reason: str,
+                            claimed: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """An enumerated review this run cannot prepare, settled in coverage as unavailable with its reason.
+
+        Only for a study pinned to a fresh enumeration (``study prepare --settle-unprepared``): ``review`` is the
+        enumeration's own row (journal, doi, stratum, first online, year), so the population stays the enumerated one.
+        The review is then in the study as unavailable (``extraction_json`` names why it was not prepared, its
+        provenance record is marked ``settled``), so the population is complete and the facts count it among the
+        unavailable reviews of its journal, never as judged.
+        """
+        journal, doi = review.get("journal"), normal_doi(review.get("doi"))
+        if not journal or not doi:
+            raise ValidationError("a settled review needs journal and doi")
+        with self.lock:
+            if self.connection.execute("SELECT 1 FROM reviews WHERE journal=? AND doi=?", (journal, doi)).fetchone():
+                return {"doi": doi, "state": "already-prepared"}
+            order = self.connection.execute("SELECT COALESCE(MAX(review_order), -1) + 1 FROM reviews").fetchone()[0]
+        detail = {"settled": True, "state": state, "reason": reason[:500], **({"claimed": dict(claimed)} if claimed else {})}
+        item = provenance_row(review_item_id(journal, doi), "review", "unavailable", detail, journal=journal, doi=doi)
+        with self.lock, self.connection:
+            self.connection.execute(
+                "INSERT INTO reviews(journal, doi, paper_key, title, year, first_online, stratum, provenance_class,"
+                " extraction_json, review_order, abstract_state, full_text_state, provenance)"
+                " VALUES(?,?,?,?,?,?,?,'unavailable',?,?,'completed','completed','unavailable')",
+                (journal, doi, None, None, review.get("year"), review.get("first_online"), review.get("stratum"),
+                 canonical({"notPrepared": {"state": state, "reason": reason[:500]}}), order))
+            self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
+        return {"doi": doi, "state": "settled-unavailable", "settledFrom": state, "reason": reason[:500]}
+
     # ------------------------------------------------------------------ abstract tier
     def _items(self, journal: str, doi: str) -> list[dict[str, Any]]:
         items = []
@@ -964,6 +1090,7 @@ class CensusRun:
         same call id and request, which meets the broker job that may still hold it). A sensitivity batch is written
         whole when it completes and re-run whole otherwise.
         """
+        started = self.clock()
         open_labels = set(it["label"] for it in batch) if todo is None else set(todo)
         got: dict[str, tuple[dict[str, Any], str, int]] = {}
         failures, drift, responded, answered, stopped = 0, None, False, True, False
@@ -974,12 +1101,10 @@ class CensusRun:
                 # A fidelity failure or a halted broker: nothing more is sent and the open labels stay open.
                 answered, stopped = False, True
                 break
-            sub = batch if kind == "first" else [it for it in batch if it["label"] in open_labels and it["label"] not in got]
+            sub = batch if kind == "first" else repair_items(batch, open_labels, got)
             if not sub:
                 break
-            messages = (C.build_abstract_messages(sub, title, journal, cut=cut) if kind == "first"
-                        else C.build_repair_messages(sub, title, journal, cut=cut))
-            payload = C.request_payload(messages, model=self.request_model, items=len(sub), tier="abstract")
+            payload = abstract_call(sub, title, journal, kind=kind, model=self.request_model, cut=cut)
             result = self._call(payload, tier="abstract", journal=journal, doi=doi, variant=variant, batch=batch_index,
                                 kind=kind, items=len(sub))
             labels = [it["label"] for it in sub]
@@ -1023,7 +1148,8 @@ class CensusRun:
                 got[label] = (record, call_id, position)
         incomplete = drift is None and not answered and any(label not in got for label in open_labels)
         return {"batch": batch_index, "items": batch, "got": got, "todo": open_labels, "failures": failures,
-                "drift": drift, "incomplete": incomplete, "responded": responded, "stopped": stopped}
+                "drift": drift, "incomplete": incomplete, "responded": responded, "stopped": stopped,
+                "started": started, "ended": self.clock()}
 
     def _write_accepted(self, journal: str, doi: str, batch_index: int, batch: list[dict[str, Any]],
                         accepted: Mapping[str, tuple[dict[str, Any], int]], *, call_id: str, cut: Any, now: str) -> None:
@@ -1113,11 +1239,13 @@ class CensusRun:
                                         (json.dumps(dict(detail), sort_keys=True, ensure_ascii=False),))
 
     def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]], Any, str]]]], *,
-                  cut: Any, variant: str) -> tuple[dict[str, int], str | None, bool]:
+                  cut: Any, variant: str,
+                  timings: list[tuple[float, float, int]] | None = None) -> tuple[dict[str, int], str | None, bool]:
         """Run review batches with at most two batches per stream in flight; write each review when complete.
 
         Returns the totals, the served model of a drift (or None) and whether the breaker stopped the pass
-        after ``self.breaker`` consecutive batches that got no response at all.
+        after ``self.breaker`` consecutive batches that got no response at all. ``timings`` receives every batch's
+        start, end and the entries it decided (accepted, or invalid after its repair call), for steady_throughput.
         """
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "open": 0, "transportFailures": 0}
         pending: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1140,6 +1268,11 @@ class CensusRun:
                 for future in done:
                     key = inflight.pop(future)
                     outcome = future.result()
+                    if timings is not None:
+                        # An incomplete or drifted batch decided only what its answered calls accepted.
+                        decided = (len(outcome["got"]) if outcome["incomplete"] or outcome["drift"] is not None
+                                   else len(outcome["todo"]))
+                        timings.append((outcome["started"], outcome["ended"], decided))
                     totals["transportFailures"] += outcome["failures"]
                     if outcome["drift"] is not None:
                         drift.append(outcome["drift"])
@@ -1227,22 +1360,33 @@ class CensusRun:
                 batches.append((index, batch, todo, start))
         return batches
 
-    def run_abstract(self, *, limit: int | None = None, transport_retries: int = 3,
+    def run_abstract(self, *, limit: int | None = None, journal: str | None = None, transport_retries: int = 3,
                      cooldown: float = 60.0) -> dict[str, Any]:
         """Abstract tier for every pending review, in enumeration order; resumable per batch.
+
+        ``journal`` judges only that journal's pending reviews (with ``limit``, the next ``limit`` of them), so a gate
+        can judge a few reviews of every journal; a journal no review of the study carries is refused.
 
         A pass stops early when the breaker trips (consecutive batches without any response). Reviews
         left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
         some are still open, the run pauses with ``paused:transport`` and the next invocation resumes it.
+        The result's ``throughput`` is the invocation's steady-state rate (``steady_throughput``).
         """
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        if journal is not None:
+            with self.lock:
+                known = self.connection.execute("SELECT 1 FROM reviews WHERE journal=? LIMIT 1", (journal,)).fetchone()
+            if not known:
+                raise ValidationError(f"no review of the study carries the journal {journal!r}")
         self._egress_gate("abstract_state='pending'")
         self._broker_preflight("abstract", "abstract_state='pending'")
         self._resume()
         with self.lock:
             reviews = [tuple(r) for r in self.connection.execute(
-                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()]
+                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' "
+                + ("AND journal=? " if journal is not None else "") + "ORDER BY review_order",
+                (journal,) if journal is not None else ()).fetchall()]
         if limit is not None:
             reviews = reviews[:limit]
 
@@ -1253,9 +1397,11 @@ class CensusRun:
                 yield journal, doi, title or "", batches
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0}
         drift, retries = None, 0
+        passes: list[list[tuple[float, float, int]]] = []
         while True:
             totals["passes"] += 1
-            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary")
+            passes.append([])
+            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary", timings=passes[-1])
             for name in ("accepted", "invalid", "transportFailures"):
                 totals[name] += outcome[name]
             if drift is not None:
@@ -1272,6 +1418,9 @@ class CensusRun:
         with self.lock:
             totals["calls"] = self.connection.execute("SELECT COUNT(*) FROM calls WHERE run_id=? AND tier='abstract'",
                                                       (self.run_id,)).fetchone()[0]
+        # Entries per second in the steady state of this invocation's passes: the rate a capacity gate checks, never
+        # the job's wall time (which also holds the drain, a hung call's tail and the cooldowns between passes).
+        totals["throughput"] = steady_throughput(passes, self.concurrency)
         if drift is None and reviews:
             totals["openReviews"] = len(reviews)
             stopped = self._stopped(totals)
@@ -1285,9 +1434,9 @@ class CensusRun:
 
     # ------------------------------------------------------------------ full-text tier
     def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
-                  cache=None) -> tuple[str | None, str, str | None, str, str]:
-        """Full text of a cited work: (text, outcome, source, provenance class, provenance label), cached per identity
-        version.
+                  cache=None) -> tuple[str | None, str, str | None, str, str, str | None]:
+        """Full text of a cited work: (text, outcome, source, provenance class, provenance label, the WITHOUT_FULL_TEXT
+        reason when there is none), cached per identity version.
 
         A study's byte caches (``cache``) are asked first; their Europe PMC fullTextXML is accepted only with its
         digest verified and its PMCID or DOI confirmed. Where the source came from is recorded once per source
@@ -1301,8 +1450,8 @@ class CensusRun:
                 "AND e.text IS NOT NULL AND e.route='source' ORDER BY e.evidence_id LIMIT 1",
                 (work["work_key"], work["identity_version"])).fetchone()
         if cached:
-            return cached[0], "cache", cached[1], cached[2], cached[3] or "supplied"
-        text = raw = source = None
+            return cached[0], "cache", cached[1], cached[2], cached[3] or "supplied", None
+        text = raw = source = miss = None
         provenance, label, detail, rejected = "public", "unavailable", {}, []
         pmcid = None
         if work.get("pmcid"):
@@ -1321,7 +1470,10 @@ class CensusRun:
                 fetched = fetch_xml(pmcid)
             except RetryableFetch:
                 # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
-                return None, "retry", None, provenance, "unavailable"
+                return None, "retry", None, provenance, "unavailable", None
+            if not fetched:
+                reason_of = getattr(fetch_xml, "miss_reason", None)
+                miss = reason_of(pmcid) if callable(reason_of) else None
             if fetched:
                 try:
                     text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
@@ -1337,7 +1489,10 @@ class CensusRun:
                 source, provenance = "entitled", "entitled"
                 label, detail = "live-entitled", {"provider": "entitled", "retrievedAt": utc_now()}
         if text is None:
-            return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, provenance, "unavailable"
+            if not work.get("pmcid"):
+                return None, "no-pmcid", None, provenance, "unavailable", "noPmcid"
+            return (None, "fetch-failed", None, provenance, "unavailable",
+                    miss if miss in FULL_TEXT_MISS_REASONS else "other")
         evidence_id = "src-" + sha256_text(canonical([work["work_key"], work["identity_version"], sha256_text(text)]))[:32]
         raw_sha = hashlib.sha256(raw).hexdigest() if raw else None
         # Whether the run retrieved escalated works live as well: a cache hit then stands in for its own download.
@@ -1350,7 +1505,7 @@ class CensusRun:
                 evidence_id, work["work_key"], work["identity_version"], "full-text", sha256_text(text), source, "source",
                 provenance, utc_now(), len(text), raw_sha, text))
             self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
-        return text, source, source, provenance, label
+        return text, source, source, provenance, label, None
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
                        allow_entitled: bool, cache=None) -> tuple[str, str, str, list[dict[str, Any]], int]:
@@ -1359,18 +1514,20 @@ class CensusRun:
         retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
-            text, outcome, source, provenance, label = self._retrieve(work, fetch_xml, entitled, cache)
+            text, outcome, source, provenance, label, miss = self._retrieve(work, fetch_xml, entitled, cache)
             if outcome == "retry":
                 retry += 1
                 continue
             if text is not None and provenance == "entitled" and not allow_entitled:
-                text, outcome = None, "entitled-blocked"
+                text, outcome, miss = None, "entitled-blocked", "entitledBlocked"
             if text is None:
                 # No window reaches the judge: the entry's full-text provenance is unavailable.
                 with self.lock, self.connection:
                     self.connection.execute(
                         "UPDATE citations SET ft_retrieval=?, ft_provenance='unavailable' WHERE journal=? AND doi=? AND label=?",
                         (outcome, journal, doi, row["label"]))
+                    reason = miss if miss in self._without_full_text else "other"
+                    self._without_full_text[reason] += 1
                 continue
             with self.lock:
                 passages = [{"sentence": r["sentence"], "section": r["section"]}
@@ -1389,6 +1546,19 @@ class CensusRun:
                                          "label": label}})
         return doi, journal, title, retrieved, retry
 
+    def prepare_full_text_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]],
+                                fetch_xml: Callable[[str], bytes | None] | None, *, cache: Any = None
+                                ) -> tuple[str, str, str, list[dict[str, Any]], int]:
+        """Retrieval and windows of one review's full-text entries, exactly as the tier prepares them, without judging.
+
+        ``group`` holds citation rows (journal, doi, label, cited_work_key, title) of one review in the tier's order;
+        each work's full text comes from the byte caches first, then ``fetch_xml`` (public sources only: no entitled
+        route), and every retrieved entry carries its claim-targeted window. Returns (doi, journal, title, retrieved
+        entries, entries left open by a transient fetch failure). ``ocsl-review capacity probe --tier full-text``
+        prepares its calls here.
+        """
+        return self._prepare_group(doi, group, works, fetch_xml, None, False, cache)
+
     def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]],
                          call_id: str | None = None) -> dict[str, Any]:
         """One full-text call; its entries are written with its receipt. ``call_id`` replays a pending broker call.
@@ -1400,8 +1570,7 @@ class CensusRun:
         if self._stop_reason():
             return {**outcome, "skipped": True}
         labels = [it["label"] for it in items]
-        messages = C.build_full_text_messages(items, title, journal)
-        payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
+        payload = full_text_call(items, title, journal, model=self.request_model)
         call_id = call_id or self._call_id(journal, doi, "full-text", "primary", index, "full-text", labels=labels)
         result = self._call(payload, tier="full-text", journal=journal, doi=doi, variant="primary", batch=index,
                             kind="full-text", items=len(items), call_id=call_id, pending=items)
@@ -1529,7 +1698,9 @@ class CensusRun:
         """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair.
 
         Entries whose fetch failed transiently or whose call got no response stay open and are retried in
-        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``.
+        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``. The result's
+        ``withoutFullText`` counts the entries this invocation closed without a window, by WITHOUT_FULL_TEXT reason;
+        ``noRecord`` should stay 0, because every PMCID of the census came from a Europe PMC record.
         ``cache`` (census_inputs.InputCaches) is asked before Europe PMC for each work's fullTextXML, and only with
         ``fetch_xml``: a cached full text stands in for a download the run makes for every escalated work, so the
         works earlier runs happened to fetch never decide which entries get a window.
@@ -1552,6 +1723,8 @@ class CensusRun:
         self._resume()
         totals = {"escalated": 0, "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0,
                   "fetchRetries": 0, "passes": 0, "replayed": 0}
+        with self.lock:
+            self._without_full_text = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
         drift, retries, still_open = None, 0, 0
         touched: set[tuple[str, str]] = set()
         while True:
@@ -1564,6 +1737,8 @@ class CensusRun:
                 break
             retries += 1
             self.sleep(cooldown * 2 ** (retries - 1))
+        with self.lock:
+            totals["withoutFullText"] = dict(self._without_full_text)
         with self.lock, self.connection:
             for journal, doi in sorted(touched):
                 scores_db.aggregate_reviews(self.connection, journal, doi)
@@ -1950,9 +2125,13 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
             "fullTextCacheHitsWithoutLiveRetrieval": c.execute(
                 "SELECT COUNT(*) FROM input_provenance WHERE kind='full-text' AND provenance LIKE 'cache-hit-%' AND "
                 "COALESCE(json_extract(detail_json, '$.liveRetrieval'), 0) != 1").fetchone()[0],
+            # A review the run settled as not prepared (study prepare --settle-unprepared) was never acquired.
             "reviewsAcquiredWithoutLiveRoute": c.execute(
-                f"SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND provenance != 'supplied' AND {live_route} != 1"
-            ).fetchone()[0],
+                f"SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND provenance != 'supplied' AND {live_route} != 1 "
+                "AND COALESCE(json_extract(detail_json, '$.settled'), 0) != 1").fetchone()[0],
+            "reviewsSettledAsNotPrepared": c.execute(
+                "SELECT COUNT(*) FROM input_provenance WHERE kind='review' AND "
+                "COALESCE(json_extract(detail_json, '$.settled'), 0) = 1").fetchone()[0],
             "suppliedIdentityMaps": c.execute("SELECT COUNT(*) FROM citations WHERE map_method='supplied'").fetchone()[0],
             "suppliedCountries": c.execute("SELECT COUNT(*) FROM reviews WHERE country_source='supplied'").fetchone()[0],
             "worksWithoutDerivation": c.execute(f"SELECT COUNT(*) FROM works WHERE NOT ({derived})").fetchone()[0],
@@ -1965,7 +2144,7 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
                               "inStudy": population["inStudy"], "notInStudy": population["enumerated"] - population["inStudy"],
                               "excluded": population["excluded"], "unexplained": population["unexplained"],
                               "reviewsOutsideEnumeration": outside, "populationSha256": population["sha256"],
-                              "queryRule": meta.get("enumerationQueryRule")}
+                              "queryRule": meta.get("enumerationQueryRule"), "settled": settled_status(c, meta)}
         if scores_db.has_table(c, "manifest_comparisons"):
             columns = scores_db.table_columns(c, "manifest_comparisons")
             digest = "MAX(population_sha256)" if "population_sha256" in columns else "NULL"
@@ -1975,6 +2154,29 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
                 for row in c.execute(f"SELECT label, MIN(run_complete), {digest} FROM manifest_comparisons "
                                      "GROUP BY label ORDER BY label")]
     return out
+
+
+def settled_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
+    """Enumerated reviews settled as unavailable (study prepare --settle-unprepared): overall, per journal and per
+    reason, each share of the enumerated reviews, and the protocol's pinned bound (None when none was pinned)."""
+    enumerated = {row[0]: row[1] for row in c.execute("SELECT journal, COUNT(*) FROM enumeration GROUP BY journal")}
+    settled: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    if scores_db.has_table(c, "input_provenance"):
+        for journal, reason, count in c.execute(
+                "SELECT journal, COALESCE(json_extract(detail_json, '$.state'), 'unrecorded'), COUNT(*) FROM "
+                "input_provenance WHERE kind='review' AND COALESCE(json_extract(detail_json, '$.settled'), 0) = 1 "
+                "GROUP BY journal, 2 ORDER BY journal, 2"):
+            settled[journal] = settled.get(journal, 0) + count
+            reasons[reason] = reasons.get(reason, 0) + count
+    total, population_size = sum(settled.values()), sum(enumerated.values())
+    bound = meta.get("settleMaxPercent")
+    return {"total": total, "share": round(total / population_size, 6) if population_size else None,
+            "byJournal": {journal: {"settled": settled.get(journal, 0), "enumerated": count,
+                                    "share": round(settled.get(journal, 0) / count, 6) if count else None}
+                          for journal, count in sorted(enumerated.items())},
+            "byReason": dict(sorted(reasons.items())),
+            "maxPercent": float(bound) if bound is not None else None}
 
 
 def record_exclusions(database: Path, records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2045,8 +2247,6 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
     database, output = Path(database), Path(output)
     if not database.is_file():
         raise ValidationError(f"scores database is missing: {database}")
-    if output.exists():
-        raise ValidationError("comparison report already exists; write it to a new path")
     writer = writer_lock(database)
     temporary = None
     try:
@@ -2057,14 +2257,26 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
             if not pinned:
                 raise ValidationError("compare a stored manifest only after study prepare --require-fresh-enumeration "
                                       "has pinned the fresh enumeration")
+            recorded = connection.execute(
+                "SELECT report_sha256, stored_sha256, enumeration_sha256 FROM manifest_comparisons WHERE label=? LIMIT 1",
+                (label,)).fetchone()
+            if recorded:
+                # The same comparison again (a step submitted again after its process stopped): its report, finished
+                # here when the earlier process stopped between recording it and renaming the report into place.
+                existing = _comparison_already(output, recorded, pinned, Path(stored))
+                if existing is None:
+                    raise ValidationError(f"comparison {label!r} is already recorded; choose another label")
+                return existing
+            if output.exists():
+                raise ValidationError("comparison report already exists; write it to a new path")
+            # A report an earlier process wrote but never recorded: never part of the study, written again.
+            output.with_name("." + output.name + ".incoming").unlink(missing_ok=True)
             # Complete means every enumerated review in the study or excluded with a reason, and nothing pending: a
             # study with no reviews, or only a pilot, is no completed run.
             state = scores_db.completeness(connection)
             if not state["complete"] and not allow_incomplete:
                 raise ValidationError("compare a stored manifest after the census run is complete (a diagnostic, never "
                                       "tuned): " + "; ".join(state["problems"]))
-            if connection.execute("SELECT 1 FROM manifest_comparisons WHERE label=?", (label,)).fetchone():
-                raise ValidationError(f"comparison {label!r} is already recorded; choose another label")
             population = state["population"]
             studied = {(row[0], row[1]) for row in connection.execute("SELECT journal, doi FROM reviews")}
             excluded = {(row[0], row[1]) for row in connection.execute("SELECT journal, doi FROM exclusions")}
@@ -2110,6 +2322,28 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
             "runProblems": state["problems"], "population": population, "totals": result["totals"], "stored": info,
             "byJournal": {journal: {k: v for k, v in cell.items() if k != "strata"}
                           for journal, cell in result["byJournal"].items()}}
+
+
+def _comparison_already(output: Path, recorded: Sequence[Any], pinned: str, stored: Path) -> dict[str, Any] | None:
+    """The result of a comparison recorded under this label from the same stored manifest and enumeration, read from
+    its report (renamed into place first when the earlier process stopped before that), or None."""
+    from .census_inputs import load_stored_manifest
+    report_sha, stored_sha, enumeration_sha = recorded
+    temporary = output.with_name("." + output.name + ".incoming")
+    if not output.exists() and temporary.is_file() and hashlib.sha256(temporary.read_bytes()).hexdigest() == report_sha:
+        os.replace(temporary, output)
+    if not output.is_file() or enumeration_sha != pinned:
+        return None
+    body = output.read_bytes()
+    if hashlib.sha256(body).hexdigest() != report_sha or load_stored_manifest(stored)[1].get("sha256") != stored_sha:
+        return None
+    report = json.loads(body)
+    return {"label": report["label"], "report": str(output), "reportSha256": report_sha,
+            "runComplete": report["runComplete"], "runProblems": report["runProblems"],
+            "population": report["population"], "totals": report["totals"], "stored": report["stored"],
+            "byJournal": {journal: {k: v for k, v in cell.items() if k != "strata"}
+                          for journal, cell in report["byJournal"].items()},
+            "alreadyRecorded": True}
 
 
 def iter_records(path: Path) -> Iterator[dict[str, Any]]:

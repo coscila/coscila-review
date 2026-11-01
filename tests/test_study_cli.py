@@ -37,8 +37,9 @@ class FactsEndToEndTests(RunnerTestCase):
             self.assertEqual(0, c.execute("SELECT COUNT(*) FROM evidence WHERE text IS NOT NULL").fetchone()[0])
             self.assertEqual("1", scores_db.meta(c)["frozen"])
             self.assertGreater(c.execute("SELECT COUNT(*) FROM data_dictionary").fetchone()[0], 100)
+        self.assertEqual(report["sha256"], scores_db.freeze(self.database, frozen)["sha256"])
         with self.assertRaises(ValidationError):
-            scores_db.freeze(self.database, frozen)
+            scores_db.freeze(self.database, frozen, keep_text=True)
         manifest = scores_db.export(frozen, self.root / "export")
         names = {f["path"] for f in manifest["files"]}
         self.assertIn("citations.tsv", names)
@@ -94,7 +95,8 @@ class CommandLineTests(RunnerTestCase):
         self.assertEqual((FIXTURES / "review.xml").read_bytes(), read_document(manifest.parent, record()))
         outputs = []
         for argv in (["study", "prepare", "--database", str(self.database), "--seed", "5", "--input", str(manifest)],
-                     ["study", "judge", "--database", str(self.database), "--seed", "5", "--base-url", self.base],
+                     ["study", "judge", "--database", str(self.database), "--seed", "5", "--base-url", self.base,
+                      "--journal", JOURNAL, "--limit", "1"],
                      ["study", "full-text", "--database", str(self.database), "--seed", "5", "--base-url", self.base],
                      ["study", "gates", "--database", str(self.database)],
                      ["study", "freeze", "--database", str(self.database), "--output", str(self.root / "frozen.sqlite3")],
@@ -107,7 +109,10 @@ class CommandLineTests(RunnerTestCase):
                 self.assertEqual(0, main(argv), argv)
             outputs.append(json.loads(buffer.getvalue()))
         self.assertEqual(1, outputs[0]["prepared"])
-        self.assertEqual("completed", outputs[1]["state"])
+        self.assertEqual(("completed", 1), (outputs[1]["state"], outputs[1]["reviews"]))
+        # One batch on sixty streams never saturates: its rate is its entries over the time it was in flight.
+        self.assertEqual(("busy", 15, 1), (outputs[1]["throughput"]["basis"], outputs[1]["throughput"]["entries"],
+                                           outputs[1]["throughput"]["batches"]))
         self.assertEqual("completed", outputs[2]["state"])
         self.assertTrue(outputs[3]["ok"], outputs[3])
         self.assertTrue(outputs[4]["complete"])

@@ -26,23 +26,31 @@ SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 DOIS_PER_QUERY = 40
 
 
-def http_get(spacing: float = 0.4, attempts: int = 4) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
-    """GET the search endpoint with per-thread spacing and bounded retries; None after the last failure."""
+def http_get(spacing: float = 0.4, attempts: int = 4, *, opener: Callable[..., Any] | None = None,
+             sleep: Callable[[float], None] = time.sleep) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
+    """GET the search endpoint with per-thread spacing and bounded retries; None after the last failure.
+
+    Every request names the census inputs' User-Agent and asks for JSON; it carries identifiers only (no contact
+    address, no credentials, no cookies).
+    """
+    from .census_inputs import USER_AGENT
     state = threading.local()
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
 
     def get(params: dict[str, Any]) -> dict[str, Any] | None:
         for attempt in range(attempts):
             wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
             if wait > 0:
-                time.sleep(wait)
+                sleep(wait)
             state.last = time.monotonic()
+            request = urllib.request.Request(SEARCH + "?" + urllib.parse.urlencode(params), headers=headers)
             try:
-                with urllib.request.urlopen(SEARCH + "?" + urllib.parse.urlencode(params), timeout=90) as response:
+                with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     if response.status == 200:
                         return json.loads(response.read())
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
                 pass
-            time.sleep(3 * (attempt + 1))
+            sleep(3 * (attempt + 1))
         return None
     return get
 

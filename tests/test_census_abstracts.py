@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unittest
 
-from ocsl_review.census_abstracts import DOIS_PER_QUERY, fetch_abstracts, fill_record
+from ocsl_review.census_abstracts import DOIS_PER_QUERY, fetch_abstracts, fill_record, http_get
 
 
 class FakeSearch:
@@ -79,6 +79,36 @@ class AbstractTests(unittest.TestCase):
                          (failed["abstract"], failed["abstractSource"], failed["europePmcOutcome"]))
         retried = fill_record({"doi": "x", "works": {"a": failed}}, FakeSearch())["works"]["a"]
         self.assertEqual(("Abstract of 10.5555/n.1.", "europe-pmc-core"), (retried["abstract"], retried["abstractSource"]))
+
+
+    def test_live_lookups_name_the_census_user_agent_and_carry_identifiers_only(self):
+        import io
+        import json
+        import urllib.error
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+        sent, sleeps = [], []
+
+        def opener(request, timeout=None):
+            sent.append(request)
+            if len(sent) == 1:
+                raise urllib.error.URLError("dropped")
+            return Response(json.dumps({"resultList": {"result": []}}).encode())
+        get = http_get(spacing=0, opener=opener, sleep=sleeps.append)
+        self.assertEqual({"resultList": {"result": []}}, get({"query": 'DOI:"10.5555/n.1"', "format": "json"}))
+        self.assertEqual(2, len(sent))
+        self.assertEqual([3], sleeps, "one retry after the dropped connection")
+        self.assertTrue(sent[0].full_url.startswith("https://www.ebi.ac.uk/europepmc/webservices/rest/search?query="))
+        self.assertEqual({"Accept": "application/json", "User-agent": "ocsl-review census inputs"},
+                         dict(sent[1].header_items()))
+        self.assertNotIn("@", sent[1].full_url + json.dumps(dict(sent[1].header_items())))
 
 
 if __name__ == "__main__":

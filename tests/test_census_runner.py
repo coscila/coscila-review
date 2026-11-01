@@ -10,6 +10,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -18,8 +19,9 @@ import io
 from contextlib import redirect_stdout
 
 from ocsl_review import citation_census as C
-from ocsl_review import estimands, scores_db
-from ocsl_review.census_runner import CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute
+from ocsl_review import corpus_facts, estimands, scores_db
+from ocsl_review.census_runner import (CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute,
+                                       steady_throughput)
 from ocsl_review.cli import main
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.study_cli import gates
@@ -39,6 +41,7 @@ class MockJudge:
         self.never_full_text = set()
         self.fail_next = 0
         self.model = MODEL
+        self.delays: dict[str, float] = {}      # a review title -> seconds every call of that review waits
         self.lock = threading.Lock()
 
     @staticmethod
@@ -95,6 +98,10 @@ def start_server(judge: MockJudge):
                 self.end_headers()
                 return
             payload = json.loads(body)
+            user = payload["messages"][1]["content"]
+            delay = max([seconds for title, seconds in judge.delays.items() if title in user], default=0.0)
+            if delay:
+                time.sleep(delay)
             response = {"model": judge.model, "system_fingerprint": "fp-mock",
                         "choices": [{"message": {"content": judge.answer(payload)}, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
@@ -317,6 +324,22 @@ class AbstractTierTests(RunnerTestCase):
         positions = {r["label"]: r["position"] for r in self.rows("SELECT label, position FROM history WHERE outcome='accepted'")}
         self.assertEqual((1, 2), (positions["2"], positions["9"]))
 
+    def test_the_repair_call_is_built_from_the_open_labels_in_batch_order(self):
+        from ocsl_review.census_runner import abstract_call, repair_items
+        batch = [{"label": label, "citing_passages": [{"sentence": "S %s." % label}], "cited_work": {"title": "T"},
+                  "abstract": "A"} for label in ("1", "2", "3", "9")]
+        self.assertEqual(["2", "9"], [it["label"] for it in repair_items(batch, ["9", "2", "3"], ["3"])])
+        self.assertEqual([], repair_items(batch, ["1"], ["1"]))
+        self.assertEqual(4, len(repair_items(batch, [it["label"] for it in batch], [])), "a failed first call repairs all")
+        sub = repair_items(batch, ["2", "9"], [])
+        payload = abstract_call(sub, "Review", JOURNAL, kind="repair", model=MODEL)
+        self.assertEqual(C.request_payload(C.build_repair_messages(sub, "Review", JOURNAL), model=MODEL, items=2),
+                         payload)
+        self.assertEqual(C.request_payload(C.build_abstract_messages(batch, "Review", JOURNAL), model=MODEL, items=4),
+                         abstract_call(batch, "Review", JOURNAL, kind="first", model=MODEL))
+        with self.assertRaises(ValidationError):
+            abstract_call(batch, "Review", JOURNAL, kind="second", model=MODEL)
+
     def test_invalid_after_repair(self):
         self.judge.never = {"3"}
         run = self.run_census()
@@ -442,6 +465,23 @@ class AbstractTierTests(RunnerTestCase):
         self.assertIn("model_drift", errors)
         self.assertEqual(0, run.status()["duplicateJudgments"])
 
+    def test_a_journal_selector_judges_only_the_next_reviews_of_that_journal(self):
+        os.environ["OCSL_TEST_JUDGE_KEY"] = "local-test-value"
+        self.addCleanup(os.environ.pop, "OCSL_TEST_JUDGE_KEY", None)
+        other = "Second Synthetic Journal"
+        run = self.run_census()
+        self.prepare(run, record(doi="10.5555/a.1"), record(doi="10.5555/b.1", journal=other),
+                     record(doi="10.5555/a.2"), record(doi="10.5555/b.2", journal=other))
+        result = run.run_abstract(limit=1, journal=other)
+        self.assertEqual(("completed", 1, 15), (result["state"], result["reviews"], result["accepted"]))
+        judged = [(row["journal"], row["doi"]) for row in
+                  self.rows("SELECT journal, doi FROM reviews WHERE abstract_state='completed'")]
+        self.assertEqual([(other, "10.5555/b.1")], judged)
+        self.assertEqual(1, len(self.judge.requests))
+        with self.assertRaisesRegex(ValidationError, "carries the journal 'Unknown Journal'"):
+            run.run_abstract(journal="Unknown Journal")
+        self.assertEqual(3, run.run_abstract()["reviews"])
+
     def test_batches_of_forty_in_bibliography_order(self):
         run = self.run_census()
         works = {"n%d" % i: {"doi": "10.5555/n%d" % i, "title": "Fictional source %d" % i, "venue": "Synth", "year": 2020,
@@ -454,6 +494,55 @@ class AbstractTierTests(RunnerTestCase):
         self.assertEqual([str(i) for i in range(1, 41)], json.loads(calls[0]["labels_json"]))
         positions = {r["label"]: (r["abs_batch"], r["abs_position"]) for r in self.rows("SELECT label, abs_batch, abs_position FROM citations")}
         self.assertEqual((1, 5), positions["45"])
+
+
+class ThroughputTests(RunnerTestCase):
+    """The judge step's steady-state rate (what a capacity gate checks), never the job's wall time."""
+
+    def test_the_steady_window_runs_from_the_first_to_the_last_batch_start(self):
+        # Two streams, four batches of 10 entries, each 2 s long, back to back: saturated from 0 until 2 (the last
+        # start), so the rate is 2 streams x 10 entries / 2 s = 10 entries per second.
+        passes = [[(0.0, 2.0, 10), (0.0, 2.0, 10), (2.0, 4.0, 10), (2.0, 4.0, 10)]]
+        rate = steady_throughput(passes, 2)
+        self.assertEqual(("steady-state", 20.0, 2.0, 10.0, 4, 2), (rate["basis"], rate["entries"], rate["seconds"],
+                                                                   rate["entriesPerSecond"], rate["batches"],
+                                                                   rate["streams"]))
+
+    def test_a_hung_batch_costs_one_stream_and_the_drain_and_cooldown_cost_nothing(self):
+        # Three streams over 0..10 s; one batch hangs from 0 to 1800 s (a bulk timeout) and decides nothing. A
+        # further pass after the cooldown re-sends it alone. The wall-time rate would be 70 entries / ~2000 s.
+        steady = [(0.0, 1800.0, 0)] + [(float(t), float(t) + 2.0, 10) for t in range(0, 10, 2) for _ in range(2)]
+        further = [(1860.0, 1862.0, 10)]
+        rate = steady_throughput([steady, further], 3)
+        self.assertEqual("steady-state", rate["basis"])
+        self.assertEqual(8.0, rate["seconds"])
+        # Two of three streams decided 10 entries every 2 s inside the window (the batches started at 8 s, the last
+        # start, lie outside it): 2/3 of what three streams deliver, never the wall-time rate.
+        self.assertAlmostEqual(10.0, rate["entriesPerSecond"], places=3)
+
+    def test_a_step_with_no_more_batches_than_streams_has_no_steady_state(self):
+        rate = steady_throughput([[(0.0, 3.0, 15), (1.0, 4.0, 15)]], 4)
+        self.assertEqual(("busy", 30, 4.0, 7.5), (rate["basis"], rate["entries"], rate["seconds"],
+                                                  rate["entriesPerSecond"]))
+        self.assertIsNone(steady_throughput([[]], 4))
+        self.assertIsNone(steady_throughput([[(0.0, 3.0, 0)]], 4))
+
+    def test_one_slow_review_leaves_the_steady_rate_far_above_the_wall_rate(self):
+        os.environ["OCSL_TEST_JUDGE_KEY"] = "local-test-value"
+        self.addCleanup(os.environ.pop, "OCSL_TEST_JUDGE_KEY", None)
+        run = self.run_census()
+        slow = {**record(doi="10.5555/synthetic.review.slow"), "title": "Slow synthetic review"}
+        self.prepare(run, slow, *(record(doi=f"10.5555/synthetic.review.{n}") for n in range(15)))
+        self.judge.delays = {"Slow synthetic review": 2.0, "zeta-kinase": 0.05}
+        started = time.monotonic()
+        result = run.run_abstract()
+        wall = time.monotonic() - started
+        self.assertEqual(("completed", 16, 240), (result["state"], result["reviews"], result["accepted"]))
+        rate = result["throughput"]
+        self.assertEqual(("steady-state", 16, 4), (rate["basis"], rate["batches"], rate["streams"]))
+        # The slow review holds one of four streams for 2 s; the other three judge the rest in a fraction of that.
+        self.assertGreater(rate["entriesPerSecond"], 2 * (240 / wall))
+        self.assertLess(rate["seconds"], wall / 3)
 
 
 def full_text_fetcher(requests):
@@ -725,8 +814,11 @@ class RetryableFetchTests(RunnerTestCase):
         run = self.run_census()
         self.prepare(run)
         run.run_abstract()
-        run.run_full_text(fetch_xml=lambda pmcid: None)
+        missed = run.run_full_text(fetch_xml=lambda pmcid: None)
         self.assertEqual(3, self.rows("SELECT COUNT(*) AS n FROM citations WHERE ft_retrieval='fetch-failed'")[0]["n"])
+        # A fetcher that names no reason for its misses: the entries count as other failed retrievals.
+        self.assertEqual({"noPmcid": 2, "notOpenAccess": 0, "noRecord": 0, "notFound": 0, "entitledBlocked": 0,
+                          "other": 3}, missed["withoutFullText"])
         self.assertEqual(0, run.run_full_text(fetch_xml=full_text_fetcher([]))["retrieved"])
         again = run.run_full_text(fetch_xml=full_text_fetcher([]), retry_failed=True)
         self.assertEqual(("completed", 3), (again["state"], again["retrieved"]))
@@ -774,6 +866,896 @@ class RetryableFetchTests(RunnerTestCase):
             europe_pmc_fetcher(spacing=0, opener=opener_for(cut), sleep=sleeps.append)("PMC1")
         recovered = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled, Response()), sleep=sleeps.append)
         self.assertEqual(b"<article/>", recovered("PMC1"))
+        # Every request names the census inputs' User-Agent and asks for XML; no contact address is sent.
+        sent = []
+
+        def recording(request, timeout=None):
+            sent.append(request)
+            return Response()
+        europe_pmc_fetcher(spacing=0, opener=recording, sleep=sleeps.append)("PMC7")
+        self.assertEqual("https://www.ebi.ac.uk/europepmc/webservices/rest/PMC7/fullTextXML", sent[0].full_url)
+        self.assertEqual({"Accept": "application/xml", "User-agent": "ocsl-review census inputs"},
+                         dict(sent[0].header_items()))
+        self.assertNotIn("@", json.dumps(dict(sent[0].header_items())))
+
+    def test_a_server_error_for_a_pmcid_outside_the_open_access_subset_is_a_definitive_miss(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # Europe PMC answers fullTextXML with HTTP 500 for every PMCID outside its open-access subset (recorded body);
+        # its own record of the PMCID tells such a miss from an outage.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001", "PMC999999999", "PMC7"}, records={"PMC7": "Y"})
+        sleeps = []
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleeps.append)
+        self.assertIsNone(fetch("PMC2000001"))
+        self.assertEqual(["fullTextXML PMC2000001", "search PMC2000001"], europe_pmc.log)
+        self.assertEqual([], sleeps, "a miss is never retried")
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC2000001"))
+        search = europe_pmc.requests[1]
+        self.assertEqual(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PMCID%3APMC2000001&format=json"
+            "&resultType=lite&pageSize=5", search.full_url)
+        self.assertEqual({"Accept": "application/json", "User-agent": "ocsl-review census inputs"},
+                         dict(search.header_items()))
+        self.assertNotIn("@", search.full_url + json.dumps(dict(search.header_items())))
+        # No record of the PMCID at all concludes nothing on one answer (the PMCID came from a Europe PMC record): one
+        # record check per fetch, then one search for it and a sentinel (PMC2000001, whose record the fetcher just
+        # saw), which only starts its absence; the entry stays open (NoRecordDecisionTests: when such an absence is a
+        # miss).
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"PMC999999999: HTTP 500; Europe PMC's search found no record of "
+                                                    r"it, not confirmed"):
+            fetch("PMC999999999")
+        self.assertEqual(["fullTextXML PMC999999999", "search PMC999999999", "search PMC999999999 OR PMC2000001",
+                          "fullTextXML PMC999999999", "fullTextXML PMC999999999"], europe_pmc.log)
+        self.assertEqual([2.0, 5.0], sleeps)
+        self.assertIsNone(fetch.miss_reason("PMC999999999"))
+        sleeps.clear()
+        # A PMCID Europe PMC lists as open access: the server error is an outage, retried and then left open.
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC lists it as open access"):
+            fetch("PMC7")
+        self.assertEqual(["fullTextXML PMC7", "search PMC7", "fullTextXML PMC7", "fullTextXML PMC7"], europe_pmc.log)
+        self.assertEqual([2.0, 5.0], sleeps)
+        self.assertIsNone(fetch.miss_reason("PMC7"))
+        # A search that fails concludes nothing: the entry stays open too.
+        down = EuropePmcStandIn(server_errors={"PMC2000001"}, search_status=503)
+        with self.assertRaisesRegex(RetryableFetch, r"PMC2000001: HTTP 500; its Europe PMC record could not be checked"):
+            europe_pmc_fetcher(spacing=0, opener=down, sleep=lambda seconds: None)("PMC2000001")
+        self.assertEqual(4, len(down.log))
+        # An outage that clears: the record says open access, the next attempt serves the full text.
+        flaky = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
+                                 errors_before_success=1)
+        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=flaky, sleep=lambda seconds: None)("PMC7"))
+
+    def test_full_text_completes_when_cited_works_have_no_open_access_full_text(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        # Escalated works 5, 7 and 15 carry a PMCID: 5 is open access, 7 is outside the subset, 15 has no record.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
+                                      server_errors={"PMC900007", "PMC900015"},
+                                      records={"PMC900005": "Y", "PMC900007": "N"})
+        clock = FakeClock()
+        run.sleep = clock.sleep
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+                                                                clock=clock), cooldown=60)
+        # The first pass leaves work 15 open: its search finds no record, and one search for it and a sentinel finds
+        # the sentinel's record and none of 15, which starts its absence. The second pass, a 60 s cooldown later,
+        # gets the same two answers: a miss.
+        self.assertEqual(("completed", 1, 1, 2), (result["state"], result["retrieved"], result["fetchRetries"],
+                                                 result["passes"]))
+        self.assertEqual({"noPmcid": 2, "notOpenAccess": 1, "noRecord": 1, "notFound": 0, "entitledBlocked": 0,
+                          "other": 0}, result["withoutFullText"])
+        self.assertEqual({"PMC900007", "PMC900015"}, {pmcid for pmcid, in self.rows_of(
+            "SELECT w.pmcid FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
+            "WHERE c.ft_retrieval='fetch-failed' AND c.ft_provenance='unavailable'")})
+        self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+        first_pass, second_pass = europe_pmc.log[:-3], europe_pmc.log[-3:]
+        joint = [line for line in first_pass if " OR " in line]
+        self.assertEqual(sorted(["fullTextXML PMC900005", "fullTextXML PMC900007", "search PMC900007"]
+                                + ["fullTextXML PMC900015"] * 3 + ["search PMC900015"]),
+                         sorted(line for line in first_pass if " OR " not in line))
+        # The sentinel is the newest PMCID the fetcher saw in the index: work 5 or 7, or the fallback PMC2000001 while
+        # the threads had seen neither (a joint answer that holds the sentinel's record makes it the newest again).
+        sentinels = ("PMC900005", "PMC900007", "PMC2000001")
+        self.assertEqual(1, len(joint))
+        self.assertIn(joint[0].removeprefix("search PMC900015 OR "), sentinels)
+        self.assertEqual(["fullTextXML PMC900015", "search PMC900015"], second_pass[:2])
+        self.assertIn(second_pass[2].removeprefix("search PMC900015 OR "), sentinels)
+        # The next invocation finds nothing open: it closes nothing.
+        again = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+                                  cooldown=0)
+        self.assertEqual(dict.fromkeys(result["withoutFullText"], 0), again["withoutFullText"])
+
+    def test_a_europe_pmc_outage_keeps_full_text_entries_open(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC900005", "PMC900007", "PMC900015"},
+                                      records={"PMC900005": "Y", "PMC900007": "Y", "PMC900015": "Y"})
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+                                   transport_retries=0, cooldown=0)
+        self.assertEqual(("paused", 3), (result["state"], result["fetchRetries"]))
+        # The three entries with a PMCID stay open; only the two without one are settled (no-pmcid).
+        self.assertEqual([("no-pmcid", 2)], self.rows_of(
+            "SELECT ft_retrieval, COUNT(*) FROM citations WHERE ft_retrieval IS NOT NULL GROUP BY 1"))
+        self.assertEqual("pending", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+
+    def test_an_empty_search_index_closes_no_entry_in_any_pass(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        # Europe PMC's search index is empty for the whole invocation (every search answers hitCount 0) while
+        # fullTextXML serves work 5 and fails for works 7 and 15: the search for each of them with the sentinel (work 5)
+        # finds no record either, so their absence never starts and nothing is concluded in any of the four passes.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
+                                      server_errors={"PMC900007", "PMC900015"})
+        clock = FakeClock()
+        run.sleep = clock.sleep
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+                                                                clock=clock))
+        self.assertEqual(("paused", 4, 2, 8), (result["state"], result["passes"], result["openEntries"],
+                                               result["fetchRetries"]))
+        self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 2}, result["withoutFullText"])
+        # One search with the sentinel after each answer without a record: each of the two entries in each of the four
+        # passes. In the first pass it names the fallback PMC2000001 when it ran before work 5's full text was served.
+        joint = [line for line in europe_pmc.log if " OR " in line]
+        for pmcid in ("PMC900007", "PMC900015"):
+            named = [line.split(" OR ")[1] for line in joint if line.split()[1] == pmcid]
+            self.assertEqual(4, len(named), pmcid)
+            self.assertIn(named[0], ("PMC900005", "PMC2000001"))
+            self.assertEqual(["PMC900005"] * 3, named[1:])
+        self.assertEqual(8, len(joint))
+        self.assertEqual([("europe-pmc-fulltextxml", 1), ("no-pmcid", 2)], self.rows_of(
+            "SELECT ft_retrieval, COUNT(*) FROM citations WHERE ft_retrieval IS NOT NULL GROUP BY 1 ORDER BY 1"))
+
+    def test_an_index_rebuilt_in_place_closes_no_entry_unless_its_partial_copy_answers_two_passes(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # Europe PMC's search index is rebuilt in place during one invocation: empty, then a partial copy that holds
+        # work 5 (served: the sentinel) and lacks the open-access work 15, then full. Work 15's fullTextXML fails
+        # throughout, work 7 has none (404), and the four passes fetch work 15 at 0, 67, 194 and 441 s. Answers from
+        # the empty copy start nothing, so work 15 closes only when the partial copy answers in two passes.
+        for number, (empty, partial, no_record) in enumerate(((60, 10, 0), (50, 20, 0), (190, 10, 0), (0, 75, 1))):
+            with self.subTest(empty=empty, partial=partial):
+                self.database = self.root / f"rebuilt-{number}.sqlite3"
+                run = self.run_census()
+                self.prepare(run)
+                run.run_abstract()
+                clock = FakeClock()
+                run.sleep = clock.sleep
+                europe_pmc, opener = rebuilt_in_place(
+                    clock, empty, partial, sentinel="PMC900005", target="PMC900015",
+                    full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
+                    server_errors={"PMC900015"})
+                result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=opener, sleep=clock.sleep,
+                                                                        clock=clock))
+                self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 2, "notFound": 1,
+                                                                               "noRecord": no_record},
+                                 result["withoutFullText"])
+                if no_record:
+                    self.assertEqual(("completed", 2), (result["state"], result["passes"]))
+                else:
+                    self.assertEqual(("paused", 4, 1), (result["state"], result["passes"], result["openEntries"]))
+                # Three attempts in each pass that leaves it open; the deciding fetch stops at its first attempt.
+                self.assertEqual(4 if no_record else 12, europe_pmc.log.count("fullTextXML PMC900015"))
+
+    def test_an_invocation_that_sees_no_pmcid_in_the_index_decides_with_the_fallback_sentinel(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        self.prepare(run)
+        run.run_abstract()
+        # A step's tail: every live fetch is of a work whose record Europe PMC dropped (works 5, 7 and 15), so the
+        # fetcher sees no PMCID in the index. Europe PMC answers for the fallback sentinel, so the first pass starts
+        # their absence, the second pass closes them, and the step completes instead of staying open in every
+        # invocation.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC900005", "PMC900007", "PMC900015"})
+        clock = FakeClock()
+        run.sleep = clock.sleep
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+                                                                clock=clock))
+        self.assertEqual(("completed", 2, 3), (result["state"], result["passes"], result["fetchRetries"]))
+        self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 2, "noRecord": 3},
+                         result["withoutFullText"])
+        self.assertEqual(["search PMC900005 OR PMC2000001"] * 2 + ["search PMC900007 OR PMC2000001"] * 2
+                         + ["search PMC900015 OR PMC2000001"] * 2,
+                         sorted(line for line in europe_pmc.log if " OR " in line))
+        self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+
+    def test_a_record_check_that_finds_no_record_once_concludes_nothing(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # A stray answer without a record (the sentinel PMC5 is known), whose search with the sentinel finds the
+        # record, and a pass later the open-access record: the server error is an outage, never a miss, and no absence
+        # starts.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC7"},
+                                      records={"PMC5": "Y", "PMC7": "Y"}, unlisted_searches=1)
+        clock, sleeps = FakeClock(), []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock.sleep(seconds)
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleep, clock=clock)
+        self.assertEqual(b"<article/>", fetch("PMC5"))
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC's search found no record of it, not "
+                                                    r"confirmed"):
+            fetch("PMC7")
+        self.assertEqual(["fullTextXML PMC5", "fullTextXML PMC7", "search PMC7", "search PMC7 OR PMC5",
+                          "fullTextXML PMC7", "fullTextXML PMC7"], europe_pmc.log)
+        self.assertEqual([2.0, 5.0], sleeps)
+        clock.sleep(60)
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC lists it as open access"):
+            fetch("PMC7")
+        # Another stray answer a minute later: its search with the sentinel finds the record, and nothing is decided.
+        clock.sleep(60)
+        europe_pmc.unlisted_left = 1
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC's search found no record of it"):
+            fetch("PMC7")
+        self.assertEqual(["fullTextXML PMC7", "search PMC7", "search PMC7 OR PMC5", "fullTextXML PMC7",
+                          "fullTextXML PMC7"], europe_pmc.log)
+        self.assertIsNone(fetch.miss_reason("PMC7"))
+        # An outage that clears after such an answer serves the full text.
+        cleared = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
+                                   errors_before_success=1, unlisted_searches=1)
+        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=cleared, sleep=lambda s: None)("PMC7"))
+
+    def test_a_record_check_without_an_open_access_flag_or_a_matching_record_concludes_nothing(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # The PMCID's record carries no isOpenAccess, or the hits list other PMCIDs only: nothing is concluded.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC8", "PMC9"}, records={"PMC8": None}, foreign_records={"PMC9"})
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        for pmcid in ("PMC8", "PMC9"):
+            with self.assertRaisesRegex(RetryableFetch, pmcid + r": HTTP 500; its Europe PMC record could not be "
+                                                                r"checked"):
+                fetch(pmcid)
+            self.assertIsNone(fetch.miss_reason(pmcid))
+        self.assertEqual(["fullTextXML PMC8", "search PMC8", "fullTextXML PMC8", "fullTextXML PMC8"],
+                         europe_pmc.log[:4], "one inconclusive check per fetch")
+
+    def test_the_record_check_is_paced_and_throttling_gets_none(self):
+        import io
+        import types
+        import urllib.error
+        from unittest import mock
+        from ocsl_review import study_cli
+        clock, requests = [100.0], []
+
+        def sleep(seconds):
+            clock[0] += seconds
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001"})
+
+        def opener(request, timeout=None):
+            requests.append((clock[0], request.full_url))
+            if "PMC3" in request.full_url and request.full_url.endswith("/fullTextXML"):
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b""))
+            return europe_pmc(request, timeout)
+        with mock.patch.object(study_cli, "time", types.SimpleNamespace(monotonic=lambda: clock[0])):
+            fetch = study_cli.europe_pmc_fetcher(spacing=0.4, opener=opener, sleep=sleep)
+            self.assertIsNone(fetch("PMC2000001"))
+            # The record check keeps the census's spacing after the fullTextXML request.
+            (full_text_at, full_text), (search_at, search) = requests
+            self.assertTrue(full_text.endswith("/PMC2000001/fullTextXML") and "/search?" in search)
+            self.assertGreaterEqual(search_at - full_text_at, 0.4)
+            # Throttling gets no record check: three fullTextXML requests, then the entry stays open.
+            requests.clear()
+            with self.assertRaisesRegex(RetryableFetch, r"^PMC3: HTTP 429$"):
+                fetch("PMC3")
+        self.assertEqual(3, len(requests))
+        self.assertFalse(any("/search?" in url for _, url in requests))
+
+    def test_an_edge_refusal_or_an_empty_body_is_checked_against_the_record(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # A 401 or 403 from the service's edge and a 200 without a body decide nothing on their own: the record
+        # decides, as for a server error. A 404 or 410 is Europe PMC's own definitive answer, without a check.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"  \n", "PMC6": b""}, records={"PMC3": "N", "PMC4": "Y",
+                                      "PMC5": "N", "PMC6": "Y"}, full_text_status={"PMC3": 403, "PMC4": 401,
+                                                                                   "PMC10": 410})
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        self.assertIsNone(fetch("PMC3"))
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC3"))
+        with self.assertRaisesRegex(RetryableFetch, r"PMC4: HTTP 401; Europe PMC lists it as open access"):
+            fetch("PMC4")
+        self.assertIsNone(fetch("PMC5"))
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC5"))
+        with self.assertRaisesRegex(RetryableFetch, r"PMC6: HTTP 200 with an empty body; Europe PMC lists it as open "
+                                                    r"access"):
+            fetch("PMC6")
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC10"))
+        self.assertEqual("notFound", fetch.miss_reason("PMC10"))
+        self.assertIsNone(fetch("PMC11"))
+        # The reason belongs to the thread's last fetch only.
+        self.assertEqual(("notFound", None), (fetch.miss_reason("PMC11"), fetch.miss_reason("PMC10")))
+        self.assertEqual(["fullTextXML PMC10", "fullTextXML PMC11"], europe_pmc.log, "no record check after a 404 or 410")
+
+    def rows_of(self, sql, *params):
+        with closing(sqlite3.connect(self.database)) as c:
+            return [tuple(r) for r in c.execute(sql, params)]
+
+
+EUROPE_PMC_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "europe_pmc"
+
+
+class EuropePmcStandIn:
+    """A urlopen stand-in for Europe PMC, from answers recorded on 2026-11-01 with the census inputs' User-Agent.
+
+    fullTextXML serves ``full_texts`` (an empty one is a 200 without a body); for ``server_errors`` it answers HTTP
+    500 with the recorded body (Europe PMC's answer for every PMCID outside its open-access subset, also during an
+    outage), for ``full_text_status`` that status, and anything else is a 404. The recorded 500 body is the one
+    served for a JSON Accept header; for the census's ``Accept: application/xml`` Europe PMC sends an empty 500 body,
+    and the fetcher reads neither. The search answers ``PMCID:<id>`` with the recorded lite record, its
+    ``isOpenAccess`` from ``records`` (None: a record without the field; PMC2000001, the recorded PMCID, always has
+    its record), the recorded zero-hit answer for a PMCID without a record, for the first ``unlisted_searches``
+    searches and for every search of an ``empty_index``, and for ``foreign_records`` a hit that lists another PMCID
+    only; ``PMCID:<a> OR PMCID:<b>`` gets one such record for each PMCID that has one (logged ``search <a> OR <b>``).
+    ``search_status`` makes the search itself fail, and ``search_failures`` a search that names one PMCID (an HTTP
+    status, or an exception such as a timeout, raised).
+    """
+
+    def __init__(self, *, full_texts=None, server_errors=(), records=None, search_status=200, errors_before_success=None,
+                 unlisted_searches=0, foreign_records=(), full_text_status=None, search_failures=None,
+                 empty_index=False):
+        self.full_texts, self.server_errors, self.records = dict(full_texts or {}), set(server_errors), dict(records or {})
+        self.search_status, self.errors_left = search_status, errors_before_success
+        self.unlisted_left, self.foreign, self.empty_index = unlisted_searches, set(foreign_records), empty_index
+        self.full_text_status, self.search_failures = dict(full_text_status or {}), dict(search_failures or {})
+        self.requests, self.log = [], []
+        self.lock = threading.Lock()
+
+    def __call__(self, request, timeout=None):
+        import io
+        import urllib.error
+        import urllib.parse
+        url = request.full_url
+        with self.lock:
+            self.requests.append(request)
+        if url.endswith("/fullTextXML"):
+            pmcid = url.rsplit("/", 2)[1]
+            with self.lock:
+                self.log.append("fullTextXML " + pmcid)
+                failing = pmcid in self.server_errors and (self.errors_left is None or self.errors_left > 0)
+                if failing and self.errors_left is not None:
+                    self.errors_left -= 1
+            if failing:
+                body = (EUROPE_PMC_FIXTURES / "fulltextxml-500-not-open-access.json").read_bytes()
+                raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, io.BytesIO(body))
+            if pmcid in self.full_text_status:
+                raise urllib.error.HTTPError(url, self.full_text_status[pmcid], "Refused", {}, io.BytesIO(b""))
+            if pmcid in self.full_texts:
+                return EuropePmcResponse(self.full_texts[pmcid])
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["query"][0]
+        pmcids = [part.split(":", 1)[1] for part in query.split(" OR ")]
+        with self.lock:
+            self.log.append("search " + " OR ".join(pmcids))
+        failure = next((self.search_failures[pmcid] for pmcid in pmcids if pmcid in self.search_failures), None)
+        if isinstance(failure, BaseException):
+            raise failure
+        if failure is not None or self.search_status != 200:
+            raise urllib.error.HTTPError(url, failure or self.search_status, "Service Unavailable", {}, io.BytesIO(b""))
+        with self.lock:
+            unlisted, self.unlisted_left = self.unlisted_left > 0, max(0, self.unlisted_left - 1)
+        listed = [] if unlisted or self.empty_index else [
+            pmcid for pmcid in pmcids if pmcid in self.records or pmcid in self.foreign or pmcid == "PMC2000001"]
+        if not listed:
+            return EuropePmcResponse((EUROPE_PMC_FIXTURES / "search-pmcid-no-record.json").read_bytes())
+        answer = json.loads((EUROPE_PMC_FIXTURES / "search-pmcid-not-open-access.json").read_bytes())
+        recorded, results = answer["resultList"]["result"][0], []
+        for pmcid in listed:
+            record = dict(recorded)
+            record["pmcid"] = "PMC1" if pmcid in self.foreign else pmcid
+            record["isOpenAccess"] = self.records.get(pmcid, recorded["isOpenAccess"])
+            if record["isOpenAccess"] is None:
+                del record["isOpenAccess"]
+            results.append(record)
+        answer["hitCount"], answer["resultList"]["result"] = len(results), results
+        return EuropePmcResponse(json.dumps(answer).encode())
+
+
+class EuropePmcResponse:
+    status = 200
+
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class FakeClock:
+    """A monotonic clock that only the code's sleeps and the test move: nothing waits for real."""
+
+    def __init__(self, now: float = 1000.0):
+        self.now, self.lock = now, threading.Lock()
+
+    def __call__(self) -> float:
+        with self.lock:
+            return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self.lock:
+            self.now += seconds
+
+
+def rebuilt_in_place(clock, empty, partial, *, sentinel, target, **stand_in):
+    """A Europe PMC search index rebuilt in place, through EuropePmcStandIn's recorded answers: from now on the fake
+    clock, every search finds nothing for ``empty`` seconds, then a partial copy holds ``sentinel`` (and PMC2000001)
+    but lacks the open-access ``target`` for ``partial`` seconds, then the full copy holds both. Returns the stand-in
+    and its opener (requests in turn, so each sees one state)."""
+    europe_pmc = EuropePmcStandIn(records={sentinel: "Y"}, **stand_in)
+    start, lock = clock(), threading.Lock()
+
+    def opener(request, timeout=None):
+        with lock:
+            elapsed = clock() - start
+            europe_pmc.empty_index = elapsed < empty
+            if elapsed < empty + partial:
+                europe_pmc.records.pop(target, None)
+            else:
+                europe_pmc.records[target] = "Y"
+            return europe_pmc(request, timeout)
+    return europe_pmc, opener
+
+
+class NoRecordDecisionTests(unittest.TestCase):
+    """A PMCID without any Europe PMC record is a definitive miss only when two searches for the PMCID and a sentinel
+    together (another PMCID the fetcher saw in the index, else NO_RECORD_FALLBACK_SENTINEL), at least NO_RECORD_SECONDS
+    apart and each in a fetch that was not throttled, return the sentinel's record and none of the PMCID, and neither
+    the PMCID's record nor its full text was seen in between. Recorded answers through EuropePmcStandIn, on a fake
+    clock."""
+
+    def fetcher(self, europe_pmc, clock, opener=None):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        return europe_pmc_fetcher(spacing=0, opener=opener or europe_pmc, sleep=clock.sleep, clock=clock)
+
+    def assertOpen(self, fetch, pmcid):
+        with self.assertRaisesRegex(RetryableFetch, "^" + pmcid + ": HTTP "):
+            fetch(pmcid)
+        self.assertIsNone(fetch.miss_reason(pmcid))
+
+    def test_an_empty_index_leaves_the_entry_open(self):
+        # The index is empty: neither the target nor the sentinel (a PMCID whose full text was served) has a record.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        self.assertEqual(b"<article/>", fetch("PMC5"))
+        self.assertOpen(fetch, "PMC9")
+        for _ in range(3):                      # the later passes of the invocation, a cooldown apart
+            clock.sleep(60)
+            europe_pmc.log.clear()
+            self.assertOpen(fetch, "PMC9")
+            self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                              "fullTextXML PMC9"], europe_pmc.log, "one search with the sentinel per would-be decision")
+
+    def test_a_rebuilding_index_decides_only_an_absence_that_lasts_60_seconds(self):
+        # The index holds the sentinel but not the target, once and then over 60 s: the first joint answer starts the
+        # absence, one 59.9 s later does not decide, one 66.9 s later does.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # the first joint answer without the target, then 2 + 5 s of backoff
+        clock.sleep(52.9)                       # the next answer comes 59.9 s after the first
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+        europe_pmc.log.clear()                  # 66.9 s after the first answer
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+        # The target and the sentinel go out in one search, with the census's headers and identifiers only.
+        joint = europe_pmc.requests[-1]
+        self.assertEqual("https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PMCID%3APMC9+OR+PMCID%3APMC5"
+                         "&format=json&resultType=lite&pageSize=10", joint.full_url)
+        self.assertEqual({"Accept": "application/json", "User-agent": "ocsl-review census inputs"},
+                         dict(joint.header_items()))
+
+    def test_an_index_that_answers_some_searches_from_an_empty_copy_closes_nothing(self):
+        # Behind one address, each search reaches an empty copy of the index (the recorded zero-hit answer) with
+        # probability p and otherwise the full copy, which holds the sentinel PMC5 and the open-access target PMC9,
+        # whose fullTextXML keeps failing. In one invocation of four passes (60, 120 and 240 s cooldowns) PMC9 is
+        # never closed: a joint answer from the empty copy lacks the sentinel, one from the full copy holds PMC9.
+        # (A search for the sentinel on its own, round 7's first rule, closed some of these entries.)
+        import random
+        import urllib.parse
+        empty = (EUROPE_PMC_FIXTURES / "search-pmcid-no-record.json").read_bytes()
+        rng = random.Random(20261101)
+        for p in (0.1, 0.25, 0.5):
+            closed, joint = 0, [0, 0]           # joint searches answered by the full copy, by the empty copy
+            for _ in range(200):
+                europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"},
+                                              records={"PMC5": "Y", "PMC9": "Y"})
+
+                def opener(request, timeout=None, europe_pmc=europe_pmc):
+                    if "/search?" not in request.full_url:
+                        return europe_pmc(request, timeout)
+                    from_empty = rng.random() < p
+                    if " OR " in urllib.parse.unquote_plus(request.full_url):
+                        joint[from_empty] += 1
+                    return EuropePmcResponse(empty) if from_empty else europe_pmc(request, timeout)
+                clock = FakeClock()
+                fetch = self.fetcher(europe_pmc, clock, opener)
+                fetch("PMC5")
+                for cooldown in (0, 60, 120, 240):
+                    clock.sleep(cooldown)
+                    try:
+                        fetch("PMC9")
+                    except RetryableFetch:
+                        continue
+                    closed += 1
+                    break
+            with self.subTest(p=p):
+                self.assertEqual(0, closed, f"entries closed with p = {p}")
+                self.assertTrue(joint[0] and joint[1], "joint searches reached both copies")
+
+    def test_a_record_of_the_target_in_the_joint_answer_ends_its_absence(self):
+        # A joint answer without the target starts its absence. Half a minute later the target's own search answers
+        # without a record (an empty copy) while the joint search finds its record (the full copy): nothing is
+        # decided and the absence is over, so a joint answer without the target 61 s after the first only starts it
+        # again, and one 60 s after that decides.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # the absence starts, then 7 s of backoff
+        clock.sleep(23)
+        europe_pmc.records["PMC9"] = "Y"
+        europe_pmc.unlisted_left = 1
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"^PMC9: HTTP 500; Europe PMC's search found no record of it, not "
+                                                    r"confirmed$"):
+            fetch("PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+        del europe_pmc.records["PMC9"]
+        clock.sleep(24)                         # 61 s after the first joint answer
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+        clock.sleep(53)                         # 60 s after the joint answer that started the absence again
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+
+    def test_an_index_rebuilt_in_place_decides_only_when_its_partial_copy_answers_60_seconds_apart(self):
+        # The index is rebuilt in place: empty, then a partial copy that holds the sentinel PMC5 and lacks the
+        # open-access target PMC9, then full; PMC9's fullTextXML fails throughout. One invocation fetches PMC9 in four
+        # passes (cooldowns 60, 120 and 240 s, 7 s of backoff in each fetch), at 0, 67, 194 and 441 s. An answer from
+        # the empty copy starts nothing, so the entry stays open unless two joint answers at least 60 s apart reach the
+        # partial copy. (Round 7's rule started the absence at the first zero-hit answer, from the empty copy, and
+        # closed the first three in passes 2, 2 and 3.)
+        for empty, partial, closed_in, joint in ((60, 10, None, 2), (50, 20, None, 2), (190, 10, None, 3), (0, 75, 2, 2),
+                                                 (60, 140, 3, 3)):
+            with self.subTest(empty=empty, partial=partial):
+                clock = FakeClock()
+                europe_pmc, opener = rebuilt_in_place(clock, empty, partial, sentinel="PMC5", target="PMC9",
+                                                      full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"})
+                fetch = self.fetcher(europe_pmc, clock, opener)
+                fetch("PMC5")
+                outcome = None
+                for number, cooldown in enumerate((0, 60, 120, 240), start=1):
+                    clock.sleep(cooldown)
+                    try:
+                        fetch("PMC9")
+                    except RetryableFetch:
+                        continue
+                    outcome = (number, fetch.miss_reason("PMC9"))
+                    break
+                self.assertEqual(None if closed_in is None else (closed_in, "noRecord"), outcome)
+                self.assertEqual(joint, europe_pmc.log.count("search PMC9 OR PMC5"),
+                                 "one joint search after each answer without a record, none once the record is found")
+
+    def test_the_deciding_answer_must_show_the_sentinel_without_the_target_too(self):
+        # A joint answer from a partial copy (the sentinel without the target) starts the absence. A minute later the
+        # joint search reaches an empty copy, and a minute after that it fails: neither decides, and neither starts
+        # the absence over. Only another answer from the partial copy decides, timed from the first.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        europe_pmc.empty_index = True           # 67 s after the first joint answer
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+        europe_pmc.empty_index = False
+        europe_pmc.search_failures["PMC5"] = 503
+        clock.sleep(60)                         # 134 s after it
+        self.assertOpen(fetch, "PMC9")
+        del europe_pmc.search_failures["PMC5"]
+        clock.sleep(60)                         # 201 s after it
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+
+    def test_a_full_text_served_between_two_answers_without_a_record_starts_the_absence_over(self):
+        # The target's full text is served between two answers without its record at least 60 s apart: the second
+        # answer decides nothing (its joint search only starts the absence again), and one 60 s after it decides.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>", "PMC9": b"<article/>"}, server_errors={"PMC9"},
+                                      records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # no record: the absence starts, then 7 s of backoff
+        clock.sleep(23)
+        europe_pmc.server_errors.discard("PMC9")
+        self.assertEqual(b"<article/>", fetch("PMC9"))  # 30 s later Europe PMC serves its full text
+        europe_pmc.server_errors.add("PMC9")
+        clock.sleep(31)                         # 61 s after the first answer without a record
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log, "the joint answer decides nothing")
+        clock.sleep(53)                         # 60 s after that answer
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+
+    def test_the_targets_own_record_in_a_record_check_starts_the_absence_over(self):
+        # Half a minute after a joint answer without the target started its absence, the target's own record check
+        # finds its open-access record (the server error is an outage): a joint answer without it 61 s after the first
+        # only starts the absence again, and one 60 s after that decides.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # the absence starts, then 7 s of backoff
+        clock.sleep(23)
+        europe_pmc.records["PMC9"] = "Y"
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"^PMC9: HTTP 500; Europe PMC lists it as open access$"):
+            fetch("PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "fullTextXML PMC9", "fullTextXML PMC9"], europe_pmc.log)
+        del europe_pmc.records["PMC9"]
+        clock.sleep(24)                         # 61 s after the first joint answer
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+        clock.sleep(53)                         # 60 s after the joint answer that started the absence again
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+
+    def test_a_fetch_throttled_with_408_and_425_stays_transient_and_makes_no_joint_search(self):
+        # 408 and 425 are throttling, like 429: never a definitive miss, and a fetch that met one makes no joint
+        # search, so a lasting absence is not decided in it.
+        import urllib.error
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        refusals = []
+
+        def opener(request, timeout=None):
+            if request.full_url.endswith("/PMC9/fullTextXML") and refusals:
+                status = refusals.pop(0)
+                europe_pmc.log.append(f"fullTextXML PMC9 {status}")
+                raise urllib.error.HTTPError(request.full_url, status, "Throttled", {}, io.BytesIO(b""))
+            return europe_pmc(request, timeout)
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock, opener)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # the absence starts
+        clock.sleep(60)                         # 67 s later the absence has lasted
+        refusals[:] = [408, 425]                # 408, then 425, then the server error
+        europe_pmc.log.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"^PMC9: HTTP 500; Europe PMC's search found no record of it, not "
+                                                    r"confirmed$"):
+            fetch("PMC9")
+        self.assertIsNone(fetch.miss_reason("PMC9"), "no notFound miss")
+        self.assertEqual(["fullTextXML PMC9 408", "fullTextXML PMC9 425", "fullTextXML PMC9", "search PMC9"],
+                         europe_pmc.log, "no joint search after throttling")
+        europe_pmc.log.clear()                  # the next fetch is not throttled: it decides
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+
+    def test_a_joint_answer_with_more_hits_than_its_page_concludes_nothing(self):
+        # A joint answer whose hitCount exceeds the records on its page may hold the target's record off the page.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+
+        def opener(request, timeout=None):
+            response = europe_pmc(request, timeout)
+            if "+OR+" not in request.full_url:
+                return response
+            answer = json.loads(response.read())
+            answer["hitCount"] = 11
+            return EuropePmcResponse(json.dumps(answer).encode())
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock, opener)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], europe_pmc.log)
+
+    def test_without_a_seen_sentinel_the_fallback_sentinel_stands_in(self):
+        from ocsl_review.study_cli import NO_RECORD_FALLBACK_SENTINEL
+        self.assertEqual("PMC2000001", NO_RECORD_FALLBACK_SENTINEL)
+        # The fetcher saw no PMCID in the index (every PMCID it fetched lacks a record): the joint search names the
+        # fallback sentinel, whose recorded record the stand-in serves.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC8", "PMC9"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        self.assertOpen(fetch, "PMC8")          # a PMCID only ever absent is no sentinel
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual("noRecord", fetch.miss_reason("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC2000001"], europe_pmc.log)
+        # In an empty index the fallback has no record either: nothing is concluded.
+        empty = EuropePmcStandIn(server_errors={"PMC9"}, empty_index=True)
+        clock = FakeClock()
+        fetch = self.fetcher(empty, clock)
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        empty.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC2000001", "fullTextXML PMC9",
+                          "fullTextXML PMC9"], empty.log)
+        # When the target is the fallback itself and the fetcher saw nothing else, there is no sentinel: nothing is
+        # searched beside the record check, and nothing is decided.
+        alone = EuropePmcStandIn(server_errors={"PMC2000001"}, empty_index=True)
+        clock = FakeClock()
+        fetch = self.fetcher(alone, clock)
+        self.assertOpen(fetch, "PMC2000001")
+        clock.sleep(60)
+        alone.log.clear()
+        self.assertOpen(fetch, "PMC2000001")
+        self.assertEqual(["fullTextXML PMC2000001", "search PMC2000001", "fullTextXML PMC2000001",
+                          "fullTextXML PMC2000001"], alone.log)
+
+    def test_a_failed_or_throttled_sentinel_search_concludes_nothing(self):
+        for failure in (503, 429, TimeoutError("timed out")):
+            with self.subTest(failure=failure):
+                europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"},
+                                              records={"PMC5": "Y"}, search_failures={"PMC5": failure})
+                clock = FakeClock()
+                fetch = self.fetcher(europe_pmc, clock)
+                fetch("PMC5")
+                self.assertOpen(fetch, "PMC9")
+                clock.sleep(60)
+                europe_pmc.log.clear()
+                self.assertOpen(fetch, "PMC9")
+                self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                                  "fullTextXML PMC9"], europe_pmc.log)
+        # The target's own record check throttled: no answer without a record, so no sentinel is searched.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        europe_pmc.search_failures["PMC9"] = 429
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "fullTextXML PMC9", "fullTextXML PMC9"], europe_pmc.log)
+
+    def test_the_sentinel_is_never_the_target(self):
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"},
+                                      records={"PMC5": "Y", "PMC9": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")          # its own record: PMC9 is now the newest PMCID seen in the index
+        del europe_pmc.records["PMC9"]          # then the index loses it
+        clock.sleep(60)
+        self.assertOpen(fetch, "PMC9")          # the first answer without a record
+        clock.sleep(60)
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+        # When the target is the only PMCID seen in the index, the fallback sentinel stands in for it.
+        alone = EuropePmcStandIn(server_errors={"PMC9"}, records={"PMC9": "Y"})
+        clock = FakeClock()
+        fetch = self.fetcher(alone, clock)
+        self.assertOpen(fetch, "PMC9")
+        del alone.records["PMC9"]
+        clock.sleep(60)
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        alone.log.clear()
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC2000001"], alone.log)
+
+    def test_a_throttled_fetch_decides_no_miss_and_searches_no_sentinel(self):
+        import urllib.error
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        throttled = [0]
+
+        def opener(request, timeout=None):
+            if request.full_url.endswith("/PMC9/fullTextXML") and throttled[0]:
+                throttled[0] -= 1
+                europe_pmc.log.append("fullTextXML PMC9 429")
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b""))
+            return europe_pmc(request, timeout)
+        clock = FakeClock()
+        fetch = self.fetcher(europe_pmc, clock, opener)
+        fetch("PMC5")
+        self.assertOpen(fetch, "PMC9")
+        clock.sleep(60)
+        throttled[0] = 1                        # this fetch is throttled once, then answered with server errors
+        europe_pmc.log.clear()
+        self.assertOpen(fetch, "PMC9")
+        self.assertEqual(["fullTextXML PMC9 429", "fullTextXML PMC9", "search PMC9", "fullTextXML PMC9"],
+                         europe_pmc.log)
+        europe_pmc.log.clear()                  # the next fetch is not throttled: it decides
+        self.assertIsNone(fetch("PMC9"))
+        self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5"], europe_pmc.log)
+
+    def test_fetch_threads_share_the_absence_and_the_sentinel(self):
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>", "PMC6": b"<article/>"}, server_errors={"PMC9"},
+                                      records={"PMC5": "Y", "PMC6": "Y"})
+        clock = FakeClock()
+        barrier, held, lock = threading.Barrier(3, timeout=10), [0], threading.Lock()
+
+        def opener(request, timeout=None):
+            # The racers' first fullTextXML requests (two of PMC9, one of PMC6) are in flight together.
+            if request.full_url.endswith("/fullTextXML"):
+                with lock:
+                    wait, held[0] = 0 < held[0], max(0, held[0] - 1)
+                if wait:
+                    barrier.wait()
+            return europe_pmc(request, timeout)
+        fetch = self.fetcher(europe_pmc, clock, opener)
+        results = []
+
+        def run(pmcid):
+            try:
+                body = fetch(pmcid)
+                results.append((pmcid, body, fetch.miss_reason(pmcid)))
+            except RetryableFetch:
+                results.append((pmcid, "open", None))
+
+        def in_threads(*pmcids):
+            threads = [threading.Thread(target=run, args=(pmcid,)) for pmcid in pmcids]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        self.assertEqual(b"<article/>", fetch("PMC5"))     # the sentinel, seen by this thread
+        in_threads("PMC9")                                  # the first answer without a record, in another thread
+        self.assertEqual([("PMC9", "open", None)], results)
+        clock.sleep(60)
+        results.clear()
+        europe_pmc.log.clear()
+        held[0] = 3
+        in_threads("PMC9", "PMC9", "PMC6")
+        expected = [("PMC9", None, "noRecord"), ("PMC9", None, "noRecord"), ("PMC6", b"<article/>", None)]
+        self.assertEqual(sorted(expected, key=repr), sorted(results, key=repr),
+                         "each decision in its own thread, from the shared memory")
+        joint_searches = [line for line in europe_pmc.log if " OR " in line]
+        self.assertEqual(2, len(joint_searches), "one search with the sentinel per decision")
+        self.assertLessEqual(set(joint_searches), {"search PMC9 OR PMC5", "search PMC9 OR PMC6"})
+        self.assertEqual(2, europe_pmc.log.count("search PMC9"))
+        self.assertIsNone(fetch.miss_reason("PMC9"), "a miss's reason belongs to the thread that fetched it")
+
+    def test_the_capacity_probe_keeps_no_miss_without_a_record(self):
+        from ocsl_review import capacity_probe as P
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"}, records={"PMC5": "Y"})
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "cache"
+            cache = P.FullTextCache(directory, self.fetcher(europe_pmc, clock))
+            self.assertEqual(b"<article/>", cache("PMC5"))
+            with self.assertRaises(RetryableFetch):
+                cache("PMC9")                   # one probe run: a first answer without a record is transient
+            clock.sleep(60)                     # another candidate citing PMC9, a minute later in the same run
+            self.assertIsNone(cache("PMC9"))
+            self.assertEqual({"fetched": 1, "transient": 1, "absent": 1, "absentNoRecord": 1}, dict(cache.counts))
+            self.assertEqual(["PMC5.xml"], sorted(path.name for path in directory.iterdir()))
 
 
 class ReadOnlyStatusTests(RunnerTestCase):
@@ -835,8 +1817,37 @@ class FreezeExportTests(RunnerTestCase):
             self.assertEqual("1", scores_db.meta(c)["frozen"])
             self.assertGreater(c.execute("SELECT COUNT(*) FROM data_dictionary").fetchone()[0], 100)
             self.assertEqual(1, c.execute("SELECT COUNT(*) FROM review_scores").fetchone()[0])
-        with self.assertRaises(ValidationError):
+        # The same freeze again (a step submitted again after its process stopped) returns the copy it wrote; other
+        # options or a database that changed since are refused.
+        again = scores_db.freeze(self.database, frozen)
+        self.assertEqual((True, report["sha256"], report["scored"]), (again["alreadyFrozen"], again["sha256"],
+                                                                      again["scored"]))
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            scores_db.freeze(self.database, frozen, keep_text=True)
+        # Facts: the same export again returns it; another bootstrap is refused; an export stopped before its
+        # facts.json is written again.
+        facts = self.root / "facts"
+        exported = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        repeated = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        self.assertEqual((True, exported["databaseSha256"], exported["count"]),
+                         (repeated["alreadyExported"], repeated["databaseSha256"], repeated["count"]))
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=4, code_revision="test")
+        (facts / "facts.json").unlink()
+        rewritten = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        self.assertNotIn("alreadyExported", rewritten)
+        self.assertTrue((facts / "facts.json").is_file())
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute("UPDATE reviews SET full_text_state='pending'")
+        with self.assertRaisesRegex(ValidationError, "already exists"):
             scores_db.freeze(self.database, frozen)
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute("UPDATE reviews SET full_text_state='completed'")
+        # A copy an earlier freeze left unfinished beside a new output never stands in for it.
+        fresh = self.root / "frozen" / "fresh.sqlite3"
+        (fresh.parent / ".fresh.sqlite3.incoming").write_bytes(b"cut off")
+        self.assertNotIn("alreadyFrozen", scores_db.freeze(self.database, fresh))
+        self.assertFalse((fresh.parent / ".fresh.sqlite3.incoming").exists())
         manifest = scores_db.export(frozen, self.root / "export")
         names = {f["path"] for f in manifest["files"]}
         self.assertIn("citations.tsv", names)
