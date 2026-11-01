@@ -223,6 +223,30 @@ class ResolutionRuleTests(unittest.TestCase):
         self.assertEqual(("unknown", ["correction", "expression-of-concern", "retraction"]),
                          (result.status, list(result.unknown_kinds)))
 
+    def test_the_retraction_watch_snapshot_alone_covers_no_correction(self):
+        """Retraction Watch records corrections only selectively: by default its silence covers retractions,
+        expressions of concern and reinstatements; a correction counts as covered through Crossref or PubMed, or when
+        the protocol declares it for the source. The basis is recorded per source."""
+        result = self.resolve(self.observation("retraction-watch-csv", "none"))
+        self.assertEqual(("unknown", ["correction"]), (result.status, list(result.unknown_kinds)))
+        entry = result.sources[0]
+        self.assertEqual((["expression-of-concern", "reinstatement", "retraction"], "default"),
+                         (entry["covers"], entry["coversBasis"]))
+        self.assertIn("correction", entry["reports"])
+        both = self.resolve(self.observation("retraction-watch-csv", "none"), self.observation("crossref", "none"))
+        self.assertEqual("none", both.status)
+        declared = S.source_covers({"status": {"covers": {"retraction-watch-csv": list(S.NOTICE_KINDS)}}})
+        alone = S.resolve_work("w", [self.observation("retraction-watch-csv", "none")], snapshot_id="s",
+                               resolved_at="2026-01-02T00:00:00Z", covers=declared)
+        self.assertEqual(("none", "protocol"), (alone.status, alone.sources[0]["coversBasis"]))
+        narrowed = S.source_covers({"status": {"covers": {"crossref": ["retraction", "expression-of-concern"]}}})
+        crossref = S.resolve_work("w", [self.observation("crossref", "none")], snapshot_id="s",
+                                  resolved_at="2026-01-02T00:00:00Z", covers=narrowed)
+        self.assertEqual(("unknown", ["correction"]), (crossref.status, list(crossref.unknown_kinds)))
+        # A correction notice the snapshot does list still decides.
+        self.assertEqual("corrected", self.resolve(self.observation("retraction-watch-csv", "corrected", "2020-01-02",
+                                                                     "day", doi="10.1/c")).status)
+
     def test_a_later_reinstatement_reverses_the_retraction_and_the_next_kind_decides(self):
         result = self.resolve(self.observation("crossref:publisher", "retracted", "2020-05", "month", doi="10.1/r"),
                               self.observation("crossref:publisher", "reinstated", "2021-02-10", "day"),

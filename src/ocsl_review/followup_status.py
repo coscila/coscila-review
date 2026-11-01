@@ -12,8 +12,12 @@ Sources (each a ``followup_model.StatusSource``; a provider failure is an ``unkn
 - ``import_retraction_watch``: the Retraction Watch CSV snapshot the operator stored as a dataset input, read locally
   (``integrity.RetractionWatchDataset``); every notice kind.
 
-A source that answers without a notice records ``none`` for the kinds it covers. ``resolve_status`` gives every cited
-work of the parent one ``fu_work_status`` row under ``status-resolution@1``. Requests go through
+A source that answers without a notice records ``none`` for the kinds it can report. ``resolve_status`` gives every
+cited work of the parent one ``fu_work_status`` row under ``status-resolution@1``; a ``none`` needs every deciding kind
+covered by an answering source, where the kinds a source counts as covering come from the protocol
+(``status.covers``) or, by default, ``DEFAULT_COVERS``: the Retraction Watch database records corrections only
+selectively, so by default its silence covers retractions, expressions of concern and reinstatements, and a
+correction counts as covered only through Crossref or PubMed. A notice found is a notice whatever the source covers. Requests go through
 ``followup_net.client()`` with identifiers only, and every provider response is recorded with
 ``followup_net.record_request``.
 """
@@ -47,6 +51,11 @@ KIND_STATUS = {"retraction": "retracted", "expression-of-concern": "expression-o
 STATUS_KIND = {status: kind for kind, status in KIND_STATUS.items()}
 # The notice kinds a status of none must have covered (a reinstatement only ever reverses a retraction).
 DECIDING_KINDS = ("retraction", "expression-of-concern", "correction")
+# The notice kinds whose absence a source's answer covers, unless the protocol declares others (status.covers).
+DEFAULT_COVERS = {"crossref": ("retraction", "expression-of-concern", "correction", "reinstatement"),
+                  "retraction-watch-csv": ("retraction", "expression-of-concern", "reinstatement"),
+                  "pubmed": ("retraction", "expression-of-concern", "correction"),
+                  "europe-pmc": ("retraction",)}
 LIVE_SOURCES = ("crossref", "pubmed", "europe-pmc")
 RW_SOURCE = "retraction-watch-csv"
 RW_LABEL = {"retraction": "Retraction", "expression-of-concern": "Expression of concern", "correction": "Correction",
@@ -703,9 +712,17 @@ def _observation(row: Mapping[str, Any]) -> StatusObservation:
                              receipt_sha256=row["receipt_sha256"], detail=json.loads(row["detail_json"] or "{}"))
 
 
+def source_covers(protocol: Mapping[str, Any] | None) -> dict[str, tuple[tuple[str, ...], str]]:
+    """Per protocol source: the notice kinds whose absence its answer covers, and the basis (protocol or default)."""
+    declared = (((protocol or {}).get("status") or {}).get("covers")) or {}
+    return {source: ((tuple(declared[source]), "protocol") if source in declared else (kinds, "default"))
+            for source, kinds in DEFAULT_COVERS.items()}
+
+
 def resolve_work(work_key: str, observations: Sequence[StatusObservation], *, snapshot_id: str,
-                 resolved_at: str) -> WorkStatus:
+                 resolved_at: str, covers: Mapping[str, tuple[tuple[str, ...], str]] | None = None) -> WorkStatus:
     """status-resolution@1 for one work (see the module docstring and docs/followup-evidence.md)."""
+    covers = covers or source_covers(None)
     by_kind: dict[str, list[StatusObservation]] = defaultdict(list)
     for observation in observations:
         if observation.status in STATUS_KIND:
@@ -727,15 +744,18 @@ def resolve_work(work_key: str, observations: Sequence[StatusObservation], *, sn
     sources: dict[str, dict[str, Any]] = {}
     covered: set[str] = set()
     for observation in observations:
+        counted, basis = covers.get(protocol_source(observation.source), ((), "default"))
         entry = sources.setdefault(observation.source, {"source": observation.source, "answered": False,
                                                         "statuses": set(), "covers": set(), "retrievedAt": "",
-                                                        "notices": []})
+                                                        "notices": [], "reports": set(), "coversBasis": basis})
         entry["statuses"].add(observation.status)
         entry["retrievedAt"] = max(entry["retrievedAt"], observation.retrieved_at)
         if observation.status != "unknown":
             entry["answered"] = True
-            entry["covers"].update(observation.covers)
-            covered.update(observation.covers)
+            entry["reports"].update(observation.covers)
+            kinds = set(observation.covers) & set(counted)
+            entry["covers"].update(kinds)
+            covered.update(kinds)
         if observation.status in STATUS_KIND:
             entry["notices"].append({"kind": STATUS_KIND[observation.status], "doi": observation.notice_doi,
                                      "pmid": observation.notice_pmid, "date": observation.notice_date,
@@ -753,7 +773,7 @@ def resolve_work(work_key: str, observations: Sequence[StatusObservation], *, sn
     checked = max(answering) if answering else max((entry["retrievedAt"] for entry in sources.values()),
                                                    default=resolved_at)
     listed = [{**entry, "statuses": sorted(entry["statuses"]), "covers": sorted(entry["covers"]),
-               "notices": sorted(entry["notices"], key=lambda item: canonical(item))}
+               "reports": sorted(entry["reports"]), "notices": sorted(entry["notices"], key=lambda item: canonical(item))}
               for _, entry in sorted(sources.items(), key=lambda item: (SOURCE_RANK.get(item[0], 99), item[0]))]
     return WorkStatus(work_key, status, listed, checked, snapshot_id, STATUS_RULE, reinstated,
                       notice.notice_doi if notice else None, notice.notice_date if notice else None,
@@ -772,6 +792,7 @@ def resolve_status(connection: Any, *, snapshots: Sequence[str] | None = None,
     allowed = set(((protocol or {}).get("status") or {}).get("sources") or (*LIVE_SOURCES, RW_SOURCE))
     resolution = "+".join(chosen) if chosen else "no-snapshot"
     resolved_at = now()
+    covers = source_covers(protocol)
     counts, decided, reinstated = Counter(), Counter(), 0
     works = cited_works(connection)
     for start in range(0, len(works), RESOLVE_CHUNK):
@@ -788,7 +809,7 @@ def resolve_status(connection: Any, *, snapshots: Sequence[str] | None = None,
         rows = []
         for work in chunk:
             result = resolve_work(work.work_key, by_work.get(work.work_key, []), snapshot_id=resolution,
-                                  resolved_at=resolved_at)
+                                  resolved_at=resolved_at, covers=covers)
             counts[result.status] += 1
             reinstated += int(result.reinstated)
             if result.decided_by:
@@ -800,7 +821,8 @@ def resolve_status(connection: Any, *, snapshots: Sequence[str] | None = None,
         connection.executemany("INSERT OR REPLACE INTO fu_work_status VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     agreement = census_flag_agreement(connection)
     return {"rule": STATUS_RULE, "snapshots": chosen, "works": len(works), "statuses": dict(sorted(counts.items())),
-            "reinstated": reinstated, "decidedBy": dict(sorted(decided.items())), "censusRetractedFlag": agreement}
+            "reinstated": reinstated, "decidedBy": dict(sorted(decided.items())), "censusRetractedFlag": agreement,
+            "covers": {source: {"kinds": list(kinds), "basis": basis} for source, (kinds, basis) in covers.items()}}
 
 
 def census_flag_agreement(connection: Any) -> dict[str, Any]:

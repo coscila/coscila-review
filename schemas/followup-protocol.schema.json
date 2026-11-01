@@ -31,7 +31,15 @@
           "properties": {"declaredVersion": {"type": "string", "minLength": 1},
                          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
         },
-        "rule": {"const": "status-resolution@1"}
+        "rule": {"const": "status-resolution@1"},
+        "covers": {
+          "type": "object", "additionalProperties": false,
+          "description": "per source, the notice kinds whose absence its answer covers (a status of none needs every deciding kind covered); a source not named keeps its default (Retraction Watch: retraction, expression-of-concern, reinstatement; Crossref: all four kinds; PubMed: retraction, expression-of-concern, correction; Europe PMC: retraction)",
+          "properties": {
+            "crossref": {"$ref": "#/$defs/noticeKinds"}, "retraction-watch-csv": {"$ref": "#/$defs/noticeKinds"},
+            "pubmed": {"$ref": "#/$defs/noticeKinds"}, "europe-pmc": {"$ref": "#/$defs/noticeKinds"}
+          }
+        }
       }
     },
     "strata": {
@@ -167,6 +175,8 @@
     "gates": {"type": "array", "uniqueItems": true, "items": {"enum": ["smoke", "pilot", "capacity", "production", "replicate"]}}
   },
   "$defs": {
+    "noticeKinds": {"type": "array", "uniqueItems": true,
+                    "items": {"enum": ["retraction", "expression-of-concern", "correction", "reinstatement"]}},
     "requestSettings": {
       "type": "object", "additionalProperties": false, "required": ["reasoningEffort"],
       "properties": {
