@@ -477,7 +477,19 @@ rate is then its decided entries over the time it had batches in flight
 (`basis: busy`).
 
 Runs are resumable per batch; receipts are written per call, and one process
-writes a database at a time (a lock beside it refuses a second writer). A call
+writes a database at a time (a lock beside it refuses a second writer).
+`study enumerate`, `freeze`, `facts` and `compare-manifest` never overwrite
+an output, but the same command submitted again after its process stopped
+returns what it finished: `enumerate` the enumeration whose receipt (written
+last, atomically) names the same spec, its kept pages verified; `freeze` a
+copy (renamed into place once complete) that records the same working-database
+state and options; `facts` an export whose `facts.json` (written last) names
+the same frozen scores, journals and bootstrap; `compare-manifest` the
+comparison recorded under its label from the same stored manifest and
+enumeration, renaming its report into place if the earlier process stopped
+first. Anything else in the way is refused, and an unfinished enumeration
+(a manifest without its receipt) or facts export (a database without its
+`facts.json`) is written again. A call
 that gets no response after its transport attempts leaves its entries open,
 never invalid: an entry is invalid only when a response arrived (a completion,
 an empty completion, or a refusal of the request itself: HTTP 400, 413 or 422,
