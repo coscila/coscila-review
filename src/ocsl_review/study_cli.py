@@ -99,6 +99,10 @@ def add_commands(families, register):
                                       "cannot prepare, and every enumerated review missing from the input, in coverage as "
                                       "unavailable with its reason, so the population is complete (the last prepare of "
                                       "a study, after every acquisition and abstracts pass)")
+            command.add_argument("--max-settled-percent", type=float,
+                                 help="with --settle-unprepared: the protocol's bound on settled reviews, in percent of "
+                                      "the enumerated reviews, overall and in every journal; pinned in the study, and "
+                                      "the gates check settledReviewsWithinBound holds it")
         if name == "abstracts":
             command.add_argument("--input", required=True, help="JSONL review records")
             command.add_argument("--output", required=True, help="JSONL review records with Europe PMC abstracts")
@@ -362,6 +366,24 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
         checks["enumerationQueriesPopulationLevel"] = enumeration.get("queryRule") == QUERY_RULE
         if require_fresh_enumeration:
             checks["everyEnumeratedReviewInStudyOrExcluded"] = enumeration.get("unexplained", 1) == 0
+        # Settled reviews (prepare --settle-unprepared) stay within the protocol's pinned bound, overall and in every
+        # journal: a systematic failure (a missed journal route, a cache the prepare was not given, an outage of both
+        # abstract passes) can then never complete as an apparently valid census. Nothing settled passes; settled
+        # reviews without a pinned bound do not.
+        settled = enumeration.get("settled") or {}
+        bound = settled.get("maxPercent")
+        limit = None if bound is None else bound / 100
+        checks["settledReviewsWithinBound"] = not settled.get("total") or (
+            limit is not None and (settled.get("share") or 0) <= limit
+            and all((cell.get("share") or 0) <= limit for cell in (settled.get("byJournal") or {}).values()))
+        if settled.get("total"):
+            notes.append(f"{settled['total']} enumerated reviews were settled as unavailable ("
+                         + ", ".join(f"{reason}: {count}" for reason, count in (settled.get("byReason") or {}).items())
+                         + "); by journal " + ", ".join(
+                             f"{journal} {cell['settled']}/{cell['enumerated']}"
+                             for journal, cell in (settled.get("byJournal") or {}).items())
+                         + (f"; the protocol's bound is {bound:g} %" if bound is not None else
+                            "; no bound was pinned (study prepare --max-settled-percent)"))
         if enumeration.get("excluded"):
             notes.append(f"{enumeration['excluded']} enumerated reviews are excluded by the protocol, each with a recorded reason")
         if enumeration.get("unexplained"):
@@ -466,8 +488,24 @@ def _gate(record: dict[str, Any], enumeration: Any, excluded: frozenset = frozen
     return None
 
 
+def pin_settle_bound(connection: Any, percent: float) -> None:
+    """Pin the protocol's bound on settled reviews (percent of the enumerated reviews, overall and per journal) once;
+    a later prepare may repeat it but never change it."""
+    from . import scores_db
+    if not isinstance(percent, (int, float)) or isinstance(percent, bool) or not 0 <= percent <= 100:
+        raise ValidationError("--max-settled-percent is a percentage from 0 to 100")
+    value = repr(float(percent))
+    pinned = scores_db.meta(connection).get("settleMaxPercent")
+    if pinned is not None and float(pinned) != float(percent):
+        raise ValidationError(f"the study is pinned to settling at most {float(pinned):g} % of its enumerated reviews; "
+                              "a protocol bound is never changed during a study")
+    if pinned is None:
+        with connection:
+            scores_db.set_meta(connection, {"settleMaxPercent": value})
+
+
 def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = None,
-            settle: bool = False) -> dict[str, Any]:
+            settle: bool = False, max_settled_percent: float | None = None) -> dict[str, Any]:
     """Prepare reviews one record at a time; a review that cannot be read or extracted is recorded, not fatal.
 
     With ``caches`` the study pins its byte caches and every cache-hit claim is re-checked against them. With
@@ -476,7 +514,8 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
     enumerated review still neither in the study nor excluded afterwards, whether this input skipped it or does not
     hold it, is recorded in coverage as unavailable with the reason it was not prepared (``record_not_prepared``):
     the population is then complete, and the study reports those reviews as unavailable instead of failing its
-    completeness at the end of a run whose acquisition cannot run again.
+    completeness at the end of a run whose acquisition cannot run again. ``max_settled_percent`` pins the protocol's
+    bound on settled reviews, which the gates check ``settledReviewsWithinBound`` holds the study to.
     """
     from . import scores_db
     from .census_inputs import normal_doi, review_provenance, verify_claim
@@ -485,6 +524,8 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
     if settle and enumeration is None:
         raise ValidationError("settling unprepared reviews needs a fresh enumeration (--require-fresh-enumeration "
                               "with --enumeration)")
+    if max_settled_percent is not None and not settle:
+        raise ValidationError("a bound on settled reviews belongs to settling them (--settle-unprepared)")
     if enumeration is None and scores_db.meta(run.connection).get("enumerationSha256"):
         raise ValidationError("this study is pinned to a fresh enumeration; prepare with --require-fresh-enumeration "
                               "and --enumeration naming its receipt (nothing is imported from other manifests)")
@@ -493,6 +534,8 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
                               "prepared after it")
     if enumeration is not None:
         run.pin_enumeration(enumeration)
+    if max_settled_percent is not None:
+        pin_settle_bound(run.connection, max_settled_percent)
     run.pin_inputs(caches)
     excluded = frozenset((row[0], row[1]) for row in run.connection.execute("SELECT journal, doi FROM exclusions"))
     counts: dict[str, int] = {}
@@ -596,6 +639,8 @@ def command(args) -> Any:
         if args.settle_unprepared and not args.require_fresh_enumeration:
             raise ValidationError("--settle-unprepared settles enumerated reviews: give --require-fresh-enumeration "
                                   "and --enumeration")
+        if args.max_settled_percent is not None and not args.settle_unprepared:
+            raise ValidationError("--max-settled-percent bounds the reviews --settle-unprepared settles; give both")
         enumeration = load_enumeration(Path(args.enumeration)) if args.require_fresh_enumeration else None
         caches = _caches(args)
         try:
@@ -603,7 +648,7 @@ def command(args) -> Any:
             try:
                 bundle = run.pin_study_bundle(args.study_bundle) if args.study_bundle else None
                 result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration,
-                                 settle=args.settle_unprepared)
+                                 settle=args.settle_unprepared, max_settled_percent=args.max_settled_percent)
                 return {**result, "studyBundle": bundle or ({"studyBundleSha256": run.study_bundle}
                                                             if run.study_bundle else None)}
             finally:

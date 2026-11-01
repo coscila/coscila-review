@@ -1040,11 +1040,53 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual((3, 0, 0), (status["enumeration"]["inStudy"], status["enumeration"]["excluded"],
                                      status["enumeration"]["unexplained"]))
         self.assertEqual(2, status["inputChecks"]["reviewsSettledAsNotPrepared"])
+        # Settled reviews without a pinned bound never pass the bound check.
+        self.assertFalse(verdict["settledReviewsWithinBound"])
+        self.assertEqual((2, None, {"absent-from-input": 1, "skipped-abstract-lookup-failed": 1}),
+                         (status["enumeration"]["settled"]["total"], status["enumeration"]["settled"]["maxPercent"],
+                          status["enumeration"]["settled"]["byReason"]))
         # The command line: settling needs a fresh enumeration.
         buffer = io.StringIO()
         with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
             code = main(["study", "prepare", "--database", str(self.database), "--seed", "1234", "--input", str(source),
                          "--settle-unprepared"])
+        self.assertNotEqual(0, code)
+
+    def test_the_settled_share_stays_within_the_protocols_bound(self):
+        manifest, enumeration, caches, rows = self.fresh_inputs()
+        source = manifest.parent / "bound.jsonl"
+        source.write_text(json.dumps(rows[0]) + "\n")       # two of three enumerated reviews are not in the input
+        outcomes = {}
+        for percent in (50.0, 100.0):
+            database = self.root / f"bound-{percent:g}.sqlite3"
+            run = self.census(database)
+            out = prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=percent)
+            self.assertEqual({"absent-from-input": 2}, out["settled"])
+            # A later prepare repeats the bound and never changes it.
+            prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=percent)
+            with self.assertRaisesRegex(ValidationError, "never changed"):
+                prepare(run, source, caches=caches, enumeration=enumeration, settle=True, max_settled_percent=10)
+            run.close()
+            with closing(scores_db.open_readonly(database)) as connection:
+                status = census_status(connection)
+            outcomes[percent] = gates(status, require_fresh_enumeration=True)
+            settled = status["enumeration"]["settled"]
+            self.assertEqual((2, percent), (settled["total"], settled["maxPercent"]))
+            # The journal of the prepared review settled one of two; the other journal settled its only review.
+            self.assertEqual({JOURNAL: {"settled": 1, "enumerated": 2, "share": 0.5},
+                              SECOND: {"settled": 1, "enumerated": 1, "share": 1.0}}, settled["byJournal"])
+        self.assertFalse(outcomes[50.0]["checks"]["settledReviewsWithinBound"])
+        self.assertTrue(outcomes[100.0]["checks"]["settledReviewsWithinBound"])
+        self.assertTrue(any("the protocol's bound is 50 %" in note for note in outcomes[50.0]["notes"]))
+        # A bound belongs to settling, from code and from the command line.
+        run = self.census(self.root / "no-settle.sqlite3")
+        with self.assertRaisesRegex(ValidationError, "belongs to settling"):
+            prepare(run, source, caches=caches, enumeration=enumeration, max_settled_percent=5)
+        run.close()
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = main(["study", "prepare", "--database", str(self.root / "cli.sqlite3"), "--seed", "1234", "--input",
+                         str(source), "--require-fresh-enumeration", "--enumeration", str(manifest) + ".receipt.json",
+                         "--max-settled-percent", "5"])
         self.assertNotEqual(0, code)
 
     def test_fresh_inputs_are_derived_in_the_run_never_carried(self):
