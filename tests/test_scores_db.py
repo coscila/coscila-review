@@ -80,8 +80,10 @@ class ScoresDatabaseTests(unittest.TestCase):
             self.assertTrue(all(0 <= r["q_value"] <= 1 for r in scores.values() if r["q_value"] is not None))
         kept = scores_db.freeze(self.path, self.root / "kept.sqlite3", keep_text=True)
         self.assertTrue(kept["evidenceTextKept"])
+        # The same freeze again returns its copy; a freeze with other options into it is refused.
+        self.assertTrue(scores_db.freeze(self.path, frozen)["alreadyFrozen"])
         with self.assertRaises(ValidationError):
-            scores_db.freeze(self.path, frozen)
+            scores_db.freeze(self.path, frozen, keep_text=True)
 
     def test_incomplete_runs_freeze_only_on_request_and_facts_refuse_them(self):
         from ocsl_review import corpus_facts

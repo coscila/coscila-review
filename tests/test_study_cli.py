@@ -37,8 +37,9 @@ class FactsEndToEndTests(RunnerTestCase):
             self.assertEqual(0, c.execute("SELECT COUNT(*) FROM evidence WHERE text IS NOT NULL").fetchone()[0])
             self.assertEqual("1", scores_db.meta(c)["frozen"])
             self.assertGreater(c.execute("SELECT COUNT(*) FROM data_dictionary").fetchone()[0], 100)
+        self.assertEqual(report["sha256"], scores_db.freeze(self.database, frozen)["sha256"])
         with self.assertRaises(ValidationError):
-            scores_db.freeze(self.database, frozen)
+            scores_db.freeze(self.database, frozen, keep_text=True)
         manifest = scores_db.export(frozen, self.root / "export")
         names = {f["path"] for f in manifest["files"]}
         self.assertIn("citations.tsv", names)
