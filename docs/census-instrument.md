@@ -291,29 +291,37 @@ at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
 a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
 without that field, hits that list other PMCIDs only, or a search without a
 usable answer keep the error transient. Each fetch checks the record once. No
-record at all (zero hits) contradicts the Europe PMC record the PMCID came
-from, and an empty or rebuilding search index answers the same, so one such
-answer concludes nothing. The fetcher (one per `study full-text` invocation,
-shared by its fetch threads) remembers when its search first found no record of
-each PMCID, and such a PMCID is a definitive miss only when all of this holds:
-its answers without a record span at least 60 s, which normally takes a later
-pass of the same invocation (the first further pass starts a
-`--transport-cooldown` of 60 s after the one before), while its own record or
-full text in between starts the span over; the fetch was not throttled; and one
-search for the PMCID and a sentinel together (`PMCID:<id> OR PMCID:<sentinel>`)
-returns the sentinel's own record and none of the PMCID, with every hit on its
-page. The sentinel is the newest other PMCID the fetcher saw in Europe PMC's
+record at all (zero hits) contradicts the Europe PMC record the PMCID came from,
+and an empty or rebuilding search index answers the same, so one such answer
+concludes nothing. In a fetch that was not throttled it is followed by one
+search for the PMCID and a sentinel together (`PMCID:<id> OR PMCID:<sentinel>`),
+and only an answer that returns the sentinel's own record and none of the PMCID,
+with every hit on its page, counts: one answer, so one state of the index, shows
+a non-empty index without the PMCID. The fetcher (one per `study full-text`
+invocation, shared by its fetch threads) remembers the first such answer for
+each PMCID, and the PMCID is a definitive miss when another such answer comes at
+least 60 s later, which normally takes a later pass of the same invocation (the
+first further pass starts a `--transport-cooldown` of 60 s after the one
+before). Both ends of the span thus show a non-empty index without the PMCID. A
+zero-hit answer, an answer without the sentinel, a failed search (a server
+error, throttling, a timeout) and a throttled fetch neither start nor confirm
+it, and the PMCID's own record (in a joint answer too) or full text starts it
+over. The sentinel is the newest other PMCID the fetcher saw in Europe PMC's
 index during the invocation (a full text it served, or a search that returned
 that PMCID's own record); a fetcher that has seen none names PMC2000001, a 1922
 record Europe PMC has indexed since 2009 (a sentinel needs a record, not a full
-text). The PMCID's absence and the sentinel's record thus come from one answer,
-so from one state of the index. When that search fails (a server error,
-throttling, a timeout), finds neither PMCID, or finds the PMCID's own record
-(which starts its span over), the entry stays open. An empty index therefore
-closes nothing, nor does one that answers some searches from an empty copy; an
-index rebuilt piecemeal can close a PMCID it has lacked for at least 60 s while
-it held the sentinel. With `--transport-retries 0`, or cooldowns far below 60 s,
-a PMCID without any record stays open instead. A 404, a 410 or another client
+text). An empty index therefore closes nothing, nor does one that answers some
+searches from an empty copy, nor one rebuilt in place (empty, then partial, then
+full) whose partial copy answers fewer than two of the PMCID's joint searches
+60 s apart. What can still close an open-access PMCID whose fullTextXML keeps
+failing is a copy of the index that holds the sentinel and lacks the PMCID in
+two joint answers at least 60 s apart, with neither the PMCID's record nor its
+full text seen in between: a rebuild whose partial phase lasts across two
+fetches of the PMCID (a minute or more within one invocation, as long as the gap
+between passes when many entries are open), or a replica without the PMCID's
+record that answers both. Within one invocation that cannot be told from a
+withdrawn record. With `--transport-retries 0`, or cooldowns far below 60 s, a
+PMCID without any record stays open instead. A 404, a 410 or another client
 error is Europe PMC's own definitive answer; throttling (408, 425, 429),
 timeouts and dropped connections get no record check. Each `study full-text`
 result counts the escalated entries that invocation closed without a window by
@@ -321,10 +329,10 @@ reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`, `noRecord`, `notFound`
 (404, 410 or another client error), `entitledBlocked` and `other` (an unreadable
 fullTextXML, no live retrieval, a fetcher that names no reason). `noRecord`
 should stay 0, because every PMCID of the census comes from a Europe PMC record;
-a non-zero count means Europe PMC's search lacked those PMCIDs for at least 60 s
-and then held another PMCID's record but not theirs in one answer (a withdrawn
-record, or an index rebuilt piecemeal), and `--retry-failed` reopens those
-entries (with every other `fetch-failed` entry).
+a non-zero count means that two searches at least 60 s apart each held another
+PMCID's record but not theirs (a withdrawn record, or a copy of the index that
+lacked them that long), and `--retry-failed` reopens those entries (with every
+other `fetch-failed` entry).
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
