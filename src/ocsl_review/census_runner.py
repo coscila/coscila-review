@@ -2196,8 +2196,6 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
     database, output = Path(database), Path(output)
     if not database.is_file():
         raise ValidationError(f"scores database is missing: {database}")
-    if output.exists():
-        raise ValidationError("comparison report already exists; write it to a new path")
     writer = writer_lock(database)
     temporary = None
     try:
@@ -2208,14 +2206,26 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
             if not pinned:
                 raise ValidationError("compare a stored manifest only after study prepare --require-fresh-enumeration "
                                       "has pinned the fresh enumeration")
+            recorded = connection.execute(
+                "SELECT report_sha256, stored_sha256, enumeration_sha256 FROM manifest_comparisons WHERE label=? LIMIT 1",
+                (label,)).fetchone()
+            if recorded:
+                # The same comparison again (a step submitted again after its process stopped): its report, finished
+                # here when the earlier process stopped between recording it and renaming the report into place.
+                existing = _comparison_already(output, recorded, pinned, Path(stored))
+                if existing is None:
+                    raise ValidationError(f"comparison {label!r} is already recorded; choose another label")
+                return existing
+            if output.exists():
+                raise ValidationError("comparison report already exists; write it to a new path")
+            # A report an earlier process wrote but never recorded: never part of the study, written again.
+            output.with_name("." + output.name + ".incoming").unlink(missing_ok=True)
             # Complete means every enumerated review in the study or excluded with a reason, and nothing pending: a
             # study with no reviews, or only a pilot, is no completed run.
             state = scores_db.completeness(connection)
             if not state["complete"] and not allow_incomplete:
                 raise ValidationError("compare a stored manifest after the census run is complete (a diagnostic, never "
                                       "tuned): " + "; ".join(state["problems"]))
-            if connection.execute("SELECT 1 FROM manifest_comparisons WHERE label=?", (label,)).fetchone():
-                raise ValidationError(f"comparison {label!r} is already recorded; choose another label")
             population = state["population"]
             studied = {(row[0], row[1]) for row in connection.execute("SELECT journal, doi FROM reviews")}
             excluded = {(row[0], row[1]) for row in connection.execute("SELECT journal, doi FROM exclusions")}
@@ -2261,6 +2271,28 @@ def record_comparison(database: Path, stored: Path, output: Path, *, label: str 
             "runProblems": state["problems"], "population": population, "totals": result["totals"], "stored": info,
             "byJournal": {journal: {k: v for k, v in cell.items() if k != "strata"}
                           for journal, cell in result["byJournal"].items()}}
+
+
+def _comparison_already(output: Path, recorded: Sequence[Any], pinned: str, stored: Path) -> dict[str, Any] | None:
+    """The result of a comparison recorded under this label from the same stored manifest and enumeration, read from
+    its report (renamed into place first when the earlier process stopped before that), or None."""
+    from .census_inputs import load_stored_manifest
+    report_sha, stored_sha, enumeration_sha = recorded
+    temporary = output.with_name("." + output.name + ".incoming")
+    if not output.exists() and temporary.is_file() and hashlib.sha256(temporary.read_bytes()).hexdigest() == report_sha:
+        os.replace(temporary, output)
+    if not output.is_file() or enumeration_sha != pinned:
+        return None
+    body = output.read_bytes()
+    if hashlib.sha256(body).hexdigest() != report_sha or load_stored_manifest(stored)[1].get("sha256") != stored_sha:
+        return None
+    report = json.loads(body)
+    return {"label": report["label"], "report": str(output), "reportSha256": report_sha,
+            "runComplete": report["runComplete"], "runProblems": report["runProblems"],
+            "population": report["population"], "totals": report["totals"], "stored": report["stored"],
+            "byJournal": {journal: {k: v for k, v in cell.items() if k != "strata"}
+                          for journal, cell in report["byJournal"].items()},
+            "alreadyRecorded": True}
 
 
 def iter_records(path: Path) -> Iterator[dict[str, Any]]:

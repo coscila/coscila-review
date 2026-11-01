@@ -718,6 +718,26 @@ class FreshEnumerationTests(CacheTestCase):
         self.addCleanup(run.close)
         return run
 
+    def test_enumerating_again_returns_the_finished_enumeration_or_starts_over(self):
+        manifest, result, requests = self.enumerate()
+        get, _ = self.provider()
+        # The same spec again (a step submitted again after its process stopped): the finished enumeration, its kept
+        # pages verified, and no new search.
+        again = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
+        self.assertEqual((True, result["records"], result["groups"]), (again["alreadyEnumerated"], again["records"],
+                                                                       again["groups"]))
+        # Another spec into the same output is refused.
+        other = json.loads(json.dumps(self.SPEC))
+        other["window"]["until"] = "2021-12-31"
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            enumerate_reviews(other, manifest, get, code_revision="test")
+        # A manifest without its receipt (stopped before it finished) is enumerated again.
+        Path(str(manifest) + ".receipt.json").unlink()
+        restarted = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
+        self.assertNotIn("alreadyEnumerated", restarted)
+        self.assertEqual(result["records"], restarted["records"])
+        load_enumeration(Path(restarted["receipt"]))
+
     def test_enumeration_keeps_its_pages_and_verifies_them(self):
         manifest, result, requests = self.enumerate()
         self.assertEqual(3, result["records"])
@@ -731,8 +751,8 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual(3, len(enumeration.reviews))
         self.assertEqual(1, json.loads(receipt.read_text())["groups"][0]["withoutDoi"])
         self.assertEqual(QUERY_RULE, json.loads(receipt.read_text())["queryRule"])
-        with self.assertRaisesRegex(ValidationError, "already exists"):
-            enumerate_reviews(self.SPEC, manifest, self.provider()[0])
+        # Enumerating the same spec again returns the finished enumeration (see the test above).
+        self.assertTrue(enumerate_reviews(self.SPEC, manifest, self.provider()[0])["alreadyEnumerated"])
         page = next(Path(str(manifest) + ".pages").iterdir())
         page.chmod(0o644)
         page.write_bytes(page.read_bytes() + b" ")
@@ -880,6 +900,19 @@ class FreshEnumerationTests(CacheTestCase):
         run.close()
         final = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
         self.assertTrue(final["runComplete"])
+        # The same comparison again returns what it recorded, also when the earlier process stopped between recording
+        # it and renaming its report into place; another stored manifest under the label is refused.
+        again = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
+        self.assertEqual((True, final["reportSha256"], final["totals"]), (again["alreadyRecorded"], again["reportSha256"],
+                                                                           again["totals"]))
+        (manifest.parent / "final.json").rename(manifest.parent / ".final.json.incoming")
+        renamed = record_comparison(self.database, stored, manifest.parent / "final.json", label="final")
+        self.assertEqual(final["byJournal"], renamed["byJournal"])
+        self.assertTrue((manifest.parent / "final.json").is_file())
+        other = manifest.parent / "other-stored.txt"
+        other.write_text(JATS_REVIEW + "\n")
+        with self.assertRaisesRegex(ValidationError, "already recorded"):
+            record_comparison(self.database, other, manifest.parent / "final.json", label="final")
         with closing(scores_db.open_readonly(self.database)) as connection:
             status = census_status(connection)
         checks = gates(status, require_fresh_enumeration=True)["checks"]
