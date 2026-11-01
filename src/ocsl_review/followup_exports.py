@@ -156,12 +156,12 @@ class Redactor:
         self.counts: Counter = Counter()
 
     def sentence(self, unit: Mapping[str, Any], text: str | None) -> str | None:
-        if text is None:
-            return None
         if self.private or unit.get("provenance_class") == "public":
             return text
+        if text is None and not unit.get("sentence_sha256"):
+            return None
         self.counts["sentences"] += 1
-        return "sha256:" + _sha(text)
+        return "sha256:" + (_sha(text) if text is not None else unit["sentence_sha256"])
 
     def section(self, unit: Mapping[str, Any]) -> str | None:
         if self.private or unit.get("provenance_class") == "public":
@@ -189,7 +189,12 @@ class Redactor:
 
 
 def claim_row(branch: FollowupBranch, connection: Any, unit: Mapping[str, Any], redactor: Redactor) -> dict[str, Any]:
-    text, _ = branch.sentence(connection, unit["journal"], unit["doi"], unit["label"], unit["seq"])
+    if redactor.private or unit.get("provenance_class") == "public":
+        text, _ = branch.sentence(connection, unit["journal"], unit["doi"], unit["label"], unit["seq"])
+    else:
+        # A public export keeps an entitled sentence only as its digest, which the frame holds: no text needed.
+        text = None
+
     support = unit["support"]
     function = unit["function"] or {}
     dependency = unit["dependency"] or {}
@@ -379,6 +384,8 @@ def export(database: Path, output: Path, *, allow_entitled_text: bool = False) -
     report = branch.verify(deep=True)
     if not report["ok"]:
         raise ValidationError("the follow-up branch does not verify: " + "; ".join(report["problems"]))
+    if allow_entitled_text:
+        branch.require_text()
     output.mkdir(parents=True, exist_ok=True)
     redactor = Redactor(allow_entitled_text)
     branch_meta = branch.meta()

@@ -102,7 +102,7 @@ def gates(database: Path) -> dict[str, Any]:
     from .followup_branch import FollowupBranch, instrument_pins
     branch = FollowupBranch(database)
     verified = branch.verify(deep=True)
-    notes = list(verified["problems"])
+    notes = list(verified["problems"]) + list(verified.get("notes") or [])
     with closing(branch.connect(check_parent=False)) as connection:
         first_call = connection.execute("SELECT MIN(started_at) FROM fu_calls").fetchone()[0]
         first_freeze = connection.execute("SELECT MIN(frozen_at) FROM fu_protocol_freeze").fetchone()[0]

@@ -419,6 +419,7 @@ def run_numeric(branch: FollowupBranch, tables: Path, *, judge: Any, policy: Any
                 sleep: Callable[[float], None] = time.sleep, code_revision: str | None = None) -> dict[str, Any]:
     with branch.writing() as connection:
         require_freeze(connection)
+        branch.require_text()
         protocol = protocol_of(branch)
         if model != protocol["model"]["served"]:
             raise ValidationError("--model must be the served model the protocol pins (model.served)")

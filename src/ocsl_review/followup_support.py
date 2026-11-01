@@ -550,6 +550,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     if tier not in TIERS:
         raise ValidationError("--tier is abstract or full-text")
     freeze = require_freeze(connection)
+    branch.require_text()
     protocol = branch.protocol()
     check_model(model, protocol)
     instrument = instruments.load(INSTRUMENT_ID)

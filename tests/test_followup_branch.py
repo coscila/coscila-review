@@ -82,6 +82,48 @@ class BranchTests(unittest.TestCase):
                                           ).fetchone()[0]
             self.assertEqual(sentence_digest(redacted), hashlib.sha256(text.encode()).hexdigest())
 
+    def test_steps_without_the_text_parent_run_and_steps_that_read_sentences_refuse(self):
+        """The private keep-text copy is mounted only for steps that read citing sentences: without it a branch
+        connects, verifies, resolves status, builds strata and exports publicly, while support, function, numeric,
+        second-gen candidates and a private export refuse instead of turning entitled loci into text-redacted."""
+        import shutil
+        from types import SimpleNamespace
+        from ocsl_review import followup_exports, followup_function
+        text_copy = self.root / "census-text-copy.sqlite3"
+        shutil.copy2(self.census["text"], text_copy)
+        branch = self.branch("unmounted.sqlite3", parent_text=text_copy, protocol=F.protocol())
+        hidden = text_copy.with_suffix(".hidden")
+        text_copy.rename(hidden)
+        try:
+            self.assertFalse(branch.text_mounted)
+            report = branch.verify()
+            self.assertTrue(report["ok"], report["problems"])
+            self.assertFalse(report["parent"]["parentTextMounted"])
+            self.assertTrue(report["notes"])
+            with closing(branch.connect()) as connection:
+                attached = [row[1] for row in connection.execute("PRAGMA database_list")]
+                self.assertEqual(["main", "census"], attached)
+                self.assertIn("⟨R1⟩", branch.sentence(connection, F.JOURNAL_A, "10.5555/fu.review.a1", "1", 1)[0])
+                with self.assertRaisesRegex(ValidationError, "not mounted"):
+                    branch.sentence(connection, F.JOURNAL_A, "10.5555/fu.review.a2", "2", 1)
+            with self.assertRaisesRegex(ValidationError, "not mounted"):
+                branch.require_text()
+            with branch.writing() as connection:
+                connection.execute("INSERT INTO fu_protocol_freeze VALUES('freeze-x', ?, ?, 's', ?, '[]', '{}', "
+                                   "'2026-01-01T00:00:00.000000Z')", ("a" * 64, "b" * 64, "c" * 64))
+                with self.assertRaisesRegex(ValidationError, "not mounted"):
+                    followup_function.run_function(connection, branch, F.ScriptedJudge(lambda m, s: "{}"), None,
+                                                   model=F.MODEL)
+            exported = followup_exports.export(branch.path, self.root / "unmounted-export")
+            self.assertFalse(exported["private"])
+            with self.assertRaisesRegex(ValidationError, "not mounted"):
+                followup_exports.export(branch.path, self.root / "unmounted-private", allow_entitled_text=True)
+        finally:
+            hidden.rename(text_copy)
+        self.assertTrue(branch.text_mounted)
+        with closing(branch.connect()) as connection:
+            self.assertTrue(branch.sentence(connection, F.JOURNAL_A, "10.5555/fu.review.a2", "2", 1)[0])
+
     def test_create_refuses_unusable_parents(self):
         with self.assertRaisesRegex(ValidationError, "frozen"):
             FollowupBranch.create(self.root / "working.sqlite3", self.census["working"])

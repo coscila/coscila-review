@@ -468,6 +468,8 @@ def run_second_gen(branch: FollowupBranch, *, stages: Sequence[str] = STAGES, cl
     result: dict[str, Any] = {"database": str(branch.path), "stages": [stage for stage in STAGES if stage in stages]}
     with branch.writing() as connection:
         require_freeze(connection)
+        if "candidates" in stages or "judge" in stages:
+            branch.require_text()
         protocol = protocol_of(branch)
         settings(protocol)
         if "judge" in stages and model != protocol["model"]["served"]:

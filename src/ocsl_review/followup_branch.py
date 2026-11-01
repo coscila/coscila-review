@@ -344,11 +344,25 @@ class FollowupBranch:
             raise ValidationError(f"the {prefix} database changed since the branch was made (size or modification "
                                   "time); run followup verify")
 
+    @property
+    def text_mounted(self) -> bool:
+        """The private text parent this branch was made with is present (it is mounted only for steps that read
+        citing sentences, typically the on-premises judging steps)."""
+        return self.parent_text is not None and self.parent_text.is_file()
+
+    def require_text(self) -> None:
+        """Refuse a command that reads citing sentences when the branch was made with a text parent that is not
+        mounted: entitled sentences would otherwise silently become text-redacted."""
+        if self.parent_text is not None and not self.parent_text.is_file():
+            raise ValidationError(f"this command reads citing sentences, and the branch's text parent is not mounted: "
+                                  f"{self.parent_text} (mount the private keep-text copy for this step)")
+
     def connect(self, *, write: bool = False, check_parent: bool = True) -> sqlite3.Connection:
-        """A connection to the branch with the parent ATTACHed read-only and immutable."""
+        """A connection to the branch with the parent ATTACHed read-only and immutable, and the text parent when it is
+        mounted (a step without it never reads an entitled sentence; ``require_text`` guards the steps that do)."""
         if check_parent:
             self._quick_check(self.parent, "parent")
-            if self.parent_text is not None:
+            if self.text_mounted:
                 self._quick_check(self.parent_text, "parentText")
         connection = sqlite3.connect(_uri(self.path, "" if write else "?mode=ro"), uri=True, timeout=60,
                                      check_same_thread=False)
@@ -395,6 +409,7 @@ class FollowupBranch:
             return value, None
         if self.parent_text is None:
             return None, "text-redacted"
+        self.require_text()
         text = connection.execute(f"SELECT sentence FROM {PARENT_TEXT}.loci WHERE journal=? AND doi=? AND label=? "
                                   "AND seq=?", (journal, doi, label, int(seq))).fetchone()
         if text is None or text[0].startswith(REDACTED_PREFIX):
@@ -428,9 +443,16 @@ class FollowupBranch:
     def verify(self, *, deep: bool = True) -> dict[str, Any]:
         """Parent digest unchanged, schema intact, every follow-up reference to the parent resolvable."""
         problems: list[str] = []
+        notes: list[str] = []
         parent: dict[str, Any] = {"path": str(self.parent), "recordedSha256": self._meta.get("parentSha256")}
+        if self.parent_text is not None:
+            parent["parentTextMounted"] = self.text_mounted
         for path, prefix in ((self.parent, "parent"), (self.parent_text, "parentText")):
             if path is None:
+                continue
+            if prefix == "parentText" and not path.is_file():
+                # The private text copy is mounted only for steps that read sentences; its digest is checked when it is.
+                notes.append(f"the text parent is not mounted here ({path}); its digest is checked where it is mounted")
                 continue
             if not path.is_file():
                 problems.append(f"the {prefix} database is missing: {path}")
@@ -465,7 +487,7 @@ class FollowupBranch:
         if dangling:
             problems.append("follow-up rows refer to rows the parent or the frame lacks: "
                             + ", ".join(f"{name}={count}" for name, count in sorted(dangling.items())))
-        return {"ok": not problems, "problems": problems, "parent": parent, "references": references,
+        return {"ok": not problems, "problems": problems, "notes": notes, "parent": parent, "references": references,
                 "citedWorksWithoutStatusRow": status_missing, "deep": deep}
 
     def describe(self) -> dict[str, Any]:

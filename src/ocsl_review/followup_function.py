@@ -339,6 +339,7 @@ def run_function(connection: Any, branch: FollowupBranch, judge: Any, policy: An
     from . import instruments
     from .followup_judge import accepted, run_items
     freeze = require_freeze(connection)
+    branch.require_text()
     protocol = branch.protocol()
     check_model(model, protocol)
     instrument = instruments.load(INSTRUMENT_ID)
