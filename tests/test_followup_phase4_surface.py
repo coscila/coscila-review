@@ -4,8 +4,8 @@
 The census instrument's bundle files, its registry digest and broker bundle digests, its builder and validator module,
 the instrument it reuses unchanged (citation-support@2: prompt, output schema, manifest, its validator and builder
 module and its registry digest) and the fidelity tests with their
-fixtures are pinned here by sha256 as they stand at the follow-up track's base. A change to any of them belongs to the
-census's own track and needs a deliberate re-pin here; the follow-up never makes one.
+fixtures are pinned here by sha256 as they stand at f726fff, the companion revision the census runs with. A change to
+any of them is a change of the census and needs a deliberate re-pin here; the follow-up never makes one.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ PINNED_FILES = {
     "schemas/corpus-assessment-v2.schema.json": "8547779a0ab620cbc74cf6a25bb015be145a3aa939644524146480aa89521b59",
     "instruments/citation-support/2/instrument.json": "123c1bf66f80c90b17c1ac107d01d1c411e44b0d2b014dc47469380bf6e8e725",
     "src/ocsl_review/corpus_assessment.py": "7c6600397dc60e03980966199d991f3df559640d410ad1bfc12d2746a4d7f4cf",
-    "tests/test_citation_census_fidelity.py": "38a29fdbb586820e1e8fd14f7f8dae9536116345331ee2a5a893207c6ed5fc50",
+    "tests/test_citation_census_fidelity.py": "caa7a8d27cb356ff83d27ade2a9ac6a6ba51f2920a7b59ff6363076b378bf5fc",
     "tests/fixtures/citation_census/judge_items.json": "cab57af1f2ed281077e8ec5f835132a5aa1d9cb91fab77505354e98da38cbfac",
     "tests/fixtures/citation_census/model_outputs.json": "0235d79332ccce2214c45a369da03883f77c7471aaf6f05c7c71b409a0adcc17",
     "tests/fixtures/citation_census/review_works.json": "d40177abf59567402611b18ac126a3b06962d1121d5c145812abdb2cceafd211",
