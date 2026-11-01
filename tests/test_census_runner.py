@@ -10,6 +10,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -19,7 +20,8 @@ from contextlib import redirect_stdout
 
 from ocsl_review import citation_census as C
 from ocsl_review import estimands, scores_db
-from ocsl_review.census_runner import CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute
+from ocsl_review.census_runner import (CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute,
+                                       steady_throughput)
 from ocsl_review.cli import main
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.study_cli import gates
@@ -39,6 +41,7 @@ class MockJudge:
         self.never_full_text = set()
         self.fail_next = 0
         self.model = MODEL
+        self.delays: dict[str, float] = {}      # a review title -> seconds every call of that review waits
         self.lock = threading.Lock()
 
     @staticmethod
@@ -95,6 +98,10 @@ def start_server(judge: MockJudge):
                 self.end_headers()
                 return
             payload = json.loads(body)
+            user = payload["messages"][1]["content"]
+            delay = max([seconds for title, seconds in judge.delays.items() if title in user], default=0.0)
+            if delay:
+                time.sleep(delay)
             response = {"model": judge.model, "system_fingerprint": "fp-mock",
                         "choices": [{"message": {"content": judge.answer(payload)}, "finish_reason": "stop"}],
                         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
@@ -470,6 +477,55 @@ class AbstractTierTests(RunnerTestCase):
         self.assertEqual([str(i) for i in range(1, 41)], json.loads(calls[0]["labels_json"]))
         positions = {r["label"]: (r["abs_batch"], r["abs_position"]) for r in self.rows("SELECT label, abs_batch, abs_position FROM citations")}
         self.assertEqual((1, 5), positions["45"])
+
+
+class ThroughputTests(RunnerTestCase):
+    """The judge step's steady-state rate (what a capacity gate checks), never the job's wall time."""
+
+    def test_the_steady_window_runs_from_the_first_to_the_last_batch_start(self):
+        # Two streams, four batches of 10 entries, each 2 s long, back to back: saturated from 0 until 2 (the last
+        # start), so the rate is 2 streams x 10 entries / 2 s = 10 entries per second.
+        passes = [[(0.0, 2.0, 10), (0.0, 2.0, 10), (2.0, 4.0, 10), (2.0, 4.0, 10)]]
+        rate = steady_throughput(passes, 2)
+        self.assertEqual(("steady-state", 20.0, 2.0, 10.0, 4, 2), (rate["basis"], rate["entries"], rate["seconds"],
+                                                                   rate["entriesPerSecond"], rate["batches"],
+                                                                   rate["streams"]))
+
+    def test_a_hung_batch_costs_one_stream_and_the_drain_and_cooldown_cost_nothing(self):
+        # Three streams over 0..10 s; one batch hangs from 0 to 1800 s (a bulk timeout) and decides nothing. A
+        # further pass after the cooldown re-sends it alone. The wall-time rate would be 70 entries / ~2000 s.
+        steady = [(0.0, 1800.0, 0)] + [(float(t), float(t) + 2.0, 10) for t in range(0, 10, 2) for _ in range(2)]
+        further = [(1860.0, 1862.0, 10)]
+        rate = steady_throughput([steady, further], 3)
+        self.assertEqual("steady-state", rate["basis"])
+        self.assertEqual(8.0, rate["seconds"])
+        # Two of three streams decided 10 entries every 2 s inside the window (the batches started at 8 s, the last
+        # start, lie outside it): 2/3 of what three streams deliver, never the wall-time rate.
+        self.assertAlmostEqual(10.0, rate["entriesPerSecond"], places=3)
+
+    def test_a_step_with_no_more_batches_than_streams_has_no_steady_state(self):
+        rate = steady_throughput([[(0.0, 3.0, 15), (1.0, 4.0, 15)]], 4)
+        self.assertEqual(("busy", 30, 4.0, 7.5), (rate["basis"], rate["entries"], rate["seconds"],
+                                                  rate["entriesPerSecond"]))
+        self.assertIsNone(steady_throughput([[]], 4))
+        self.assertIsNone(steady_throughput([[(0.0, 3.0, 0)]], 4))
+
+    def test_one_slow_review_leaves_the_steady_rate_far_above_the_wall_rate(self):
+        os.environ["OCSL_TEST_JUDGE_KEY"] = "local-test-value"
+        self.addCleanup(os.environ.pop, "OCSL_TEST_JUDGE_KEY", None)
+        run = self.run_census()
+        slow = {**record(doi="10.5555/synthetic.review.slow"), "title": "Slow synthetic review"}
+        self.prepare(run, slow, *(record(doi=f"10.5555/synthetic.review.{n}") for n in range(15)))
+        self.judge.delays = {"Slow synthetic review": 2.0, "zeta-kinase": 0.05}
+        started = time.monotonic()
+        result = run.run_abstract()
+        wall = time.monotonic() - started
+        self.assertEqual(("completed", 16, 240), (result["state"], result["reviews"], result["accepted"]))
+        rate = result["throughput"]
+        self.assertEqual(("steady-state", 16, 4), (rate["basis"], rate["batches"], rate["streams"]))
+        # The slow review holds one of four streams for 2 s; the other three judge the rest in a fraction of that.
+        self.assertGreater(rate["entriesPerSecond"], 2 * (240 / wall))
+        self.assertLess(rate["seconds"], wall / 3)
 
 
 def full_text_fetcher(requests):
