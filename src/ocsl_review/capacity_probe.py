@@ -839,10 +839,13 @@ class FullTextCache:
     """Europe PMC fullTextXML of the probe's entries, kept in a directory across probe runs.
 
     Each PMCID's bytes are kept as Europe PMC served them (``PMC<n>.xml``, mode 0600) and a definitive miss (no
-    open-access full text) as ``PMC<n>.absent``, so a later run fetches nothing it has asked for before; a transient
-    failure is never kept. ``fetch`` is the census's own fetcher (``study_cli.europe_pmc_fetcher``: its headers,
-    spacing and retries). Without ``fetch`` (the dry run) nothing is fetched and only what the directory holds is
-    returned.
+    open-access full text) as ``PMC<n>.absent`` holding the fetcher's reason, so a later run fetches nothing it has
+    asked for before. A transient failure is never kept, and neither is a miss for want of any Europe PMC record of
+    the PMCID (``noRecord``: it contradicts the record the work's PMCID came from), so a later run asks again.
+    Fresh misses are also counted by the fetcher's reason (``absentNotOpenAccess``, ``absentNoRecord``,
+    ``absentNotFound``). ``fetch`` is the census's own fetcher (``study_cli.europe_pmc_fetcher``: its headers,
+    spacing, retries and record checks). Without ``fetch`` (the dry run) nothing is fetched and only what the
+    directory holds is returned.
     """
 
     def __init__(self, directory: Path | None, fetch: Callable[[str], bytes | None] | None):
@@ -857,7 +860,7 @@ class FullTextCache:
             self.counts[key] += 1
 
     def __call__(self, pmcid: str) -> bytes | None:
-        from .census_runner import RetryableFetch
+        from .census_runner import FULL_TEXT_MISS_REASONS, RetryableFetch
         name = str(pmcid or "").strip().upper()
         if not PMCID.fullmatch(name):
             self._count("invalidPmcid")
@@ -879,9 +882,15 @@ class FullTextCache:
         except RetryableFetch:
             self._count("transient")        # throttled or failed: the entry stays open, nothing is kept
             raise
-        if body_path is not None and absent_path is not None:
-            atomic_write(body_path if body else absent_path, body or b"", mode=0o600)
+        reason = None
+        if not body:
+            reason_of = getattr(self.fetch, "miss_reason", None)
+            reason = reason_of(name) if callable(reason_of) else None
+        if body_path is not None and absent_path is not None and reason != "noRecord":
+            atomic_write(body_path if body else absent_path, body or (reason or "").encode(), mode=0o600)
         self._count("fetched" if body else "absent")
+        if reason in FULL_TEXT_MISS_REASONS:
+            self._count("absent" + reason[0].upper() + reason[1:])
         return body
 
 
@@ -1035,8 +1044,9 @@ class FullTextInputs:
                           **dict(sorted(cache.counts.items())),
                           "fetcher": ("study_cli.europe_pmc_fetcher: the census's own Europe PMC fullTextXML fetcher "
                                       "(its User-Agent, 0.4 s spacing per thread, 3 attempts; a server error is "
-                                      "checked once against the PMCID's Europe PMC record, and a PMCID outside the "
-                                      "open-access subset is a definitive miss)") if live else None,
+                                      "checked against the PMCID's Europe PMC record: a PMCID outside the "
+                                      "open-access subset is a definitive miss, one without any record only after a "
+                                      "second check, absentNoRecord, which should stay 0)") if live else None,
                           "fetchWorkers": settings.fetch_workers},
             "calls": {"count": len(self.calls), "byItems": {str(k): sizes[k] for k in sorted(sizes)},
                       "meanItems": _round(sum(n * c for n, c in sizes.items()) / len(self.calls), 2) if self.calls else None},
@@ -3343,8 +3353,12 @@ def _full_text_inputs_lines(inputs: dict[str, Any] | None) -> list[str]:
     reviews, entries, texts, calls = inputs["reviews"], inputs["entries"], inputs["fullTexts"], inputs["calls"]
     store = inputs.get("store") or {}
     sources = ", ".join(f"{k} {v}" for k, v in (entries.get("bySource") or {}).items()) or "none"
-    fetched = ", ".join(f"{k} {texts[k]}" for k in ("fetched", "cacheHits", "absent", "cachedAbsent", "transient",
-                                                     "notFetched") if texts.get(k))
+    reasons = ", ".join(f"{label} {texts[key]}" for key, label in (
+        ("absentNotOpenAccess", "outside the open-access subset"), ("absentNoRecord", "without any Europe PMC record"),
+        ("absentNotFound", "not found")) if texts.get(key))
+    fetched = ", ".join(f"{k} {texts[k]}" + (f" ({reasons})" if k == "absent" and reasons else "")
+                        for k in ("fetched", "cacheHits", "absent", "cachedAbsent", "transient", "notFetched")
+                        if texts.get(k))
     return [f"- Inputs: real loci from the store `{_cell(str(store.get('merkleRoot', ''))[:16])}` ({store.get('id')}), "
             f"journal label {_cell(inputs['journal'])}, review DOI prefixes {_cell(', '.join(inputs['reviewDoiPrefixes']))}; "
             f"{_cell(inputs['selection'])}",

@@ -502,6 +502,46 @@ class EuropePmcTests(FullTextCase):
         self.assertEqual((len(searches), 0), (texts["absent"], texts.get("transient", 0)))
         self.assertGreater(texts["absent"], 0)
         self.assertEqual(0, report["fullTextInputs"]["entries"]["transient"])
+        # Each miss is counted by the fetcher's reason; none for want of a record.
+        self.assertEqual(texts["absent"], texts["absentNotOpenAccess"])
+        self.assertNotIn("absentNoRecord", texts)
+        self.assertIn(f"absent {texts['absent']} (outside the open-access subset {texts['absent']})",
+                      "\n".join(P._full_text_inputs_lines(report["fullTextInputs"])))
+
+    def test_misses_are_counted_by_reason_and_one_without_any_record_is_asked_for_again(self):
+        directory = self.root / "full-text-cache-reasons"
+        reasons = {"PMC1001": "notOpenAccess", "PMC1002": "noRecord", "PMC1003": "notFound"}
+
+        def fetcher(asked):
+            def fetch(pmcid):
+                asked.append(pmcid)
+                return None
+            fetch.miss_reason = reasons.get
+            return fetch
+        first = []
+        cache = P.FullTextCache(directory, fetcher(first))
+        self.assertEqual([None] * 3, [cache(pmcid) for pmcid in reasons])
+        self.assertEqual({"absent": 3, "absentNotOpenAccess": 1, "absentNoRecord": 1, "absentNotFound": 1},
+                         dict(cache.counts))
+        # A miss for want of any record contradicts the record the PMCID came from: it is never kept.
+        self.assertEqual(["PMC1001.absent", "PMC1003.absent"], sorted(path.name for path in directory.iterdir()))
+        self.assertEqual((b"notOpenAccess", b"notFound"), ((directory / "PMC1001.absent").read_bytes(),
+                                                          (directory / "PMC1003.absent").read_bytes()))
+        second = []
+        again = P.FullTextCache(directory, fetcher(second))
+        self.assertEqual([None] * 3, [again(pmcid) for pmcid in reasons])
+        self.assertEqual(["PMC1002"], second, "a later run asks again for the PMCID without a record, and only it")
+        self.assertEqual({"cachedAbsent": 2, "absent": 1, "absentNoRecord": 1}, dict(again.counts))
+        line = next(line for line in P._full_text_inputs_lines({
+            "reviews": {"withPrefix": 0, "retainedInStore": 0, "considered": 0, "prepared": 0, "used": 0, "unavailable": 0,
+                        "extractionFailed": 0, "refused": 0, "notPrepared": 0},
+            "entries": {"judgeable": 0, "candidates": 0, "tried": 0, "retrieved": 0, "target": 1, "withoutFullText": 0,
+                        "transient": 0},
+            "fullTexts": dict(cache.counts), "calls": {"count": 0, "meanItems": None, "byItems": {}},
+            "works": {"derived": 0, "metadataFromStore": 0, "metadataLookedUpLive": 0, "withoutRecord": 0,
+                      "lookupFailed": 0, "withPmcid": 0, "lookup": "-"},
+            "journal": JOURNAL, "reviewDoiPrefixes": [PREFIX], "selection": "-"}) if line.startswith("- Full texts:"))
+        self.assertIn("absent 3 (outside the open-access subset 1, without any Europe PMC record 1, not found 1)", line)
 
 
 if __name__ == "__main__":
