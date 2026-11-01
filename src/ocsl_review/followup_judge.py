@@ -3,7 +3,8 @@
 
 ``run_items`` runs one registered instrument over a list of items: the follow-up instruments (citation-function@1,
 numeric-check@1, claim-match@1), whose validator modules expose ``build_messages(items, tier)`` and
-``validate_response(items, text)``, and citation-support@2 unchanged through ``corpus_assessment``. It
+``validate_response(items, text)``, and citation-support@2 unchanged through ``corpus_assessment``, as does its
+verbatim version citation-support-verbatim@1 (the same planner and validator, with request settings of its own). It
 
 - refuses before any call when an item with entitled evidence would reach a judge the operator's policy does not list
   as on premises (``provenance`` travels with every item and is never sent);
@@ -110,9 +111,10 @@ class FollowupHttpJudge:
 
 
 class SupportModule:
-    """citation-support@2 unchanged: the corpus_assessment planner and validator. A response the validator cannot
-    read at all (not JSON, no items array) rejects every item of its call, retryable as the validator says, instead
-    of ending the run."""
+    """citation-support@2 unchanged: the corpus_assessment planner and validator, for every instrument whose validator
+    module is ``corpus_assessment`` (citation-support@2 and citation-support-verbatim@1). A response the validator
+    cannot read at all (not JSON, no items array) rejects every item of its call, retryable as the validator says,
+    instead of ending the run."""
 
     def build_messages(self, items: Sequence[Mapping[str, Any]], tier: str) -> list[dict[str, str]]:
         from .corpus_assessment import build_messages
@@ -433,9 +435,14 @@ def prepare_judge(judge: Any, instrument: Any, tier: str) -> None:
 
 
 def judge_summary(judge: Any) -> dict[str, Any]:
-    """Name and location of the judge, and the reason a broker judge halted its transport (a fidelity stop)."""
-    return {"name": getattr(judge, "name", "judge"), "location": getattr(judge, "location", ""),
-            "stopped": getattr(judge, "stopped", None)}
+    """Name and location of the judge, the reason a broker judge halted its transport (a fidelity stop) and, for a
+    broker judge, the broker bundles it required (instrument and tier to broker digest)."""
+    summary = {"name": getattr(judge, "name", "judge"), "location": getattr(judge, "location", ""),
+               "stopped": getattr(judge, "stopped", None)}
+    bundles = getattr(judge, "bundles", None)
+    if isinstance(bundles, Mapping) and bundles:
+        summary["bundles"] = dict(sorted(bundles.items()))
+    return summary
 
 
 def close_judge(judge: Any) -> None:

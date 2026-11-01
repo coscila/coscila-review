@@ -84,9 +84,9 @@ DICTIONARY = {
         "cited_year": "cited work year", "status": "resolved status of the cited work (status-resolution@1)",
         "reinstated": "1 when a later reinstatement reverses a retraction", "notice_doi": "DOI of the deciding notice",
         "notice_date": "date of the deciding notice", "date_precision": "day, month or year",
-        "status_source": "source of the deciding notice", "abstract_verdict": "citation-support@2 abstract verdict",
+        "status_source": "source of the deciding notice", "abstract_verdict": "abstract-tier support verdict",
         "abstract_reason": "why the abstract tier has no verdict", "abstract_quote": "first exact quote (abstract)",
-        "fulltext_verdict": "citation-support@2 full-text verdict", "fulltext_reason": "why the full-text tier has no "
+        "fulltext_verdict": "full-text support verdict", "fulltext_reason": "why the full-text tier has no "
         "verdict", "fulltext_quote": "first exact quote (full text; removed for entitled evidence in a public export)",
         "function_class": "citation-function@1 class", "function_reason": "why the function is not classified",
         "function_quote": "exact quote of the function judgment", "dependency_class": "dependency-aggregation@1 class",

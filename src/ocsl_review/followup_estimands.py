@@ -46,6 +46,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from . import claim_match, estimands as census_estimands
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, require_freeze
+from .followup_model import SUPPORT_INSTRUMENTS
 from .followup_schema import ADVERSE, NUMERIC_CLASSES
 from .followup_stats import (INTERVAL, QUANTILES, clear_estimates, cluster_ratio_bootstrap, grace_days, lag_rows,
                              quantile, rng, write_coverage, write_share_rows, write_value_rows)
@@ -512,9 +513,9 @@ AGREEMENT_FIELDS = {"citation-function@1": "function", "numeric-check@1": "decis
 
 
 def agreement_label(instrument_id: str, verdict: Mapping[str, Any]) -> str | None:
-    """The class a replicate is compared on: citation-support@2's class map (supported, adverse, uncertain); the
-    class or decision field of the follow-up instruments (abstain is its own class)."""
-    if instrument_id == "citation-support@2":
+    """The class a replicate is compared on: citation-support@2's class map (supported, adverse, uncertain) for both
+    support instruments; the class or decision field of the follow-up instruments (abstain is its own class)."""
+    if instrument_id in SUPPORT_INSTRUMENTS:
         from .followup_dependency import support_classes
         value = verdict.get("supportVerdict")
         return next((name for name, members in support_classes().items() if value in members), None)
@@ -593,7 +594,7 @@ def replicate_agreement(connection: sqlite3.Connection, protocol: Mapping[str, A
             detail = {"estimand": AGREEMENT, "instrument": instrument_id, "instrumentDigest": instrument_digest,
                       "tier": tier, "group": group, "pairs": len(selected), "unpaired": unpaired if group is None else
                       None, "classes": sorted({label for pair in selected for label in pair[2:]}),
-                      "classMap": "citation-support@2 class map" if instrument_id == "citation-support@2" else
+                      "classMap": "citation-support@2 class map" if instrument_id in SUPPORT_INSTRUMENTS else
                       AGREEMENT_FIELDS.get(instrument_id), "interval": INTERVAL, "b": b, "seed": seed,
                       "scope": list(scope_parts), "replicates": len(kappas),
                       "interpretation": "agreement of two runs of one model: stability, not accuracy"}

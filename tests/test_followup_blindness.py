@@ -34,7 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FOLLOWUP_SOURCES = ("src/ocsl_review/followup_*.py", "src/ocsl_review/citation_function.py",
                     "src/ocsl_review/numeric_check.py", "src/ocsl_review/claim_match.py")
 LAB_TEXT_GLOBS = ("instruments/citation-function/**/*", "instruments/numeric-check/**/*", "instruments/claim-match/**/*",
-                  "skills/ocsl-review-followup-audit/**/*", "docs/followup*.md", "schemas/followup-*.json")
+                  "instruments/citation-support-verbatim/**/*", "skills/ocsl-review-followup-audit/**/*",
+                  "docs/followup*.md", "schemas/followup-*.json")
 FOLLOWUP_TESTS = ("tests/followup_fixtures.py", "tests/fixtures/followup/**/*", "tests/test_followup_*.py")
 FOLLOWUP_GLOBS = FOLLOWUP_SOURCES + LAB_TEXT_GLOBS + FOLLOWUP_TESTS
 # The modules that hold the digest tables and the phrase list themselves.
@@ -589,9 +590,11 @@ class FollowupBlindnessTests(unittest.TestCase):
     def test_the_scans_see_the_follow_up_files_tests_and_fixtures(self):
         names = {str(path.relative_to(ROOT)) for path in files(FOLLOWUP_GLOBS)}
         for required in ("src/ocsl_review/followup_schema.py", "src/ocsl_review/followup_branch.py",
-                         "instruments/citation-function/1/system-prompt.txt", "docs/followup-audit.md",
+                         "instruments/citation-function/1/system-prompt.txt",
+                         "instruments/citation-support-verbatim/1/instrument.json", "docs/followup-audit.md",
                          "skills/ocsl-review-followup-audit/SKILL.md", "schemas/followup-protocol.schema.json",
                          "tests/followup_fixtures.py", "tests/test_followup_pipeline.py",
+                         "tests/test_followup_support_broker.py",
                          "tests/fixtures/followup/README.md", "tests/fixtures/followup/status/retraction-watch-snapshot.csv",
                          "tests/fixtures/followup/tables/synthetic-statistics-tables.json"):
             self.assertIn(required, names)

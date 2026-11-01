@@ -299,8 +299,9 @@ CORE_DICTIONARY: dict[str, dict[str, str]] = {
         "candidate": "1 when the work meets the citing-review minimum", "family_excluded": "1 for an excluded family",
         "selected": "1 when the work enters S2", "model": "test specification version"},
     "fu_support": {
-        "locus_id": "frame locus", "tier": "abstract or full-text", "verdict": "citation-support@2 verdict",
-        "assessable": "1 when the verdict is assessable", "reason": "why not assessable",
+        "locus_id": "frame locus", "tier": "abstract or full-text",
+        "verdict": "support verdict (support-verdict@2 classes)", "assessable": "1 when the verdict is assessable",
+        "reason": "why not assessable",
         "evidence_coverage": "complete, excerpt or missing", "provenance_class": "public or entitled evidence",
         "judgment_id": "fu_judgments row", "evidence_id": "evidence the verdict used", "quote": "first exact quote"},
     "fu_function": {

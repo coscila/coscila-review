@@ -30,6 +30,14 @@ INSTRUMENTS = {
     "match": "claim-match@1",
 }
 FOLLOWUP_INSTRUMENTS = ("citation-function@1", "claim-match@1", "numeric-check@1")
+# The support instruments a protocol may pin (instruments.support): citation-support@2 unchanged, which declares no
+# request settings and runs only on a judge called directly, or its verbatim version, which carries citation-support@2's
+# prompt, output schema, validator and class map with its request settings declared per tier and one item per call, so
+# the run principal's broker can check and send every call unchanged.
+VERBATIM_SUPPORT_INSTRUMENT = "citation-support-verbatim@1"
+SUPPORT_INSTRUMENTS = ("citation-support@2", VERBATIM_SUPPORT_INSTRUMENT)
+# The instruments the broker judge runs: every follow-up instrument that exports verbatim broker bundles.
+BROKER_INSTRUMENTS = (*FOLLOWUP_INSTRUMENTS, VERBATIM_SUPPORT_INSTRUMENT)
 STATUS_RULE = "status-resolution@1"
 DEPENDENCY_RULE = "dependency-aggregation@1"
 NUMERIC_RULE = "numeric-comparison@1"

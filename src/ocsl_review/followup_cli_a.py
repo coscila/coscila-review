@@ -49,7 +49,9 @@ def add_commands(commands: Any, register: Any) -> None:
                                            help="status snapshots to resolve (default: the latest live snapshot and "
                                                 "the latest Retraction Watch import)")
     parsers["support"] = commands.add_parser(
-        "support", help="citation-support@2 verdicts for the frozen strata at one evidence tier")
+        "support", help="support verdicts (the protocol's support instrument: citation-support@2, or "
+                        "citation-support-verbatim@1, which also runs through the broker) for the frozen strata at one "
+                        "evidence tier")
     parsers["support"].add_argument("--tier", required=True, choices=("abstract", "full-text"))
     parsers["support"].add_argument("--store", help="literature-evidence@2 projection read as a byte cache")
     parsers["support"].add_argument("--store-root", help="Merkle root the store must have")

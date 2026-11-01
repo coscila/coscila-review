@@ -1,0 +1,62 @@
+{
+  "id": "citation-support-verbatim@1",
+  "name": "citation-support-verbatim",
+  "version": 1,
+  "status": "active",
+  "description": "citation-support@2 as a verbatim instrument: the same per-locus support judgment (one claim at one citation locus against one cited work, exact quotes from supplied evidence units, explicit escalation) with citation-support@2's prompt, output schema, validator and class map unchanged, and with its request settings declared per tier and one item per call, so that the run principal's broker can check every call against the installed bundle and send it unchanged.",
+  "unit": "claim at one citation locus against one cited work",
+  "files": {
+    "systemPrompt": {"repoPath": "prompts/citation-support-v2.txt", "sha256": "cf075fee7e7aeaad9acd73c25928dcb4f8604fd4c024248983f06e62cab531d6", "mediaType": "text/plain; charset=utf-8"},
+    "outputSchema": {"repoPath": "schemas/corpus-assessment-v2.schema.json", "sha256": "8547779a0ab620cbc74cf6a25bb015be145a3aa939644524146480aa89521b59", "mediaType": "application/schema+json"}
+  },
+  "tiers": {
+    "abstract": {
+      "population": "loci of the frozen follow-up strata",
+      "evidencePolicy": {
+        "evidence": "complete abstract as evidence units",
+        "completeness": "complete abstract required; otherwise blocked",
+        "neverSent": ["identifiers of the cited work", "status of the cited work", "stratum", "provenance class"],
+        "entitledRouting": "on-premises judges only"
+      },
+      "geometry": {"itemsPerCall": 1, "grouping": "locus",
+                   "note": "citation-support@2 requires calibration above one item per call, so every call carries one item"},
+      "request": {"api": "chat.completions", "payload": "JSON items with protocol citation-support-v2",
+                  "temperature": 0.0, "seed": null, "reasoningEffort": "none", "stream": false,
+                  "maxOutputTokens": {"floor": 3000, "perItem": 700, "rule": "max(floor, perItem * items)"},
+                  "timeoutSeconds": 600},
+      "repair": {"passes": 1, "scope": "items without a valid output after the first call"},
+      "transport": {"attempts": 3, "backoffSeconds": [2, 4, 6]}
+    },
+    "full-text": {
+      "population": "loci of the frozen follow-up strata",
+      "evidencePolicy": {
+        "evidence": "supplied full-text units with explicit coverage",
+        "absence": "not-addressed only with complete full-text coverage",
+        "neverSent": ["identifiers of the cited work", "status of the cited work", "stratum", "provenance class"],
+        "entitledRouting": "on-premises judges only"
+      },
+      "geometry": {"itemsPerCall": 1, "grouping": "locus",
+                   "note": "citation-support@2 requires calibration above one item per call, so every call carries one item"},
+      "request": {"api": "chat.completions", "payload": "JSON items with protocol citation-support-v2",
+                  "temperature": 0.0, "seed": null, "reasoningEffort": "low", "stream": false,
+                  "maxOutputTokens": {"floor": 3000, "perItem": 700, "rule": "max(floor, perItem * items)"},
+                  "timeoutSeconds": 600},
+      "repair": {"passes": 1, "scope": "items without a valid output after the first call"},
+      "transport": {"attempts": 3, "backoffSeconds": [2, 4, 6]}
+    }
+  },
+  "requiredModel": {"served": "nvidia/Qwen3.8-Flash-Next-NVFP4", "fingerprint": "record-when-offered", "onMismatch": "pause"},
+  "validator": {"id": "citation-support-v2", "module": "ocsl_review.corpus_assessment",
+                "sha256": "7c6600397dc60e03980966199d991f3df559640d410ad1bfc12d2746a4d7f4cf"},
+  "builder": {"module": "ocsl_review.corpus_assessment",
+              "sha256": "7c6600397dc60e03980966199d991f3df559640d410ad1bfc12d2746a4d7f4cf"},
+  "classMap": {"id": "support-verdict@2",
+               "supported": ["direct-support", "scope-caveat"], "adverse": ["contradicted", "not-addressed"],
+               "uncertain": ["partial-indirect", "abstain"]},
+  "transport": {"messages": "verbatim", "sentBytesRecorded": true},
+  "notes": [
+    "The prompt and output schema are citation-support@2's files under the same digests, the validator and builder are its module (corpus_assessment, pinned here by sha256) and the class map is citation-support@2's; citation-support@2 stays registered unchanged.",
+    "Declared here, where citation-support@2 leaves them to the caller: the request settings of each tier (temperature zero, no seed, reasoning off at the abstract tier and low at the full-text tier, the output-token rule), one item per call, the required served model (another served model pauses the run) and the verbatim message transport. Each tier exports its own broker bundle (ocsl-review instruments export citation-support-verbatim@1 --tier abstract|full-text).",
+    "A change of any setting, the served model included, is another instrument version."
+  ]
+}

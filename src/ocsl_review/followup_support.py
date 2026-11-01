@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""citation-support@2, unchanged, on the loci of the frozen strata at the abstract or the full-text tier.
+"""Support verdicts on the loci of the frozen strata at the abstract or the full-text tier.
+
+The protocol pins the support instrument (``instruments.support``): citation-support@2 itself, which declares no
+request settings (the protocol predeclares its reasoning effort per tier in ``instruments.supportSettings``) and has no
+verbatim bundle, so it runs only on a judge called directly; or citation-support-verbatim@1, which carries
+citation-support@2's prompt, output schema, validator and class map with its request settings declared per tier and
+one item per call, so it also runs through the run principal's broker (``--broker-socket``), each tier under its own
+broker bundle. Both build the same tasks and are read with the same validator and class map.
 
 Evidence per cited work, stored once in the branch (``fu_evidence``, ``fu_evidence_units``):
 
@@ -36,7 +43,7 @@ from .followup_branch import FollowupBranch, now, require_freeze
 from .followup_function import (ReviewDocuments, block_new, check_model, citation_target, cited_work, judgment_state,
                                 provenance_of, reason_of, resolve_marker, sanitize, select_units, sentence_targets)
 from .followup_judge import close_judge, judge_summary, prepare_judge, step_result
-from .followup_model import canonical, digest
+from .followup_model import SUPPORT_INSTRUMENTS, canonical, digest
 from .followup_status import ProviderSession, Recorder, normal_doi, normal_pmid
 
 INSTRUMENT_ID = "citation-support@2"
@@ -64,18 +71,61 @@ def throttle_pause(fetched: Mapping[str, int]) -> dict[str, Any]:
                                          "run the command again to resume"}
 
 
-def support_settings(protocol: Mapping[str, Any] | None, tier: str) -> dict[str, Any]:
-    """The predeclared request settings of citation-support@2 at one tier (``instruments.supportSettings``).
+def support_instrument(protocol: Mapping[str, Any] | None) -> str:
+    """The support instrument the protocol pins (``instruments.support``; citation-support@2 when it names none)."""
+    named = (((protocol or {}).get("instruments") or {}).get("support")) or INSTRUMENT_ID
+    if named not in SUPPORT_INSTRUMENTS:
+        raise ValidationError(f"the protocol pins {named!r} for support; support runs "
+                              + " or ".join(SUPPORT_INSTRUMENTS))
+    return named
+
+
+def declares_settings(instrument: Any, tier: str) -> bool:
+    """Whether the instrument's tier declares its own request settings (a reasoning effort)."""
+    return bool((instrument.tier(tier).get("request") or {}).get("reasoningEffort"))
+
+
+def support_settings(protocol: Mapping[str, Any] | None, tier: str, instrument: Any = None) -> dict[str, Any] | None:
+    """The predeclared request settings of citation-support@2 at one tier (``instruments.supportSettings``), or None
+    for a support instrument that declares its own (citation-support-verbatim@1).
 
     citation-support@2 declares no reasoning effort and must stay unchanged, so the protocol predeclares it: the
-    setting is explicit, frozen with the protocol and recorded with every request body and its settings digest.
+    setting is explicit, frozen with the protocol and recorded with every request body and its settings digest. An
+    instrument that declares its settings per tier takes none from the protocol, and a protocol that declares them
+    for it is refused rather than half applied.
     """
-    settings = ((((protocol or {}).get("instruments") or {}).get("supportSettings") or {}).get(tier))
+    declared = ((protocol or {}).get("instruments") or {}).get("supportSettings")
+    if instrument is not None and declares_settings(instrument, tier):
+        if declared:
+            raise ValidationError(f"{instrument.id} declares its request settings per tier; the protocol's "
+                                  "instruments.supportSettings belongs to citation-support@2 and must be left out")
+        return None
+    settings = (declared or {}).get(tier)
     if not settings or not settings.get("reasoningEffort"):
         raise ValidationError(f"the protocol declares no request settings for citation-support@2 at the {tier} tier "
                               "(instruments.supportSettings with reasoningEffort): the reasoning setting must be "
                               "explicit before any support call")
     return dict(settings)
+
+
+def check_required_model(instrument: Any, model: str) -> None:
+    """An instrument that requires one served model (``requiredModel.onMismatch`` pause, carried in its broker
+    bundles) runs only under a protocol that pins that model."""
+    required = instrument.manifest.get("requiredModel") or {}
+    if required.get("onMismatch") == "pause" and required.get("served") != model:
+        raise ValidationError(f"{instrument.id} requires the served model {required.get('served')!r} (its broker "
+                              f"bundles carry it); the protocol pins {model!r}")
+
+
+def reported_settings(instrument: Any, tier: str, request_settings: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The request settings every support request of the tier carries, and where they come from: the protocol's
+    ``instruments.supportSettings`` for citation-support@2, the instrument's own tier for one that declares them."""
+    from .followup_judge import plan_for
+    plan = plan_for(instrument, tier, request_settings)
+    return {"tier": tier, "reasoningEffort": plan.reasoning_effort, "temperature": plan.temperature,
+            "maxTokens": plan.settings(plan.items_per_call)["max_tokens"], "itemsPerCall": plan.items_per_call,
+            "source": "protocol instruments.supportSettings" if request_settings is not None
+            else f"instrument {instrument.id}"}
 
 
 def make_client(workspace: Path | None = None) -> Any:
@@ -573,8 +623,9 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
     branch.require_text()
     protocol = branch.protocol()
     check_model(model, protocol)
-    instrument = instruments.load(INSTRUMENT_ID)
-    request_settings = support_settings(protocol, tier)
+    instrument = instruments.load(support_instrument(protocol))
+    check_required_model(instrument, model)
+    request_settings = support_settings(protocol, tier, instrument)
     prepare_judge(judge, instrument, tier)
     documents = documents or ReviewDocuments(None)
     everything, _ = select_units(connection, TIER_STRATA[tier])
@@ -655,7 +706,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
             "withheldEntitled": len(items) - len(sendable), "blocked": dict(Counter(code for _, code, _ in blocked)),
             "blockedRecorded": blocks, "evidence": dict(sorted(fetched.items())), "unsent": dict(unsent),
             "contexts": dict(documents.counts), "retrieval": {"k": k, "maxEvidenceCharacters": window},
-            "requestSettings": {"tier": tier, **request_settings, "source": "protocol instruments.supportSettings"},
+            "requestSettings": reported_settings(instrument, tier, request_settings),
             "requests": session.recorder.summary() if session else {}, "run": summary,
             "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge),
             **throttle_pause(fetched)}

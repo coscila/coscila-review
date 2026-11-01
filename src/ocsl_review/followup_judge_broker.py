@@ -15,9 +15,13 @@ repeated call meets the job the broker already holds. As in ``census_runner.exec
 - every other failure (a pause, an outage, a timeout, an upstream error) is a call without a response: its items stay
   open for the runner's further passes.
 
-Only the verbatim follow-up instruments can run here (citation-support@2 declares no verbatim transport). The judge
-is on premises only when ``--on-premises`` is given and the operator's policy lists the broker provider (and model) in
-``onPremBrokerProviders``.
+Only the verbatim follow-up instruments can run here (``followup_model.BROKER_INSTRUMENTS``: citation-function@1,
+numeric-check@1, claim-match@1 and citation-support-verbatim@1, the verbatim version of citation-support@2, which
+itself declares no verbatim transport). A call names the broker bundle of its instrument and tier: the bundle whose
+system prompt is the call's system message and whose settings are the call's (temperature, reasoning effort, seed and
+the output-token rule for the call's items), so the two tiers of citation-support-verbatim@1, which share their
+prompt, are told apart by their reasoning effort. The judge is on premises only when ``--on-premises`` is given and the
+operator's policy lists the broker provider (and model) in ``onPremBrokerProviders``.
 """
 from __future__ import annotations
 
@@ -30,7 +34,7 @@ from . import instruments
 from .census_broker import BrokerTransport, idempotency_key, request_sha256
 from .errors import ConfidentialityError, ReviewError, ValidationError
 from .followup_judge import JudgeReply
-from .followup_model import FOLLOWUP_INSTRUMENTS
+from .followup_model import BROKER_INSTRUMENTS
 
 MISSING_MODEL = "(no model named in the response)"
 REFUSED_STATUS = frozenset({400, 413, 422})
@@ -39,6 +43,28 @@ BROKER_REFUSALS = frozenset({"INSTRUMENT_MESSAGE_MISMATCH", "PRINCIPAL_REQUIRED"
 
 def _count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _items_of(messages: list[dict[str, str]]) -> int:
+    """The number of instrument items a call carries (its user message's ``items``), at least one."""
+    try:
+        return max(1, len(json.loads(messages[-1]["content"]).get("items") or []))
+    except (ValueError, AttributeError, KeyError, TypeError, IndexError):
+        return 1
+
+
+def settings_match(bundle: Mapping[str, Any], settings: Mapping[str, Any], items: int) -> bool:
+    """Whether a call's request settings are the ones the broker sends for ``bundle`` (the execution daemon's verbatim
+    check): temperature and reasoning effort as the bundle's, the seed only when the bundle has one, and max_tokens
+    max(minimum, perItem x items)."""
+    rule = bundle.get("maxOutputTokens") or {}
+    expected = {"temperature": bundle.get("temperature"), "reasoning_effort": bundle.get("reasoning"),
+                "max_tokens": max(int(rule.get("minimum") or 0), int(rule.get("perItem") or 0) * items)}
+    if bundle.get("seed") is not None:
+        expected["seed"] = bundle["seed"]
+    elif settings.get("seed") is not None:
+        return False
+    return all(settings.get(name) == value for name, value in expected.items())
 
 
 class BrokerJudge:
@@ -57,54 +83,82 @@ class BrokerJudge:
         self.host = "broker"
         self.name = f"broker-judge:{getattr(transport, 'worker_id', None) or 'worker'}"
         self.stopped: str | None = None
-        self._bundles: dict[str, Mapping[str, Any]] = {}
+        # The broker bundles the judge knows, by the sha256 of their system prompt and then by broker digest (the two
+        # tiers of an instrument may share one prompt), and the bundles the command prepared and required.
+        self._bundles: dict[str, dict[str, Mapping[str, Any]]] = {}
+        self._prepared: set[str] = set()
         self._required: set[str] = set()
+        self.bundles: dict[str, str] = {}
         self._lock = threading.Lock()
         self._loaded = False
 
     # ------------------------------------------------------------------ bundles
     def _remember(self, exported: Mapping[str, Any]) -> None:
         prompt = exported["bundle"]["systemPrompt"]
-        self._bundles[hashlib.sha256(prompt.encode("utf-8")).hexdigest()] = exported
+        self._bundles.setdefault(hashlib.sha256(prompt.encode("utf-8")).hexdigest(), {})[exported["digest"]] = exported
 
     def _load(self) -> None:
+        """Every tier of every verbatim follow-up instrument (an instrument that does not verify is left out)."""
         if self._loaded:
             return
-        for instrument_id in FOLLOWUP_INSTRUMENTS:
+        for instrument_id in BROKER_INSTRUMENTS:
             try:
-                self._remember(instruments.broker_bundle(instrument_id))
+                tiers = sorted(instruments.load(instrument_id).manifest["tiers"])
             except ValidationError:
                 continue
+            for tier in tiers:
+                try:
+                    self._remember(instruments.broker_bundle(instrument_id, tier=tier))
+                except ValidationError:
+                    continue
         self._loaded = True
 
     def _require(self, exported: Mapping[str, Any]) -> None:
         with self._lock:
             if exported["digest"] in self._required:
                 return
-            self.transport.require({f"{exported['instrumentId']} {exported['tier']}": exported["digest"]},
-                                   model=self.model)
+            label = f"{exported['instrumentId']} {exported['tier']}"
+            self.transport.require({label: exported["digest"]}, model=self.model)
             self._required.add(exported["digest"])
+            self.bundles[label] = exported["digest"]
 
     def prepare(self, instrument: Any, tier: str) -> None:
-        """Before any call: the instrument must export a verbatim bundle, installed and granted on the broker."""
+        """Before any call: the instrument must export a verbatim bundle for the tier, installed and granted on the
+        broker."""
         exported = instruments.broker_bundle(instrument.id, tier=tier)
         with self._lock:
             self._remember(exported)
+            self._prepared.add(exported["digest"])
         self._require(exported)
 
-    def bundle_for(self, messages: list[dict[str, str]]) -> Mapping[str, Any]:
+    def bundle_for(self, messages: list[dict[str, str]],
+                   settings: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        """The broker bundle of a call: its system prompt names the instrument, and where tiers share the prompt the
+        call's settings (``settings_match``), then the tier the command prepared, name the tier. A call whose settings
+        fit no tier still goes out under its instrument's bundle, and the broker refuses it (a fidelity stop)."""
         system = messages[0].get("content") if messages and messages[0].get("role") == "system" else None
         if not isinstance(system, str):
             raise ValidationError("a verbatim instrument call starts with its system prompt")
         key = hashlib.sha256(system.encode("utf-8")).hexdigest()
         with self._lock:
-            if key not in self._bundles:
-                self._load()
-            exported = self._bundles.get(key)
-        if exported is None:
-            raise ValidationError("the broker judge runs only the verbatim follow-up instruments (citation-function@1, "
-                                  "numeric-check@1, claim-match@1); this call's system prompt is none of them")
-        return exported
+            self._load()
+            candidates = list((self._bundles.get(key) or {}).values())
+            prepared = set(self._prepared)
+        if not candidates:
+            raise ValidationError("the broker judge runs only the verbatim follow-up instruments ("
+                                  + ", ".join(BROKER_INSTRUMENTS) + "); this call's system prompt is none of them")
+        if len(candidates) > 1 and settings is not None:
+            items = _items_of(messages)
+            candidates = [exported for exported in candidates
+                          if settings_match(exported["bundle"], settings, items)] or candidates
+        if len(candidates) > 1:
+            candidates = [exported for exported in candidates if exported["digest"] in prepared] or candidates
+        if len(candidates) != 1:
+            raise ValidationError("this call's system prompt and settings fit several broker bundles ("
+                                  + ", ".join(sorted(f"{exported['instrumentId']} {exported['tier']}"
+                                                     for exported in candidates))
+                                  + "): prepare the instrument tier before the first call")
+        return candidates[0]
 
     # ------------------------------------------------------------------ calls
     def _halt(self, reason: str, stop: str) -> None:
@@ -116,16 +170,12 @@ class BrokerJudge:
             halt(reason, code="FIDELITY")
 
     def complete(self, messages: list[dict[str, str]], *, settings: Mapping[str, Any]) -> JudgeReply:
-        exported = self.bundle_for(messages)
+        exported = self.bundle_for(messages, settings)
         self._require(exported)
         payload = {"model": self.model, "messages": messages, **dict(settings)}
         expected = request_sha256(payload)
         item_id = "followup-" + expected[:40]
-        try:
-            count = len(json.loads(messages[-1]["content"]).get("items") or [])
-        except (ValueError, AttributeError, KeyError, TypeError):
-            count = 1
-        outcome = self.transport.call(item_id=item_id, messages=messages, item_count=max(1, count),
+        outcome = self.transport.call(item_id=item_id, messages=messages, item_count=_items_of(messages),
                                       digest=exported["digest"], key=idempotency_key(item_id, expected),
                                       settings={key: value for key, value in payload.items() if key != "messages"},
                                       wait_seconds=self.wait_seconds)

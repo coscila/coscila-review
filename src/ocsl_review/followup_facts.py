@@ -263,7 +263,7 @@ def define_facts(connection: sqlite3.Connection) -> Facts:
         base = f"tier={_q(tier)}"
         counted(f"followup.support.{tier}.units", "fs_support", "units", base, f"{tier} tier: units with a support row")
         counted(f"followup.support.{tier}.assessable", "fs_support", "units", base + " AND assessable=1",
-                f"{tier} tier: units with an assessable citation-support@2 verdict")
+                f"{tier} tier: units with an assessable support verdict")
         for verdict in verdicts:
             counted(f"followup.support.{tier}.verdict.{verdict}", "fs_support", "units",
                     base + f" AND assessable=1 AND verdict={_q(verdict)}", f"{tier} tier: units with verdict {verdict}")

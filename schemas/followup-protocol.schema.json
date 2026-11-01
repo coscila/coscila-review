@@ -109,7 +109,8 @@
     "instruments": {
       "type": "object", "additionalProperties": false, "required": ["support", "function"],
       "properties": {
-        "support": {"const": "citation-support@2"},
+        "support": {"enum": ["citation-support@2", "citation-support-verbatim@1"],
+                    "description": "citation-support@2 runs on a judge called directly with the request settings of supportSettings; citation-support-verbatim@1 carries the same prompt, output schema, validator and class map with its request settings declared per tier and one item per call, and also runs through the run principal's broker"},
         "function": {"const": "citation-function@1"},
         "numeric": {"const": "numeric-check@1"},
         "match": {"const": "claim-match@1"},
@@ -117,13 +118,15 @@
                     "description": "registry digests the run must use, keyed by instrument id; checked before any call"},
         "supportSettings": {
           "type": "object", "additionalProperties": false, "required": ["abstract", "full-text"],
-          "description": "request settings of citation-support@2, which declares none: predeclared here so the reasoning setting of each tier is explicit, frozen and recorded with every request",
+          "description": "request settings of citation-support@2, which declares none: predeclared here so the reasoning setting of each tier is explicit, frozen and recorded with every request; left out with citation-support-verbatim@1, which declares its own",
           "properties": {
             "abstract": {"$ref": "#/$defs/requestSettings"},
             "full-text": {"$ref": "#/$defs/requestSettings"}
           }
         }
-      }
+      },
+      "if": {"properties": {"support": {"const": "citation-support-verbatim@1"}}, "required": ["support"]},
+      "then": {"not": {"required": ["supportSettings"]}}
     },
     "model": {
       "type": "object", "additionalProperties": false, "required": ["served", "location"],
