@@ -383,15 +383,20 @@ HTTP 500 for every PMCID outside its open-access subset; the fetcher checks a
 server error against the PMCID's Europe PMC record, so such a PMCID costs two
 requests and is a definitive miss, while a server error for a PMCID in the
 subset stays transient (`left open by a transient failure`). A PMCID the search
-finds no record of is a miss only after a second check (four requests and a
-backoff); every cited work's PMCID came from a Europe PMC record, so such
-misses should not occur. The `Full texts:` line counts the misses by the
+finds no record of is never a miss on one answer: under the census's rule (its
+search finds no record over at least 60 s while it finds another PMCID the
+fetcher saw in the index; docs/census-instrument.md) it can be one only when a
+later candidate of the same probe run cites the same PMCID a minute or more
+after the first answer. Otherwise it is left open by a transient failure after
+four requests and 7 s of backoff. Every cited work's PMCID came from a Europe
+PMC record, so neither should occur. The `Full texts:` line counts misses by the
 fetcher's reason (`absentNotOpenAccess`, `absentNoRecord`, `absentNotFound` in
 the report's `fullTextInputs.fullTexts`). Fetched full texts are kept in the
 cache directory as Europe PMC served them (`PMC<n>.xml`, mode 0600; a
 definitive miss as `PMC<n>.absent`, holding the reason), so a later run with the
-same `--full-text-cache` fetches nothing it asked for before, except a PMCID
-missed for want of any record, which is never kept and is asked for again. The calls are the census's: five retrieved
+same `--full-text-cache` fetches nothing it asked for before, except candidates
+left transient and a PMCID missed for want of any record, which are never kept
+and are asked for again. The calls are the census's: five retrieved
 entries of one review per call, each review's remainder in its last call
 (`citation_census.full_text_chunks`), built by `census_runner.full_text_call`
 (the windows in the FULL TEXT field, reasoning `low`,
