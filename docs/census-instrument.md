@@ -390,7 +390,19 @@ stratum, year and first-online date and the reason it was not prepared
 result lists them by reason under `settled`, `study status` counts them
 (`inputChecks.reviewsSettledAsNotPrepared`), and the facts count them among the
 unavailable reviews of their journal, never as judged. A settled review was
-never acquired, so the live-route check leaves it out. An exclusion list
+never acquired, so the live-route check leaves it out. Settling is bounded by
+the protocol: `--max-settled-percent P` (only with `--settle-unprepared`) pins
+P, the largest share of the enumerated reviews that may be settled, overall and
+in every journal (a later prepare may repeat it, never change it). `study
+status` reports the settled reviews under `enumeration.settled` (overall, per
+journal with its enumerated reviews and share, per reason, and the pinned
+bound), and `study gates` checks `settledReviewsWithinBound`: nothing settled,
+or a pinned bound that the overall share and every journal's share stay within.
+Settled reviews without a pinned bound fail it. A systematic failure, such as a
+journal acquired without its live route, a prepare not given a cache the
+acquisition used, or Europe PMC unreachable during both abstract passes, then
+stops the gate that checks it instead of completing as an apparently valid
+census. An exclusion list
 written before the run cannot know the fresh population, and `study exclude`
 refuses a review already in the study: a protocol frozen before a fresh
 enumeration names its exclusions as part of its queries, or none.
@@ -448,6 +460,21 @@ ocsl-review study facts --scores results/scores.sqlite3 --output results/facts \
   --journal "$JOURNAL_A" --journal "$JOURNAL_B" --ratio "$JOURNAL_A" "$JOURNAL_B" --bootstrap-seed "$SEED"
 ocsl-review study verify-facts --facts results/facts/facts.json
 ```
+
+`study judge --limit N` judges the next N pending reviews in enumeration
+order; with `--journal LABEL` only reviews of that journal, so a small gate can
+judge some reviews of every journal (one judge step per journal). A journal
+label no review of the study carries is refused. The judge result reports
+`throughput`, the entries per second of the invocation's steady state: from
+the first batch's start to the last batch's start of a pass that had more
+batches than streams (after that the pass drains), each batch's decided
+entries spread over its own duration and counted where it overlaps that window
+(`basis: steady-state`, with the window's `seconds` and the time-weighted
+`entries`). The drain at the end, a slow or hung call (one stream of many while
+it lasts), the cooldown before a further pass and the process start do not
+lower it. A pass with no more batches than streams has no steady state; its
+rate is then its decided entries over the time it had batches in flight
+(`basis: busy`).
 
 Runs are resumable per batch; receipts are written per call, and one process
 writes a database at a time (a lock beside it refuses a second writer). A call
