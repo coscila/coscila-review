@@ -466,6 +466,48 @@ def abstract_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, 
     return C.request_payload(messages, model=model, items=len(items), tier="abstract")
 
 
+def steady_throughput(passes: Sequence[Sequence[tuple[float, float, int]]], streams: int) -> dict[str, Any] | None:
+    """Entries per second of a judge step in its steady state: what a capacity gate measures.
+
+    ``passes`` holds, for each scheduling pass of the step, every batch as (start, end, entries it decided) on one
+    monotonic clock. A pass with more batches than streams ran saturated from its first batch's start until its last
+    batch's start: after that no stream takes new work and the pass drains. That interval is its steady window. Each
+    batch's entries are spread evenly over its own duration and counted where it overlaps the window (a time-weighted
+    rate, as the capacity probe measures it). So neither the drain at the end, nor a single slow or hung call (one
+    stream of many while it lasts), nor the cooldown before a further pass, nor the job's sandbox start and broker
+    checks lower the rate. A step whose passes never saturated (no more batches than streams) has no steady state:
+    its rate is its entries over the time its passes had batches in flight (``basis: busy``). None when nothing was
+    decided.
+    """
+    window_entries = window_seconds = busy_seconds = 0.0
+    busy_entries = batches = 0
+    for timings in passes:
+        if not timings:
+            continue
+        batches += len(timings)
+        first = min(start for start, _, _ in timings)
+        last = max(start for start, _, _ in timings)
+        busy_entries += sum(entries for _, _, entries in timings)
+        busy_seconds += max(end for _, end, _ in timings) - first
+        if len(timings) <= streams or last <= first:
+            continue
+        window_seconds += last - first
+        for start, end, entries in timings:
+            if not entries:
+                continue
+            if end > start:
+                window_entries += entries * max(0.0, min(end, last) - max(start, first)) / (end - start)
+            elif first <= end <= last:
+                window_entries += entries
+    if window_seconds > 0:
+        return {"basis": "steady-state", "entries": round(window_entries, 3), "seconds": round(window_seconds, 3),
+                "entriesPerSecond": round(window_entries / window_seconds, 3), "batches": batches, "streams": streams}
+    if busy_entries > 0 and busy_seconds > 0:
+        return {"basis": "busy", "entries": busy_entries, "seconds": round(busy_seconds, 3),
+                "entriesPerSecond": round(busy_entries / busy_seconds, 3), "batches": batches, "streams": streams}
+    return None
+
+
 def repair_items(batch: Sequence[dict[str, Any]], open_labels: Iterable[str],
                  answered: Iterable[str]) -> list[dict[str, Any]]:
     """The items of a batch's one repair call: the open labels the first call left without a parseable line (every
@@ -479,7 +521,8 @@ class CensusRun:
 
     def __init__(self, database: Path, *, seed: int, transport: Any = None, request_model: str | None = None,
                  concurrency: int = 60, run_id: str | None = None, sleep: Callable[[float], None] = time.sleep,
-                 revision: str | None = None, breaker: int | None = None):
+                 revision: str | None = None, breaker: int | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValidationError("the census protocol seed must be an integer")
         if not 1 <= concurrency <= 1024:
@@ -488,6 +531,8 @@ class CensusRun:
         self.required_model = self.instrument.manifest["requiredModel"]["served"]
         self.request_model = request_model or self.required_model
         self.transport, self.concurrency, self.sleep = transport, concurrency, sleep
+        # The batches' start and end times of the abstract tier (steady_throughput), on one monotonic clock.
+        self.clock = clock
         # Consecutive batches or calls without any response before a pass stops dispatching (an outage).
         self.breaker = breaker or max(4, concurrency)
         self.revision = revision or code_revision()
@@ -1020,6 +1065,7 @@ class CensusRun:
         same call id and request, which meets the broker job that may still hold it). A sensitivity batch is written
         whole when it completes and re-run whole otherwise.
         """
+        started = self.clock()
         open_labels = set(it["label"] for it in batch) if todo is None else set(todo)
         got: dict[str, tuple[dict[str, Any], str, int]] = {}
         failures, drift, responded, answered, stopped = 0, None, False, True, False
@@ -1077,7 +1123,8 @@ class CensusRun:
                 got[label] = (record, call_id, position)
         incomplete = drift is None and not answered and any(label not in got for label in open_labels)
         return {"batch": batch_index, "items": batch, "got": got, "todo": open_labels, "failures": failures,
-                "drift": drift, "incomplete": incomplete, "responded": responded, "stopped": stopped}
+                "drift": drift, "incomplete": incomplete, "responded": responded, "stopped": stopped,
+                "started": started, "ended": self.clock()}
 
     def _write_accepted(self, journal: str, doi: str, batch_index: int, batch: list[dict[str, Any]],
                         accepted: Mapping[str, tuple[dict[str, Any], int]], *, call_id: str, cut: Any, now: str) -> None:
@@ -1167,11 +1214,13 @@ class CensusRun:
                                         (json.dumps(dict(detail), sort_keys=True, ensure_ascii=False),))
 
     def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]], Any, str]]]], *,
-                  cut: Any, variant: str) -> tuple[dict[str, int], str | None, bool]:
+                  cut: Any, variant: str,
+                  timings: list[tuple[float, float, int]] | None = None) -> tuple[dict[str, int], str | None, bool]:
         """Run review batches with at most two batches per stream in flight; write each review when complete.
 
         Returns the totals, the served model of a drift (or None) and whether the breaker stopped the pass
-        after ``self.breaker`` consecutive batches that got no response at all.
+        after ``self.breaker`` consecutive batches that got no response at all. ``timings`` receives every batch's
+        start, end and the entries it decided (accepted, or invalid after its repair call), for steady_throughput.
         """
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "open": 0, "transportFailures": 0}
         pending: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1194,6 +1243,11 @@ class CensusRun:
                 for future in done:
                     key = inflight.pop(future)
                     outcome = future.result()
+                    if timings is not None:
+                        # An incomplete or drifted batch decided only what its answered calls accepted.
+                        decided = (len(outcome["got"]) if outcome["incomplete"] or outcome["drift"] is not None
+                                   else len(outcome["todo"]))
+                        timings.append((outcome["started"], outcome["ended"], decided))
                     totals["transportFailures"] += outcome["failures"]
                     if outcome["drift"] is not None:
                         drift.append(outcome["drift"])
@@ -1288,6 +1342,7 @@ class CensusRun:
         A pass stops early when the breaker trips (consecutive batches without any response). Reviews
         left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
         some are still open, the run pauses with ``paused:transport`` and the next invocation resumes it.
+        The result's ``throughput`` is the invocation's steady-state rate (``steady_throughput``).
         """
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
@@ -1307,9 +1362,11 @@ class CensusRun:
                 yield journal, doi, title or "", batches
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0}
         drift, retries = None, 0
+        passes: list[list[tuple[float, float, int]]] = []
         while True:
             totals["passes"] += 1
-            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary")
+            passes.append([])
+            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary", timings=passes[-1])
             for name in ("accepted", "invalid", "transportFailures"):
                 totals[name] += outcome[name]
             if drift is not None:
@@ -1326,6 +1383,9 @@ class CensusRun:
         with self.lock:
             totals["calls"] = self.connection.execute("SELECT COUNT(*) FROM calls WHERE run_id=? AND tier='abstract'",
                                                       (self.run_id,)).fetchone()[0]
+        # Entries per second in the steady state of this invocation's passes: the rate a capacity gate checks, never
+        # the job's wall time (which also holds the drain, a hung call's tail and the cooldowns between passes).
+        totals["throughput"] = steady_throughput(passes, self.concurrency)
         if drift is None and reviews:
             totals["openReviews"] = len(reviews)
             stopped = self._stopped(totals)
