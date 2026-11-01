@@ -384,9 +384,10 @@ server error against the PMCID's Europe PMC record, so such a PMCID costs two
 requests and is a definitive miss, while a server error for a PMCID in the
 subset stays transient (`left open by a transient failure`). A PMCID the search
 finds no record of is never a miss on one answer: under the census's rule (its
-search finds no record over at least 60 s while it finds another PMCID the
-fetcher saw in the index; docs/census-instrument.md) it can be one only when a
-later candidate of the same probe run cites the same PMCID a minute or more
+search finds no record over at least 60 s, and then one search for it and a
+sentinel, another PMCID the fetcher saw in the index or else PMC2000001, finds
+the sentinel's record only; docs/census-instrument.md) it can be one only when
+a later candidate of the same probe run cites the same PMCID a minute or more
 after the first answer. Otherwise it is left open by a transient failure after
 four requests and 7 s of backoff. Every cited work's PMCID came from a Europe
 PMC record, so neither should occur. The `Full texts:` line counts misses by the
