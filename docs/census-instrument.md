@@ -284,12 +284,26 @@ thread (`--fetch-workers`, 4 by default) spaces its requests 0.4 s apart and
 retries throttling and server errors with backoff. Europe PMC serves
 fullTextXML for its open-access subset only and answers every other PMCID
 (free-to-read articles and author manuscripts included) with HTTP 500, not 404.
-The first server error of a fetch is therefore checked once against Europe
-PMC's record of the PMCID (`PMCID:<id>` on the search `study abstracts` uses,
-JSON, the same User-Agent): a record outside the open-access subset
-(`isOpenAccess` other than `Y`), or no record at all, is a definitive miss; a
-record in the subset (a genuine server error) or a search without a usable
-answer keeps the error transient.
+A server error (and a 401 or 403 from the service's edge, or a 200 without a
+body) is therefore checked against Europe PMC's record of the PMCID
+(`PMCID:<id>` on the search `study abstracts` uses, JSON, the same User-Agent,
+at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
+a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
+without that field, hits that list other PMCIDs only, or a search without a
+usable answer keep the error transient. No record at all (zero hits)
+contradicts the Europe PMC record the PMCID came from, so it concludes nothing
+at first: the record is checked again at the next server error before the last
+attempt, and only a second answer without a record is a definitive miss. A 404,
+a 410 or another client error is Europe PMC's own definitive answer; throttling
+(408, 425, 429), timeouts and dropped connections get no record check. Each
+`study full-text` result counts the escalated entries that invocation closed
+without a window by reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`,
+`noRecord`, `notFound` (404, 410 or another client error), `entitledBlocked`
+and `other` (an unreadable fullTextXML, no live retrieval, a fetcher that names
+no reason). `noRecord` should stay 0, because every PMCID of the census comes
+from a Europe PMC record; a non-zero count points to a fault of Europe PMC's
+search, and `--retry-failed` reopens those entries (with every other
+`fetch-failed` entry).
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
@@ -519,7 +533,8 @@ the next invocation. In the full-text tier, throttled or failed fetches (429,
 server errors of a PMCID Europe PMC lists as open access or whose record could
 not be checked, timeouts, dropped connections) keep their entries open the same
 way; a 404, and a server error for a PMCID outside the open-access subset or
-without a record, is a failed retrieval, and `--retry-failed` reopens those. `replicate`
+without a record in two checks, is a failed retrieval, and `--retry-failed`
+reopens those. `replicate`
 re-runs whole primary batches, unchanged, in a sample stratified by journal and
 first-online year and allocated in proportion to judged entries; its verdicts go
 to the history as variant `replicate`, and the estimands report category and

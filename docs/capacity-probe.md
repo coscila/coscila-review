@@ -379,13 +379,19 @@ then Europe PMC live through the census's own fetcher (`study_cli.europe_pmc_fet
 the census inputs' User-Agent, 0.4 s between a thread's requests, retries with
 backoff), with `--fetch-workers` threads, review by review until
 `--full-text-entries` entries are retrieved. Europe PMC answers fullTextXML with
-HTTP 500 for every PMCID outside its open-access subset; the fetcher checks the
-first server error once against the PMCID's Europe PMC record, so such a PMCID
-costs two requests and is a definitive miss, while a server error for a PMCID
-in the subset stays transient (`left open by a transient failure`). Fetched full
-texts are kept in the cache directory as Europe PMC served them (`PMC<n>.xml`,
-mode 0600; a definitive miss as `PMC<n>.absent`), so a later run with the same
-`--full-text-cache` fetches nothing it asked for before. The calls are the census's: five retrieved
+HTTP 500 for every PMCID outside its open-access subset; the fetcher checks a
+server error against the PMCID's Europe PMC record, so such a PMCID costs two
+requests and is a definitive miss, while a server error for a PMCID in the
+subset stays transient (`left open by a transient failure`). A PMCID the search
+finds no record of is a miss only after a second check (four requests and a
+backoff); every cited work's PMCID came from a Europe PMC record, so such
+misses should not occur. The `Full texts:` line counts the misses by the
+fetcher's reason (`absentNotOpenAccess`, `absentNoRecord`, `absentNotFound` in
+the report's `fullTextInputs.fullTexts`). Fetched full texts are kept in the
+cache directory as Europe PMC served them (`PMC<n>.xml`, mode 0600; a
+definitive miss as `PMC<n>.absent`, holding the reason), so a later run with the
+same `--full-text-cache` fetches nothing it asked for before, except a PMCID
+missed for want of any record, which is never kept and is asked for again. The calls are the census's: five retrieved
 entries of one review per call, each review's remainder in its last call
 (`citation_census.full_text_chunks`), built by `census_runner.full_text_call`
 (the windows in the FULL TEXT field, reasoning `low`,
