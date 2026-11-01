@@ -125,10 +125,15 @@ def gates(database: Path) -> dict[str, Any]:
         pins = instrument_pins(connection)
         replicated = {tuple(row) for row in connection.execute(
             "SELECT DISTINCT instrument_digest, tier FROM fu_judgments WHERE variant='replicate' AND outcome='accepted'")}
-        agreement = set()
-        for (detail,) in connection.execute("SELECT detail_json FROM fu_estimates WHERE estimand='replicate-agreement'"):
-            value = json.loads(detail)
-            agreement.add((value.get("instrumentDigest"), value.get("tier")))
+        agreement, settings = set(), set()
+        for estimand, detail in connection.execute("SELECT DISTINCT estimand, detail_json FROM fu_estimates"):
+            value = json.loads(detail or "{}")
+            if not isinstance(value, dict):
+                continue
+            if estimand == "replicate-agreement":
+                agreement.add((value.get("instrumentDigest"), value.get("tier")))
+            if value.get("b") is not None:
+                settings.add((int(value["b"]), str(value.get("seed"))))
         off_pin = sum(count for instrument_id, digest, count in connection.execute(
             "SELECT instrument_id, instrument_digest, COUNT(*) FROM fu_calls GROUP BY instrument_id, instrument_digest")
             if any(pinned != digest for pinned in pins.get(instrument_id, {}).values()))
@@ -158,6 +163,10 @@ def gates(database: Path) -> dict[str, Any]:
         # The replicate gate (as in the census): agreement with the primary verdicts reported for every replicated
         # instrument and tier (followup estimands writes it).
         checks["replicateAgreementReported"] = replicated <= agreement
+    if settings:
+        # Every estimate with the protocol's predeclared bootstrap replicates and seed (no --b or --bootstrap-seed).
+        declared = json.loads(meta.get("protocol") or "{}").get("bootstrap") or {}
+        checks["bootstrapAsProtocol"] = settings == {(declared.get("b"), str(declared.get("seed")))}
     if not checks["parentComplete"]:
         notes.append("the parent census records an incomplete run (followup init --allow-incomplete-parent)")
     if not responded[0]:

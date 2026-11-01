@@ -195,13 +195,53 @@ class FactsTests(unittest.TestCase):
                 self.assertFalse(text in bundle, "the text is in facts.json")
         with closing(sqlite3.connect((self.output / "facts.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1",
                                      uri=True)) as connection:
-            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM fu_artifacts").fetchone()[0])
-            self.assertEqual(0, connection.execute("SELECT COUNT(*) FROM fu_judgments WHERE verdict_json IS NOT NULL"
-                                                   ).fetchone()[0])
+            tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             inputs = dict(connection.execute("SELECT key, value FROM fact_inputs").fetchall())
+        # aggregates only: no per-locus table, no request or response body, no judgment
+        self.assertFalse(tables & {"fu_frame", "fu_strata", "fu_support", "fu_function", "fu_dependency",
+                                   "fu_numeric", "fu_judgments", "fu_calls", "fu_requests", "fu_artifacts",
+                                   "fu_status_observations", "fu_work_status", "fu_evidence_units",
+                                   "fu_secondgen_matches", "fu_secondgen_sentences", "fu_citedby_edges"})
+        self.assertLessEqual({"fs_support", "fs_calls", "fu_estimates", "fu_coverage", "fu_census_counts",
+                              "fact_inputs"}, tables)
         self.assertEqual(self.branch.meta()["parentSha256"], inputs["parentSha256"])
-        self.assertEqual(("200", "13", "11"), (inputs["bootstrapB"], inputs["bootstrapSeed"], inputs["selectionSeed"]))
+        self.assertEqual(("200", "13", "11", "1"), (inputs["bootstrapB"], inputs["bootstrapSeed"],
+                                                    inputs["selectionSeed"], inputs["bootstrapAsProtocol"]))
         self.assertIn("citation-function@1", json.loads(inputs["instrumentDigests"]))
+
+    def test_inputs_are_recorded_once_and_summaries_name_their_branch_query(self):
+        bundle = json.loads((self.output / "facts.json").read_text(encoding="utf-8"))
+        self.assertFalse([key for key, fact in bundle["facts"].items() if "inputs" in fact])
+        self.assertEqual(self.result["inputs"], bundle["provenance"]["inputs"])
+        self.assertEqual({"b": 200, "seed": "13", "asProtocol": True}, bundle["provenance"]["bootstrap"])
+        derivation = bundle["facts"]["followup.support.abstract.units"]["derivation"]
+        self.assertEqual("fs_support", derivation["summary"])
+        self.assertIn("FROM fu_support GROUP BY", derivation["branchSql"])
+        self.assertEqual("fs_support_strata",
+                         bundle["facts"]["followup.support.full-text.s1.verdict.contradicted"]["derivation"]["summary"])
+
+    def test_the_writing_companion_verifies_the_export(self):
+        from test_corpus_facts import writing_source
+        import importlib
+        import sys
+        source = writing_source()
+        if source is None:
+            self.skipTest("no coscila-writing checkout available")
+        sys.path.insert(0, str(source))
+        self.addCleanup(sys.path.remove, str(source))
+        report = importlib.import_module("ocsl_writing.facts").verify_facts(self.output / "facts.json")
+        self.assertTrue(report["ok"])
+        self.assertEqual(set(self.facts), set(report["facts"]))
+
+    def test_estimates_with_different_bootstrap_settings_are_refused(self):
+        path = self.root / "mixed.sqlite3"
+        path.write_bytes(self.branch.path.read_bytes())
+        mixed = FollowupBranch(path)
+        with mixed.writing() as connection:
+            connection.execute("INSERT INTO fu_estimates VALUES('followup.other.all.all.share', 0.5, 'other', NULL, "
+                               "NULL, 'S1', 1.0, 2.0, 2, ?)", (json.dumps({"b": 50, "seed": 13}),))
+        with self.assertRaisesRegex(ValidationError, "different bootstrap settings"):
+            export_facts(mixed.path, self.root / "mixed-facts", code_revision="synthetic-revision")
 
     def test_the_commands_export_and_verify(self):
         target = self.root / "cli-facts"

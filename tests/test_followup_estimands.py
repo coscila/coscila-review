@@ -233,10 +233,16 @@ class EstimandTests(unittest.TestCase):
         after = self.estimates(self.branch)
         self.assertEqual({key: row for key, row in before.items() if not key.startswith("followup.lag.")},
                          {key: row for key, row in after.items() if not key.startswith("followup.lag.")})
-        followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=120, bootstrap_seed=7))
+        from ocsl_review.followup_cli import gates
+        self.assertTrue(gates(self.branch.path)["checks"]["bootstrapAsProtocol"])
+        overridden = followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=120,
+                                                                      bootstrap_seed=7))
+        self.assertIn("bootstrapOverride", overridden)
         detail = json.loads(self.estimates(self.branch)["followup.compromised-share.all.all.share"]["detail_json"])
         self.assertEqual((120, 7), (detail["b"], detail["seed"]))
+        self.assertFalse(gates(self.branch.path)["checks"]["bootstrapAsProtocol"])
         followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=None, bootstrap_seed=None))
+        self.assertTrue(gates(self.branch.path)["checks"]["bootstrapAsProtocol"])
         with self.assertRaisesRegex(ValidationError, "positive"):
             followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=0, bootstrap_seed=None))
 
