@@ -885,6 +885,7 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertIsNone(fetch("PMC2000001"))
         self.assertEqual(["fullTextXML PMC2000001", "search PMC2000001"], europe_pmc.log)
         self.assertEqual([], sleeps, "a miss is never retried")
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC2000001"))
         search = europe_pmc.requests[1]
         self.assertEqual(
             "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=PMCID%3APMC2000001&format=json"
@@ -892,14 +893,21 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual({"Accept": "application/json", "User-agent": "ocsl-review census inputs"},
                          dict(search.header_items()))
         self.assertNotIn("@", search.full_url + json.dumps(dict(search.header_items())))
-        # No record of the PMCID at all: a miss as well.
+        # No record of the PMCID at all: a miss only when a second check, on the next server error before the last
+        # attempt, finds no record either (the PMCID came from a Europe PMC record).
+        europe_pmc.log.clear()
         self.assertIsNone(fetch("PMC999999999"))
+        self.assertEqual(["fullTextXML PMC999999999", "search PMC999999999"] * 2, europe_pmc.log)
+        self.assertEqual([2.0], sleeps)
+        self.assertEqual("noRecord", fetch.miss_reason("PMC999999999"))
+        sleeps.clear()
         # A PMCID Europe PMC lists as open access: the server error is an outage, retried and then left open.
         europe_pmc.log.clear()
         with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC lists it as open access"):
             fetch("PMC7")
         self.assertEqual(["fullTextXML PMC7", "search PMC7", "fullTextXML PMC7", "fullTextXML PMC7"], europe_pmc.log)
         self.assertEqual([2.0, 5.0], sleeps)
+        self.assertIsNone(fetch.miss_reason("PMC7"))
         # A search that fails concludes nothing: the entry stays open too.
         down = EuropePmcStandIn(server_errors={"PMC2000001"}, search_status=503)
         with self.assertRaisesRegex(RetryableFetch, r"PMC2000001: HTTP 500; its Europe PMC record could not be checked"):
@@ -927,7 +935,8 @@ class RetryableFetchTests(RunnerTestCase):
             "WHERE c.ft_retrieval='fetch-failed' AND c.ft_provenance='unavailable'")})
         self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
         self.assertEqual(sorted(["fullTextXML PMC900005", "fullTextXML PMC900007", "search PMC900007",
-                                 "fullTextXML PMC900015", "search PMC900015"]), sorted(europe_pmc.log))
+                                 "fullTextXML PMC900015", "search PMC900015", "fullTextXML PMC900015",
+                                 "search PMC900015"]), sorted(europe_pmc.log))
 
     def test_a_europe_pmc_outage_keeps_full_text_entries_open(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
@@ -944,6 +953,97 @@ class RetryableFetchTests(RunnerTestCase):
             "SELECT ft_retrieval, COUNT(*) FROM citations WHERE ft_retrieval IS NOT NULL GROUP BY 1"))
         self.assertEqual("pending", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
 
+    def test_a_record_check_that_finds_no_record_once_concludes_nothing(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # The search answers without a record once (an empty or rebuilding index), then with the open-access record:
+        # the server error is an outage, never a miss.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC7"}, records={"PMC7": "Y"}, unlisted_searches=1)
+        sleeps = []
+        with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC lists it as open access"):
+            europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleeps.append)("PMC7")
+        self.assertEqual(["fullTextXML PMC7", "search PMC7", "fullTextXML PMC7", "search PMC7", "fullTextXML PMC7"],
+                         europe_pmc.log)
+        self.assertEqual([2.0, 5.0], sleeps)
+        # Without an attempt left after the first check, one answer without a record leaves the entry open.
+        once = EuropePmcStandIn(server_errors={"PMC999999999"})
+        with self.assertRaisesRegex(RetryableFetch, r"PMC999999999: HTTP 500; Europe PMC's search found no record of "
+                                                    r"it in one check"):
+            europe_pmc_fetcher(spacing=0, attempts=2, opener=once, sleep=lambda seconds: None)("PMC999999999")
+        self.assertEqual(["fullTextXML PMC999999999", "search PMC999999999", "fullTextXML PMC999999999"], once.log)
+        # An outage that clears after such an answer serves the full text.
+        cleared = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
+                                   errors_before_success=1, unlisted_searches=1)
+        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=cleared, sleep=lambda s: None)("PMC7"))
+
+    def test_a_record_check_without_an_open_access_flag_or_a_matching_record_concludes_nothing(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # The PMCID's record carries no isOpenAccess, or the hits list other PMCIDs only: nothing is concluded.
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC8", "PMC9"}, records={"PMC8": None}, foreign_records={"PMC9"})
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        for pmcid in ("PMC8", "PMC9"):
+            with self.assertRaisesRegex(RetryableFetch, pmcid + r": HTTP 500; its Europe PMC record could not be "
+                                                                r"checked"):
+                fetch(pmcid)
+            self.assertIsNone(fetch.miss_reason(pmcid))
+        self.assertEqual(["fullTextXML PMC8", "search PMC8", "fullTextXML PMC8", "fullTextXML PMC8"],
+                         europe_pmc.log[:4], "one inconclusive check per fetch")
+
+    def test_the_record_check_is_paced_and_throttling_gets_none(self):
+        import io
+        import types
+        import urllib.error
+        from unittest import mock
+        from ocsl_review import study_cli
+        clock, requests = [100.0], []
+
+        def sleep(seconds):
+            clock[0] += seconds
+        europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001"})
+
+        def opener(request, timeout=None):
+            requests.append((clock[0], request.full_url))
+            if "PMC3" in request.full_url and request.full_url.endswith("/fullTextXML"):
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b""))
+            return europe_pmc(request, timeout)
+        with mock.patch.object(study_cli, "time", types.SimpleNamespace(monotonic=lambda: clock[0])):
+            fetch = study_cli.europe_pmc_fetcher(spacing=0.4, opener=opener, sleep=sleep)
+            self.assertIsNone(fetch("PMC2000001"))
+            # The record check keeps the census's spacing after the fullTextXML request.
+            (full_text_at, full_text), (search_at, search) = requests
+            self.assertTrue(full_text.endswith("/PMC2000001/fullTextXML") and "/search?" in search)
+            self.assertGreaterEqual(search_at - full_text_at, 0.4)
+            # Throttling gets no record check: three fullTextXML requests, then the entry stays open.
+            requests.clear()
+            with self.assertRaisesRegex(RetryableFetch, r"^PMC3: HTTP 429$"):
+                fetch("PMC3")
+        self.assertEqual(3, len(requests))
+        self.assertFalse(any("/search?" in url for _, url in requests))
+
+    def test_an_edge_refusal_or_an_empty_body_is_checked_against_the_record(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        # A 401 or 403 from the service's edge and a 200 without a body decide nothing on their own: the record
+        # decides, as for a server error. A 404 or 410 is Europe PMC's own definitive answer, without a check.
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"  \n", "PMC6": b""}, records={"PMC3": "N", "PMC4": "Y",
+                                      "PMC5": "N", "PMC6": "Y"}, full_text_status={"PMC3": 403, "PMC4": 401,
+                                                                                   "PMC10": 410})
+        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        self.assertIsNone(fetch("PMC3"))
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC3"))
+        with self.assertRaisesRegex(RetryableFetch, r"PMC4: HTTP 401; Europe PMC lists it as open access"):
+            fetch("PMC4")
+        self.assertIsNone(fetch("PMC5"))
+        self.assertEqual("notOpenAccess", fetch.miss_reason("PMC5"))
+        with self.assertRaisesRegex(RetryableFetch, r"PMC6: HTTP 200 with an empty body; Europe PMC lists it as open "
+                                                    r"access"):
+            fetch("PMC6")
+        europe_pmc.log.clear()
+        self.assertIsNone(fetch("PMC10"))
+        self.assertEqual("notFound", fetch.miss_reason("PMC10"))
+        self.assertIsNone(fetch("PMC11"))
+        # The reason belongs to the thread's last fetch only.
+        self.assertEqual(("notFound", None), (fetch.miss_reason("PMC11"), fetch.miss_reason("PMC10")))
+        self.assertEqual(["fullTextXML PMC10", "fullTextXML PMC11"], europe_pmc.log, "no record check after a 404 or 410")
+
     def rows_of(self, sql, *params):
         with closing(sqlite3.connect(self.database)) as c:
             return [tuple(r) for r in c.execute(sql, params)]
@@ -955,15 +1055,22 @@ EUROPE_PMC_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "europe_pmc
 class EuropePmcStandIn:
     """A urlopen stand-in for Europe PMC, from answers recorded on 2026-11-01 with the census inputs' User-Agent.
 
-    fullTextXML serves ``full_texts``; for ``server_errors`` it answers HTTP 500 with the recorded body (Europe PMC's
-    answer for every PMCID outside its open-access subset, also during an outage); anything else is a 404. The search
-    answers ``PMCID:<id>`` with the recorded lite record, its ``isOpenAccess`` from ``records``, and the recorded
-    zero-hit answer for a PMCID without a record; ``search_status`` makes the search itself fail.
+    fullTextXML serves ``full_texts`` (an empty one is a 200 without a body); for ``server_errors`` it answers HTTP
+    500 with the recorded body (Europe PMC's answer for every PMCID outside its open-access subset, also during an
+    outage), for ``full_text_status`` that status, and anything else is a 404. The recorded 500 body is the one
+    served for a JSON Accept header; for the census's ``Accept: application/xml`` Europe PMC sends an empty 500 body,
+    and the fetcher reads neither. The search answers ``PMCID:<id>`` with the recorded lite record, its
+    ``isOpenAccess`` from ``records`` (None: a record without the field), the recorded zero-hit answer for a PMCID
+    without a record and for the first ``unlisted_searches`` searches, and for ``foreign_records`` a hit that lists
+    another PMCID only; ``search_status`` makes the search itself fail.
     """
 
-    def __init__(self, *, full_texts=None, server_errors=(), records=None, search_status=200, errors_before_success=None):
+    def __init__(self, *, full_texts=None, server_errors=(), records=None, search_status=200, errors_before_success=None,
+                 unlisted_searches=0, foreign_records=(), full_text_status=None):
         self.full_texts, self.server_errors, self.records = dict(full_texts or {}), set(server_errors), dict(records or {})
         self.search_status, self.errors_left = search_status, errors_before_success
+        self.unlisted_left, self.foreign = unlisted_searches, set(foreign_records)
+        self.full_text_status = dict(full_text_status or {})
         self.requests, self.log = [], []
         self.lock = threading.Lock()
 
@@ -984,6 +1091,8 @@ class EuropePmcStandIn:
             if failing:
                 body = (EUROPE_PMC_FIXTURES / "fulltextxml-500-not-open-access.json").read_bytes()
                 raise urllib.error.HTTPError(url, 500, "Internal Server Error", {}, io.BytesIO(body))
+            if pmcid in self.full_text_status:
+                raise urllib.error.HTTPError(url, self.full_text_status[pmcid], "Refused", {}, io.BytesIO(b""))
             if pmcid in self.full_texts:
                 return EuropePmcResponse(self.full_texts[pmcid])
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b""))
@@ -993,12 +1102,16 @@ class EuropePmcStandIn:
             self.log.append("search " + pmcid)
         if self.search_status != 200:
             raise urllib.error.HTTPError(url, self.search_status, "Service Unavailable", {}, io.BytesIO(b""))
-        if pmcid not in self.records and pmcid != "PMC2000001":
+        with self.lock:
+            unlisted, self.unlisted_left = self.unlisted_left > 0, max(0, self.unlisted_left - 1)
+        if unlisted or (pmcid not in self.records and pmcid not in self.foreign and pmcid != "PMC2000001"):
             return EuropePmcResponse((EUROPE_PMC_FIXTURES / "search-pmcid-no-record.json").read_bytes())
         answer = json.loads((EUROPE_PMC_FIXTURES / "search-pmcid-not-open-access.json").read_bytes())
         record = answer["resultList"]["result"][0]
-        record["pmcid"] = pmcid
+        record["pmcid"] = "PMC1" if pmcid in self.foreign else pmcid
         record["isOpenAccess"] = self.records.get(pmcid, record["isOpenAccess"])
+        if record["isOpenAccess"] is None:
+            del record["isOpenAccess"]
         return EuropePmcResponse(json.dumps(answer).encode())
 
 
