@@ -10,11 +10,13 @@ instrument (``followup_numeric``), so a table source can change without a new in
 
 Table values are never part of an item. A parse is checked against the sentence it comes from: valueText and the
 quote occur exactly, the quote contains valueText, and the condition (unless "all"), the geography and the year are
-written in the sentence (case aside), so a parse cannot carry a figure, place or year the sentence does not state.
+written in the sentence (case aside), so a parse cannot carry a figure, place or year the sentence does not state;
+valueText must state a number (a digit or an ordinal word), otherwise the item is sent again in the repair pass.
 """
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
@@ -26,6 +28,7 @@ TIER = "claim"
 DECISIONS = ("parsed", "not-epidemiological", "abstain")
 METRICS = ("incidence-count", "incidence-rate", "mortality-count", "mortality-rate", "prevalence", "survival", "rank",
            "trend", "other")
+ORDINAL_WORDS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
 FIELDS = ("id", "marker", "citingSentence", "citedWork")
 REQUIRED = ("id", "marker", "citingSentence", "citedWork")
 PARSED_FIELDS = ("condition", "metric", "geography", "valueText", "unit", "quote")
@@ -70,6 +73,8 @@ def _rules(item: Mapping[str, Any], output: Mapping[str, Any]) -> None:
     sentence = str(item.get("citingSentence", ""))
     if output["valueText"] not in sentence:
         raise ItemError("invalid_value", "valueText is absent from the citing sentence", retryable=True)
+    if not states_number(output["valueText"]):
+        raise ItemError("invalid_value", "valueText states no number (digits or an ordinal word)", retryable=True)
     if output["condition"].strip().casefold() != "all" and not _written(output["condition"], sentence):
         raise ItemError("invalid_parse", "the condition is neither written in the sentence nor all", retryable=True)
     if output["geography"].strip() and not _written(output["geography"], sentence):
@@ -79,6 +84,12 @@ def _rules(item: Mapping[str, Any], output: Mapping[str, Any]) -> None:
     followup_items.require_quote(item, output, allowed=("citingSentence",), field_key=None)
     if output["valueText"] not in output["quote"]:
         raise ItemError("invalid_quote", "the quote must contain valueText", retryable=True)
+
+
+def states_number(text: Any) -> bool:
+    """A valueText states a number when it holds a digit or is an ordinal word (first to tenth)."""
+    value = str(text or "").strip()
+    return re.search(r"\d", value) is not None or value.casefold() in ORDINAL_WORDS
 
 
 def _written(value: str, sentence: str) -> bool:

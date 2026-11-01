@@ -12,15 +12,23 @@ the provenance class of the citing text for routing; table values, status, strat
 Entitled sentences reach only on-premises judges (``followup_judge.run_items`` refuses otherwise); a redacted sentence
 without the private text copy is recorded as ``text-redacted`` and never sent.
 
-``numeric-comparison@1`` normalises valueText to a number with its stated precision (thousands separators, decimal
-comma, thousand / million / billion, percent, ordinals) and maps condition, metric and geography through the source's
-versioned synonym lists, then classifies in order: not epidemiological -> ``non-epidemiological``; abstained ->
-unassessable ``abstained``; the cited work is no report of the source -> unassessable ``no-matching-table``; no cells
-for the cited edition -> unassessable ``table-unavailable``; a valueText the rule cannot read -> unassessable
-``invalid-output``; a cell of the cited edition for the claimed condition, metric, geography and year whose value,
-rounded to the claim's precision, equals the claim -> ``consistent``; the value of a cell of the cited edition for
-another geography -> ``wrong-geography``; the claimed statistic in a cell of another edition -> ``wrong-edition``;
-otherwise ``number-absent-or-different``.
+``numeric-comparison@1`` reads valueText as one number with its stated precision (thousands separators, decimal
+comma, thousand / million / billion, percent, a rate base "per 100,000", ordinals); percent, scale and rate base may
+also come from the parsed unit. The stated precision is the place of the last significant digit as written: every
+written decimal counts, and in a whole number without a decimal mark trailing zeros do not (so "1,200,000" is compared
+at hundreds of thousands and "40" at tens). A valueText with numeric content the rule does not read (a range such as
+"2-3 million", a ratio such as "1 in 8" or "1/3", a second number) is never read as its first number. Condition, metric
+and geography are mapped through the source's versioned synonym lists, then the rule classifies in order: not
+epidemiological -> ``non-epidemiological``; abstained -> unassessable ``abstained``; the cited work is no report of the
+source -> unassessable ``no-matching-table``; no cells for the cited edition -> unassessable ``table-unavailable``; a
+valueText without a number -> unassessable ``invalid-output``; numeric content the rule does not read -> unassessable
+``unsupported-value-form``; a cell of the cited edition for the claimed condition, metric, geography and year whose
+value, rounded to the claim's precision, equals the claim -> ``consistent``; the value of a cell of the cited edition
+for another geography -> ``wrong-geography``; the claimed statistic in a cell of another edition -> ``wrong-edition``;
+a cell for the claimed statistic exists in the cited edition but its value differs -> ``number-absent-or-different``;
+no cell of the source holds the claimed condition, metric, geography and year at all (an unmapped label, a metric the
+tables do not carry such as other or trend) -> unassessable ``no-matching-cell``: a failure to compare is never an
+adverse finding.
 """
 from __future__ import annotations
 
@@ -44,30 +52,38 @@ from .followup_strata import protocol_of, replicate_keys
 RULE = NUMERIC_RULE
 TIER = numeric_check.TIER
 SCALES = {"thousand": 3, "million": 6, "billion": 9}
-ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
-            "ninth": 9, "tenth": 10}
-_SPACES = str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2007": " ", "−": "-", "–": "-"})
+ORDINALS = {word: number for number, word in enumerate(numeric_check.ORDINAL_WORDS, 1)}
+_SPACES = str.maketrans({"\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2007": " ", "−": "-", "–": "-",
+                         "—": "-"})
 _NUMBER = re.compile(r"(?<![\w.,])(-?)(\d(?:[\d,.]|\s(?=\d{3}(?!\d)))*)")
 _ORDINAL_DIGITS = re.compile(r"^\s*(\d+)(?:st|nd|rd|th)\b", re.IGNORECASE)
+_SCALE = re.compile(r"\s*(thousand|million|billion)s?\b")
+_PERCENT = re.compile(r"\s*(?:%|percent\b|per cent\b)")
+_PER = re.compile(r"\s*per\s+(\d(?:[\d,.]|\s(?=\d{3}(?!\d)))*)(?:\s*(thousand|million|billion)s?\b)?")
+UNSUPPORTED = "unsupported-form"
+NO_NUMBER = "no-number"
 
 
 # ----------------------------------------------------------------------------- numbers
 @dataclass(frozen=True)
 class ClaimValue:
-    """A claimed number: mantissa as written, its decimals (stated precision), a power-of-ten scale and percent."""
+    """A claimed number: mantissa as written, its stated precision as decimals (negative when trailing zeros of a
+    whole number are not significant), a power-of-ten scale, percent and a rate base ("per 100,000")."""
     mantissa: Decimal
     decimals: int
     exponent: int = 0
     percent: bool = False
+    per: Decimal | None = None
 
     @property
     def value(self) -> float:
         return float(self.mantissa.scaleb(self.exponent))
 
     def matches(self, cell_value: float, cell_unit: str = "") -> bool:
-        """The cell's value, rounded to the claim's stated precision, equals the claimed number (percent to percent)."""
-        exponent, percent = cell_scale(cell_unit)
-        if percent != self.percent:
+        """The cell's value, rounded to the claim's stated precision, equals the claimed number (percent to percent,
+        a rate to a rate with the same base)."""
+        exponent, percent, per = cell_units(cell_unit)
+        if percent != self.percent or (self.per is not None and per != self.per):
             return False
         absolute = Decimal(repr(float(cell_value))).scaleb(exponent)
         quantum = Decimal(1).scaleb(-self.decimals)
@@ -75,8 +91,11 @@ class ClaimValue:
             quantum, ROUND_HALF_UP)
 
     def record(self) -> dict[str, Any]:
-        return {"mantissa": str(self.mantissa), "decimals": self.decimals, "exponent": self.exponent,
-                "percent": self.percent, "value": self.value}
+        value = {"mantissa": str(self.mantissa), "decimals": self.decimals, "exponent": self.exponent,
+                 "percent": self.percent, "value": self.value}
+        if self.per is not None:
+            value["per"] = str(self.per)
+        return value
 
 
 def _digits(token: str) -> tuple[str, int] | None:
@@ -111,46 +130,102 @@ def _digits(token: str) -> tuple[str, int] | None:
     return (whole + ("." + fraction if fraction else "")), len(fraction)
 
 
-def normalize_value(text: Any) -> ClaimValue | None:
-    """The number a valueText states, or None.
+def _significant(digits: str, decimals: int) -> int:
+    """The stated precision of a number as written: its decimals, or for a whole number without a decimal mark minus
+    the count of its trailing zeros (significant figures: "1200000" is stated to hundreds of thousands)."""
+    if decimals or "." in digits:
+        return decimals
+    whole = digits.lstrip("-")
+    stripped = whole.rstrip("0")
+    return -(len(whole) - len(stripped)) if stripped else 0
+
+
+def _per_base(text: str) -> Decimal | None:
+    match = _PER.fullmatch(text)
+    if not match:
+        return None
+    parsed = _digits(match.group(1))
+    if parsed is None:
+        return None
+    return Decimal(parsed[0]).scaleb(SCALES[match.group(2)] if match.group(2) else 0)
+
+
+def read_value(text: Any, unit: Any = "") -> tuple[ClaimValue | None, str | None]:
+    """(the number a valueText states, None) or (None, why not): ``no-number`` or ``unsupported-form``.
 
     Thousands separators are commas, points (more than one) or spaces between groups of three digits; one comma
     followed by exactly three digits separates thousands, any other single comma is a decimal comma; with both marks the
     later one is the decimal mark. "thousand", "million" and "billion" scale the number; "%", "percent" or "per cent"
-    mark a percentage; "first" to "tenth" and "1st", "2nd", ... are ranks. The stated precision is the number of
-    decimals as written.
+    mark a percentage; "per 100,000" is a rate base; "first" to "tenth" and "1st", "2nd", ... are ranks. The parsed
+    unit supplies percent, scale and rate base when valueText states none. The stated precision is the place of the
+    last significant digit as written (``_significant``). Numeric content after the number that the rule does not
+    read (a range, a ratio, a second number) makes the form unsupported: the first number alone is never the claim.
     """
     value = str(text or "").translate(_SPACES).strip()
     folded = value.casefold()
+    unit_exponent, unit_percent, unit_per = cell_units(unit)
     if folded in ORDINALS:
-        return ClaimValue(Decimal(ORDINALS[folded]), 0)
+        return ClaimValue(Decimal(ORDINALS[folded]), 0), None
     ordinal = _ORDINAL_DIGITS.match(value)
     if ordinal:
-        return ClaimValue(Decimal(int(ordinal.group(1))), 0)
+        if re.search(r"\d", value[ordinal.end():]):
+            return None, UNSUPPORTED
+        return ClaimValue(Decimal(int(ordinal.group(1))), 0), None
     match = _NUMBER.search(value)
     if not match:
-        return None
+        return None, NO_NUMBER
     parsed = _digits(match.group(2))
     if parsed is None:
-        return None
+        return None, UNSUPPORTED
     digits, decimals = parsed
     rest = value[match.end():].casefold()
-    exponent = 0
-    scale = re.match(r"\s*(thousand|million|billion)s?\b", rest)
+    exponent = None
+    scale = _SCALE.match(rest)
     if scale:
         exponent = SCALES[scale.group(1)]
         rest = rest[scale.end():]
-    percent = bool(re.match(r"\s*(?:%|percent\b|per cent\b)", rest))
+    percent = bool(_PERCENT.match(rest))
+    if percent:
+        rest = rest[_PERCENT.match(rest).end():]
+    per = None
+    tail = re.match(r"\s*per\s+\d", rest)
+    if tail:
+        end = _PER.match(rest)
+        per = _per_base(rest[:end.end()]) if end else None
+        if per is None:
+            return None, UNSUPPORTED
+        rest = rest[end.end():]
+    if re.search(r"\d", rest):
+        return None, UNSUPPORTED
     mantissa = Decimal(("-" if match.group(1) else "") + digits)
-    return ClaimValue(mantissa, decimals, exponent, percent)
+    return ClaimValue(mantissa, _significant(digits, decimals), unit_exponent if exponent is None else exponent,
+                      percent or unit_percent, per if per is not None else unit_per), None
 
 
-def cell_scale(unit: Any) -> tuple[int, bool]:
-    """(power-of-ten scale, percent) a cell's unit declares: "thousand deaths" scales by 10^3, "percent" is a share."""
+def normalize_value(text: Any, unit: Any = "") -> ClaimValue | None:
+    """The number a valueText states, or None when it states none or a form the rule does not read (``read_value``)."""
+    return read_value(text, unit)[0]
+
+
+def cell_units(unit: Any) -> tuple[int, bool, Decimal | None]:
+    """(power-of-ten scale, percent, rate base) a unit declares: "thousand deaths" scales by 10^3, "percent" is a
+    share, "per 100,000 population" is a rate per 100,000."""
     folded = followup_tables.fold(unit)
     scale = re.match(r"(thousand|million|billion)s?\b", folded)
     percent = folded in ("%", "percent", "per cent") or "percent" in folded.split() or folded.startswith("%")
-    return (SCALES[scale.group(1)] if scale else 0), percent
+    base = re.search(r"\bper\s+(\d(?:[\d,.]|\s(?=\d{3}(?!\d)))*)(?:\s*(thousand|million|billion)s?\b)?", folded)
+    per = None
+    if base:
+        parsed = _digits(base.group(1))
+        if parsed is not None:
+            per = Decimal(parsed[0]).scaleb(SCALES[base.group(2)] if base.group(2) else 0)
+    return (SCALES[scale.group(1)] if scale else 0), percent, per
+
+
+def cell_scale(unit: Any) -> tuple[int, bool]:
+    """(power-of-ten scale, percent) a cell's unit declares (``cell_units`` without the rate base)."""
+    exponent, percent, _ = cell_units(unit)
+    return exponent, percent
 
 
 # ----------------------------------------------------------------------------- comparison
@@ -178,9 +253,9 @@ def compare(output: Mapping[str, Any], work: WorkRef, source: Any) -> dict[str, 
     cited = list(source.cells(report, edition)) if edition else []
     if not cited:
         return _unassessable("table-unavailable")
-    claim = normalize_value(output["valueText"])
+    claim, problem = read_value(output["valueText"], output.get("unit"))
     if claim is None:
-        return _unassessable("invalid-output")
+        return _unassessable("invalid-output" if problem == NO_NUMBER else "unsupported-value-form")
     condition = source.canonical("condition", output["condition"])
     metric = source.canonical("metric", output["metric"])
     geography = source.canonical("geography", output["geography"]) if (output["geography"] or "").strip() else None
@@ -203,12 +278,17 @@ def compare(output: Mapping[str, Any], work: WorkRef, source: Any) -> dict[str, 
                    for cell in source.cells(report, other) if same(cell, when=False) and claim.matches(cell.value,
                                                                                                        cell.unit)]
         verdict = "wrong-edition"
+    record = {"rule": RULE, "report": report, "edition": edition, "claim": claim.record(),
+              "labels": {"condition": condition, "metric": metric, "geography": geography, "year": year},
+              "synonyms": source.describe().get("synonyms")}
+    if not matched and not identity:
+        # No cell holds the claimed statistic: the rule could not compare, which is never an adverse finding.
+        return {"class": None, "assessable": 0, "reason": "no-matching-cell", "value": claim.value,
+                "matched": {**record, "cells": []}}
     if not matched:
         matched, verdict = identity, "number-absent-or-different"
     return {"class": verdict, "assessable": 1, "reason": None, "value": claim.value,
-            "matched": {"rule": RULE, "report": report, "edition": edition, "claim": claim.record(),
-                        "cells": [_cell_record(cell) for cell in matched],
-                        "synonyms": source.describe().get("synonyms")}}
+            "matched": {**record, "cells": [_cell_record(cell) for cell in matched]}}
 
 
 # ----------------------------------------------------------------------------- licensing

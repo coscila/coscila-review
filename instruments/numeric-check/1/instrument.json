@@ -79,7 +79,7 @@
   "validator": {
     "id": "numeric-check-items@1",
     "module": "ocsl_review.numeric_check",
-    "sha256": "16950b1f7708cd4f1063e15fe95e8b9be7a5ea056df8d62088bc4696fe123e96"
+    "sha256": "2e6a8740b4529591927e170629b91306b81e1aec0a6269bab3038ad426b22ab0"
   },
   "builder": {
     "module": "ocsl_review.followup_items"

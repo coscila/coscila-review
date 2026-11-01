@@ -54,7 +54,7 @@ JUDGMENT_OUTCOMES = ("accepted", "rejected", "blocked")
 # goes into the coverage tables and never into a numerator as "unsupported".
 UNASSESSABLE = ("no-citing-text", "text-redacted", "identity-unresolved", "fetch-failed", "no-open-full-text",
                 "abstract-incomplete", "abstained", "invalid-output", "not-judged", "excluded-by-protocol",
-                "table-unavailable", "no-matching-table")
+                "table-unavailable", "no-matching-table", "no-matching-cell", "unsupported-value-form")
 
 
 def _in(column: str, values: Iterable[str], *, nullable: bool = False) -> str:

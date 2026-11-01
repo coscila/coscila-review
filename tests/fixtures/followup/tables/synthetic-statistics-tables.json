@@ -48,7 +48,7 @@
        "metric": "incidence-rate",
        "geography": "Exampleland",
        "year": 2018,
-       "value": 38.0,
+       "value": 34.0,
        "unit": "per population unit",
        "locator": "table 2"
       },

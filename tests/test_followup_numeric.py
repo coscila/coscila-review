@@ -70,14 +70,16 @@ def numeric_protocol(**s3):
 class NumberTests(unittest.TestCase):
     def test_value_text_is_normalised_with_its_stated_precision(self):
         cases = {
-            "12.5 thousand": ClaimValue(Decimal("12.5"), 1, 3), "12,500": ClaimValue(Decimal("12500"), 0),
-            "12 500": ClaimValue(Decimal("12500"), 0), "12\u00a0500": ClaimValue(Decimal("12500"), 0),
+            "12.5 thousand": ClaimValue(Decimal("12.5"), 1, 3), "12,500": ClaimValue(Decimal("12500"), -2),
+            "12 500": ClaimValue(Decimal("12500"), -2), "12\u00a0500": ClaimValue(Decimal("12500"), -2),
             "3,4 %": ClaimValue(Decimal("3.4"), 1, 0, True), "1.234,5": ClaimValue(Decimal("1234.5"), 1),
             "1,234.5": ClaimValue(Decimal("1234.5"), 1), "0.125": ClaimValue(Decimal("0.125"), 3),
             "1.234.567": ClaimValue(Decimal("1234567"), 0), "1.5 billion": ClaimValue(Decimal("1.5"), 1, 9),
             "2 millions": ClaimValue(Decimal("2"), 0, 6), "64.5%": ClaimValue(Decimal("64.5"), 1, 0, True),
             "18 per cent": ClaimValue(Decimal("18"), 0, 0, True), "−2.5 percent": ClaimValue(Decimal("-2.5"), 1, 0, True),
-            "second": ClaimValue(Decimal(2), 0), "3rd": ClaimValue(Decimal(3), 0), "about 40,": ClaimValue(Decimal(40), 0),
+            "second": ClaimValue(Decimal(2), 0), "3rd": ClaimValue(Decimal(3), 0), "about 40,": ClaimValue(Decimal(40), -1),
+            "1,200,000": ClaimValue(Decimal("1200000"), -5), "40.0": ClaimValue(Decimal("40.0"), 1),
+            "0": ClaimValue(Decimal(0), 0), "12.3 per 100,000": ClaimValue(Decimal("12.3"), 1, 0, False, Decimal(100000)),
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
@@ -87,14 +89,46 @@ class NumberTests(unittest.TestCase):
                 self.assertIsNone(normalize_value(text))
         self.assertEqual(12500.0, normalize_value("12.5 thousand").value)
 
+    def test_forms_the_rule_does_not_read_are_never_read_as_their_first_number(self):
+        for text in ("2-3 million", "2\u20133 million", "1 in 8", "1/3", "2 to 3 million", "in 2019, 12,500",
+                     "between 2 and 3 million", "3rd of 5"):
+            with self.subTest(text=text):
+                self.assertEqual((None, "unsupported-form"), followup_numeric.read_value(text))
+        for text in ("about", "", "most"):
+            with self.subTest(text=text):
+                self.assertEqual((None, "no-number"), followup_numeric.read_value(text))
+
+    def test_percent_scale_and_rate_base_may_come_from_the_parsed_unit(self):
+        self.assertEqual(ClaimValue(Decimal("64.5"), 1, 0, True), normalize_value("64.5", "%"))
+        self.assertTrue(normalize_value("64.5", "%").matches(64.5, "percent"))
+        self.assertTrue(normalize_value("64.5", "per cent").matches(64.5, "%"))
+        self.assertTrue(normalize_value("1.8", "million cases").matches(1.8, "million cases"))
+        self.assertTrue(normalize_value("1.8", "million cases").matches(1834000, "cases"))
+        rate = normalize_value("12.3", "per 100,000 population")
+        self.assertEqual(Decimal(100000), rate.per)
+        self.assertTrue(rate.matches(12.31, "per 100 000"))
+        self.assertFalse(rate.matches(12.31, "per 1,000,000"))
+        self.assertFalse(rate.matches(12.31, "cases"))
+        self.assertTrue(normalize_value("12.3 per 100,000").matches(12.3, "per 100,000 person-years"))
+
     def test_rounding_to_the_claimed_precision(self):
         claim = normalize_value("12.5 thousand")
         for value, expected in ((12500, True), (12460, True), (12549, True), (12551, False), (12449, False)):
             with self.subTest(value=value):
                 self.assertEqual(expected, claim.matches(value, "deaths"))
-        self.assertFalse(normalize_value("40").matches(38.0))
+        # A whole number's trailing zeros are not significant: "40" is stated to tens, "40.0" to tenths.
+        self.assertTrue(normalize_value("40").matches(38.0))
+        self.assertFalse(normalize_value("40").matches(34.0))
+        self.assertFalse(normalize_value("40.0").matches(38.0))
         self.assertTrue(normalize_value("40").matches(40.0))
         self.assertTrue(normalize_value("38").matches(38.4))
+        self.assertTrue(normalize_value("1,200,000").matches(1234567))
+        self.assertTrue(normalize_value("1,230,000").matches(1234567))
+        self.assertFalse(normalize_value("1,240,000").matches(1234567))
+        self.assertTrue(normalize_value("1.2 million").matches(1234567))
+        self.assertTrue(normalize_value("about 41,000").matches(41267))
+        self.assertTrue(normalize_value("41,300").matches(41267))
+        self.assertFalse(normalize_value("41,200").matches(41267))
         self.assertTrue(normalize_value("12,500").matches(12.5, "thousand deaths"))
         self.assertFalse(normalize_value("64.5%").matches(64.5, "deaths"))
         self.assertTrue(normalize_value("64.5%").matches(64.5, "percent"))
@@ -130,7 +164,27 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual("consistent", self.classify(parse("64.5%", metric="survival", unit="%",
                                                            geography="Republic of Exampleland"))["class"])
         self.assertEqual("consistent", self.classify(parse("12.5 thousand", geography=""))["class"])
-        self.assertEqual("number-absent-or-different", self.classify(parse("12.5 thousand", year=2018))["class"])
+        self.assertEqual("consistent", self.classify(parse("10,000"))["class"])
+        self.assertEqual("number-absent-or-different", self.classify(parse("12,600"))["class"])
+
+    def test_a_failure_to_compare_is_never_an_adverse_class(self):
+        """No cell of the source holds the claimed statistic (an unmapped label, a metric the tables do not carry, a
+        year without a row), or the value has a form the rule does not read: unassessable, never number-absent."""
+        cases = {
+            "no-matching-cell": (parse("12.5 thousand", metric="other"), parse("12.5 thousand", metric="trend"),
+                                 parse("12,500", condition="all malignant diseases"),
+                                 parse("12.5 thousand", year=2018)),
+            "unsupported-value-form": (parse("12-13 thousand"), parse("1 in 8"), parse("1/3")),
+        }
+        for reason, outputs in cases.items():
+            for output in outputs:
+                with self.subTest(reason=reason, output=output["valueText"], metric=output["metric"]):
+                    result = self.classify(output)
+                    self.assertEqual((None, 0, reason), (result["class"], result["assessable"], result["reason"]))
+        missing = self.classify(parse("12.5 thousand", metric="other"))
+        self.assertEqual(([], "other"), (missing["matched"]["cells"], missing["matched"]["labels"]["metric"]))
+        # A unit-only percent reaches a percent cell.
+        self.assertEqual("consistent", self.classify(parse("64.5", metric="survival", unit="%"))["class"])
 
     def test_unassessable_comparisons_keep_their_reason(self):
         cases = {
@@ -215,7 +269,7 @@ class NumericCommandTests(unittest.TestCase):
             for item in json.loads(body)["items"]:
                 self.assertEqual({"id", "marker", "citingSentence", "citedWork"}, set(item))
                 self.assertEqual({"title", "year"}, set(item["citedWork"]))
-            for table_value in ("7300", "38.0", "12500", "40.0", "Otherland", "table 1"):
+            for table_value in ("7300", "34.0", "12500", "40.0", "Otherland", "table 1"):
                 self.assertNotIn(table_value, body)
         with closing(branch.connect()) as connection:
             dataset = connection.execute("SELECT kind, sha256 FROM fu_datasets WHERE dataset_id=?",
@@ -395,6 +449,14 @@ class InstrumentRuleTests(unittest.TestCase):
             with self.subTest(field=field):
                 result = numeric_check.validate_response([item], json.dumps({"items": [output]}))
                 self.assertEqual("invalid_parse", result["rejected"]["locus-3"]["code"])
+        # A valueText that states no number is sent again in the repair pass, never accepted.
+        for text in ("about", "deaths"):
+            output = {**good, "valueText": text}
+            with self.subTest(valueText=text):
+                result = numeric_check.validate_response([item], json.dumps({"items": [output]}))
+                self.assertEqual(("invalid_value", True), (result["rejected"]["locus-3"]["code"],
+                                                           result["rejected"]["locus-3"]["retryable"]))
+        self.assertTrue(numeric_check.states_number("second"))
         self.assertEqual({"epidemiological": 1, "condition": "disease", "metric": "mortality-count",
                           "geography": "Exampleland", "value_text": "12.5 thousand", "unit": "deaths",
                           "quote": "caused 12.5 thousand deaths", "year": 2019}, numeric_check.parse_fields(good))
