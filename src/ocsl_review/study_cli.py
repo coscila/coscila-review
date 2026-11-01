@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import json
 import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import closing
 from pathlib import Path
@@ -27,6 +29,8 @@ from typing import Any
 from .errors import ValidationError
 
 EUROPE_PMC_FULL_TEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/%s/fullTextXML"
+# The search the census's abstracts step uses; the full-text fetcher asks it for one PMCID's record after a server error.
+EUROPE_PMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 
 
 def add_commands(families, register):
@@ -235,38 +239,120 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
                        opener: Any = None, sleep: Any = time.sleep):
     """Fetch fullTextXML by PMCID; each fetching thread pauses ``spacing`` seconds between its requests.
 
-    A 404 or another definitive client error means there is no open-access full text (None). Throttling
-    (429), server errors, timeouts and dropped connections are retried with backoff and then raise
-    ``RetryableFetch``, so the entry stays open for the next run instead of becoming a failed retrieval.
+    A 404, a 410 or another definitive client error means there is no open-access full text (None). Europe PMC serves
+    fullTextXML for its open-access subset only and answers every other PMCID (free-to-read articles and author
+    manuscripts included) with HTTP 500, not 404. So a server error (and a 401 or 403 from the service's edge, or a
+    200 with an empty body) is checked against Europe PMC's own record of the PMCID (``PMCID:<id>`` on the search
+    the census's abstracts step uses), at the census's spacing:
+
+    - a record whose ``isOpenAccess`` is ``N`` (outside the open-access subset) is a definitive miss (None);
+    - a record whose ``isOpenAccess`` is ``Y`` makes the error an outage, retried with backoff;
+    - an answer that concludes nothing (a failed or unreadable search, hits without the PMCID, a matching record
+      without ``isOpenAccess`` Y or N) leaves the error transient;
+    - no record at all (hitCount 0) contradicts the record the PMCID came from, so it concludes nothing either: the
+      record is checked again on the next server error before the last attempt, and only a second answer without a
+      record makes the PMCID a definitive miss.
+
+    Throttling (408, 425, 429), timeouts and dropped connections get no record check. Whatever stays undecided
+    after the last attempt raises ``RetryableFetch``, so the entry stays open for the next pass instead of becoming
+    a failed retrieval. After a definitive miss ``fetch.miss_reason(pmcid)`` names why in the fetching thread
+    (``census_runner.FULL_TEXT_MISS_REASONS``: notFound, notOpenAccess, noRecord), so the census counts its entries
+    without a full text by reason. Every request names the census inputs' User-Agent and asks for XML (the record
+    check for JSON); it carries identifiers only (no contact address, no credentials, no cookies), as the census's
+    other Europe PMC requests do.
     """
+    from .census_inputs import USER_AGENT
     from .census_runner import RetryableFetch
     state = threading.local()
+    headers = {"Accept": "application/xml", "User-Agent": USER_AGENT}
+    search_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    notes = {"open-access": "; Europe PMC lists it as open access",
+             "no-record": "; Europe PMC's search found no record of it in one check",
+             None: "; its Europe PMC record could not be checked"}
+
+    def pace() -> None:
+        wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
+        if wait > 0:
+            sleep(wait)
+        state.last = time.monotonic()
+
+    def record_of(pmcid: str) -> str | None:
+        """Europe PMC's record of ``pmcid``: "open-access" or "not-open-access" when a matching record says
+        ``isOpenAccess`` Y (any of them) or N (all of them), "no-record" when the search found nothing (hitCount 0),
+        and None when the answer concludes nothing."""
+        pace()
+        query = urllib.parse.urlencode({"query": f"PMCID:{pmcid}", "format": "json", "resultType": "lite",
+                                        "pageSize": 5})
+        request = urllib.request.Request(EUROPE_PMC_SEARCH + "?" + query, headers=search_headers)
+        try:
+            with (opener or urllib.request.urlopen)(request, timeout=90) as response:
+                if getattr(response, "status", 200) != 200:
+                    return None
+                answer = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+            return None
+        listing = answer.get("resultList") if isinstance(answer, dict) else None
+        results = listing.get("result") if isinstance(listing, dict) else None
+        if not isinstance(results, list) or not isinstance(answer.get("hitCount"), int):
+            return None
+        records = [record for record in results
+                   if isinstance(record, dict) and str(record.get("pmcid") or "").upper() == pmcid.upper()]
+        if not records:
+            return "no-record" if answer["hitCount"] == 0 and not results else None
+        flags = {record.get("isOpenAccess") for record in records}
+        if "Y" in flags:
+            return "open-access"
+        return "not-open-access" if flags == {"N"} else None
+
+    def miss(pmcid: str, reason: str) -> None:
+        state.miss = (pmcid, reason)
+        return None
 
     def fetch(pmcid: str) -> bytes | None:
-        error = "no attempt"
-        for attempt in range(max(1, attempts)):
-            wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
-            if wait > 0:
-                sleep(wait)
-            state.last = time.monotonic()
+        state.miss = None
+        error, note, checks, unlisted = "no attempt", "", 0, False
+        tries = max(1, attempts)
+        for attempt in range(tries):
+            last = attempt + 1 >= tries
+            pace()
+            request = urllib.request.Request(EUROPE_PMC_FULL_TEXT % pmcid, headers=headers)
+            status, body = None, b""
             try:
-                with (opener or urllib.request.urlopen)(EUROPE_PMC_FULL_TEXT % pmcid, timeout=90) as response:
+                with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     body = response.read()
                     status = getattr(response, "status", 200)
-                if status == 200:
-                    return body if body.strip() else None
-                if status in (404, 410):
-                    return None
-                error = f"HTTP {status}"
             except urllib.error.HTTPError as failure:
-                if failure.code in (404, 410) or (400 <= failure.code < 500 and failure.code not in (408, 425, 429)):
-                    return None
-                error = f"HTTP {failure.code}"
+                status = failure.code
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as failure:
                 error = type(failure).__name__
-            if attempt + 1 < attempts:
+            if status == 200 and body.strip():
+                return body
+            if status is not None:
+                error = "HTTP 200 with an empty body" if status == 200 else f"HTTP {status}"
+                if 400 <= status < 500 and status not in (401, 403, 408, 425, 429):
+                    return miss(pmcid, "notFound")
+                checkable = status == 200 or status in (401, 403) or 500 <= status < 600
+                if checkable and (checks == 0 or (unlisted and not last)):
+                    # A PMCID outside the open-access subset gets a server error, not 404: Europe PMC's record decides
+                    # whether this is a miss or an outage; no record at all decides only when a second check agrees.
+                    checks += 1
+                    listed = record_of(pmcid)
+                    if listed == "not-open-access":
+                        return miss(pmcid, "notOpenAccess")
+                    if listed == "no-record" and unlisted:
+                        return miss(pmcid, "noRecord")
+                    unlisted = listed == "no-record"
+                    note = notes.get(listed, notes[None])
+            if not last:
                 sleep(backoff[min(attempt, len(backoff) - 1)])
-        raise RetryableFetch(f"{pmcid}: {error}")
+        raise RetryableFetch(f"{pmcid}: {error}{note}")
+
+    def miss_reason(pmcid: str) -> str | None:
+        """Why this thread's last fetch of ``pmcid`` found no open-access full text, or None."""
+        last = getattr(state, "miss", None)
+        return last[1] if last and last[0] == pmcid else None
+
+    fetch.miss_reason = miss_reason
     return fetch
 
 

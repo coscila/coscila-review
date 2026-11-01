@@ -134,7 +134,8 @@ every cited work the abstract of one provider, Europe PMC `resultType=core`, 40
 DOIs per query with a PMID fallback, and records the outcome per work
 (`europePmcOutcome`: `europe-pmc-core`, `europe-pmc-core-pmid`,
 `europe-pmc-no-abstract`, `europe-pmc-no-hit`, `europe-pmc-failed`,
-`no-identifier`); requests carry identifiers only. A Europe PMC abstract
+`no-identifier`); requests carry identifiers only and name the census inputs'
+User-Agent. A Europe PMC abstract
 replaces whatever a work carried; where Europe PMC definitively has none, an
 abstract supplied from another provider is kept as a recorded fallback
 (`abstractSource` `fallback:<provider>`, outside the Europe-PMC-only ladder).
@@ -277,7 +278,32 @@ retrieval a cache hit only stands in for a download the run makes for every
 escalated work (`liveRetrieval` in the source's provenance record). Only Europe
 PMC documents are candidates. Each escalated entry records `ft_provenance`: the
 class of the source behind its window, or `unavailable` when no window was
-sent.
+sent. Live fullTextXML requests name the census inputs' User-Agent and ask for
+XML; like every other census request they carry identifiers only. Each fetch
+thread (`--fetch-workers`, 4 by default) spaces its requests 0.4 s apart and
+retries throttling and server errors with backoff. Europe PMC serves
+fullTextXML for its open-access subset only and answers every other PMCID
+(free-to-read articles and author manuscripts included) with HTTP 500, not 404.
+A server error (and a 401 or 403 from the service's edge, or a 200 without a
+body) is therefore checked against Europe PMC's record of the PMCID
+(`PMCID:<id>` on the search `study abstracts` uses, JSON, the same User-Agent,
+at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
+a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
+without that field, hits that list other PMCIDs only, or a search without a
+usable answer keep the error transient. No record at all (zero hits)
+contradicts the Europe PMC record the PMCID came from, so it concludes nothing
+at first: the record is checked again at the next server error before the last
+attempt, and only a second answer without a record is a definitive miss. A 404,
+a 410 or another client error is Europe PMC's own definitive answer; throttling
+(408, 425, 429), timeouts and dropped connections get no record check. Each
+`study full-text` result counts the escalated entries that invocation closed
+without a window by reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`,
+`noRecord`, `notFound` (404, 410 or another client error), `entitledBlocked`
+and `other` (an unreadable fullTextXML, no live retrieval, a fetcher that names
+no reason). `noRecord` should stay 0, because every PMCID of the census comes
+from a Europe PMC record; a non-zero count points to a fault of Europe PMC's
+search, and `--retry-failed` reopens those entries (with every other
+`fetch-failed` entry).
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
@@ -438,7 +464,11 @@ report, and nothing of the stored manifest enters the study.
 Before a census commits to a concurrency, `ocsl-review capacity probe` measures
 the entries per second the judge sustains with this instrument's own requests
 over synthetic entries, and whether the judge serves other clients
-([capacity probe](capacity-probe.md)).
+([capacity probe](capacity-probe.md)). `capacity probe --tier full-text`
+measures the full-text tier with its own calls over real loci from the study's
+literature-evidence@2 store: the share of entries without a parseable verdict
+(the full-text tier has no repair pass), tokens per entry and entries per
+second.
 
 ```bash
 ocsl-review study acquire --input inputs/manifest.jsonl --output inputs/reviews.jsonl --store "$STORE" \
@@ -500,8 +530,11 @@ batches get no response at all, the pass stops dispatching; open entries are
 retried in further passes after a growing cooldown (`--transport-retries`,
 `--transport-cooldown`), and the run then pauses as `paused:transport` until
 the next invocation. In the full-text tier, throttled or failed fetches (429,
-server errors, timeouts, dropped connections) keep their entries open the same
-way; a 404 is a failed retrieval, and `--retry-failed` reopens those. `replicate`
+server errors of a PMCID Europe PMC lists as open access or whose record could
+not be checked, timeouts, dropped connections) keep their entries open the same
+way; a 404, and a server error for a PMCID outside the open-access subset or
+without a record in two checks, is a failed retrieval, and `--retry-failed`
+reopens those. `replicate`
 re-runs whole primary batches, unchanged, in a sample stratified by journal and
 first-online year and allocated in proportion to judged entries; its verdicts go
 to the history as variant `replicate`, and the estimands report category and

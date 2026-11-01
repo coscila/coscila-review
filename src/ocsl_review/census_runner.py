@@ -119,6 +119,16 @@ class RetryableFetch(ReviewError):
     """A full-text fetch failed transiently (throttling, server error, timeout); the entry stays open."""
 
 
+# Why a full-text fetcher found no open-access full text (study_cli.europe_pmc_fetcher's ``miss_reason``): Europe PMC
+# answered fullTextXML with 404, 410 or another definitive client error; its record of the PMCID says the work is
+# outside the open-access subset; or two record checks found no record of the PMCID at all.
+FULL_TEXT_MISS_REASONS = ("notFound", "notOpenAccess", "noRecord")
+# Escalated entries one full-text invocation closed without a window, by reason (``withoutFullText`` of its result):
+# the cited work has no PMCID; the fetcher's reasons above; entitled text for a judge that is not on premises; any
+# other failed retrieval (an unreadable fullTextXML, no live retrieval, a fetcher that names no reason).
+WITHOUT_FULL_TEXT = ("noPmcid", *FULL_TEXT_MISS_REASONS, "entitledBlocked", "other")
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -466,6 +476,18 @@ def abstract_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, 
     return C.request_payload(messages, model=model, items=len(items), tier="abstract")
 
 
+def full_text_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, model: str) -> dict[str, Any]:
+    """The request of one full-text call, as the census sends it.
+
+    ``items`` are up to the tier's five retrieved entries of one review (a review's last call carries its remainder),
+    each with its claim-targeted window in the FULL TEXT field; reasoning effort and ``max_tokens`` come from the
+    instrument's full-text tier. citation-census@1 has no repair pass at this tier. ``ocsl-review capacity probe
+    --tier full-text`` builds its calls here too, so the shares it measures are those of the census's own requests.
+    """
+    messages = C.build_full_text_messages(items, title, journal)
+    return C.request_payload(messages, model=model, items=len(items), tier="full-text")
+
+
 def steady_throughput(passes: Sequence[Sequence[tuple[float, float, int]]], streams: int) -> dict[str, Any] | None:
     """Entries per second of a judge step in its steady state: what a capacity gate measures.
 
@@ -538,6 +560,8 @@ class CensusRun:
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
         self.input_caches: Any = None
+        # Escalated entries closed without a full text by the current full-text invocation, by WITHOUT_FULL_TEXT reason.
+        self._without_full_text: dict[str, int] = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
         self._fidelity: list[str] = []
         self._digests: dict[tuple[str, str], str] = {}
         self._writer = writer_lock(Path(database))
@@ -1409,9 +1433,9 @@ class CensusRun:
 
     # ------------------------------------------------------------------ full-text tier
     def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
-                  cache=None) -> tuple[str | None, str, str | None, str, str]:
-        """Full text of a cited work: (text, outcome, source, provenance class, provenance label), cached per identity
-        version.
+                  cache=None) -> tuple[str | None, str, str | None, str, str, str | None]:
+        """Full text of a cited work: (text, outcome, source, provenance class, provenance label, the WITHOUT_FULL_TEXT
+        reason when there is none), cached per identity version.
 
         A study's byte caches (``cache``) are asked first; their Europe PMC fullTextXML is accepted only with its
         digest verified and its PMCID or DOI confirmed. Where the source came from is recorded once per source
@@ -1425,8 +1449,8 @@ class CensusRun:
                 "AND e.text IS NOT NULL AND e.route='source' ORDER BY e.evidence_id LIMIT 1",
                 (work["work_key"], work["identity_version"])).fetchone()
         if cached:
-            return cached[0], "cache", cached[1], cached[2], cached[3] or "supplied"
-        text = raw = source = None
+            return cached[0], "cache", cached[1], cached[2], cached[3] or "supplied", None
+        text = raw = source = miss = None
         provenance, label, detail, rejected = "public", "unavailable", {}, []
         pmcid = None
         if work.get("pmcid"):
@@ -1445,7 +1469,10 @@ class CensusRun:
                 fetched = fetch_xml(pmcid)
             except RetryableFetch:
                 # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
-                return None, "retry", None, provenance, "unavailable"
+                return None, "retry", None, provenance, "unavailable", None
+            if not fetched:
+                reason_of = getattr(fetch_xml, "miss_reason", None)
+                miss = reason_of(pmcid) if callable(reason_of) else None
             if fetched:
                 try:
                     text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
@@ -1461,7 +1488,10 @@ class CensusRun:
                 source, provenance = "entitled", "entitled"
                 label, detail = "live-entitled", {"provider": "entitled", "retrievedAt": utc_now()}
         if text is None:
-            return None, "no-pmcid" if not work.get("pmcid") else "fetch-failed", None, provenance, "unavailable"
+            if not work.get("pmcid"):
+                return None, "no-pmcid", None, provenance, "unavailable", "noPmcid"
+            return (None, "fetch-failed", None, provenance, "unavailable",
+                    miss if miss in FULL_TEXT_MISS_REASONS else "other")
         evidence_id = "src-" + sha256_text(canonical([work["work_key"], work["identity_version"], sha256_text(text)]))[:32]
         raw_sha = hashlib.sha256(raw).hexdigest() if raw else None
         # Whether the run retrieved escalated works live as well: a cache hit then stands in for its own download.
@@ -1474,7 +1504,7 @@ class CensusRun:
                 evidence_id, work["work_key"], work["identity_version"], "full-text", sha256_text(text), source, "source",
                 provenance, utc_now(), len(text), raw_sha, text))
             self.connection.execute(f"INSERT OR IGNORE INTO input_provenance VALUES({PROVENANCE_MARKS})", item)
-        return text, source, source, provenance, label
+        return text, source, source, provenance, label, None
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
                        allow_entitled: bool, cache=None) -> tuple[str, str, str, list[dict[str, Any]], int]:
@@ -1483,18 +1513,20 @@ class CensusRun:
         retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
-            text, outcome, source, provenance, label = self._retrieve(work, fetch_xml, entitled, cache)
+            text, outcome, source, provenance, label, miss = self._retrieve(work, fetch_xml, entitled, cache)
             if outcome == "retry":
                 retry += 1
                 continue
             if text is not None and provenance == "entitled" and not allow_entitled:
-                text, outcome = None, "entitled-blocked"
+                text, outcome, miss = None, "entitled-blocked", "entitledBlocked"
             if text is None:
                 # No window reaches the judge: the entry's full-text provenance is unavailable.
                 with self.lock, self.connection:
                     self.connection.execute(
                         "UPDATE citations SET ft_retrieval=?, ft_provenance='unavailable' WHERE journal=? AND doi=? AND label=?",
                         (outcome, journal, doi, row["label"]))
+                    reason = miss if miss in self._without_full_text else "other"
+                    self._without_full_text[reason] += 1
                 continue
             with self.lock:
                 passages = [{"sentence": r["sentence"], "section": r["section"]}
@@ -1513,6 +1545,19 @@ class CensusRun:
                                          "label": label}})
         return doi, journal, title, retrieved, retry
 
+    def prepare_full_text_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]],
+                                fetch_xml: Callable[[str], bytes | None] | None, *, cache: Any = None
+                                ) -> tuple[str, str, str, list[dict[str, Any]], int]:
+        """Retrieval and windows of one review's full-text entries, exactly as the tier prepares them, without judging.
+
+        ``group`` holds citation rows (journal, doi, label, cited_work_key, title) of one review in the tier's order;
+        each work's full text comes from the byte caches first, then ``fetch_xml`` (public sources only: no entitled
+        route), and every retrieved entry carries its claim-targeted window. Returns (doi, journal, title, retrieved
+        entries, entries left open by a transient fetch failure). ``ocsl-review capacity probe --tier full-text``
+        prepares its calls here.
+        """
+        return self._prepare_group(doi, group, works, fetch_xml, None, False, cache)
+
     def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]],
                          call_id: str | None = None) -> dict[str, Any]:
         """One full-text call; its entries are written with its receipt. ``call_id`` replays a pending broker call.
@@ -1524,8 +1569,7 @@ class CensusRun:
         if self._stop_reason():
             return {**outcome, "skipped": True}
         labels = [it["label"] for it in items]
-        messages = C.build_full_text_messages(items, title, journal)
-        payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
+        payload = full_text_call(items, title, journal, model=self.request_model)
         call_id = call_id or self._call_id(journal, doi, "full-text", "primary", index, "full-text", labels=labels)
         result = self._call(payload, tier="full-text", journal=journal, doi=doi, variant="primary", batch=index,
                             kind="full-text", items=len(items), call_id=call_id, pending=items)
@@ -1653,7 +1697,9 @@ class CensusRun:
         """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair.
 
         Entries whose fetch failed transiently or whose call got no response stay open and are retried in
-        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``.
+        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``. The result's
+        ``withoutFullText`` counts the entries this invocation closed without a window, by WITHOUT_FULL_TEXT reason;
+        ``noRecord`` should stay 0, because every PMCID of the census came from a Europe PMC record.
         ``cache`` (census_inputs.InputCaches) is asked before Europe PMC for each work's fullTextXML, and only with
         ``fetch_xml``: a cached full text stands in for a download the run makes for every escalated work, so the
         works earlier runs happened to fetch never decide which entries get a window.
@@ -1676,6 +1722,8 @@ class CensusRun:
         self._resume()
         totals = {"escalated": 0, "retrieved": 0, "calls": 0, "judged": 0, "missing": 0, "transportFailures": 0,
                   "fetchRetries": 0, "passes": 0, "replayed": 0}
+        with self.lock:
+            self._without_full_text = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
         drift, retries, still_open = None, 0, 0
         touched: set[tuple[str, str]] = set()
         while True:
@@ -1688,6 +1736,8 @@ class CensusRun:
                 break
             retries += 1
             self.sleep(cooldown * 2 ** (retries - 1))
+        with self.lock:
+            totals["withoutFullText"] = dict(self._without_full_text)
         with self.lock, self.connection:
             for journal, doi in sorted(touched):
                 scores_db.aggregate_reviews(self.connection, journal, doi)
