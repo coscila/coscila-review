@@ -233,6 +233,26 @@ class FactsTests(unittest.TestCase):
         self.assertTrue(report["ok"])
         self.assertEqual(set(self.facts), set(report["facts"]))
 
+    def test_the_follow_up_postflight_hashes_each_snapshot_once_and_refuses_tampering(self):
+        from ocsl_review.followup_facts import verify_facts_export
+        report = verify_facts_export(self.output / "facts.json")
+        self.assertEqual((True, len(self.facts), 1), (report["ok"], report["facts"], report["snapshots"]))
+        bundle = json.loads((self.output / "facts.json").read_text(encoding="utf-8"))
+        key = next(iter(bundle["facts"]))
+        for name, change in (("value", lambda fact: fact.update(value=-1)),
+                             ("sha", lambda fact: fact["source"].update(sha256="0" * 64)),
+                             ("write", lambda fact: fact.update(sql="DELETE FROM fs_totals"))):
+            mutated = json.loads(json.dumps(bundle))
+            change(mutated["facts"][key])
+            path = self.output / f"mutated-{name}.json"
+            path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.subTest(mutation=name), self.assertRaises(ValidationError):
+                verify_facts_export(path)
+        with closing(sqlite3.connect((self.output / "facts.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1",
+                                     uri=True)) as connection:
+            rows, details = connection.execute("SELECT COUNT(*), COUNT(DISTINCT detail_id) FROM fu_estimates").fetchone()
+        self.assertLessEqual(details, rows)
+
     def test_estimates_with_different_bootstrap_settings_are_refused(self):
         path = self.root / "mixed.sqlite3"
         path.write_bytes(self.branch.path.read_bytes())

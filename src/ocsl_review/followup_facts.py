@@ -7,8 +7,9 @@ and verifying a fact (which hashes the file) stays cheap:
 - per-family summaries of the branch (``fs_*``): status rows and observations, frame and strata counts, support,
   function, dependency, numeric, cited-by, second-generation, judge-call, judgment and provider-request counts, each a
   GROUP BY over the branch table it names (the branch SQL is in each fact's derivation);
-- the estimates and coverage of the analysis commands (``fu_estimates``, ``fu_coverage``), the stratum sizes, the
-  protocol freeze and the dataset versions;
+- the estimates and coverage of the analysis commands (``fu_estimates``, with the derivation a cell's statistics share
+  stored once in ``fu_estimate_details``; ``fu_coverage``), the stratum sizes, the protocol freeze and the dataset
+  versions;
 - materialized tables of the parent census: ``fu_census_counts`` (per journal, year and status, the parent's in-body
   identity-resolved loci, the denominator of the compromised share; ``no-status-row`` for a work without a status row)
   and ``fu_census_flags`` (the parent's retraction flag against the resolved status of every cited work, a diagnostic,
@@ -22,10 +23,12 @@ sha256 and the code revision; the inputs are recorded once, in the provenance. K
 (status, census, strata, support, function, dependency, numeric, citedby, secondgen, calls, requests, estimates from
 ``fu_estimates`` with their ``followup.`` key placed under ``followup.estimates.``, coverage from ``fu_coverage``).
 The estimates must share one bootstrap setting: an export over estimates computed with different replicates or seeds
-is refused. ``followup verify-facts`` checks an export with ``corpus_facts.verify_export``.
+is refused. ``followup verify-facts`` checks an export with the postflight of ``corpus_facts.verify_export``, each
+snapshot hashed once (``verify_facts_export``).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,7 +39,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from . import scores_db
-from .corpus_facts import FACT_KEY, slug, verify_export
+from .corpus_facts import FACT_KEY, slug
 from .errors import ValidationError
 from .followup_branch import FollowupBranch
 from .followup_schema import (CITEDBY_SOURCES, DEPENDENCY_CLASSES, FUNCTION_CLASSES, MATCH_CLASSES, NUMERIC_CLASSES,
@@ -95,7 +98,9 @@ SUMMARIES: tuple[tuple[str, str, str], ...] = (
      "SELECT provider, outcome, COUNT(*) FROM fu_requests GROUP BY 1, 2"),
 )
 # Branch tables copied as they are: aggregates and versions, no per-locus rows and no text of a review or a work.
-COPIED = ("fu_estimates", "fu_coverage", "fu_stratum_sizes", "fu_protocol_freeze", "fu_datasets")
+# fu_estimates is copied with its derivations stored once (fu_estimate_details): a cell's share, interval and counts
+# share one derivation.
+COPIED = ("fu_coverage", "fu_stratum_sizes", "fu_protocol_freeze", "fu_datasets")
 
 
 def _q(value: Any) -> str:
@@ -363,8 +368,9 @@ def define_facts(connection: sqlite3.Connection) -> Facts:
                 f"provider={_q(provider)} AND outcome={_q(outcome)}", f"provider requests to {provider} with outcome "
                 f"{outcome}")
     # estimates and coverage of the analysis commands
-    for key, estimand, detail in _distinct(connection, "SELECT key, estimand, detail_json FROM fu_estimates "
-                                                       "ORDER BY key"):
+    for key, estimand, detail in _distinct(connection, "SELECT e.key, e.estimand, d.detail_json FROM fu_estimates e "
+                                                       "JOIN fu_estimate_details d ON d.detail_id=e.detail_id "
+                                                       "ORDER BY e.key"):
         fact = estimate_fact(key)
         try:
             derivation = json.loads(detail) if detail else None
@@ -423,6 +429,12 @@ def export_facts(database: Path, output: Path, *, code_revision: str | None = No
         copies = [(connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
                                       (table,)).fetchone()[0],
                    table, [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]) for table in COPIED]
+        estimates, details = [], {}
+        for row in connection.execute("SELECT key, value, estimand, journal, year, stratum, numerator, denominator, "
+                                      "units, detail_json FROM fu_estimates ORDER BY key"):
+            detail_id = hashlib.sha256((row[9] or "").encode("utf-8")).hexdigest()[:16]
+            details[detail_id] = row[9]
+            estimates.append((*tuple(row)[:9], detail_id))
     output.mkdir(parents=True, exist_ok=True)
     branch_sha = scores_db.file_sha256(branch.path)
     revision = code_revision or _revision()
@@ -445,6 +457,12 @@ def export_facts(database: Path, output: Path, *, code_revision: str | None = No
             closed.execute(create)
             if rows:
                 closed.executemany(f"INSERT INTO {table} VALUES({','.join('?' for _ in rows[0])})", rows)
+        closed.execute("CREATE TABLE fu_estimate_details(detail_id TEXT PRIMARY KEY, detail_json TEXT NOT NULL)")
+        closed.executemany("INSERT INTO fu_estimate_details VALUES(?,?)", sorted(details.items()))
+        closed.execute("CREATE TABLE fu_estimates(key TEXT PRIMARY KEY, value NOT NULL, estimand TEXT NOT NULL, "
+                       "journal TEXT, year INTEGER, stratum TEXT, numerator REAL, denominator REAL, units INTEGER, "
+                       "detail_id TEXT NOT NULL REFERENCES fu_estimate_details(detail_id))")
+        closed.executemany("INSERT INTO fu_estimates VALUES(?,?,?,?,?,?,?,?,?,?)", estimates)
         closed.execute("CREATE TABLE fu_census_counts(journal TEXT NOT NULL, year INTEGER, status TEXT NOT NULL, "
                        "loci INTEGER NOT NULL, reviews INTEGER NOT NULL)")
         closed.executemany("INSERT INTO fu_census_counts VALUES(?,?,?,?,?)", counts)
@@ -496,10 +514,69 @@ def cmd_facts(args: Any) -> dict[str, Any]:
     return export_facts(Path(args.database), Path(args.output))
 
 
+def verify_facts_export(path: Path) -> dict[str, Any]:
+    """The version-1 facts postflight of ``corpus_facts.verify_export`` (hashes, closed snapshot, scalar read-only
+    derivations), with each snapshot hashed once instead of once per fact."""
+    path = Path(path).resolve()
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("schemaVersion") != 1 or not isinstance(data.get("facts"), dict) or not data["facts"]:
+        raise ValidationError("expected a non-empty version-1 facts export")
+    allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+    hashes: dict[Path, str] = {}
+    connections: dict[Path, sqlite3.Connection] = {}
+    checked = 0
+    try:
+        for key, fact in data["facts"].items():
+            if not FACT_KEY.fullmatch(key):
+                raise ValidationError(f"invalid fact key: {key}")
+            source = fact.get("source") or {}
+            relative = Path(source.get("path", ""))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValidationError(f"{key}: source escapes the export")
+            snapshot = (path.parent / relative).resolve()
+            if not snapshot.is_relative_to(path.parent) or not snapshot.is_file():
+                raise ValidationError(f"{key}: source snapshot missing")
+            if snapshot not in hashes:
+                if Path(str(snapshot) + "-wal").exists():
+                    raise ValidationError(f"{key}: snapshot has a WAL")
+                hashes[snapshot] = scores_db.file_sha256(snapshot)
+                connections[snapshot] = sqlite3.connect(snapshot.as_uri() + "?mode=ro&immutable=1", uri=True)
+            if hashes[snapshot] != source.get("sha256"):
+                raise ValidationError(f"{key}: source sha256 mismatch")
+            reads = set()
+
+            def authorize(action, first, second, database, trigger):
+                if action == sqlite3.SQLITE_READ:
+                    reads.add(first)
+                if action not in allowed or (action == sqlite3.SQLITE_FUNCTION and second == "load_extension"):
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            connection = connections[snapshot]
+            connection.set_authorizer(authorize)
+            try:
+                rows = connection.execute(fact["sql"]).fetchmany(2)
+            except sqlite3.Error as error:
+                raise ValidationError(f"{key}: the derivation is not a read-only scalar query ({error})") from error
+            finally:
+                connection.set_authorizer(None)
+            if not reads or reads <= {"sqlite_master", "sqlite_schema"}:
+                raise ValidationError(f"{key}: derivation reads no data")
+            if len(rows) != 1 or len(rows[0]) != 1 or rows[0][0] != fact["value"] or isinstance(fact["value"], bool):
+                raise ValidationError(f"{key}: derivation differs from the exported value")
+            checked += 1
+        for snapshot, digest in hashes.items():
+            if scores_db.file_sha256(snapshot) != digest:
+                raise ValidationError("a facts snapshot changed while it was verified")
+    finally:
+        for connection in connections.values():
+            connection.close()
+    return {"ok": True, "facts": checked, "snapshots": len(hashes)}
+
+
 def cmd_verify_facts(args: Any) -> dict[str, Any]:
     path = Path(args.facts)
     if path.is_dir():
         path = path / "facts.json"
     if not path.is_file():
         raise ValidationError(f"the facts export is missing: {path}")
-    return verify_export(path)
+    return verify_facts_export(path)
