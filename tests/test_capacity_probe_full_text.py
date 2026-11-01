@@ -389,6 +389,8 @@ class DryRunTests(FullTextCase):
         plan = probe.plan()
         self.assertEqual(("full-text", 3), (plan["tier"], plan["fullTextInputs"]["reviews"]["withPrefix"]))
         self.assertEqual(1, plan["fullTextInputs"]["entries"]["retrieved"], "only the full text the store holds")
+        self.assertEqual((23, 0), (plan["fullTextInputs"]["entries"]["notFetched"],
+                                   plan["fullTextInputs"]["entries"]["withoutFullText"]))
         self.assertEqual(3, plan["fullTextInputs"]["sample"]["reviews"])
         self.assertEqual(0, self.judge.requests)
         self.assertFalse(plan["census"]["repairPass"])
