@@ -835,7 +835,10 @@ class FreshEnumerationTests(CacheTestCase):
         self.assertEqual(0, status["inputChecks"]["abstractsWithoutLookup"])
         self.assertEqual({"sha256": enumeration.sha256, "reviews": 3, "inStudy": 3, "notInStudy": 0, "excluded": 0,
                           "unexplained": 0, "reviewsOutsideEnumeration": 0, "queryRule": QUERY_RULE},
-                         {k: v for k, v in status["enumeration"].items() if k != "populationSha256"})
+                         {k: v for k, v in status["enumeration"].items() if k not in ("populationSha256", "settled")})
+        self.assertEqual((0, None), (status["enumeration"]["settled"]["total"],
+                                     status["enumeration"]["settled"]["maxPercent"]))
+        self.assertTrue(verdict["settledReviewsWithinBound"])
         stored = manifest.parent / "stored.csv"
         with stored.open("w", newline="") as handle:
             writer = csv.writer(handle)
