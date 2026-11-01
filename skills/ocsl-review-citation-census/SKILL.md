@@ -17,9 +17,10 @@ instrument's fixed evidence policy, batch geometry and request settings), use
 `ocsl-review study`: prepare, abstracts, judge, full-text, the predeclared
 sensitivities, gates, freeze and facts. A study that builds its population
 fresh enumerates it with population-level queries, acquires with the journals'
-live routes, derives each review's cited works with `study works`, records any
-protocol exclusion with `study exclude` and runs any predeclared manifest
-comparison only after the census is complete. In the lab the judging commands run through the run principal's
+live routes, derives each review's cited works with `study works`, settles the
+enumerated reviews its last prepare cannot prepare with `study prepare
+--settle-unprepared` (recorded as unavailable, each with its reason) and runs
+any predeclared manifest comparison only after the census is complete. In the lab the judging commands run through the run principal's
 broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`) once the operator has
 installed the bundles that `ocsl-review instruments export` prints, with the
 study bundle pinned by `study prepare --study-bundle`. Read

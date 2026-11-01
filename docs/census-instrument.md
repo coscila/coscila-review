@@ -308,13 +308,18 @@ manifest comes only after the census is complete:
 ocsl-review study enumerate --spec protocol/enumeration.json --output study/enumeration.jsonl
 ocsl-review study acquire --input study/enumeration.jsonl --output study/reviews.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
-ocsl-review study works --input study/reviews.jsonl --output study/reviews.works.jsonl
+# one bounded retry pass on its own output: acquisitions that failed transiently are tried again
+ocsl-review study acquire --input study/reviews.jsonl --output study/reviews.retry.jsonl \
+  --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
+ocsl-review study works --input study/reviews.retry.jsonl --output study/reviews.works.jsonl
 ocsl-review study abstracts --input study/reviews.works.jsonl --output study/reviews.works.abstracts.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE"
-ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.jsonl \
+# one bounded retry pass of the lookups that failed in transport
+ocsl-review study abstracts --input study/reviews.works.abstracts.jsonl --output study/reviews.works.abstracts.retry.jsonl \
+  --store "$STORE" --provider-cache "$PROVIDER_CACHE"
+ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.retry.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" \
-  --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json
-ocsl-review study exclude --database work/census.sqlite3 --input protocol/exclusions.jsonl   # if the protocol excludes any
+  --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json --settle-unprepared
 ocsl-review study gates --database work/census.sqlite3 --require-fresh-enumeration
 # after the census is complete, only if the protocol predeclares a comparison:
 ocsl-review study compare-manifest --database work/census.sqlite3 --stored "$COMPARISON_MANIFEST" \
@@ -371,6 +376,24 @@ recorded reason: `study exclude --input FILE` reads JSON lines of `journal`,
 `exclusions`. Freezing, facts export and the manifest comparison treat a
 population with reviews neither in the study nor excluded as incomplete (a
 study with no reviews, or only a pilot, is no completed run).
+
+**Reviews a run cannot prepare.** `study prepare` skips a record it cannot
+prepare now (an acquisition or an abstract lookup that failed in transport, a
+cache claim it cannot re-check, works it cannot derive again) and keeps it out
+of the database, so that a later acquisition or abstracts pass can still bring
+it in. When no such pass follows (the last prepare of a study whose acquisition
+ran once, as in a Study Run), `--settle-unprepared` records every enumerated
+review still neither in the study nor excluded, whether the input skipped it or
+does not hold it, in coverage as unavailable, with the enumeration's own
+stratum, year and first-online date and the reason it was not prepared
+(`extraction_json.notPrepared`, its provenance record marked `settled`); the
+result lists them by reason under `settled`, `study status` counts them
+(`inputChecks.reviewsSettledAsNotPrepared`), and the facts count them among the
+unavailable reviews of their journal, never as judged. A settled review was
+never acquired, so the live-route check leaves it out. An exclusion list
+written before the run cannot know the fresh population, and `study exclude`
+refuses a review already in the study: a protocol frozen before a fresh
+enumeration names its exclusions as part of its queries, or none.
 
 `study gates --require-fresh-enumeration` adds checks that the enumeration is
 pinned with its query rule, that no review lies outside it and every enumerated
