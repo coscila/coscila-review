@@ -12,13 +12,24 @@ rho = sum[(k - n mu)^2 - n mu (1 - mu)] / sum[n mu (1 - mu) (n - 1)], clipped to
 P(X >= k_w) (``estimands.upper_tail``), q-values are Benjamini-Hochberg over candidates (``estimands.
 benjamini_hochberg``), and a candidate is selected when q <= the protocol's FDR level.
 
-Retraction-lag model. For every S1 locus: the citing review's first-online date minus the deciding notice's date. The
-two dates are compared at the coarser of their precisions (day, month, year); equal at that precision is undecidable
-(``after_notice`` NULL, coverage); days are counted only when both dates are given to the day. Outputs (``fu_estimates``
-keys ``followup.lag.*``): the share of loci cited after the notice by journal and year; quartiles of the lag of
-post-notice citations with review-clustered bootstrap intervals; the rate ratio of citing reviews per work-year after
-versus before the notice (work-clustered, ``estimands.ratio_bootstrap``); the trend of the after-notice share by year
-(``estimands.year_trend``). Replicates and seed come from the protocol; every estimate has its own scope tuple.
+Retraction-lag model. For every S1 locus: the citing review's first-online date minus the deciding notice's date. A
+date given to the day, month or year is the period it names; the citing review is after the notice when its period
+starts at or after the end of the notice's period plus the protocol's grace days (``timing.graceDays``, default 0),
+not after it when its period ends at or before the start of the notice's period plus the grace days, and undecidable
+otherwise (``after_notice`` NULL, coverage) — without grace days this is the comparison at the coarser of the two
+precisions. Days are counted only when both dates are given to the day. Outputs (``fu_estimates`` keys
+``followup.lag.*``): the share of loci cited after the notice by journal and year; quartiles of the lag of post-notice
+citations with review-clustered bootstrap intervals; the rate ratio of citing reviews after versus before the notice;
+the trend of the after-notice share by year (``estimands.year_trend``). Replicates and seed come from the protocol;
+every estimate has its own scope tuple.
+
+The rate ratio is descriptive. Its exposure is the census volume: per cited work, the reviews of the census (in the
+protocol's journals and years, of the cell's journal) published decidably before the notice and after the work's
+publication year, and those published decidably after the notice plus the grace days; the notice's own period (its
+precision, and the grace days) belongs to neither side, for exposure and citations alike. The ratio is (citing
+reviews after / reviews after) / (citing reviews before / reviews before) over works, and its interval resamples works
+jointly (``paired_ratio_bootstrap``), so a work's citations before and after its notice stay paired. Citation ageing
+and other changes over calendar time are not modelled.
 """
 from __future__ import annotations
 
@@ -26,6 +37,7 @@ import math
 import random
 import re
 import sqlite3
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
@@ -340,41 +352,63 @@ def parse_date(text: Any, declared: str | None = None) -> tuple[date, str] | Non
     return value, precision
 
 
-def compare_dates(notice: Any, notice_precision: str | None, citing: Any) -> dict[str, Any]:
-    """after_notice, lag_days, the precision compared at and the reason when undecidable."""
-    first = parse_date(notice, notice_precision)
-    second = parse_date(citing)
+def period(text: Any, declared: str | None = None) -> tuple[date, date, str] | None:
+    """The period an ISO date names at its precision: (first day, first day after it, precision)."""
+    parsed = parse_date(text, declared)
+    if parsed is None:
+        return None
+    start, precision = parsed
+    if precision == "day":
+        end = start + timedelta(days=1)
+    elif precision == "month":
+        end = date(start.year + (start.month == 12), start.month % 12 + 1, 1)
+    else:
+        end = date(start.year + 1, 1, 1)
+    return start, end, precision
+
+
+def compare_dates(notice: Any, notice_precision: str | None, citing: Any, grace_days: int = 0) -> dict[str, Any]:
+    """after_notice, lag_days, the coarser precision of the two dates and the reason when undecidable (see the module
+    docstring for the comparison of the two periods and the grace days)."""
+    first = period(notice, notice_precision)
+    second = period(citing)
     if first is None:
         return {"after_notice": None, "lag_days": None, "date_basis": "none", "reason": "notice-date-unknown"}
     if second is None:
         return {"after_notice": None, "lag_days": None, "date_basis": "none", "reason": "first-online-unknown"}
-    basis = max(first[1], second[1], key=PRECISION_ORDER.__getitem__)
-
-    def truncated(value: date) -> tuple[int, ...]:
-        return (value.year,) if basis == "year" else (value.year, value.month) if basis == "month" else (
-            value.year, value.month, value.day)
-    a, c = truncated(first[0]), truncated(second[0])
-    days = (second[0] - first[0]).days if first[1] == second[1] == "day" else None
-    if a == c:
-        return {"after_notice": None, "lag_days": days, "date_basis": basis, "reason": "undecidable-at-precision"}
-    return {"after_notice": int(c > a), "lag_days": days, "date_basis": basis, "reason": None}
+    basis = max(first[2], second[2], key=PRECISION_ORDER.__getitem__)
+    days = (second[0] - first[0]).days if first[2] == second[2] == "day" else None
+    grace = timedelta(days=max(0, int(grace_days or 0)))
+    if second[0] >= first[1] + grace:
+        return {"after_notice": 1, "lag_days": days, "date_basis": basis, "reason": None}
+    if second[1] <= first[0] + grace:
+        return {"after_notice": 0, "lag_days": days, "date_basis": basis, "reason": None}
+    return {"after_notice": None, "lag_days": days, "date_basis": basis, "reason": "undecidable-at-precision"}
 
 
-def lag_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    """One row per S1 locus: review, cited work, status, notice and citing dates and the comparison."""
+def grace_days(protocol: Mapping[str, Any] | None) -> int:
+    """The protocol's grace days after a notice (``timing.graceDays``; 0 when it declares none)."""
+    return int((((protocol or {}).get("timing") or {}).get("graceDays")) or 0)
+
+
+def lag_rows(connection: sqlite3.Connection, *, grace: int = 0, pilot_only: bool = False) -> list[dict[str, Any]]:
+    """One row per S1 locus: review, cited work, status, notice and citing dates and the comparison.
+
+    ``pilot_only``: the pilot subsample's S1 loci, weighted by their pilot probability."""
     cursor = connection.cursor()
     cursor.row_factory = sqlite3.Row
     rows = []
     for row in cursor.execute(
             "SELECT f.locus_id, f.journal, f.doi, f.review_year, f.review_first_online, f.work_key, "
-            "s.inclusion_probability, w.status, w.notice_date, w.date_precision FROM fu_strata s "
+            "s.inclusion_probability, s.pilot_probability, w.status, w.notice_date, w.date_precision FROM fu_strata s "
             "JOIN fu_frame f ON f.locus_id=s.locus_id JOIN fu_work_status w ON w.work_key=f.work_key "
-            "WHERE s.stratum='S1' ORDER BY f.locus_id"):
+            "WHERE s.stratum='S1'" + (" AND s.pilot=1" if pilot_only else "") + " ORDER BY f.locus_id"):
+        probability = row["pilot_probability"] if pilot_only else row["inclusion_probability"]
         rows.append({"locus_id": row["locus_id"], "journal": row["journal"], "doi": row["doi"],
                      "year": row["review_year"], "work_key": row["work_key"], "status": row["status"],
-                     "weight": 1.0 / row["inclusion_probability"], "notice_date": row["notice_date"],
+                     "weight": 1.0 / probability, "notice_date": row["notice_date"],
                      "notice_precision": row["date_precision"], "citing_first_online": row["review_first_online"],
-                     **compare_dates(row["notice_date"], row["date_precision"], row["review_first_online"])})
+                     **compare_dates(row["notice_date"], row["date_precision"], row["review_first_online"], grace)})
     return rows
 
 
@@ -434,78 +468,113 @@ def after_notice_share(connection: sqlite3.Connection, rows: Sequence[Mapping[st
     return written
 
 
-def _window(connection: sqlite3.Connection, protocol: Mapping[str, Any], journal: str | None) -> tuple[date, date] | None:
-    years = protocol.get("years")
+def paired_ratio_bootstrap(units: Sequence[Sequence[float]], *, b: int, seed: Any,
+                           scope_parts: Sequence[Any]) -> dict[str, Any]:
+    """(sum a / sum A) / (sum c / sum C) over units (key, a, A, c, C) with a percentile bootstrap that resamples units
+    jointly: each replicate draws units once and sums all four columns of that one draw (a unit's numerator and
+    denominator stay paired, unlike ``estimands.ratio_bootstrap``, which resamples two independent groups)."""
+    columns = [[float(unit[index]) for unit in units] for index in range(1, 5)]
+
+    def ratio(a: float, exposure_a: float, c: float, exposure_c: float) -> float | None:
+        if not exposure_a or not exposure_c or not c:
+            return None
+        return (a / exposure_a) / (c / exposure_c)
+    estimate = ratio(*(sum(column) for column in columns)) if units else None
+    result: dict[str, Any] = {"estimate": estimate, "lo": None, "hi": None, "b": b, "seed": seed,
+                              "scope": list(scope_parts), "replicates": 0, "units": len(units)}
+    if estimate is None:
+        return result
+    generator = rng(seed, *scope_parts)
+    size = len(units)
+    estimates = []
+    for _ in range(int(b)):
+        draw = generator.choices(range(size), k=size)
+        value = ratio(*(sum(map(column.__getitem__, draw)) for column in columns))
+        if value is not None:
+            estimates.append(value)
+    lo, hi = estimands.percentile_bounds(estimates)
+    return {**result, "lo": lo, "hi": hi, "replicates": len(estimates),
+            "excludesOne": lo is not None and (lo > 1 or hi < 1)}
+
+
+def census_periods(connection: sqlite3.Connection, protocol: Mapping[str, Any],
+                   journal: str | None) -> tuple[list[date], list[date], int]:
+    """Sorted period starts and ends of the census reviews in the protocol's scope (of one journal), and the number of
+    reviews without a first-online date (in no exposure)."""
     clause, params = scope(protocol)
     if journal is not None:
         clause += " AND r.journal=?"
         params.append(journal)
-    dates = [parse_date(row[0]) for row in connection.execute(
-        f"SELECT r.first_online FROM census.reviews r WHERE {clause} AND r.first_online IS NOT NULL", params)]
-    dates = [value[0] for value in dates if value]
-    start = date(int(years["from"]), 1, 1) if years else (min(dates) if dates else None)
-    end = date(int(years["to"]), 12, 31) if years else (max(dates) if dates else None)
-    return (start, end) if start and end and end > start else None
-
-
-def _midpoint(value: tuple[date, str]) -> date:
-    day, precision = value
-    if precision == "month":
-        return day + timedelta(days=14)
-    if precision == "year":
-        return date(day.year, 7, 2)
-    return day
+    starts, ends, undated = [], [], 0
+    for (first_online,) in connection.execute(f"SELECT r.first_online FROM census.reviews r WHERE {clause}", params):
+        named = period(first_online)
+        if named is None:
+            undated += 1
+            continue
+        starts.append(named[0])
+        ends.append(named[1])
+    return sorted(starts), sorted(ends), undated
 
 
 def rate_ratio(connection: sqlite3.Connection, protocol: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], *,
-               journals: Sequence[str], b: int, seed: Any, statuses: Sequence[str]) -> int:
-    """Citing reviews per work-year after vs before the notice (work-clustered ratio bootstrap)."""
+               journals: Sequence[str], b: int, seed: Any, statuses: Sequence[str], grace: int = 0) -> int:
+    """Citing reviews per census review after vs before the notice (descriptive; see the module docstring)."""
     slugs = journal_slugs(journals)
     publication = {row[0]: row[1] for row in connection.execute("SELECT work_key, year FROM census.works")}
+    shift = timedelta(days=max(0, int(grace or 0)))
     written = 0
     for status in [None, *statuses]:
         selected = [row for row in rows if status is None or row["status"] == status]
         for journal in [None, *journals]:
-            window = _window(connection, protocol, journal)
+            starts, ends, undated = census_periods(connection, protocol, journal)
             cell = [row for row in selected if journal is None or row["journal"] == journal]
             works: dict[str, dict[str, Any]] = {}
             for row in cell:
-                entry = works.setdefault(row["work_key"], {"notice": parse_date(row["notice_date"],
-                                                                                row["notice_precision"]),
+                entry = works.setdefault(row["work_key"], {"notice": period(row["notice_date"],
+                                                                            row["notice_precision"]),
                                                            "before": set(), "after": set()})
-                if row["after_notice"] is not None:
-                    entry["after" if row["after_notice"] else "before"].add((row["journal"], row["doi"]))
-            after_units, before_units, skipped = [], [], 0
+                citing = period(row["citing_first_online"])
+                notice = entry["notice"]
+                if notice is None or citing is None:
+                    continue
+                if citing[0] >= notice[1] + shift:
+                    entry["after"].add((row["journal"], row["doi"]))
+                elif citing[1] <= notice[0]:
+                    entry["before"].add((row["journal"], row["doi"]))
+            units, skipped = [], 0
             for work, entry in sorted(works.items()):
-                if window is None or entry["notice"] is None:
+                notice = entry["notice"]
+                if notice is None:
                     skipped += 1
                     continue
-                notice = _midpoint(entry["notice"])
-                published = date(int(publication[work][:4]), 1, 1) if re.match(r"^\d{4}", str(
-                    publication.get(work) or "")) else window[0]
-                start, end = max(window[0], published), window[1]
-                before_years = max(0.0, (min(notice, end) - start).days / 365.25)
-                after_years = max(0.0, (end - max(notice, start)).days / 365.25)
-                after_units.append((work, len(entry["after"]), after_years))
-                before_units.append((work, len(entry["before"]), before_years))
+                year = str(publication.get(work) or "")
+                published = date(int(year[:4]), 1, 1) if re.match(r"^\d{4}", year) else date.min
+                after_reviews = len(starts) - bisect_left(starts, notice[1] + shift)
+                before_reviews = max(0, bisect_right(ends, notice[0]) - bisect_right(ends, published))
+                units.append((work, len(entry["after"]), after_reviews, len(entry["before"]), before_reviews))
             scope_parts = ("lag.rate-ratio", slugs.get(journal, ALL), status or ALL)
-            result = estimands.ratio_bootstrap(after_units, before_units, b=b, seed=seed, scope=scope_parts)
-            detail = {"estimand": "lag.rate-ratio", "status": status, "rule": LAG_RULE,
-                      "definition": "citing reviews per work-year after the notice divided by citing reviews per "
-                                    "work-year before it, within the census window",
-                      "interval": "percentile bootstrap: works resampled with replacement (estimands.ratio_bootstrap)",
-                      "b": b, "seed": seed, "scope": list(scope_parts), "works": len(after_units),
-                      "worksWithoutNoticeDate": skipped, "replicates": result.get("replicates", 0),
-                      "window": [window[0].isoformat(), window[1].isoformat()] if window else None,
-                      "exposureDates": "a notice dated to the month or year counts from the middle of that period",
-                      "citationsAfter": sum(unit[1] for unit in after_units),
-                      "citationsBefore": sum(unit[1] for unit in before_units),
-                      "workYearsAfter": sum(unit[2] for unit in after_units),
-                      "workYearsBefore": sum(unit[2] for unit in before_units)}
+            result = paired_ratio_bootstrap(units, b=b, seed=seed, scope_parts=scope_parts)
+            detail = {"estimand": "lag.rate-ratio", "status": status, "rule": LAG_RULE, "descriptive": True,
+                      "definition": "citing reviews per census review published after the notice divided by citing "
+                                    "reviews per census review published before it, over the S1 works with a dated "
+                                    "notice (descriptive: an offset for census volume, no model of citation ageing)",
+                      "exposure": "census reviews in the protocol's journals and years (of this journal), published "
+                                  "decidably before the notice and not before the work's publication year, or "
+                                  "decidably after the notice plus the grace days; the notice's own period is in "
+                                  "neither exposure",
+                      "interval": "percentile bootstrap: works resampled jointly with their four sums "
+                                  "(paired_ratio_bootstrap)",
+                      "graceDays": int(grace or 0), "b": b, "seed": seed, "scope": list(scope_parts),
+                      "works": len(units), "worksWithoutNoticeDate": skipped, "reviewsWithoutDate": undated,
+                      "replicates": result.get("replicates", 0),
+                      "citationsAfter": sum(unit[1] for unit in units),
+                      "reviewsAfter": sum(unit[2] for unit in units),
+                      "citationsBefore": sum(unit[3] for unit in units),
+                      "reviewsBefore": sum(unit[4] for unit in units)}
             written += write_value_rows(connection, estimand="lag.rate-ratio", qualifiers=[status], journal=journal,
                                         slug=slugs.get(journal, ALL), year=None, stratum="S1",
                                         value=result["estimate"], bounds=(result["lo"], result["hi"]),
-                                        units=len(after_units), detail=detail)
+                                        units=len(units), detail=detail)
     return written
 
 
@@ -564,7 +633,8 @@ def lag_trend(connection: sqlite3.Connection, rows: Sequence[Mapping[str, Any]],
 
 def run_lag(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict[str, Any]:
     require_freeze(connection)
-    rows = lag_rows(connection)
+    grace = grace_days(protocol)
+    rows = lag_rows(connection, grace=grace)
     connection.execute("DELETE FROM fu_lag")
     connection.executemany("INSERT INTO fu_lag(locus_id, work_key, status, notice_date, citing_first_online, lag_days, "
                            "after_notice, date_basis, reason) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -578,14 +648,15 @@ def run_lag(connection: sqlite3.Connection, protocol: Mapping[str, Any]) -> dict
         clear_estimates(connection, estimand)
     written = after_notice_share(connection, rows, estimand="lag.after-notice", journals=journals, b=b, seed=seed)
     written += lag_quantiles(connection, rows, journals=journals, b=b, seed=seed)
-    written += rate_ratio(connection, protocol, rows, journals=journals, b=b, seed=seed, statuses=statuses)
+    written += rate_ratio(connection, protocol, rows, journals=journals, b=b, seed=seed, statuses=statuses,
+                          grace=grace)
     written += lag_trend(connection, rows, journals=journals, b=b, seed=seed)
     reasons: dict[str, int] = defaultdict(int)
     for row in rows:
         reasons[row["reason"] or "decidable"] += 1
     return {"rule": LAG_RULE, "loci": len(rows), "afterNotice": sum(1 for row in rows if row["after_notice"] == 1),
             "beforeNotice": sum(1 for row in rows if row["after_notice"] == 0), "comparisons": dict(sorted(reasons.items())),
-            "estimateRows": written, "b": b, "seed": seed}
+            "estimateRows": written, "b": b, "seed": seed, "graceDays": grace}
 
 
 def cmd_lag(args: Any) -> dict[str, Any]:

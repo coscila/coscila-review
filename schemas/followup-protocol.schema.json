@@ -121,6 +121,14 @@
       "type": "object", "additionalProperties": false, "required": ["served", "location"],
       "properties": {"served": {"type": "string", "minLength": 1}, "location": {"const": "on-premises"}}
     },
+    "timing": {
+      "type": "object", "additionalProperties": false, "required": ["graceDays"],
+      "description": "a citing article counts as after a notice only from the end of the notice's period plus graceDays (an article online shortly after a notice was written before it); sensitivityGraceDays predeclares a second reading of cited-after-notice and acknowledges-notice",
+      "properties": {
+        "graceDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+        "sensitivityGraceDays": {"type": "integer", "minimum": 0, "maximum": 3650}
+      }
+    },
     "secondGeneration": {
       "type": "object", "additionalProperties": false, "required": ["edges", "k", "sources"],
       "properties": {

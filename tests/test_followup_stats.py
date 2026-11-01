@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr, redirect_stdout
@@ -191,6 +192,11 @@ class LagTests(unittest.TestCase):
         self.assertEqual("notice-date-unknown", compare(None, None, "2021-03-01")["reason"])
         self.assertEqual("first-online-unknown", compare("2021-03-01", "day", None)["reason"])
         self.assertEqual("notice-date-unknown", compare("2021-02-30", "day", "2021-03-01")["reason"])
+        # Grace days: an article online within them is not after the notice; one that straddles them is undecidable.
+        self.assertEqual(0, compare("2021-03-01", "day", "2021-03-20", 30)["after_notice"])
+        self.assertEqual(1, compare("2021-03-01", "day", "2021-04-01", 30)["after_notice"])
+        self.assertEqual("undecidable-at-precision", compare("2021-03-01", "day", "2021-03", 20)["reason"])
+        self.assertEqual(1, compare("2021-03", "month", "2021-05-01", 30)["after_notice"])
 
     def test_lag_rows_for_every_s1_locus(self):
         with closing(self.branch.connect()) as connection:
@@ -229,13 +235,21 @@ class LagTests(unittest.TestCase):
         self.assertAlmostEqual(379.0, values["followup.lag.days-q1.all.all.value"])
         self.assertAlmostEqual(619.0, values["followup.lag.days-q3.all.all.value"])
         self.assertEqual(2, values["followup.lag.days-median.all.all.n"])
-        # all statuses: the concern notice (dated to the month, counted from mid-month) adds exposure before it up
-        # to the window's end (the latest first-online date) and no citing review on either side
-        self.assertAlmostEqual(2 * (92 + 831) / 739, values["followup.lag.rate-ratio.all.all.value"])
-        # retracted only: two citing reviews in 739 days after the notice, one in the 92 days before it
-        self.assertAlmostEqual(2 * 92 / 739, values["followup.lag.rate-ratio.retracted.all.all.value"])
+        # retracted only (notice 2021-06-01): of the three census reviews one went online before the notice and cites
+        # the work, two after it and both cite it: (2 / 2) / (1 / 1)
+        self.assertAlmostEqual(1.0, values["followup.lag.rate-ratio.retracted.all.all.value"])
+        # all statuses: the concern notice (dated to the month) adds two reviews before it and none after it as
+        # exposure; its citing review falls in the notice's own month, in neither side: (2 / 2) / (1 / 3)
+        self.assertAlmostEqual(3.0, values["followup.lag.rate-ratio.all.all.value"])
+        self.assertAlmostEqual(1.0, values[f"followup.lag.rate-ratio.retracted.{SLUG_A}.all.value"])
         self.assertAlmostEqual(0.5, values["followup.lag.trend.all.all.value"])
         self.assertEqual("not-measured", values["followup.lag.rate-ratio.corrected.all.all.value"])
+        with closing(self.branch.connect()) as connection:
+            detail = json.loads(connection.execute("SELECT detail_json FROM fu_estimates WHERE key=?",
+                                                   ("followup.lag.rate-ratio.all.all.value",)).fetchone()[0])
+        self.assertTrue(detail["descriptive"])
+        self.assertEqual((2, 2, 1, 3), (detail["citationsAfter"], detail["reviewsAfter"], detail["citationsBefore"],
+                                        detail["reviewsBefore"]))
 
     def test_the_lag_model_is_reproducible_and_needs_a_freeze(self):
         before = self.estimates()
@@ -262,6 +276,30 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(300, first["replicates"])
         empty = followup_stats.cluster_ratio_bootstrap([[], []], b=10, seed=1, scope_parts=())
         self.assertEqual(([None], [(None, None)]), (empty["estimates"], empty["bounds"]))
+
+    def test_works_are_resampled_jointly_for_the_rate_ratio(self):
+        """A work's citations before and after its notice are correlated (citation intensity differs between works);
+        resampling works jointly keeps the pairs and gives a narrower interval than resampling the two sides apart."""
+        from ocsl_review import estimands
+        generator = random.Random(7)
+        units = []
+        for index in range(300):
+            intensity = generator.lognormvariate(0, 1.2)
+            exposure_before, exposure_after = generator.randint(5, 30), generator.randint(5, 30)
+            before = sum(1 for _ in range(exposure_before) if generator.random() < min(1.0, 0.05 * intensity))
+            after = sum(1 for _ in range(exposure_after) if generator.random() < min(1.0, 0.05 * intensity))
+            units.append((f"w{index}", after, exposure_after, before, exposure_before))
+        paired = followup_stats.paired_ratio_bootstrap(units, b=2000, seed=1, scope_parts=("rr",))
+        unpaired = estimands.ratio_bootstrap([(u[0], u[1], u[2]) for u in units], [(u[0], u[3], u[4]) for u in units],
+                                             b=2000, seed=1, scope=("rr",))
+        self.assertAlmostEqual(unpaired["estimate"], paired["estimate"])
+        self.assertLess(paired["hi"] - paired["lo"], unpaired["hi"] - unpaired["lo"])
+        self.assertLessEqual(paired["lo"], paired["estimate"])
+        self.assertGreaterEqual(paired["hi"], paired["estimate"])
+        self.assertEqual(paired, followup_stats.paired_ratio_bootstrap(units, b=2000, seed=1, scope_parts=("rr",)))
+        self.assertIsNone(followup_stats.paired_ratio_bootstrap([], b=10, seed=1, scope_parts=())["estimate"])
+        self.assertIsNone(followup_stats.paired_ratio_bootstrap([("w", 1, 2, 0, 3)], b=10, seed=1,
+                                                                scope_parts=())["estimate"])
 
     def test_quantiles_interpolate_linearly(self):
         self.assertEqual(2.5, followup_stats.quantile([1.0, 2.0, 3.0, 4.0], 0.5))
