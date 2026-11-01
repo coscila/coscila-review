@@ -465,6 +465,23 @@ class AbstractTierTests(RunnerTestCase):
         self.assertIn("model_drift", errors)
         self.assertEqual(0, run.status()["duplicateJudgments"])
 
+    def test_a_journal_selector_judges_only_the_next_reviews_of_that_journal(self):
+        os.environ["OCSL_TEST_JUDGE_KEY"] = "local-test-value"
+        self.addCleanup(os.environ.pop, "OCSL_TEST_JUDGE_KEY", None)
+        other = "Second Synthetic Journal"
+        run = self.run_census()
+        self.prepare(run, record(doi="10.5555/a.1"), record(doi="10.5555/b.1", journal=other),
+                     record(doi="10.5555/a.2"), record(doi="10.5555/b.2", journal=other))
+        result = run.run_abstract(limit=1, journal=other)
+        self.assertEqual(("completed", 1, 15), (result["state"], result["reviews"], result["accepted"]))
+        judged = [(row["journal"], row["doi"]) for row in
+                  self.rows("SELECT journal, doi FROM reviews WHERE abstract_state='completed'")]
+        self.assertEqual([(other, "10.5555/b.1")], judged)
+        self.assertEqual(1, len(self.judge.requests))
+        with self.assertRaisesRegex(ValidationError, "carries the journal 'Unknown Journal'"):
+            run.run_abstract(journal="Unknown Journal")
+        self.assertEqual(3, run.run_abstract()["reviews"])
+
     def test_batches_of_forty_in_bibliography_order(self):
         run = self.run_census()
         works = {"n%d" % i: {"doi": "10.5555/n%d" % i, "title": "Fictional source %d" % i, "venue": "Synth", "year": 2020,

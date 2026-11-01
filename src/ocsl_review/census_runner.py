@@ -1335,9 +1335,12 @@ class CensusRun:
                 batches.append((index, batch, todo, start))
         return batches
 
-    def run_abstract(self, *, limit: int | None = None, transport_retries: int = 3,
+    def run_abstract(self, *, limit: int | None = None, journal: str | None = None, transport_retries: int = 3,
                      cooldown: float = 60.0) -> dict[str, Any]:
         """Abstract tier for every pending review, in enumeration order; resumable per batch.
+
+        ``journal`` judges only that journal's pending reviews (with ``limit``, the next ``limit`` of them), so a gate
+        can judge a few reviews of every journal; a journal no review of the study carries is refused.
 
         A pass stops early when the breaker trips (consecutive batches without any response). Reviews
         left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
@@ -1346,12 +1349,19 @@ class CensusRun:
         """
         if self.transport is None:
             raise ValidationError("a transport is required to run the census")
+        if journal is not None:
+            with self.lock:
+                known = self.connection.execute("SELECT 1 FROM reviews WHERE journal=? LIMIT 1", (journal,)).fetchone()
+            if not known:
+                raise ValidationError(f"no review of the study carries the journal {journal!r}")
         self._egress_gate("abstract_state='pending'")
         self._broker_preflight("abstract", "abstract_state='pending'")
         self._resume()
         with self.lock:
             reviews = [tuple(r) for r in self.connection.execute(
-                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' ORDER BY review_order").fetchall()]
+                "SELECT journal, doi, title FROM reviews WHERE abstract_state='pending' "
+                + ("AND journal=? " if journal is not None else "") + "ORDER BY review_order",
+                (journal,) if journal is not None else ()).fetchall()]
         if limit is not None:
             reviews = reviews[:limit]
 
