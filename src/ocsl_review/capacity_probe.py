@@ -36,6 +36,24 @@ stream sends the repair call the census runner builds (``census_runner``'s
 each cell reports its invalid outputs before and after the repair pass, overall
 and by the items of the batch's first call (1, 2-9, 10-39, 40), as the census
 gates count them.
+
+``--tier full-text`` probes the full-text tier with real inputs instead: the
+reviews of one journal in the operator's literature-evidence@2 projection (the
+store the census reads as a byte cache, opened through the census's own guarded
+reader, so no label or verdict can be read) are prepared exactly as a census
+prepares them (``ReviewAcquirer`` from the store, ``derive_works``, metadata from
+the store's Europe PMC records, ``CensusRun.prepare_review``), every entry whose
+cited work has a PMCID is retrieved and windowed by the tier's own code
+(``CensusRun.prepare_full_text_group``: the store first, then Europe PMC through
+the census's fetcher, with its headers and spacing; fetched full texts are kept
+in a cache directory for later runs), and the calls are the census's
+(``census_runner.full_text_call``: five entries of one review per call, the
+claim-targeted windows in the FULL TEXT field, reasoning low, ``max_tokens`` for
+the call's size, the journal label in the system prompt). One cell sends each
+prepared call once and reports valid, missing and malformed entries per call
+and overall. citation-census@1 has no repair pass at that tier, which the report
+states; ``--hypothetical-repair`` adds a predeclared single-item resend of every
+entry left without a valid verdict, reported as hypothetical.
 """
 from __future__ import annotations
 
@@ -69,6 +87,19 @@ from .util import atomic_write
 FORMAT = "ocsl-capacity-probe@2"
 PROFILE_FORMAT = "ocsl-capacity-profile@1"
 TIER = "abstract"
+FULL_TEXT = "full-text"
+TIERS = (TIER, FULL_TEXT)
+FULL_TEXT_STAGE = "fulltext"              # the validator's stage at the full-text tier (census_runner._judge_full_text)
+FULL_TEXT_STREAMS = 20                    # the full-text cell's default streams (Stage B is paced by its retrieval)
+FULL_TEXT_ENTRIES = 2000                  # retrieved entries the full-text tier prepares by default
+FULL_TEXT_INPUTS_NAME = "full-text-inputs.sqlite3"
+FULL_TEXT_CACHE_NAME = "full-text-cache"
+FETCH_WORKERS = 4                         # study full-text --fetch-workers' default
+FETCH_WORKERS_LIMIT = 16
+PLAN_REVIEWS = 5                          # reviews the dry run prepares (offline) to describe the full-text inputs
+HYPOTHETICAL_REPAIR = "hypothetical-repair"
+REFUSED_FAILURES = ("http-400", "http-413", "http-422")   # refusals the census counts as answered without labels
+PMCID = re.compile(r"PMC[0-9]{1,12}")
 DEFAULT_STREAMS = (30, 60, 90, 120)
 DEFAULT_ITEMS = (1, 5, 10, 40)
 ORDERS = ("load", "streams", "items", "as-given", "shuffle")
@@ -330,10 +361,29 @@ class ProbeSettings:
     heartbeat_seconds: float = 30.0
     plan_calls: int = 32
     repair: bool = False
+    tier: str = TIER
+    store: str | None = None
+    store_root: str | None = None
+    review_prefixes: tuple[str, ...] = ()
+    full_text_entries: int = FULL_TEXT_ENTRIES
+    fetch_workers: int = FETCH_WORKERS
+    full_text_cache: str | None = None
+    hypothetical_repair: bool = False
+    review_route: str = "entitled"
+    on_premises: bool = False
+    policy: str | None = None
 
     def validate(self, *, live: bool) -> None:
         if live and not self.base_url:
             raise ValidationError("--base-url is required unless --dry-run is given")
+        if self.tier not in TIERS:
+            raise ValidationError(f"--tier must be one of {', '.join(TIERS)}")
+        if self.tier == FULL_TEXT:
+            self._validate_full_text()
+        elif (self.store or self.store_root or self.review_prefixes or self.full_text_cache
+              or self.hypothetical_repair or self.on_premises or self.policy):
+            raise ValidationError("--store, --store-root, --review-doi-prefix, --full-text-cache, --hypothetical-repair, "
+                                  "--on-premises and --policy belong to --tier full-text")
         if self.order not in ORDERS:
             raise ValidationError(f"--order must be one of {', '.join(ORDERS)}")
         if self.order == "as-given" and not self.cells:
@@ -392,9 +442,60 @@ class ProbeSettings:
             if not isinstance(pid, int) or pid < 1:
                 raise ValidationError("--proxy-pid takes process ids")
 
+    def _validate_full_text(self) -> None:
+        """The full-text tier: real loci of one journal's reviews from a literature-evidence@2 projection, one cell."""
+        if not self.store:
+            raise ValidationError("--tier full-text needs --store: the literature-evidence@2 projection the census reads "
+                                  "(its review documents give the real loci)")
+        if not Path(self.store).is_absolute():
+            raise ValidationError("--store must be an absolute path")
+        if self.full_text_cache is not None and not Path(self.full_text_cache).is_absolute():
+            raise ValidationError("--full-text-cache must be an absolute path")
+        if not self.review_prefixes:
+            raise ValidationError("--tier full-text needs --review-doi-prefix: the DOI prefix of the reviews of the "
+                                  "journal --journal names (the store does not record journals)")
+        if self.journal == DEFAULT_JOURNAL:
+            raise ValidationError("--tier full-text sends real reviews' loci: give their journal label with --journal, "
+                                  "exactly as the census's enumeration spec spells it (it enters the system prompt)")
+        if self.repair:
+            raise ValidationError("citation-census@1 has no repair pass at the full-text tier (its full-text repair "
+                                  "passes are 0), so --repair has nothing to send; --hypothetical-repair measures a "
+                                  "single-item resend of every entry left without a valid verdict, reported as hypothetical")
+        if self.profile is not None or self.expect_output_tokens is not None or self.expect_prompt_tokens is not None:
+            raise ValidationError("--profile and --expect-*-tokens describe the abstract tier's synthetic entries; the "
+                                  "full-text tier sends real loci")
+        cells = self.grid_cells()
+        if len(cells) != 1:
+            raise ValidationError("--tier full-text runs one cell (--cells STREAMSx%d): each prepared call is sent once"
+                                  % C.items_per_call(FULL_TEXT))
+        if cells[0][1] != C.items_per_call(FULL_TEXT):
+            raise ValidationError("the full-text tier sends the instrument's %d items per call (each review's last call "
+                                  "carries its remainder): --cells STREAMSx%d" % ((C.items_per_call(FULL_TEXT),) * 2))
+        if not 1 <= self.full_text_entries <= 1_000_000:
+            raise ValidationError("--full-text-entries must be from 1 to 1000000")
+        if not 1 <= self.fetch_workers <= FETCH_WORKERS_LIMIT:
+            raise ValidationError(f"--fetch-workers must be from 1 to {FETCH_WORKERS_LIMIT}")
+        for prefix in self.review_prefixes:
+            if not normal_prefix(prefix) or not normal_prefix(prefix).startswith("10."):
+                raise ValidationError(f"--review-doi-prefix takes a DOI prefix such as 10.1234/abc., not {prefix!r}")
+        if self.review_route not in ("public", "entitled"):
+            raise ValidationError("--review-route is public or entitled (the journal's route class in the protocol)")
+        if self.on_premises and not self.policy:
+            raise ValidationError("--on-premises needs --policy with the judge endpoint in onPremEndpoints")
+        if self.policy and not self.on_premises:
+            raise ValidationError("--policy declares the judge on premises: give --on-premises with it")
+        if self.review_route == "entitled" and not self.on_premises:
+            # The census's own rule (census_runner._egress_gate): entitled review text reaches only a judge the operator
+            # declared on premises in an egress policy.
+            raise ValidationError("reviews acquired under an entitled route reach only an on-premises judge, as in the "
+                                  "census: give --on-premises --policy naming the judge endpoint, or --review-route public "
+                                  "for a journal the protocol acquires as public (an open-access journal)")
+
     def grid_cells(self) -> list[tuple[int, int]]:
         if self.cells:
             return list(dict.fromkeys(self.cells))
+        if self.tier == FULL_TEXT:
+            return [(FULL_TEXT_STREAMS, C.items_per_call(FULL_TEXT))]
         return [(s, n) for s in dict.fromkeys(self.streams) for n in dict.fromkeys(self.items)]
 
     def requested_model(self) -> str:
@@ -417,9 +518,18 @@ class ProbeSettings:
         return {**expected, "tolerance": self.expect_tolerance, "source": source}
 
 
-def instrument_items() -> int:
-    """The instrument's items per call: the only geometry a census sends."""
-    return C.items_per_call(TIER)
+def instrument_items(tier: str = TIER) -> int:
+    """The instrument's items per call at ``tier``: the only geometry a census sends there."""
+    return C.items_per_call(tier)
+
+
+def normal_prefix(value: Any) -> str:
+    """A DOI prefix as the census normalises DOIs: lower case, without a resolver in front."""
+    text = str(value or "").strip().lower()
+    for resolver in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "http://dx.doi.org/", "doi:"):
+        if text.startswith(resolver):
+            text = text[len(resolver):]
+    return text
 
 
 def parse_cells(values: Sequence[str] | None) -> tuple[tuple[int, int], ...]:
@@ -456,7 +566,10 @@ def label(streams: int, items: int) -> str:
 
 def cell_role(streams: int, items: int, settings: ProbeSettings) -> str:
     """``decisive`` (the instrument's geometry at the allowed concurrency), ``instrument`` (its geometry at other
-    stream counts), or ``exploratory`` (other items per call, which a census never sends)."""
+    stream counts), or ``exploratory`` (other items per call, which a census never sends); the full-text tier's one
+    cell is ``full-text``."""
+    if settings.tier == FULL_TEXT:
+        return FULL_TEXT
     if items != instrument_items():
         return "exploratory"
     return "decisive" if streams == settings.allowed_streams else "instrument"
@@ -690,6 +803,358 @@ class _BatchSource:
         return self._build(batch)
 
 
+# ----------------------------------------------------------------------------- the full-text tier's real inputs
+class SourceExhausted(Exception):
+    """A finite call sequence (the full-text tier's prepared calls) has handed out its last call."""
+
+
+class _FullTextSource:
+    """The prepared full-text calls, shared by the cell's streams; each call is sent once."""
+
+    finite = True
+
+    def __init__(self, calls: Sequence[tuple[Batch, bytes, list[str]]]):
+        self._ready: deque = deque(calls)
+        self._lock = threading.Lock()
+        self.total = len(calls)
+        self.exhausted_at: float | None = None
+
+    def next(self) -> tuple[Batch, bytes, list[str]]:
+        with self._lock:
+            if self._ready:
+                return self._ready.popleft()
+            if self.exhausted_at is None:
+                self.exhausted_at = time.monotonic()
+        raise SourceExhausted
+
+
+def _no_live_lookup(params: dict[str, Any]) -> None:
+    """The probe looks cited works up in the store only: a work without a stored Europe PMC record gets no metadata,
+    so no PMCID, and is no candidate (a census would look it up live)."""
+    return None
+
+
+class FullTextCache:
+    """Europe PMC fullTextXML of the probe's entries, kept in a directory across probe runs.
+
+    Each PMCID's bytes are kept as Europe PMC served them (``PMC<n>.xml``, mode 0600) and a definitive miss (no
+    open-access full text) as ``PMC<n>.absent``, so a later run fetches nothing it has asked for before; a transient
+    failure is never kept. ``fetch`` is the census's own fetcher (``study_cli.europe_pmc_fetcher``: its headers,
+    spacing and retries). Without ``fetch`` (the dry run) nothing is fetched and only what the directory holds is
+    returned.
+    """
+
+    def __init__(self, directory: Path | None, fetch: Callable[[str], bytes | None] | None):
+        self.directory, self.fetch = directory, fetch
+        self._lock = threading.Lock()
+        self.counts: Counter = Counter()
+        if directory is not None and fetch is not None:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _count(self, key: str) -> None:
+        with self._lock:
+            self.counts[key] += 1
+
+    def __call__(self, pmcid: str) -> bytes | None:
+        from .census_runner import RetryableFetch
+        name = str(pmcid or "").strip().upper()
+        if not PMCID.fullmatch(name):
+            self._count("invalidPmcid")
+            return None
+        body_path = absent_path = None
+        if self.directory is not None:
+            body_path, absent_path = self.directory / f"{name}.xml", self.directory / f"{name}.absent"
+            if body_path.is_file():
+                self._count("cacheHits")
+                return body_path.read_bytes()
+            if absent_path.is_file():
+                self._count("cachedAbsent")
+                return None
+        if self.fetch is None:
+            self._count("notFetched")
+            return None
+        try:
+            body = self.fetch(name)
+        except RetryableFetch:
+            self._count("transient")        # throttled or failed: the entry stays open, nothing is kept
+            raise
+        if body_path is not None and absent_path is not None:
+            atomic_write(body_path if body else absent_path, body or b"", mode=0o600)
+        self._count("fetched" if body else "absent")
+        return body
+
+
+# Candidates of the full-text tier in a scratch census database the probe prepared itself: in-body entries with a
+# resolved identity whose cited work has a PMCID, in bibliography order. No verdict column is read (none exists in
+# that database: nothing in it was ever judged).
+FULL_TEXT_CANDIDATES = (
+    "SELECT c.journal, c.doi, c.label, c.cited_work_key, r.title FROM citations c JOIN reviews r "
+    "ON r.journal=c.journal AND r.doi=c.doi WHERE c.journal=? AND c.doi=? AND c.cited_inbody=1 "
+    "AND c.identity IN ('resolved','resolved_unverified') AND c.cited_pmcid IS NOT NULL ORDER BY c.ordinal")
+
+
+def _seeded(seed: int, scope: str) -> random.Random:
+    material = f"{FORMAT}:{seed}:{scope}".encode()
+    return random.Random(int.from_bytes(hashlib.sha256(material).digest()[:16], "big"))
+
+
+class FullTextInputs:
+    """The full-text tier's calls over real loci, prepared and retrieved by the census's own code, never judged.
+
+    The reviews are the operator's store's retained review captures whose DOI starts with one of the prefixes, in a
+    seeded order. The store must be a ``literature-evidence@2`` projection, the byte cache a census reads (``study
+    prepare --store``), and it is read only through the census's guarded reader, which refuses every table outside
+    the projection's kept tables: no label, verdict, locus or bibliography row can be read. Each
+    review is acquired from the store as a census acquires it without a live route (``ReviewAcquirer``), its cited
+    works are derived from its own bibliography (``derive_works``) with title, venue, year and PMCID from the store's
+    Europe PMC records (``fill_record`` without a live lookup), and it is prepared into a scratch census database
+    (``CensusRun.prepare_review``), whose loci are the census's own. Every in-body entry with a resolved identity
+    whose cited work has a PMCID is a candidate: the census's full-text population is the subset its abstract tier
+    escalates, which the probe cannot know and never reads. Each review's candidates are shuffled with the seed
+    (``citation_census.full_text_groups``) and retrieved and windowed by the tier itself
+    (``CensusRun.prepare_full_text_group``: the store first, then Europe PMC through the census's fetcher), review by
+    review with ``fetch_workers`` threads, until ``full_text_entries`` entries are retrieved. The calls are the
+    census's: five retrieved entries of one review per call, its remainder in the last
+    (``citation_census.full_text_chunks``), built by ``census_runner.full_text_call``.
+    """
+
+    def __init__(self, settings: ProbeSettings, *, model: str, revision: str,
+                 emit: Callable[[dict[str, Any]], None] | None = None):
+        self.settings, self.model, self.revision = settings, model, revision
+        self.emit = emit or (lambda event: None)
+        self.calls: list[tuple[Batch, bytes, list[str]]] = []
+        self.record: dict[str, Any] = {}
+
+    def _open(self):
+        from .census_inputs import InputCaches
+        return InputCaches.open(store=self.settings.store, store_root=self.settings.store_root)
+
+    def _acquirer(self, caches):
+        """The census's acquirer over the store alone (no live route): the journal's route class decides the class of
+        a retained capture, as the protocol's route does in a census; a Europe PMC document is always public."""
+        from .census_inputs import ReviewAcquirer, Route
+        return ReviewAcquirer(caches, routes={self.settings.journal: Route(self.settings.review_route)}, live=None)
+
+    def _reviews(self, caches) -> tuple[list[str], int]:
+        """(review DOIs with one of the prefixes, in the seeded order; DOIs the store's retained-source index holds)."""
+        from .census_inputs import normal_doi
+        rows = caches.store.rows("SELECT DISTINCT doi FROM evidence.retained_sources ORDER BY doi")
+        wanted = tuple(normal_prefix(prefix) for prefix in self.settings.review_prefixes)
+        dois = sorted({doi for doi in (normal_doi(row[0]) for row in rows) if doi and doi.startswith(wanted)})
+        _seeded(self.settings.seed, "full-text-reviews").shuffle(dois)
+        if not dois:
+            raise ValidationError("the store holds no retained review whose DOI starts with "
+                                  + ", ".join(self.settings.review_prefixes))
+        return dois, len(rows)
+
+    def _prepare_review(self, run, acquirer, caches, doi: str, stats: Counter, acquired: Counter
+                        ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]] | None:
+        """One review into the scratch database, as a census prepares it; its candidates and their works, or None."""
+        from .census_abstracts import fill_record
+        from .census_inputs import CLASS_OF
+        from .census_works import derived_record
+        record: dict[str, Any] = {"journal": self.settings.journal, "doi": doi}
+        acquisition = acquirer.acquire(record)
+        if acquisition.state != "acquired":
+            stats["unavailable"] += 1
+            return None
+        acquired[acquisition.provenance] += 1
+        # The record as the acquisition step writes it (acquired_record), with the document in memory instead of a file.
+        record = {**record, "document": {"kind": acquisition.kind,
+                                         "sha256": hashlib.sha256(acquisition.body).hexdigest()},
+                  "provenanceClass": CLASS_OF[acquisition.provenance]}
+        record = derived_record(record, acquisition.body, acquisition.kind, acquisition.tables)
+        if (record.get("worksDerivation") or {}).get("state") != "derived":
+            stats["extractionFailed"] += 1
+            return None
+        record = fill_record(record, _no_live_lookup, cache=caches)
+        try:
+            result = run.prepare_review(record, acquisition.body, acquisition.tables,
+                                        provenance=(acquisition.provenance, acquisition.detail, None))
+        except ValidationError:
+            stats["refused"] += 1
+            return None
+        if result.get("state") != "prepared":
+            stats["notPrepared"] += 1
+            return None
+        stats["prepared"] += 1
+        stats["judgeableEntries"] += int(result.get("judgeable") or 0)
+        with run.lock:
+            rows = [dict(row) for row in run.connection.execute(FULL_TEXT_CANDIDATES, (self.settings.journal, doi))]
+            keys = sorted({row["cited_work_key"] for row in rows})
+            works: dict[str, dict[str, Any]] = {}
+            for start in range(0, len(keys), 500):
+                chunk = keys[start:start + 500]
+                works.update({row["work_key"]: dict(row) for row in run.connection.execute(
+                    f"SELECT * FROM works WHERE work_key IN ({','.join('?' * len(chunk))})", chunk)})
+        stats["candidates"] += len(rows)
+        if not rows:
+            return None
+        return C.full_text_groups(rows, self.settings.seed, review=lambda row: row["doi"])[0][1], works
+
+    def _record(self, caches, scratch: Path, *, dois: Sequence[str], retained: int, considered: int, stats: Counter,
+                acquired: Counter, sources: Counter, kept: Sequence[tuple[int, str, str, list]], cache: "FullTextCache",
+                started: float, live: bool) -> dict[str, Any]:
+        settings = self.settings
+        sizes = Counter(len(labels) for _, _, labels in self.calls)
+        windows = [len(item["fulltext_window"]) for *_, entries in kept for item in entries]
+        return {
+            "store": caches.store.version, "storePath": settings.store, "journal": settings.journal,
+            "reviewDoiPrefixes": list(settings.review_prefixes), "seed": settings.seed,
+            "reviewRoute": settings.review_route, "onPremises": settings.on_premises,
+            "selection": ("in-body entries with a resolved identity whose cited work has a PMCID, from the store's "
+                          "retained reviews with these DOI prefixes, prepared by the census's own code; not the census's "
+                          "escalated entries (the probe never reads a verdict, and nothing it prepared was judged)"),
+            "reviews": {"retainedInStore": retained, "withPrefix": len(dois), "considered": considered,
+                        "prepared": stats["prepared"], "used": len(kept), "unavailable": stats["unavailable"],
+                        "extractionFailed": stats["extractionFailed"], "refused": stats["refused"],
+                        "notPrepared": stats["notPrepared"], "acquisitions": dict(sorted(acquired.items()))},
+            "entries": {"target": settings.full_text_entries, "judgeable": stats["judgeableEntries"],
+                        "candidates": stats["candidates"], "tried": stats["tried"], "retrieved": stats["retrieved"],
+                        "withoutFullText": stats["withoutFullText"], "transient": stats["transient"],
+                        "bySource": dict(sorted(sources.items()))},
+            "fullTexts": {"cacheDirectory": str(cache.directory) if cache.directory else None, "live": live,
+                          **dict(sorted(cache.counts.items())),
+                          "fetcher": ("study_cli.europe_pmc_fetcher: the census's own Europe PMC fullTextXML fetcher "
+                                      "(its User-Agent, 0.4 s spacing per thread, 3 attempts)") if live else None,
+                          "fetchWorkers": settings.fetch_workers},
+            "calls": {"count": len(self.calls), "byItems": {str(k): sizes[k] for k in sorted(sizes)},
+                      "meanItems": _round(sum(n * c for n, c in sizes.items()) / len(self.calls), 2) if self.calls else None},
+            "windows": {"meanCharacters": _round(sum(windows) / len(windows), 1) if windows else None,
+                        "maxCharacters": max(windows) if windows else None,
+                        "budgetCharacters": C.window_characters()},
+            "scratchDatabase": str(scratch), "seconds": round(time.monotonic() - started, 1),
+        }
+
+    def prepare(self, scratch: Path, cache: "FullTextCache") -> dict[str, Any]:
+        """Prepare reviews, retrieve and window their candidates, build the calls; returns the inputs record."""
+        import concurrent.futures
+        from .census_runner import CensusRun, full_text_call
+        settings, started = self.settings, time.monotonic()
+        caches = self._open()
+        try:
+            dois, retained = self._reviews(caches)
+            run = CensusRun(scratch, seed=settings.seed, revision=self.revision)
+            try:
+                run.pin_inputs(caches)
+                acquirer = self._acquirer(caches)
+                stats, acquired, sources = Counter(), Counter(), Counter()
+                kept: list[tuple[int, str, str, list]] = []
+                position, hit_rate = 0, None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=settings.fetch_workers) as pool:
+                    while stats["retrieved"] < settings.full_text_entries and position < len(dois):
+                        # Prepare reviews (here, while no retrieval runs) until their candidates cover the entries
+                        # still needed, at the share of candidates retrieved so far.
+                        wanted = (settings.full_text_entries - stats["retrieved"]) / (hit_rate or 0.7)
+                        groups, candidates = [], 0
+                        while candidates < wanted and position < len(dois):
+                            doi = dois[position]
+                            position += 1
+                            prepared = self._prepare_review(run, acquirer, caches, doi, stats, acquired)
+                            if prepared:
+                                groups.append((position, doi, *prepared))
+                                candidates += len(prepared[0])
+                            if position % 10 == 0:
+                                self.emit({"event": "full-text-inputs", "phase": "reviews", "considered": position,
+                                           "prepared": stats["prepared"], "candidates": stats["candidates"]})
+                        futures = [pool.submit(run.prepare_full_text_group, doi, rows, works, cache, cache=caches)
+                                   for _, doi, rows, works in groups]
+                        for (ordinal, doi, rows, _), future in zip(groups, futures):
+                            if stats["retrieved"] >= settings.full_text_entries:
+                                future.cancel()     # one already running finishes; its full texts stay in the cache
+                                continue
+                            _, journal, title, entries, retry = future.result()
+                            stats["tried"] += len(rows)
+                            stats["retrieved"] += len(entries)
+                            stats["transient"] += retry
+                            stats["withoutFullText"] += len(rows) - len(entries) - retry
+                            sources.update(item["_entry"].get("label") or "supplied" for item in entries)
+                            if entries:
+                                kept.append((ordinal, doi, title, entries))
+                            self.emit({"event": "full-text-inputs", "phase": "retrieval", "retrieved": stats["retrieved"],
+                                       "tried": stats["tried"], "fetched": cache.counts["fetched"],
+                                       "cacheHits": cache.counts["cacheHits"]})
+                        if stats["tried"]:
+                            hit_rate = max(0.05, stats["retrieved"] / stats["tried"])
+                for number, (_, doi, title, entries) in enumerate(kept):
+                    for part, chunk in enumerate(C.full_text_chunks(entries)):
+                        payload = full_text_call(chunk, title, settings.journal, model=self.model)
+                        self.calls.append((Batch(len(self.calls), number, part, title, chunk), C.request_body(payload),
+                                           [item["label"] for item in chunk]))
+            finally:
+                run.close()
+            self.record = self._record(caches, scratch, dois=dois, retained=retained, considered=position, stats=stats,
+                                       acquired=acquired, sources=sources, kept=kept, cache=cache, started=started,
+                                       live=cache.fetch is not None)
+        finally:
+            caches.close()
+        entitled = sum(count for label, count in self.record["reviews"]["acquisitions"].items()
+                       if label.endswith("-entitled"))
+        if entitled and not self.settings.on_premises:
+            raise ValidationError(f"{entitled} reviews were acquired as entitled; they reach only an on-premises judge")
+        if not self.calls:
+            raise ValidationError("no candidate's full text could be retrieved (no PMCID with an open-access full text "
+                                  "among the reviews considered); nothing to send")
+        self.emit({"event": "full-text-inputs", "phase": "done", "calls": len(self.calls),
+                   "retrieved": self.record["entries"]["retrieved"], "seconds": self.record["seconds"]})
+        return self.record
+
+    def plan(self, cache: "FullTextCache") -> dict[str, Any]:
+        """Without any network: the store's reviews for the prefixes, and the first ``PLAN_REVIEWS`` of them prepared
+        in a temporary database, with the full texts the store or the cache directory already hold."""
+        import tempfile
+        from .census_runner import CensusRun, full_text_call
+        settings, started = self.settings, time.monotonic()
+        caches = self._open()
+        try:
+            dois, retained = self._reviews(caches)
+            stats, acquired, sources = Counter(), Counter(), Counter()
+            kept: list[tuple[int, str, str, list]] = []
+            with tempfile.TemporaryDirectory(prefix="ocsl-capacity-plan-") as temporary:
+                scratch = Path(temporary) / FULL_TEXT_INPUTS_NAME
+                run = CensusRun(scratch, seed=settings.seed, revision=self.revision)
+                try:
+                    run.pin_inputs(caches)
+                    acquirer = self._acquirer(caches)
+                    for position, doi in enumerate(dois[:PLAN_REVIEWS], 1):
+                        prepared = self._prepare_review(run, acquirer, caches, doi, stats, acquired)
+                        if not prepared:
+                            continue
+                        rows, works = prepared
+                        _, journal, title, entries, retry = run.prepare_full_text_group(doi, rows, works, cache,
+                                                                                         cache=caches)
+                        stats["tried"] += len(rows)
+                        stats["retrieved"] += len(entries)
+                        sources.update(item["_entry"].get("label") or "supplied" for item in entries)
+                        if entries:
+                            kept.append((position, doi, title, entries))
+                    for number, (_, doi, title, entries) in enumerate(kept):
+                        for part, chunk in enumerate(C.full_text_chunks(entries)):
+                            payload = full_text_call(chunk, title, settings.journal, model=self.model)
+                            self.calls.append((Batch(len(self.calls), number, part, title, chunk),
+                                               C.request_body(payload), [item["label"] for item in chunk]))
+                finally:
+                    run.close()
+            record = self._record(caches, Path("(temporary)"), dois=dois, retained=retained,
+                                  considered=min(PLAN_REVIEWS, len(dois)), stats=stats, acquired=acquired,
+                                  sources=sources, kept=kept, cache=cache, started=started, live=False)
+        finally:
+            caches.close()
+        per_review = stats["candidates"] / stats["prepared"] if stats["prepared"] else None
+        record["entries"]["note"] = ("the dry run fetches nothing: retrieved counts only the full texts the store or the "
+                                     "cache directory hold")
+        record["sample"] = {"reviews": min(PLAN_REVIEWS, len(dois)), "candidatesPerReview": _round(per_review, 1),
+                            "note": "prepared offline; only full texts the store or the cache directory hold were used"}
+        record["estimate"] = {
+            "reviewsForTarget": math.ceil(settings.full_text_entries / per_review) if per_review else None,
+            "fetchSecondsAtLeast": round(settings.full_text_entries * 0.4 / settings.fetch_workers),
+            "note": ("one Europe PMC request per candidate the store and the cache directory do not hold, until the "
+                     "target is retrieved (target / share of PMCIDs with an open-access full text); each fetch thread "
+                     "spaces its requests 0.4 s apart, so fetching takes at least target x 0.4 s / threads plus the "
+                     "downloads, and a rerun with the same cache directory fetches nothing it fetched before")}
+        return record
+
+
 # ----------------------------------------------------------------------------- endpoints and connections
 @dataclass(frozen=True)
 class Endpoint:
@@ -908,14 +1373,29 @@ def _detail(body: bytes, scrub: Callable[[str], str] = _same) -> str:
     return re.sub(r"\s+", " ", scrub(text)).strip()[:DETAIL_CHARACTERS]
 
 
+def malformed_entries(problems: Sequence[str], missing: Sequence[str]) -> int:
+    """How many of an answer's entries without a valid line had a line the validator rejected (``malformed``).
+
+    A line with a wanted label but a bad category names its entry (``citation_census.parse_labels`` reports it as
+    ``bad category for <label>: ...``); every other rejected line (unparseable, not JSON, an unexpected label) may
+    have been the line of any one entry still without a valid line. The other entries without a valid line got no
+    line at all (``missing``): the judge returned fewer lines than items.
+    """
+    named = [problem for problem in problems if problem.startswith("bad category for ")]
+    hit = sum(1 for label in missing if any(problem.startswith(f"bad category for {label}: ") for problem in named))
+    return hit + min(len(missing) - hit, len(problems) - len(named))
+
+
 def classify_response(status: int, body: bytes, labels: Sequence[str],
-                      scrub: Callable[[str], str] = _same) -> dict[str, Any]:
+                      scrub: Callable[[str], str] = _same, *, stage: str = TIER) -> dict[str, Any]:
     """One HTTP response: a transport failure, or an answered call validated by the instrument's own label parser.
 
     Transport failures are a non-2xx status (``http-<status>``), a body that is not a JSON object (``invalid-json``)
     and a JSON object that is no chat completion (``invalid-response``); each carries a short ``detail`` from the
-    body. An answered call counts its entries with a valid line; an empty completion is an answer whose entries
-    are all invalid outputs. ``scrub`` cleans every string the server supplied (detail, model, fingerprint).
+    body. An answered call counts its entries with a valid line, and of those without one (``missing``, the census's
+    invalid outputs) how many had a rejected line (``malformed``); an empty completion is an answer whose entries
+    are all invalid outputs. ``stage`` is the validator's stage (``fulltext`` at the full-text tier, as the census
+    parses it). ``scrub`` cleans every string the server supplied (detail, model, fingerprint).
     """
     if not 200 <= status < 300:
         return {"outcome": "failed", "failure": f"http-{status}", "detail": _detail(body, scrub)}
@@ -934,10 +1414,11 @@ def classify_response(status: int, body: bytes, labels: Sequence[str],
         return {"outcome": "failed", "failure": "invalid-response", "detail": "no message text"}
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
-    records, problems, missing = C.parse_labels(content or "", list(labels), stage=TIER)
+    records, problems, missing = C.parse_labels(content or "", list(labels), stage=stage)
     model, fingerprint = payload.get("model"), payload.get("system_fingerprint")
     finish = choices[0].get("finish_reason")
     return {"outcome": "answered", "failure": None, "valid": len(records), "missing": len(missing),
+            "malformed": malformed_entries(problems, missing),
             "missingLabels": list(missing), "problems": len(problems), "empty": not content,
             "finishReason": scrub(finish)[:40] if isinstance(finish, str) else None,
             "model": scrub(model) if isinstance(model, str) else None,
@@ -1296,6 +1777,160 @@ def repair_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# ----------------------------------------------------------------------------- the full-text tier's shares
+def census_full_text_repair() -> dict[str, Any]:
+    """What citation-census@1 does with full-text entries left without a parseable verdict, from its manifest and the
+    census runner: the instrument's full-text tier has no repair pass, ``census_runner.run_full_text`` records an
+    answered call's entries without a parseable verdict as missing (they stay unsure and are never sent again), and
+    only a call without any response is sent again whole, in a further pass. The census gate
+    ``fullTextInvalidOutputsAtMostOnePercent`` counts the missing entries over the decided ones."""
+    spec = C.settings(FULL_TEXT)
+    passes = int((spec.get("repair") or {}).get("passes") or 0)
+    attempts = int(spec["transport"]["attempts"])
+    return {"repairPasses": passes, "repairPass": passes > 0,
+            "statement": (f"citation-census@1 has no repair pass at the full-text tier (instrument: full-text repair "
+                          f"passes {passes}): the census records an answered call's entries without a parseable verdict "
+                          "as missing, never sends them again, and its gate fullTextInvalidOutputsAtMostOnePercent "
+                          "counts them; so the share before any repair is the census's own share")
+            if passes == 0 else "the instrument declares a full-text repair pass the probe does not send",
+            "retry": (f"only a call without any response is sent again: up to {attempts} transport attempts per call, "
+                      "then again whole in up to --transport-retries further passes (study full-text, 3 by default)")}
+
+
+def _entry_counts(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Valid, missing (no line at all) and malformed (a rejected line) entries of answered calls, with their shares."""
+    entries = sum(r.get("items") or 0 for r in rows)
+    valid = sum(r.get("valid") or 0 for r in rows)
+    invalid = sum(r.get("missing") or 0 for r in rows)
+    malformed = sum(r.get("malformed") or 0 for r in rows)
+    missing = invalid - malformed
+    return {"calls": len(rows), "entries": entries, "valid": valid, "missing": missing, "malformed": malformed,
+            "invalid": invalid, "validShare": _share(valid, entries), "missingShare": _share(missing, entries),
+            "malformedShare": _share(malformed, entries), "invalidShare": _share(invalid, entries)}
+
+
+def hypothetical_repair_summary(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The full-text tier's entries without a valid verdict before and after a single-item resend (``--hypothetical-
+    repair``), overall and by the items of the entry's first call.
+
+    Before: over the entries of answered first calls. After: an entry the first call left invalid is decided by its
+    answered resend (valid or still invalid); one whose resend got no answer or was not sent stays open, and so do the
+    entries of a first call that got no answer (the census sends such a call again whole). Shares after are over the
+    decided entries.
+    """
+    size = C.items_per_call(FULL_TEXT)
+    firsts = {r["batch"]: r for r in records if r.get("kind", "first") == "first"}
+    resends: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        if record.get("kind") == HYPOTHETICAL_REPAIR:
+            resends.setdefault(record["batch"], []).append(record)
+    before = {str(n): {"entries": 0, "invalid": 0} for n in range(1, size + 1)}
+    after = {str(n): {"decided": 0, "invalid": 0, "open": 0} for n in range(1, size + 1)}
+    needed = 0
+    for index, first in firsts.items():
+        name = str(first.get("items") or 0)
+        if name not in before:
+            continue
+        items = first.get("items") or 0
+        if first.get("outcome") != "answered":
+            after[name]["open"] += items
+            continue
+        invalid = first.get("missing") or 0
+        before[name]["entries"] += items
+        before[name]["invalid"] += invalid
+        needed += invalid
+        answered = [r for r in resends.get(index, []) if r.get("outcome") == "answered"]
+        unresolved = max(0, invalid - len(answered))
+        after[name]["decided"] += items - unresolved
+        after[name]["invalid"] += sum(r.get("missing") or 0 for r in answered)
+        after[name]["open"] += unresolved
+    for row in before.values():
+        row["share"] = _share(row["invalid"], row["entries"])
+    for row in after.values():
+        row["share"] = _share(row["invalid"], row["decided"])
+    calls = [r for rows in resends.values() for r in rows]
+    answered = [r for r in calls if r.get("outcome") == "answered"]
+    latencies = [r["seconds"] for r in answered if isinstance(r.get("seconds"), (int, float))]
+    entries, invalid_before = sum(r["entries"] for r in before.values()), sum(r["invalid"] for r in before.values())
+    decided, invalid_after = sum(r["decided"] for r in after.values()), sum(r["invalid"] for r in after.values())
+    prompt = sum(r.get("promptTokens") or 0 for r in answered)
+    completion = sum(r.get("completionTokens") or 0 for r in answered)
+    return {
+        "hypothetical": True,
+        "label": ("hypothetical: citation-census@1 sends no such call (its full-text repair passes are 0); adopting it "
+                  "is a predeclared change of the instrument, decided by the author before the run"),
+        "resend": ("one call per entry an answered full-text call left without a valid verdict, carrying that entry "
+                   "alone, sent by the same stream right after the call: census_runner.full_text_call([entry], title, "
+                   "journal) - citation_census.build_full_text_messages and request_payload with items 1 at the "
+                   "full-text tier: the same system prompt, the entry's citing sentences and window, temperature 0, "
+                   f"reasoning {C.settings(FULL_TEXT)['request'].get('reasoningEffort')}, max_tokens "
+                   f"{C.max_tokens(1, FULL_TEXT)}; one resend per entry and nothing further; a call without any "
+                   "response is not resent (the census sends it again whole)"),
+        "entriesNeedingResend": needed,
+        "calls": {"sent": len(calls), "answered": len(answered),
+                  "failed": sum(1 for r in calls if r.get("outcome") == "failed"),
+                  "abandoned": sum(1 for r in calls if r.get("outcome") == "abandoned"),
+                  "notSent": max(0, needed - len(calls)),
+                  "recovered": sum(r.get("valid") or 0 for r in answered),
+                  "stillInvalid": sum(r.get("missing") or 0 for r in answered),
+                  "stillMissing": sum((r.get("missing") or 0) - (r.get("malformed") or 0) for r in answered),
+                  "stillMalformed": sum(r.get("malformed") or 0 for r in answered),
+                  "truncatedCalls": sum(1 for r in answered if r.get("finishReason") == "length"),
+                  "promptTokens": prompt, "completionTokens": completion,
+                  "promptTokensPerEntry": _round(prompt / len(answered), 1) if answered else None,
+                  "completionTokensPerEntry": _round(completion / len(answered), 1) if answered else None,
+                  "failures": dict(sorted(Counter(r.get("failure") or "unknown" for r in calls
+                                                  if r.get("outcome") == "failed").items())),
+                  "latencySeconds": {"p50": _round(percentile(latencies, 0.5)),
+                                     "p95": _round(percentile(latencies, 0.95))}},
+        "beforeRepair": {"entries": entries, "invalid": invalid_before, "share": _share(invalid_before, entries),
+                         "byItemsPerCall": before},
+        "afterRepair": {"decided": decided, "invalid": invalid_after, "share": _share(invalid_after, decided),
+                        "open": sum(r["open"] for r in after.values()), "byItemsPerCall": after},
+    }
+
+
+def full_text_summary(records: Sequence[dict[str, Any]], *, hypothetical: bool) -> dict[str, Any]:
+    """The full-text cell's entries: valid, missing (no line) and malformed (a rejected line) per call and overall.
+
+    Over answered first calls: overall, by the call's items (1 to 5: each review's last call carries its remainder),
+    and per call (how many calls were all valid, had a missing or a malformed entry, and how many entries each left
+    invalid); tokens per entry; the census's own handling (``census_full_text_repair``: no repair pass, so these are
+    the census's shares); and with ``hypothetical`` the single-item resend.
+    """
+    firsts = [r for r in records if r.get("kind", "first") == "first"]
+    answered = [r for r in firsts if r.get("outcome") == "answered"]
+    # A call the judge refused (HTTP 400, 413 or 422) is a transport failure here; the census counts it as answered
+    # and its entries as missing, so its gate share adds them.
+    refused = [r for r in firsts if r.get("outcome") == "failed" and r.get("failure") in REFUSED_FAILURES]
+    size = C.items_per_call(FULL_TEXT)
+    by_invalid = Counter(min(r.get("missing") or 0, size) for r in answered)
+    prompt = sum(r.get("promptTokens") or 0 for r in answered)
+    completion = sum(r.get("completionTokens") or 0 for r in answered)
+    entries = sum(r.get("items") or 0 for r in answered)
+    calls = {"answered": len(answered),
+             "allValid": sum(1 for r in answered if not r.get("missing")),
+             "withMissing": sum(1 for r in answered if (r.get("missing") or 0) > (r.get("malformed") or 0)),
+             "withMalformed": sum(1 for r in answered if r.get("malformed")),
+             "emptyCompletions": sum(1 for r in answered if r.get("empty")),
+             "truncatedCalls": sum(1 for r in answered if r.get("finishReason") == "length"),
+             "byInvalidEntries": {str(k): by_invalid[k] for k in range(0, size + 1)}}
+    calls["shares"] = {key: _share(calls[key], len(answered)) for key in ("allValid", "withMissing", "withMalformed")}
+    counts = _entry_counts(answered)
+    refused_entries = sum(r.get("items") or 0 for r in refused)
+    counts.update({"refusedCalls": len(refused), "refusedEntries": refused_entries,
+                   "censusInvalidShare": _share(counts["invalid"] + refused_entries, counts["entries"] + refused_entries)})
+    summary = {"census": census_full_text_repair(), "entries": counts,
+               "byItemsPerCall": {str(n): _entry_counts([r for r in answered if r.get("items") == n])
+                                  for n in range(1, size + 1)},
+               "calls": calls,
+               "tokensPerEntry": {"prompt": _round(prompt / entries, 1) if entries else None,
+                                  "output": _round(completion / entries, 1) if entries else None}}
+    if hypothetical:
+        summary["hypotheticalRepair"] = hypothetical_repair_summary(records)
+    return summary
+
+
 # ----------------------------------------------------------------------------- one cell
 class _Inflight:
     """Our own calls in flight, with the peak since the last mark (for the shared-server comparison)."""
@@ -1325,9 +1960,11 @@ class _Inflight:
 
 
 class _CellRun:
-    def __init__(self, probe: "CapacityProbe", entry: dict[str, Any]):
+    def __init__(self, probe: "CapacityProbe", entry: dict[str, Any], source: Any = None):
         self.probe, self.settings = probe, probe.settings
         self.entry = entry
+        self.source = source            # a finite source of prepared calls (full-text tier); default synthetic batches
+        self.stage = FULL_TEXT_STAGE if self.settings.tier == FULL_TEXT else TIER
         self.streams, self.items, self.label = entry["streams"], entry["itemsPerCall"], entry["cell"]
         self.records: list[dict[str, Any]] = []
         self.samples: list[dict[str, Any]] = []
@@ -1380,7 +2017,7 @@ class _CellRun:
         if failure is not None:
             result = {"outcome": "abandoned" if self.abandoning.is_set() else "failed", "failure": failure}
         else:
-            result = classify_response(status, data, labels, scrub=self.probe.scrub_server)
+            result = classify_response(status, data, labels, scrub=self.probe.scrub_server, stage=self.stage)
         return {**result, "status": status, "reused": reused, "start": round(started - self.t0, 4),
                 "end": round(ended - self.t0, 4), "seconds": round(ended - started, 4)}
 
@@ -1390,7 +2027,10 @@ class _CellRun:
         seq = 0
         try:
             while not self.stop.is_set() and not self.aborted.is_set():
-                batch, body, labels = source.next()
+                try:
+                    batch, body, labels = source.next()
+                except SourceExhausted:
+                    break
                 if self.stop.is_set() or self.aborted.is_set():
                     break
                 try:
@@ -1402,13 +2042,16 @@ class _CellRun:
                 record = {"cell": self.label, "stream": index, "seq": seq, "batch": batch.index, "review": batch.review,
                           "items": len(labels), "bodyBytes": len(body), "bodySha256": hashlib.sha256(body).hexdigest(),
                           **outcome}
-                if self.settings.repair:
+                if self.settings.repair or self.settings.tier == FULL_TEXT:
                     record["kind"] = "first"
                 self._record(record, examples, detail)
                 seq += 1
-                if self.settings.repair:
+                if self.settings.repair or self.settings.hypothetical_repair:
                     try:
-                        seq += self._repair(index, seq, pool, batch, labels, outcome, missing or [])
+                        if self.settings.repair:
+                            seq += self._repair(index, seq, pool, batch, labels, outcome, missing or [])
+                        else:
+                            seq += self._hypothetical_repair(index, seq, pool, batch, labels, outcome, missing or [])
                     except PoolClosed:
                         break
         except Exception as error:  # noqa: BLE001 - a probe defect stops the grid and is reported
@@ -1446,6 +2089,36 @@ class _CellRun:
         self._record(record, examples, detail)
         return 1
 
+    def _hypothetical_repair(self, stream: int, seq: int, pool: ConnectionPool, batch: Batch, labels: list[str],
+                             first: dict[str, Any], missing: Sequence[str]) -> int:
+        """``--hypothetical-repair`` (full-text tier): every entry an answered call left without a valid verdict is
+        sent again alone, by the same stream right after the call, as the census's own full-text call of one item
+        (``census_runner.full_text_call``: the same system prompt, window and citing sentences, reasoning low,
+        ``max_tokens`` for one item). citation-census@1 sends no such call (its full-text repair passes are 0), so what
+        this measures is hypothetical. A failed call is not resent (the census sends it again whole in a further
+        pass). Nothing is sent once an abort rule fired or the calls in flight are being cut off. Returns the calls
+        made."""
+        from .census_runner import full_text_call
+        if first["outcome"] != "answered" or not missing:
+            return 0
+        left, sent = set(missing), 0
+        for item in batch.items:
+            if item["label"] not in left:
+                continue
+            if self.aborted.is_set() or self.abandoning.is_set():
+                break
+            payload = full_text_call([item], batch.title, self.settings.journal, model=self.probe.model)
+            body = C.request_body(payload)
+            outcome = self._call(pool, body, [item["label"]])
+            outcome.pop("missingLabels", None)
+            examples, detail = outcome.pop("examples", None), outcome.pop("detail", None)
+            record = {"cell": self.label, "stream": stream, "seq": seq + sent, "batch": batch.index,
+                      "review": batch.review, "kind": HYPOTHETICAL_REPAIR, "items": 1, "firstItems": len(labels),
+                      "bodyBytes": len(body), "bodySha256": hashlib.sha256(body).hexdigest(), **outcome}
+            self._record(record, examples, detail)
+            sent += 1
+        return sent
+
     def _record(self, record: dict[str, Any], examples: dict[str, Any] | None, detail: str | None = None) -> None:
         with self.lock:
             self.records.append(record)
@@ -1459,7 +2132,7 @@ class _CellRun:
                 if len(kept) < 3:
                     kept.append({"batch": record["batch"], "status": record.get("status"), "detail": detail})
         if record["outcome"] == "abandoned" or record.get("failure") == "timeout":
-            self.probe.abandoned(self.t0 + record["end"], C.max_tokens(record["items"], TIER),
+            self.probe.abandoned(self.t0 + record["end"], C.max_tokens(record["items"], self.settings.tier),
                                  record["bodyBytes"] + PROMPT_OVERHEAD)
         if record["outcome"] != "abandoned":
             self.monitor.call_finished(record["end"], record["outcome"] == "failed")
@@ -1528,8 +2201,13 @@ class _CellRun:
     # -------------------------------------------------------------- run
     def run(self) -> dict[str, Any]:
         settings, probe = self.settings, self.probe
-        corpus = cell_corpus(settings, self.streams, self.items)
-        source = _BatchSource(corpus, self.items, journal=settings.journal, model=probe.model, prefill=self.streams)
+        source = self.source
+        if source is None:
+            corpus = cell_corpus(settings, self.streams, self.items)
+            source = _BatchSource(corpus, self.items, journal=settings.journal, model=probe.model, prefill=self.streams)
+        # A finite source (the full-text tier's prepared calls) ends the cell once its last call is handed out, or at
+        # --cell-seconds, whichever comes first: no call is sent twice, so there is no tail past that point.
+        finite = bool(getattr(source, "finite", False))
         pool = ConnectionPool(probe.endpoint, self.streams, settings.request_timeout)
         started_at = utc_now()
         self.t0 = time.monotonic()
@@ -1550,10 +2228,13 @@ class _CellRun:
         cut: list[float] = []
         try:
             while not self.aborted.is_set() and time.monotonic() < end_at:
-                self.aborted.wait(max(0.0, min(1.0, end_at - time.monotonic())))
-            stopped = min(time.monotonic(), end_at)
+                if finite and source.exhausted_at is not None:
+                    break
+                self.aborted.wait(max(0.0, min(0.1 if finite else 1.0, end_at - time.monotonic())))
+            exhausted = finite and source.exhausted_at is not None
+            stopped = min(time.monotonic(), end_at, source.exhausted_at if exhausted else end_at)
             window_end = stopped - self.t0
-            if not self.aborted.is_set():
+            if not self.aborted.is_set() and not exhausted:
                 # The tail: the streams keep sending until every call that overlaps the window's end has finished,
                 # so those calls run under full load (a server emptying behind them would make the window read high).
                 with self.lock:
@@ -1598,6 +2279,10 @@ class _CellRun:
         summary = self.summarize(started_at=started_at, window_end=window_end, tail=tail, cut=cut,
                                  drained=drained_at - self.t0, abandoned_in_flight=abandoned_in_flight,
                                  pool=pool.stats(), unjoined=sum(worker.is_alive() for worker in workers))
+        if finite:
+            summary["timing"]["inputs"] = {"calls": source.total, "exhausted": source.exhausted_at is not None,
+                                           "exhaustedAtSeconds": round(source.exhausted_at - self.t0, 3)
+                                           if source.exhausted_at is not None else None}
         if interrupted:
             summary["state"] = "interrupted"
         return summary
@@ -1723,6 +2408,13 @@ class _CellRun:
                                                     if measured else None)
             summary["repair"] = repair
             summary["invalidOutputShareAfterRepair"] = repair["afterRepair"]["share"]
+        if settings.tier == FULL_TEXT:
+            full_text = full_text_summary(every, hypothetical=settings.hypothetical_repair)
+            full_text["entriesPerSecond"] = summary["entries"]["perSecond"]
+            if settings.hypothetical_repair:
+                full_text["hypotheticalRepair"]["entriesPerSecondWithRepair"] = (
+                    _round(time_weighted_rate(every, window_start, window_end, valid), 2) if measured else None)
+            summary["fullText"] = full_text
         return summary
 
     def _proxy_summary(self) -> dict[str, Any] | None:
@@ -1749,7 +2441,7 @@ class _CellRun:
         carried = self.carried
         our_completion = sum(r.get("completionTokens") or 0 for r in answered)
         our_prompt = sum(r.get("promptTokens") or 0 for r in answered)
-        generation_bound = sum(C.max_tokens(r["items"], TIER) for r in ran) + carried["tokens"]
+        generation_bound = sum(C.max_tokens(r["items"], self.settings.tier) for r in ran) + carried["tokens"]
         prompt_bound = sum(r["bodyBytes"] + PROMPT_OVERHEAD for r in ran) + carried["prompt"]
         request_bound = len(ran) + carried["calls"]
         margin = COUNTER_MARGIN[0] + COUNTER_MARGIN[1] * (len(answered) + request_bound)
@@ -1831,9 +2523,11 @@ class _CellRun:
 # ----------------------------------------------------------------------------- the probe
 class CapacityProbe:
     def __init__(self, settings: ProbeSettings, *, progress: Callable[[str], None] | None = None,
-                 environ: dict[str, str] | None = None):
+                 environ: dict[str, str] | None = None, fetch_xml: Callable[[str], bytes | None] | None = None):
         self.settings = settings
         self.progress = progress
+        # The full-text tier's Europe PMC fetcher: the census's own (study_cli.europe_pmc_fetcher) unless a test gives one.
+        self._fetch_xml = fetch_xml
         self._environ = os.environ if environ is None else environ
         self._key: str | None = None
         self.endpoint: Endpoint | None = None
@@ -1907,6 +2601,8 @@ class CapacityProbe:
         """The grid, request sizes and expected load; sends nothing."""
         settings = self.settings
         settings.validate(live=False)
+        if settings.tier == FULL_TEXT:
+            return self._plan_full_text()
         grid = ordered_grid(settings)
         runnable = [entry for entry in grid if not entry["skip"]]
         sizes: dict[int, dict[str, Any]] = {}
@@ -1961,28 +2657,75 @@ class CapacityProbe:
                 "estimatedSeconds": {"min": round(minimum),
                                      "max": round(minimum + len(runnable) * 2 * settings.drain_seconds)}}
 
+    def _plan_full_text(self) -> dict[str, Any]:
+        """The full-text cell, its inputs and request sizes, without any network: the store is read and the first
+        reviews are prepared offline, with only the full texts the store or the cache directory already hold."""
+        settings = self.settings
+        directory = Path(settings.full_text_cache) if settings.full_text_cache else None
+        cache = FullTextCache(directory if directory is not None and directory.is_dir() else None, None)
+        inputs = FullTextInputs(settings, model=self.model, revision=_code_revision())
+        record = inputs.plan(cache)
+        grid = ordered_grid(settings)
+        system = C.system_prompt(settings.journal)
+        bodies = [len(body) for _, body, _ in inputs.calls]
+        users = [len(json.loads(body)["messages"][1]["content"]) for _, body, _ in inputs.calls]
+        size = C.items_per_call(FULL_TEXT)
+        budget = len(system) + size * (C.window_characters() + 1200)
+        tokens = [(len(system) + u) / TOKEN_CHARACTERS for u in users]
+        entry = grid[0]
+        # At least target / 5 calls: five entries per call, each review's last call carrying its remainder.
+        calls_for_target = math.ceil(settings.full_text_entries / size)
+        return {"format": FORMAT, "dryRun": True, "tier": FULL_TEXT, "instrument": self._instrument_record(),
+                "request": self._request_record(),
+                "endpoint": {"baseUrl": self._safe_url(settings.base_url, "base URL"),
+                             "metricsUrl": self._safe_url(settings.metrics_url, "metrics URL"), "contacted": False},
+                "fullTextInputs": record, "census": census_full_text_repair(),
+                "grid": self._grid_record(grid),
+                "requestSizes": {"sampleCalls": len(bodies),
+                                 "bodyBytes": {"p50": percentile(bodies, 0.5), "max": max(bodies)} if bodies else None,
+                                 "promptTokensEstimate": {"p50": round(percentile(tokens, 0.5)),
+                                                          "max": round(max(tokens))} if tokens else None,
+                                 "promptTokensUpperBound": round(budget / TOKEN_CHARACTERS),
+                                 "maxTokens": {str(n): C.max_tokens(n, FULL_TEXT) for n in range(1, size + 1)}},
+                "load": {**entry, "callsForTargetAtLeast": calls_for_target,
+                         "promptTokensInFlightUpperBound": entry["streams"] * round(budget / TOKEN_CHARACTERS)},
+                "abortRules": self._abort_record(), "decision": self._decision_record(),
+                "estimatedSeconds": {"cellAtMost": round(settings.cell_seconds + settings.drain_seconds),
+                                     "fetchAtLeast": record["estimate"]["fetchSecondsAtLeast"]}}
+
     def _safe_url(self, url: str | None, what: str) -> str | None:
         return Endpoint.parse(url, what).url() if url else None
 
     def _instrument_record(self) -> dict[str, Any]:
-        instrument = C.instrument()
-        return {"id": instrument.id, "digest": instrument.digest, "tier": TIER, "itemsPerCall": instrument_items(),
+        instrument, tier = C.instrument(), self.settings.tier
+        return {"id": instrument.id, "digest": instrument.digest, "tier": tier, "itemsPerCall": instrument_items(tier),
                 "requiredModel": instrument.manifest["requiredModel"]["served"],
                 "validator": instrument.manifest["validator"]["id"],
                 "systemPromptSha256": hashlib.sha256(C.system_prompt(self.settings.journal).encode("utf-8")).hexdigest()}
 
     def _request_record(self) -> dict[str, Any]:
-        request = C.settings(TIER)["request"]
+        tier = self.settings.tier
+        request = C.settings(tier)["request"]
         rule = request["maxOutputTokens"]
-        return {"model": self.model, "journal": self.settings.journal, "temperature": float(request["temperature"]),
-                "reasoningEffort": request.get("reasoningEffort"), "stream": False,
-                "maxTokensRule": f"max({rule['floor']}, {rule['perItem']} * items)",
-                "maxTokens": {str(n): C.max_tokens(n, TIER) for n in sorted({c[1] for c in self.settings.grid_cells()})},
-                "requestTimeoutSeconds": self.settings.request_timeout,
-                "instrumentTimeoutSeconds": request.get("timeoutSeconds"), "repairPass": self.settings.repair,
-                "abstractCut": C.abstract_cut()}
+        sizes = (range(1, C.items_per_call(FULL_TEXT) + 1) if tier == FULL_TEXT
+                 else sorted({c[1] for c in self.settings.grid_cells()}))
+        record = {"model": self.model, "journal": self.settings.journal, "temperature": float(request["temperature"]),
+                  "reasoningEffort": request.get("reasoningEffort"), "stream": False,
+                  "maxTokensRule": f"max({rule['floor']}, {rule['perItem']} * items)",
+                  "maxTokens": {str(n): C.max_tokens(n, tier) for n in sizes},
+                  "requestTimeoutSeconds": self.settings.request_timeout,
+                  "instrumentTimeoutSeconds": request.get("timeoutSeconds"), "repairPass": self.settings.repair}
+        if tier == FULL_TEXT:
+            record.update({"builder": "census_runner.full_text_call (citation_census.build_full_text_messages)",
+                           "windowCharacters": C.window_characters(), "windowField": "FULL TEXT",
+                           "hypotheticalRepair": self.settings.hypothetical_repair})
+        else:
+            record["abstractCut"] = C.abstract_cut()
+        return record
 
-    def _synthetic_record(self) -> dict[str, Any]:
+    def _synthetic_record(self) -> dict[str, Any] | None:
+        if self.settings.tier == FULL_TEXT:
+            return None             # real loci from the store (fullTextInputs), no synthetic entries
         return {"seed": self.settings.seed, "scope": "one call sequence per cell (seed and cell label)",
                 "profile": self.settings.synthetic_profile(),
                 "profileSource": self.settings.profile_source or {"source": "built-in"},
@@ -2010,6 +2753,15 @@ class CapacityProbe:
 
     def _decision_record(self) -> dict[str, Any]:
         settings = self.settings
+        if settings.tier == FULL_TEXT:
+            streams, items = settings.grid_cells()[0]
+            return {"cell": label(streams, items), "gate": "fullTextInvalidOutputsAtMostOnePercent",
+                    "limit": 0.01, "itemsPerCall": items,
+                    "requires": ["answered by the instrument's required model",
+                                 "the share of entries without a parseable verdict over the entries of answered calls, "
+                                 "as the census gate counts them (no repair pass at this tier)"],
+                    "throughput": "reported only: a census's full-text calls arrive at the pace of its Europe PMC "
+                                  "retrieval"}
         return {"cell": label(settings.allowed_streams, instrument_items()), "targetEntriesPerSecond": settings.target_rate,
                 "allowedStreams": settings.allowed_streams, "itemsPerCall": instrument_items(),
                 "requires": ["answered by the instrument's required model",
@@ -2084,28 +2836,50 @@ class CapacityProbe:
                 "foreignSamples": foreign, "countersAdvanced": advanced,
                 "foreign": (active or foreign >= min(settings.shared_min_samples, len(known))) if known else None}
 
+    def _check_on_premises(self) -> dict[str, Any] | None:
+        """``--on-premises --policy`` (full-text tier): the judge endpoint must be an on-prem endpoint of the operator's
+        egress policy, exactly as ``study full-text --on-premises --policy`` requires before entitled text is sent."""
+        settings = self.settings
+        if not settings.on_premises:
+            return None
+        from .claim_check import ConfidentialPolicy
+        from .errors import ConfidentialityError
+        policy = ConfidentialPolicy.load(Path(settings.policy or ""))
+        endpoint = (settings.base_url or "").rstrip("/") + "/chat/completions"
+        if not policy.endpoint_on_prem(endpoint):
+            raise ConfidentialityError(f"{Endpoint.parse(settings.base_url or '', 'base URL').url()}/chat/completions is "
+                                       "not an on-prem endpoint of the policy")
+        return {"policySha256": policy.digest, "endpointOnPremises": True}
+
     def run(self, output: Path) -> dict[str, Any]:
         settings = self.settings
         settings.validate(live=True)
+        on_premises = self._check_on_premises()
         self._prepare_transport()
         output = Path(output)
         if output.exists() and (not output.is_dir() or any(output.iterdir())):
             raise ValidationError(f"the output directory must be new or empty: {output}")
         grid = ordered_grid(settings)
         C.instrument()
+        full_text = settings.tier == FULL_TEXT
+        revision = _code_revision()
         report: dict[str, Any] = {
-            "format": FORMAT, "state": "running", "startedAt": utc_now(), "finishedAt": None,
-            "code": {"revision": _code_revision(), "python": platform.python_version()},
+            "format": FORMAT, "state": "running", "tier": settings.tier, "startedAt": utc_now(), "finishedAt": None,
+            "code": {"revision": revision, "python": platform.python_version()},
             "client": {"host": socket.gethostname(), "platform": platform.platform(terse=True)},
             "instrument": self._instrument_record(), "request": self._request_record(),
             "endpoint": {"baseUrl": self.endpoint.url(), "chatPath": self.chat_path,
                          "metricsUrl": self._safe_url(settings.metrics_url, "metrics URL"),
                          "apiKeyEnv": settings.api_key_env, "keySent": bool(self._key),
-                         "connection": "direct HTTP/1.1 keep-alive; proxies from the environment are not used"},
+                         "connection": "direct HTTP/1.1 keep-alive; proxies from the environment are not used"
+                                       + ("; the full-text tier's Europe PMC fetches use the census's fetcher, which "
+                                          "honours them" if full_text else "")},
             "synthetic": self._synthetic_record(), "expectation": settings.expectation(),
             "grid": self._grid_record(grid), "abortRules": self._abort_record(), "decision": self._decision_record(),
             "preflight": None, "baseline": None, "cells": [], "abort": None,
         }
+        if full_text:
+            report.update({"fullTextInputs": None, "census": census_full_text_repair(), "onPremises": on_premises})
         try:
             report["preflight"] = self._preflight()
             if self.metrics:
@@ -2118,7 +2892,17 @@ class CapacityProbe:
         files = {"json": output / REPORT_NAME, "markdown": output / MARKDOWN_NAME, "calls": output / CALLS_NAME}
         report["files"] = {k: str(v) for k, v in files.items()}
         atomic_write(files["calls"], "")
+        source = None
         try:
+            if full_text:
+                # The inputs first (minutes of Europe PMC fetches the first time), then the idle baseline, then the cell.
+                self._write(report, files, final=False)
+                from .study_cli import europe_pmc_fetcher
+                directory = Path(settings.full_text_cache) if settings.full_text_cache else output / FULL_TEXT_CACHE_NAME
+                cache = FullTextCache(directory, self._fetch_xml or europe_pmc_fetcher())
+                inputs = FullTextInputs(settings, model=self.model, revision=revision, emit=self.emit)
+                report["fullTextInputs"] = inputs.prepare(output / FULL_TEXT_INPUTS_NAME, cache)
+                source = _FullTextSource(inputs.calls)
             report["baseline"] = self._baseline()
             self.emit({"event": "baseline", **{k: report["baseline"].get(k) for k in ("metrics", "foreign")}})
             self._write(report, files, final=False)
@@ -2138,7 +2922,7 @@ class CapacityProbe:
                     continue
                 self.emit({"event": "cell-start", "cell": entry["cell"], "position": entry["position"],
                            "of": len(runnable)})
-                cell = _CellRun(self, entry)
+                cell = _CellRun(self, entry, source=source)
                 summary = cell.run()
                 with files["calls"].open("a", encoding="utf-8") as handle:
                     for record in cell.records:
@@ -2162,6 +2946,8 @@ class CapacityProbe:
             raise
         except Exception as error:
             report["state"], report["error"] = "failed", type(error).__name__
+            if isinstance(error, ValidationError):
+                report["errorMessage"] = str(error)[:300]
             self._write(report, files, final=True)
             raise
         finally:
@@ -2365,12 +3151,68 @@ def _tokens_note(assessment: dict[str, Any], settings: ProbeSettings) -> str:
     return note
 
 
+def full_text_exit(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
+    """The full-text cell against the census gate ``fullTextInvalidOutputsAtMostOnePercent``.
+
+    The share is the entries of answered calls without a parseable verdict over the entries of those calls, as the
+    census counts them: citation-census@1 has no repair pass at this tier. Throughput is reported, never a criterion
+    (a census's full-text calls arrive at the pace of its Europe PMC retrieval). The hypothetical single-item resend
+    is reported beside the share and never changes the verdict.
+    """
+    head = ("Full-text tier (census gate fullTextInvalidOutputsAtMostOnePercent: at most 1 % of full-text entries "
+            "without a parseable verdict; citation-census@1 has no repair pass at this tier):")
+    base = {"tier": FULL_TEXT, "gate": "fullTextInvalidOutputsAtMostOnePercent", "limit": 0.01}
+    ran = [c for c in report.get("cells", []) if c.get("state") != "skipped"]
+    if not ran:
+        return {**base, "passes": None, "line": f"{head} not assessed - no cell ran."}
+    cell = ran[0]
+    full_text = cell.get("fullText") or {}
+    entries = full_text.get("entries") or {}
+    if not entries.get("entries"):
+        return {**base, "cell": cell.get("cell"), "passes": None,
+                "line": f"{head} not assessed - {cell.get('cell')}: no answered call (state {cell.get('state')})."}
+    served = cell.get("served") or {}
+    models = ", ".join(f"`{m}`" for m in sorted(served.get("models") or {})) or "no model"
+    if not served.get("matchesInstrument"):
+        return {**base, "cell": cell.get("cell"), "passes": None,
+                "line": (f"{head} not assessed - {cell.get('cell')}: the server answered as {models}, not the "
+                         f"instrument's required model `{served.get('requiredModel')}`.")}
+    share = entries.get("censusInvalidShare", entries.get("invalidShare"))
+    passes = share is not None and share <= 0.01
+    buckets = ", ".join(f"{name}: {_percent(row.get('invalidShare'), 2)}"
+                        for name, row in (full_text.get("byItemsPerCall") or {}).items() if row.get("entries"))
+    tokens = full_text.get("tokensPerEntry") or {}
+    state = "" if cell.get("state") == "completed" else f" (cell {cell.get('state')})"
+    refusals = (f"; with {entries['refusedEntries']} entries of {entries['refusedCalls']} calls the judge refused, "
+                "which the census counts as missing" if entries.get("refusedCalls") else "")
+    line = (f"{head} {'PASS' if passes else 'FAIL'} - {cell.get('cell')}{state}: invalid {_percent(share, 2)} of "
+            f"{entries['entries']} entries in {entries['calls']} answered calls (missing {_percent(entries.get('missingShare'), 2)}, "
+            f"malformed {_percent(entries.get('malformedShare'), 2)}; by items per call {buckets}{refusals}); transport failures "
+            f"{_percent(cell.get('transportFailureShare'), 2)}; {_num(full_text.get('entriesPerSecond'), 2)} entries/s; "
+            f"tokens per entry: prompt {_num(tokens.get('prompt'), 1)}, output {_num(tokens.get('output'), 1)}; served "
+            f"model {models}")
+    hypothetical = full_text.get("hypotheticalRepair")
+    result = {**base, "cell": cell.get("cell"), "passes": passes, "invalidShare": share,
+              "missingShare": entries.get("missingShare"), "malformedShare": entries.get("malformedShare")}
+    if hypothetical:
+        after = hypothetical.get("afterRepair") or {}
+        line += (f"; hypothetical single-item resend (not part of citation-census@1): invalid "
+                 f"{_percent(after.get('share'), 2)} after it ({after.get('open')} open), "
+                 f"{_num(hypothetical.get('entriesPerSecondWithRepair'), 2)} entries/s with it")
+        result["hypotheticalShareAfter"] = after.get("share")
+    result["line"] = line + ("." if passes else "; the author decides in D1.")
+    return result
+
+
 def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
     """The instrument's geometry at the allowed concurrency, and whether it reaches the target rate.
 
     Only that cell decides (the census sends nothing else); the other geometries at or below the allowed streams are
-    reported as exploratory and never pass the criterion.
+    reported as exploratory and never pass the criterion. The full-text tier is assessed against its census gate
+    instead (``full_text_exit``).
     """
+    if settings.tier == FULL_TEXT:
+        return full_text_exit(report, settings)
     target, allowed, items = settings.target_rate, settings.allowed_streams, instrument_items()
     name = label(allowed, items)
     head = (f"Exit criterion (≥ {target:g} entries/s with the instrument's {items} items per call at the allowed "
@@ -2423,6 +3265,14 @@ def exit_criterion(report: dict[str, Any], settings: ProbeSettings) -> dict[str,
 def allowed_concurrency(report: dict[str, Any], settings: ProbeSettings) -> dict[str, Any]:
     """The allowed concurrency stays at ``allowed_streams`` unless the report shows the server is not shared."""
     shared = (report.get("server") or {}).get("shared")
+    if settings.tier == FULL_TEXT:
+        streams = settings.grid_cells()[0][0]
+        return {"streams": streams, "serverShared": shared, "mayExceed": False, "bestAbove": None,
+                "exploratoryAbove": None,
+                "line": (f"Concurrency: {streams} streams for the full-text tier, a probe setting and no census one: a "
+                         "census's full-text calls arrive at the pace of its Europe PMC retrieval (study full-text "
+                         "--fetch-workers, 0.4 s between a thread's requests), so the judge holds far fewer of them than "
+                         f"the abstract tier's {settings.allowed_streams} streams.")}
     allowed, items = settings.allowed_streams, instrument_items()
     above = [assess_cell(c, settings) for c in report.get("cells", []) if c.get("streams", 0) > allowed]
     eligible = [a for a in above if a["eligible"]]
@@ -2456,22 +3306,117 @@ def _num(value: Any, digits: int = 1) -> str:
     return str(value)
 
 
+def _full_text_inputs_lines(inputs: dict[str, Any] | None) -> list[str]:
+    """The full-text tier's inputs: store, reviews, entries, full texts and calls (counts only)."""
+    if not inputs:
+        return ["- Inputs: not prepared"]
+    reviews, entries, texts, calls = inputs["reviews"], inputs["entries"], inputs["fullTexts"], inputs["calls"]
+    store = inputs.get("store") or {}
+    sources = ", ".join(f"{k} {v}" for k, v in (entries.get("bySource") or {}).items()) or "none"
+    fetched = ", ".join(f"{k} {texts[k]}" for k in ("fetched", "cacheHits", "absent", "cachedAbsent", "transient",
+                                                     "notFetched") if texts.get(k))
+    return [f"- Inputs: real loci from the store `{_cell(str(store.get('merkleRoot', ''))[:16])}` ({store.get('id')}), "
+            f"journal label {_cell(inputs['journal'])}, review DOI prefixes {_cell(', '.join(inputs['reviewDoiPrefixes']))}; "
+            f"{_cell(inputs['selection'])}",
+            f"- Reviews: {reviews['withPrefix']} with the prefixes of {reviews['retainedInStore']} retained in the store; "
+            f"{reviews['considered']} considered, {reviews['prepared']} prepared, {reviews['used']} used "
+            f"(unavailable {reviews['unavailable']}, extraction failed {reviews['extractionFailed']}, refused "
+            f"{reviews['refused']}, not prepared {reviews['notPrepared']})",
+            f"- Entries: {entries['judgeable']} judgeable, {entries['candidates']} with a PMCID, {entries['tried']} tried, "
+            f"{entries['retrieved']} retrieved (target {entries['target']}; without a full text {entries['withoutFullText']}, "
+            f"left open by a transient failure {entries['transient']}); sources: {sources}",
+            f"- Full texts: {fetched or 'nothing fetched'}; cache directory {_cell(texts.get('cacheDirectory') or '-')}; "
+            f"{texts.get('fetchWorkers')} fetch threads",
+            f"- Calls: {calls['count']} (mean {_num(calls['meanItems'], 2)} items; by items "
+            f"{', '.join(f'{k}: {v}' for k, v in calls['byItems'].items())}); windows mean "
+            f"{_num((inputs.get('windows') or {}).get('meanCharacters'), 0)} characters of at most "
+            f"{(inputs.get('windows') or {}).get('budgetCharacters')}; prepared in {inputs.get('seconds')} s"]
+
+
+def _full_text_markdown(report: dict[str, Any]) -> list[str]:
+    """The full-text cell's entries by items per call, its calls, and the hypothetical single-item resend."""
+    cells = [cell for cell in report.get("cells", []) if cell["state"] != "skipped" and cell.get("fullText")]
+    if not cells:
+        return []
+    census = (report.get("census") or cells[0]["fullText"].get("census") or {})
+    lines = ["", f"Full-text entries of answered calls ({census.get('statement', '')}):",
+             "| Cell | Items/call | Calls | Entries | Valid | Missing (no line) | Malformed (rejected line) | Invalid |",
+             "|---|---|---|---|---|---|---|---|"]
+    for cell in cells:
+        full_text = cell["fullText"]
+        for name, row in [*full_text["byItemsPerCall"].items(), ("all", full_text["entries"])]:
+            lines.append(f"| {cell['cell']} | {name} | {row['calls']} | {row['entries']} | {_percent(row['validShare'], 2)} | "
+                         f"{_percent(row['missingShare'], 2)} | {_percent(row['malformedShare'], 2)} | "
+                         f"{_percent(row['invalidShare'], 2)} |")
+    for cell in cells:
+        calls = cell["fullText"]["calls"]
+        shares = calls["shares"]
+        lines.append(f"- {cell['cell']} calls: {calls['answered']} answered; all valid {_percent(shares['allValid'])}, with a "
+                     f"missing entry {_percent(shares['withMissing'])}, with a malformed entry {_percent(shares['withMalformed'])}; "
+                     f"empty completions {calls['emptyCompletions']}, truncated {calls['truncatedCalls']}; calls by entries "
+                     f"left invalid: {', '.join(f'{k}: {v}' for k, v in calls['byInvalidEntries'].items())}")
+    if census.get("retry"):
+        lines.append(f"- The census's retry: {census['retry']}")
+    repaired = [cell for cell in cells if cell["fullText"].get("hypotheticalRepair")]
+    if repaired:
+        label_text = repaired[0]["fullText"]["hypotheticalRepair"]["label"]
+        lines += ["", f"Hypothetical single-item resend - {label_text}. Decided entries; open: the resend got no answer "
+                      "or was not sent, or the call itself got none:",
+                  "| Cell | Items/call | Entries (answered calls) | Invalid before | Share before | Decided | Invalid after | "
+                  "Share after | Open |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for cell in repaired:
+            repair = cell["fullText"]["hypotheticalRepair"]
+            before, after = repair["beforeRepair"], repair["afterRepair"]
+            for bucket in [*before["byItemsPerCall"], "all"]:
+                b = before if bucket == "all" else before["byItemsPerCall"][bucket]
+                a = after if bucket == "all" else after["byItemsPerCall"][bucket]
+                lines.append(f"| {cell['cell']} | {bucket} | {b['entries']} | {b['invalid']} | {_percent(b['share'], 2)} | "
+                             f"{a['decided']} | {a['invalid']} | {_percent(a['share'], 2)} | {a['open']} |")
+        for cell in repaired:
+            repair = cell["fullText"]["hypotheticalRepair"]
+            calls = repair["calls"]
+            lines.append(f"- {cell['cell']} resend calls: {calls['sent']} sent for {repair['entriesNeedingResend']} entries "
+                         f"({calls['answered']} answered, {calls['failed']} failed, {calls['abandoned']} cut off, "
+                         f"{calls['notSent']} not sent), {calls['recovered']} recovered, {calls['stillInvalid']} still "
+                         f"without a valid verdict; entries/s with the resend "
+                         f"{_num(repair.get('entriesPerSecondWithRepair'), 2)}")
+        lines.append(f"- The resend: {repaired[0]['fullText']['hypotheticalRepair']['resend']}")
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [f"# Capacity probe: {report['instrument']['id']} ({report['instrument']['tier']} tier)", ""]
     endpoint, request, grid = report["endpoint"], report["request"], report["grid"]
+    full_text = report["instrument"]["tier"] == FULL_TEXT
     profile_source = (report.get("synthetic") or {}).get("profileSource") or {}
+    if full_text:
+        calls = ("the census's full-text calls (no repair pass at this tier)"
+                 + ("; with the hypothetical single-item resend (--hypothetical-repair)"
+                    if request.get("hypotheticalRepair") else ""))
+    else:
+        calls = ("first calls and the census's repair pass (--repair)" if request.get("repairPass")
+                 else "first calls only (no repair pass)")
     lines += [f"- State: **{report['state']}**; started {report['startedAt']}, finished {report.get('finishedAt') or '-'}",
               f"- Endpoint: {endpoint['baseUrl']} (metrics: {endpoint.get('metricsUrl') or 'not configured'}); "
               f"requested model `{request['model']}`",
               f"- Requests: temperature {request['temperature']:g}, reasoning {request['reasoningEffort']}, "
-              f"stream off, max_tokens = {request['maxTokensRule']}, "
-              + ("first calls and the census's repair pass (--repair)" if request.get("repairPass")
-                 else "first calls only (no repair pass)"),
-              f"- Synthetic entries: seed {report['synthetic']['seed']}, profile "
-              f"{_cell(profile_source.get('path') or profile_source.get('source') or 'built-in')}, instrument digest "
-              f"`{report['instrument']['digest'][:16]}`",
-              f"- Grid: order {grid['order']}; each cell {grid['cellSeconds']:g} s with a {grid['warmupSeconds']:g} s "
-              f"warm-up, a tail until the window's last calls finish and a drain of up to {grid['drainSeconds']:g} s", ""]
+              f"stream off, max_tokens = {request['maxTokensRule']}, " + calls]
+    if full_text:
+        lines += _full_text_inputs_lines(report.get("fullTextInputs"))
+        lines.append(f"- Instrument digest `{report['instrument']['digest'][:16]}`; journal label in the system prompt "
+                     f"{_cell(request['journal'])}")
+        lines.append(f"- Cell: each prepared call sent once, for at most {grid['cellSeconds']:g} s with a "
+                     f"{grid['warmupSeconds']:g} s warm-up and a drain of up to {grid['drainSeconds']:g} s")
+    else:
+        lines += [f"- Synthetic entries: seed {report['synthetic']['seed']}, profile "
+                  f"{_cell(profile_source.get('path') or profile_source.get('source') or 'built-in')}, instrument digest "
+                  f"`{report['instrument']['digest'][:16]}`",
+                  f"- Grid: order {grid['order']}; each cell {grid['cellSeconds']:g} s with a {grid['warmupSeconds']:g} s "
+                  f"warm-up, a tail until the window's last calls finish and a drain of up to {grid['drainSeconds']:g} s"]
+    if report.get("errorMessage"):
+        lines.append(f"- Error: {_cell(report['errorMessage'])}")
+    lines.append("")
     exit_line = (report.get("exitCriterion") or {}).get("line")
     concurrency = (report.get("allowedConcurrency") or {}).get("line")
     if exit_line:
@@ -2541,6 +3486,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                          f"{calls['notSent']} not sent), {calls['items']} items, {calls['recovered']} recovered, "
                          f"{calls['stillWithoutLine']} still without a parseable line; entries/s with repair calls "
                          f"{_num(cell['repair'].get('entriesPerSecondWithRepair'), 2)}")
+    lines += _full_text_markdown(report)
     examples = [f"- {cell['cell']} {failure}: {_cell(kept[0]['detail']) or '(empty body)'}"
                 for cell in report.get("cells", []) if cell["state"] != "skipped"
                 for failure, kept in (cell.get("failureExamples") or {}).items() if kept]
@@ -2563,7 +3509,41 @@ def _cell(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value if value is not None else "")).replace("|", "\\|").strip()
 
 
+def render_full_text_plan(plan: dict[str, Any]) -> str:
+    request, grid, inputs, sizes = plan["request"], plan["grid"], plan["fullTextInputs"], plan["requestSizes"]
+    load, estimate = plan["load"], inputs["estimate"]
+    sample = inputs["sample"]
+    lines = ["Capacity probe plan, full-text tier (dry run: nothing is sent and nothing is fetched)",
+             f"instrument {plan['instrument']['id']} {plan['instrument']['digest'][:16]}, full-text tier; model "
+             f"{request['model']}; journal label {request['journal']}",
+             f"requests: the census's full-text calls ({request['builder']}): temperature {request['temperature']:g}, "
+             f"reasoning {request['reasoningEffort']}, stream off, max_tokens = {request['maxTokensRule']}, windows of at "
+             f"most {request['windowCharacters']} characters in the {request['windowField']} field"
+             + ("; hypothetical single-item resend of every entry left without a valid verdict"
+                if request.get("hypotheticalRepair") else ""),
+             f"census: {plan['census']['statement']}",
+             f"endpoint: {plan['endpoint']['baseUrl'] or '(no --base-url)'} (not contacted)", ""]
+    lines += [line[2:] for line in _full_text_inputs_lines(inputs)]
+    lines += ["",
+              f"sample: the first {sample['reviews']} reviews prepared offline, {_num(sample['candidatesPerReview'], 1)} "
+              f"candidates per review; {sample['note']}",
+              f"estimate: about {estimate['reviewsForTarget'] if estimate['reviewsForTarget'] is not None else 'n/a'} "
+              f"reviews for the {inputs['entries']['target']} entries; fetching at least "
+              f"{_duration(estimate['fetchSecondsAtLeast'])}; {estimate['note']}",
+              f"request sizes of the sample's calls: body bytes p50 "
+              f"{_num((sizes.get('bodyBytes') or {}).get('p50'), 0)}, max {(sizes.get('bodyBytes') or {}).get('max', 'n/a')}; "
+              f"~prompt tokens p50 {(sizes.get('promptTokensEstimate') or {}).get('p50', 'n/a')}, max "
+              f"{(sizes.get('promptTokensEstimate') or {}).get('max', 'n/a')} (upper bound "
+              f"{sizes['promptTokensUpperBound']} at {TOKEN_CHARACTERS} characters per token)",
+              f"cell {load['cell']}: {load['streams']} streams, at least {load['callsForTargetAtLeast']} calls (five "
+              f"entries each, a review's last call its remainder), each sent once; at most "
+              f"{_duration(grid['cellSeconds'])} plus a drain of up to {_duration(grid['drainSeconds'])}", ""]
+    return "\n".join(lines)
+
+
 def render_plan(plan: dict[str, Any]) -> str:
+    if plan.get("tier") == FULL_TEXT:
+        return render_full_text_plan(plan)
     request, grid, decision = plan["request"], plan["grid"], plan["decision"]
     source = (plan["synthetic"].get("profileSource") or {})
     expectation = plan.get("expectation") or {}
@@ -2632,7 +3612,8 @@ def add_commands(families: Any, register: Callable[..., None]) -> None:
     probe = commands.add_parser(
         "probe", help="run the citation-census@1 capacity grid against an OpenAI-compatible judge (operator)",
         description="Streams x items-per-call grid of real citation-census@1 abstract-tier requests over synthetic "
-                    "entries. See docs/capacity-probe.md.")
+                    "entries, or (--tier full-text) the census's full-text calls over real loci from a "
+                    "literature-evidence@2 projection. See docs/capacity-probe.md.")
     target = probe.add_argument_group("target")
     target.add_argument("--base-url", help="chat-completions base URL, for example http://127.0.0.1:8000/v1")
     target.add_argument("--api-key-env", help="name of the environment variable holding the judge key (never printed)")
@@ -2695,6 +3676,36 @@ def add_commands(families: Any, register: Callable[..., None]) -> None:
                        help="also send the census's one repair call for every batch whose first call left labels without "
                             "a parseable line (or failed), built by the census runner, and report invalid outputs before "
                             "and after the repair pass, overall and by items per call (1, 2-9, 10-39, 40)")
+    full_text = probe.add_argument_group("full-text tier")
+    full_text.add_argument("--tier", choices=TIERS, default=TIER,
+                           help="abstract (default: synthetic entries, the grid) or full-text (the census's full-text "
+                                "calls over real loci from --store, one cell, default %dx%d)"
+                                % (FULL_TEXT_STREAMS, C.items_per_call(FULL_TEXT)))
+    full_text.add_argument("--store", help="literature-evidence@2 projection (absolute path), the byte cache the census "
+                                           "reads: its retained reviews give the real loci; read through the census's "
+                                           "guarded reader (no label or verdict can be read)")
+    full_text.add_argument("--store-root", help="Merkle root the store must have (the pinned dataset version)")
+    full_text.add_argument("--review-doi-prefix", action="append", default=[],
+                           help="DOI prefix of the reviews to use (repeatable), all of the journal --journal names")
+    full_text.add_argument("--full-text-entries", type=int, default=FULL_TEXT_ENTRIES,
+                           help=f"retrieved entries to prepare and send (default {FULL_TEXT_ENTRIES})")
+    full_text.add_argument("--fetch-workers", type=int, default=FETCH_WORKERS,
+                           help=f"Europe PMC fetch threads (default {FETCH_WORKERS}, as study full-text)")
+    full_text.add_argument("--full-text-cache",
+                           help="directory (absolute) that keeps fetched fullTextXML across runs (default: "
+                                f"{FULL_TEXT_CACHE_NAME} in --output)")
+    full_text.add_argument("--review-route", choices=("public", "entitled"), default="entitled",
+                           help="the journal's route class in the protocol (default entitled, as a census treats a "
+                                "journal without a route): public for an open-access journal; entitled reviews reach "
+                                "only an on-premises judge (--on-premises --policy)")
+    full_text.add_argument("--on-premises", action="store_true",
+                           help="the judge runs on premises (entitled review text allowed); needs --policy naming its "
+                                "endpoint, as study full-text does")
+    full_text.add_argument("--policy", help="operator egress policy (JSON, version 2) whose onPremEndpoints lists the judge")
+    full_text.add_argument("--hypothetical-repair", action="store_true",
+                           help="also resend every entry a full-text call left without a valid verdict alone (a "
+                                "single-item call built by the census's full-text builder) and report the share after "
+                                "it as hypothetical: citation-census@1 has no repair pass at that tier")
     probe.add_argument("--output", help="new or empty directory for the report, markdown table and call log")
     probe.add_argument("--dry-run", action="store_true", help="print the grid, request sizes and expected load; send nothing")
     register(probe, "capacity_probe", "command", "operator", state_required=False)
@@ -2727,7 +3738,15 @@ def settings_from_args(args: Any) -> ProbeSettings:
         shared_tolerance=args.shared_tolerance, allowed_streams=args.allowed_streams, target_rate=args.target_rate,
         expect_output_tokens=args.expect_output_tokens, expect_prompt_tokens=args.expect_prompt_tokens,
         expect_tolerance=args.expect_tolerance, profile=profile, profile_expected=expected, profile_source=source,
-        seed=args.seed, journal=args.journal, repair=bool(getattr(args, "repair", False)))
+        seed=args.seed, journal=args.journal, repair=bool(getattr(args, "repair", False)),
+        tier=getattr(args, "tier", None) or TIER, store=getattr(args, "store", None),
+        store_root=getattr(args, "store_root", None), review_prefixes=tuple(getattr(args, "review_doi_prefix", None) or ()),
+        full_text_entries=getattr(args, "full_text_entries", FULL_TEXT_ENTRIES),
+        fetch_workers=getattr(args, "fetch_workers", FETCH_WORKERS),
+        full_text_cache=getattr(args, "full_text_cache", None),
+        hypothetical_repair=bool(getattr(args, "hypothetical_repair", False)),
+        review_route=getattr(args, "review_route", None) or "entitled",
+        on_premises=bool(getattr(args, "on_premises", False)), policy=getattr(args, "policy", None))
 
 
 def _stderr(line: str) -> None:
@@ -2758,7 +3777,9 @@ def profile_command(args: Any) -> Any:
 
 
 __all__ = ["CapacityProbe", "ProbeSettings", "SyntheticCorpus", "ConnectionPool", "AbortMonitor", "classify_response",
-           "build_repair_request", "repair_summary", "item_bucket",
+           "build_repair_request", "repair_summary", "item_bucket", "FullTextInputs", "FullTextCache",
+           "full_text_summary", "hypothetical_repair_summary", "census_full_text_repair", "full_text_exit",
+           "malformed_entries", "render_full_text_plan",
            "parse_prometheus", "server_load", "time_weighted_rate", "completed_rate", "percentile", "ordered_grid",
            "parse_cells", "build_request", "render_markdown", "render_plan", "exit_criterion", "allowed_concurrency",
            "server_verdict", "assess_cell", "above_allowed_reason", "profile_from_database", "load_profile",
