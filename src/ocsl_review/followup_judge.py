@@ -44,7 +44,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .claim_check import ConfidentialPolicy, endpoint_text, normalize_endpoint
 from .errors import ConfidentialityError, ReviewError, ValidationError
-from .followup_branch import now, store_artifact
+from .followup_branch import check_instrument, now, store_artifact
 from .followup_model import canonical, digest
 
 REPAIR_NOTE_KEY = "repair"
@@ -220,6 +220,13 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
         raise ValidationError("every item needs its provenance class (public or entitled)")
     if "entitled" in classes and not entitled_allowed(policy, judge):
         raise ConfidentialityError("entitled evidence reaches only judges the operator's policy lists as on premises")
+    # Before any call: the registry digest equals every pin (study bundle, protocol), and the pinned bundle's sha256
+    # goes into every receipt, replicate calls included. A broker run needs a pinned bundle, as the census's does.
+    pinned_bundle = check_instrument(connection, instrument)
+    study_bundle = study_bundle or pinned_bundle
+    if items and getattr(judge, "requires_study_bundle", False) and not study_bundle:
+        raise ValidationError("a broker run records the study bundle in every receipt: pin it first with followup init "
+                              "--study-bundle or followup pin-bundle")
     instrument_digest = instrument.digest
     done = set(accepted(connection, instrument_digest, tier, variant))
     pending = [dict(item) for item in items if item["id"] not in done]

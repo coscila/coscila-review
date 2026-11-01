@@ -111,6 +111,76 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(report["checks"]["oneDigestPerInstrument"])
         self.assertFalse(report["checks"]["strataFrozenBeforeJudging"])
 
+    def bundle_file(self, name, **changes):
+        record = instruments.study_bundle_digest(
+            protocol=changes.pop("protocol", F.protocol()), study_prompt="synthetic study prompt",
+            instruments=changes.pop("instruments", {instrument_id: instruments.load(instrument_id).digest
+                                                    for instrument_id in ("citation-support@2", "citation-function@1",
+                                                                          "numeric-check@1", "claim-match@1")}),
+            dataset_versions={}, package_tags={})
+        path = self.root / f"{name}-{self.count}.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path, record["sha256"]
+
+    def test_a_pinned_study_bundle_is_checked_and_recorded_in_every_receipt(self):
+        from ocsl_review.followup_branch import pin_study_bundle
+        from ocsl_review.followup_cli import gates
+        path, sha = self.bundle_file("bundle")
+        for name, changes, message in (
+                ("other-protocol", {"protocol": F.protocol(version="another")}, "another protocol"),
+                ("wrong-digest", {"instruments": {"citation-support@2": instruments.load("citation-support@2").digest,
+                                                  "citation-function@1": "0" * 64}}, "citation-function@1 as 0")):
+            other, _ = self.bundle_file(name, **changes)
+            with self.subTest(bundle=name), self.branch.writing() as connection:
+                with self.assertRaisesRegex(ValidationError, message):
+                    pin_study_bundle(connection, other)
+        with self.branch.writing() as connection:
+            self.assertEqual({"studyBundleSha256": sha, "contentVerified": True, "alreadyPinned": False},
+                             pin_study_bundle(connection, path))
+            self.assertTrue(pin_study_bundle(connection, path)["alreadyPinned"])
+            with self.assertRaisesRegex(ValidationError, "one bundle"):
+                pin_study_bundle(connection, "c" * 64)
+        judge = F.ScriptedJudge(answer_with(FUNCTION["response"]))
+        self.run_function(judge)
+        self.run_function(judge, variant="replicate")
+        with closing(self.branch.connect()) as connection:
+            self.assertEqual({sha}, {row[0] for row in connection.execute("SELECT study_bundle_sha256 FROM fu_calls")})
+        checks = gates(self.branch.path)["checks"]
+        self.assertTrue(checks["everyReceiptCarriesTheStudyBundle"])
+        self.assertTrue(checks["instrumentDigestsAsPinned"])
+        self.assertTrue(checks["oneDigestPerInstrument"])
+        self.assertTrue(checks["parentComplete"])
+        with self.branch.writing() as connection:
+            connection.execute("UPDATE fu_meta SET value=? WHERE key='studyBundleSha256'", ("d" * 64,))
+        self.assertFalse(gates(self.branch.path)["checks"]["everyReceiptCarriesTheStudyBundle"])
+        # A pin after the first call is refused on a branch that has none.
+        path2 = self.root / f"late-{self.count}.sqlite3"
+        FollowupBranch.create(path2, self.census["parent"], protocol=F.protocol())
+        late = FollowupBranch(path2)
+        with late.writing() as connection:
+            run_items(connection, self.instrument, FUNCTION["items"], judge, tier="locus", model=F.MODEL)
+            with self.assertRaisesRegex(ValidationError, "before the first call"):
+                pin_study_bundle(connection, path)
+
+    def test_an_instrument_digest_other_than_the_pinned_one_never_runs(self):
+        from ocsl_review.followup_cli import gates
+        path = self.root / f"pinned-{self.count}.sqlite3"
+        FollowupBranch.create(path, self.census["parent"], protocol=F.protocol(
+            instruments={**F.PROTOCOL["instruments"], "digests": {"citation-function@1": "0" * 64}}))
+        branch = FollowupBranch(path)
+        judge = F.ScriptedJudge(answer_with(FUNCTION["response"]))
+        with branch.writing() as connection, self.assertRaisesRegex(ValidationError, "instruments.digests"):
+            run_items(connection, self.instrument, FUNCTION["items"], judge, tier="locus", model=F.MODEL)
+        self.assertEqual([], judge.requests)
+        # oneDigestPerInstrument counts replicate calls too.
+        self.run_function(judge)
+        with self.branch.writing() as connection:
+            row = dict(connection.execute("SELECT * FROM fu_calls").fetchone())
+            row.update(call_id="call-other", instrument_digest="e" * 64, variant="replicate")
+            connection.execute(f"INSERT INTO fu_calls({','.join(row)}) VALUES({','.join('?' for _ in row)})",
+                               list(row.values()))
+        self.assertFalse(gates(self.branch.path)["checks"]["oneDigestPerInstrument"])
+
     def test_a_response_from_another_model_stops_the_run(self):
         judge = F.ScriptedJudge(answer_with(FUNCTION["response"]), served="another-model")
         summary = self.run_function(judge)

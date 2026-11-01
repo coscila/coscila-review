@@ -69,7 +69,8 @@ class FollowupCliTests(unittest.TestCase):
         family = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
         followup = family.choices["followup"]
         commands = next(action for action in followup._actions if isinstance(action, argparse._SubParsersAction))
-        expected = {"init", "verify", "describe", "gates"} | set(followup_cli_a.VERBS) | set(followup_cli_b.VERBS)
+        expected = ({"init", "verify", "describe", "gates", "pin-bundle"} | set(followup_cli_a.VERBS)
+                    | set(followup_cli_b.VERBS))
         self.assertEqual(expected, set(commands.choices))
         self.assertFalse(set(followup_cli_a.VERBS) & set(followup_cli_b.VERBS))
         helps = {action.dest: action.help for action in commands._choices_actions}

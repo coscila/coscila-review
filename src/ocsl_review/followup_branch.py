@@ -138,6 +138,113 @@ def register_dataset(connection: sqlite3.Connection, *, kind: str, name: str, de
     return identifier
 
 
+STUDY_BUNDLE_FORMAT = "ocsl-study-bundle-v1"
+
+
+def load_study_bundle(value: Any) -> tuple[dict[str, Any] | None, str]:
+    """(bundle, sha256) of ``--study-bundle``: an ``ocsl-study-bundle-v1`` file whose sha256 is checked against its
+    content, or a bare sha256 (bundle None) when the bundle itself lives with the Study Run."""
+    import re
+    from .instruments import canonical as bundle_canonical, sha256_bytes
+    text = str(value or "").strip()
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return None, text
+    path = Path(text)
+    if not text or not path.is_file():
+        raise ValidationError("--study-bundle takes a study bundle file (JSON) or the bundle's sha256")
+    data = path.read_bytes()
+    if len(data) > 1024 * 1024:
+        raise ValidationError("the study bundle file exceeds 1 MiB")
+    try:
+        bundle = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValidationError("the study bundle file is not UTF-8 JSON") from error
+    if not isinstance(bundle, dict) or bundle.get("format") != STUDY_BUNDLE_FORMAT:
+        raise ValidationError(f"the study bundle file is no {STUDY_BUNDLE_FORMAT} record")
+    bundle.pop("artifactSha256", None)
+    record = {key: item for key, item in bundle.items() if key != "sha256"}
+    digest = sha256_bytes(bundle_canonical(record).encode("utf-8"))
+    if bundle.get("sha256") != digest:
+        raise ValidationError("the study bundle's sha256 differs from its content")
+    return bundle, digest
+
+
+def protocol_instruments(protocol: Mapping[str, Any] | None) -> list[str]:
+    """The registry ids of the instruments a protocol names (support, function and, when declared, numeric, match)."""
+    named = (protocol or {}).get("instruments") or {}
+    return [named[role] for role in ("support", "function", "numeric", "match") if named.get(role)]
+
+
+def instrument_pins(connection: sqlite3.Connection) -> dict[str, dict[str, str]]:
+    """Instrument digests the branch pins: from the study bundle's content and from the protocol's
+    ``instruments.digests`` (keyed by registry id)."""
+    meta = dict(connection.execute("SELECT key, value FROM fu_meta WHERE key IN ('studyBundle', 'protocol')"
+                                   ).fetchall())
+    pins: dict[str, dict[str, str]] = {}
+    if meta.get("studyBundle"):
+        for instrument_id, digest in (json.loads(meta["studyBundle"]).get("instruments") or {}).items():
+            pins.setdefault(instrument_id, {})["studyBundle"] = digest
+    if meta.get("protocol"):
+        declared = (json.loads(meta["protocol"]).get("instruments") or {}).get("digests") or {}
+        for instrument_id, digest in declared.items():
+            pins.setdefault(instrument_id, {})["protocol"] = digest
+    return pins
+
+
+def check_instrument(connection: sqlite3.Connection, instrument: Any) -> str | None:
+    """Before any call: the instrument's registry digest must equal every pin of it (the study bundle's content and the
+    protocol's ``instruments.digests``), and a pinned bundle file must pin it at all; returns the pinned bundle's
+    sha256 (recorded in every receipt), or None."""
+    meta = dict(connection.execute("SELECT key, value FROM fu_meta WHERE key IN ('studyBundleSha256', 'studyBundle')"
+                                   ).fetchall())
+    pins = instrument_pins(connection).get(instrument.id, {})
+    if meta.get("studyBundle") and "studyBundle" not in pins:
+        raise ValidationError(f"the pinned study bundle pins no digest for {instrument.id}; pin a bundle that covers "
+                              "every instrument the follow-up runs")
+    for source, digest in sorted(pins.items()):
+        if digest != instrument.digest:
+            where = "the pinned study bundle" if source == "studyBundle" else "the protocol (instruments.digests)"
+            raise ValidationError(f"{where} pins {instrument.id} as {digest}; the installed instrument's registry "
+                                  f"digest is {instrument.digest}: a changed builder, validator or bundle never runs "
+                                  "silently under a new digest")
+    return meta.get("studyBundleSha256")
+
+
+def pin_study_bundle(connection: sqlite3.Connection, value: Any) -> dict[str, Any]:
+    """Pin the study bundle in fu_meta before the first judge call; its sha256 goes into every call receipt.
+
+    A bundle file must be ``ocsl-study-bundle-v1`` with a matching sha256, carry the branch protocol's sha256 and pin
+    every instrument the protocol names at its registry digest. A branch pins one bundle: the same bundle again is a
+    no-op, another one is refused, and a pin after the first call is refused.
+    """
+    from . import instruments
+    bundle, digest = load_study_bundle(value)
+    meta = dict(connection.execute("SELECT key, value FROM fu_meta").fetchall())
+    pinned = meta.get("studyBundleSha256")
+    if pinned:
+        if pinned != digest:
+            raise ValidationError(f"the branch already pins the study bundle {pinned}; a branch pins one bundle")
+        return {"studyBundleSha256": digest, "contentVerified": bool(meta.get("studyBundle")), "alreadyPinned": True}
+    if connection.execute("SELECT 1 FROM fu_calls LIMIT 1").fetchone():
+        raise ValidationError("the study bundle is pinned before the first call: this branch already holds call "
+                              "receipts without it")
+    values = {"studyBundleSha256": digest}
+    if bundle is not None:
+        protocol = json.loads(meta["protocol"]) if meta.get("protocol") else None
+        if protocol is not None and bundle.get("protocolSha256") != meta.get("protocolSha256"):
+            raise ValidationError("the study bundle names another protocol than the one the branch registered")
+        pinned_instruments = bundle.get("instruments") or {}
+        for instrument_id in protocol_instruments(protocol):
+            registry = instruments.load(instrument_id).digest
+            if pinned_instruments.get(instrument_id) != registry:
+                raise ValidationError(f"the study bundle pins {instrument_id} as "
+                                      f"{pinned_instruments.get(instrument_id) or 'nothing'}; the installed instrument's "
+                                      f"registry digest is {registry}")
+        values["studyBundle"] = canonical(bundle)
+    connection.executemany("INSERT OR REPLACE INTO fu_meta VALUES(?,?)", sorted(values.items()))
+    return {"studyBundleSha256": digest, "contentVerified": bundle is not None, "alreadyPinned": False}
+
+
 def require_freeze(connection: sqlite3.Connection) -> dict[str, Any]:
     """The latest protocol freeze; judging commands call this first and refuse a branch whose strata are not frozen."""
     row = connection.execute("SELECT * FROM fu_protocol_freeze ORDER BY frozen_at DESC LIMIT 1").fetchone()
@@ -164,7 +271,8 @@ class FollowupBranch:
     # ---------------------------------------------------------------- creation
     @classmethod
     def create(cls, path: Path, parent: Path, *, parent_text: Path | None = None, protocol: Any = None,
-               allow_incomplete: bool = False, code_revision: str | None = None) -> dict[str, Any]:
+               allow_incomplete: bool = False, code_revision: str | None = None,
+               study_bundle: Any = None) -> dict[str, Any]:
         path = Path(path)
         if path.exists():
             raise ValidationError("the follow-up branch database already exists; branch into a new path")
@@ -205,11 +313,18 @@ class FollowupBranch:
                 if loaded:
                     register_dataset(connection, kind="protocol", name="followup-protocol",
                                      declared_version=str(loaded[0].get("version", "1")), sha256=loaded[1])
-        finally:
+                if allow_incomplete and info["meta"].get("complete") != "1":
+                    connection.execute("INSERT OR REPLACE INTO fu_meta VALUES('parentIncompleteAllowed', '1')")
+                pinned = pin_study_bundle(connection, study_bundle) if study_bundle is not None else None
+        except BaseException:
             connection.close()
+            path.unlink(missing_ok=True)
+            raise
+        connection.close()
         branch = cls(path)
         return {"database": str(branch.path), "parent": info, "parentText": text_info,
-                "protocolSha256": loaded[1] if loaded else None, "schemaVersion": followup_schema.SCHEMA_VERSION}
+                "protocolSha256": loaded[1] if loaded else None, "schemaVersion": followup_schema.SCHEMA_VERSION,
+                "studyBundle": pinned}
 
     # ---------------------------------------------------------------- access
     def meta(self) -> dict[str, str]:

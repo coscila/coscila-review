@@ -44,6 +44,9 @@ def _count(value: Any) -> int | None:
 class BrokerJudge:
     """One bulk job per call over the run principal's broker socket (see the module docstring)."""
 
+    # A broker run records the pinned study bundle in every receipt (followup_judge.run_items refuses without one).
+    requires_study_bundle = True
+
     def __init__(self, transport: Any, *, model: str, location: str = "external",
                  wait_seconds: float | None = None):
         if location not in ("external", "on-prem"):

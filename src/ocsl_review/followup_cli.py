@@ -13,6 +13,7 @@ implementing module is not part of the build fails with a usage error; it never 
 from __future__ import annotations
 
 import importlib
+import json
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Mapping
@@ -68,8 +69,16 @@ def add_commands(families: Any, register: Any) -> None:
     init.add_argument("--parent-text", help="private frozen copy that keeps entitled citing sentences (--keep-text)")
     init.add_argument("--protocol", help="follow-up protocol (JSON, schemas/followup-protocol.schema.json)")
     init.add_argument("--allow-incomplete-parent", action="store_true",
-                      help="branch a census frozen as incomplete (recorded; for tests and pilots only)")
+                      help="branch a census frozen as incomplete (recorded; for tests and pilots only, never a study "
+                           "run)")
+    init.add_argument("--study-bundle", help="study bundle file (ocsl-study-bundle-v1) or its sha256, pinned before "
+                                             "the first judge call and recorded in every receipt")
     register(init, "followup_cli", "command", "workspace", state_required=False)
+    pin = commands.add_parser("pin-bundle", help="pin the study bundle before the first judge call")
+    pin.add_argument("--database", required=True)
+    pin.add_argument("--study-bundle", required=True,
+                     help="study bundle file (ocsl-study-bundle-v1) or its sha256")
+    register(pin, "followup_cli", "command", "workspace", state_required=False)
     verify = commands.add_parser("verify", help="parent digest unchanged, schema intact, every reference resolvable")
     verify.add_argument("--database", required=True)
     verify.add_argument("--light", action="store_true", help="compare size and modification time instead of the sha256")
@@ -90,7 +99,7 @@ def gates(database: Path) -> dict[str, Any]:
     """Checks a Study Run can require: parent unchanged, references resolve, a status row for every cited work, strata
     frozen before any judging, invalid outputs within the bound, fingerprints, one digest per instrument, no entitled
     evidence sent to a judge that is not on premises."""
-    from .followup_branch import FollowupBranch
+    from .followup_branch import FollowupBranch, instrument_pins
     branch = FollowupBranch(database)
     verified = branch.verify(deep=True)
     notes = list(verified["problems"])
@@ -105,8 +114,18 @@ def gates(database: Path) -> dict[str, Any]:
           FROM fu_judgments j WHERE outcome IN ('accepted','rejected') GROUP BY instrument_digest, tier, variant""").fetchall()
         responded = connection.execute("SELECT COUNT(*), SUM(fingerprint IS NOT NULL) FROM fu_calls "
                                        "WHERE served_model IS NOT NULL").fetchone()
+        # Every variant counts: a replicate under another digest would compare two instruments.
         digests = connection.execute("SELECT instrument_id, COUNT(DISTINCT instrument_digest) FROM fu_calls "
-                                     "WHERE variant='primary' GROUP BY instrument_id").fetchall()
+                                     "GROUP BY instrument_id").fetchall()
+        meta = dict(connection.execute("SELECT key, value FROM fu_meta").fetchall())
+        bundle = meta.get("studyBundleSha256")
+        without_bundle = connection.execute(
+            "SELECT COUNT(*) FROM fu_calls WHERE study_bundle_sha256 IS NULL OR study_bundle_sha256!=?",
+            (bundle or "",)).fetchone()[0]
+        pins = instrument_pins(connection)
+        off_pin = sum(count for instrument_id, digest, count in connection.execute(
+            "SELECT instrument_id, instrument_digest, COUNT(*) FROM fu_calls GROUP BY instrument_id, instrument_digest")
+            if any(pinned != digest for pinned in pins.get(instrument_id, {}).values()))
         entitled_external = connection.execute(
             "SELECT COUNT(*) FROM fu_calls WHERE provenance_classes LIKE '%\"entitled\"%' AND judge_location!='on-prem'"
         ).fetchone()[0]
@@ -123,7 +142,14 @@ def gates(database: Path) -> dict[str, Any]:
         "oneDigestPerInstrument": all(count == 1 for _, count in digests),
         "noEntitledEvidenceToExternalJudges": entitled_external == 0,
         "noModelDrift": drift == 0,
+        "parentComplete": json.loads(meta.get("parentMeta") or "{}").get("complete") == "1",
     }
+    if bundle:
+        checks["everyReceiptCarriesTheStudyBundle"] = without_bundle == 0
+    if pins:
+        checks["instrumentDigestsAsPinned"] = off_pin == 0
+    if not checks["parentComplete"]:
+        notes.append("the parent census records an incomplete run (followup init --allow-incomplete-parent)")
     if not responded[0]:
         notes.append("no judge call has a response yet")
     return {"ok": all(checks.values()), "checks": checks, "invalidShares": shares, "notes": notes,
@@ -137,7 +163,11 @@ def command(args: Any) -> Any:
         return FollowupBranch.create(Path(args.database), Path(args.parent).absolute(),
                                      parent_text=Path(args.parent_text).absolute() if args.parent_text else None,
                                      protocol=args.protocol, allow_incomplete=args.allow_incomplete_parent,
-                                     code_revision=code_revision())
+                                     code_revision=code_revision(), study_bundle=getattr(args, "study_bundle", None))
+    if args.command == "pin-bundle":
+        from .followup_branch import pin_study_bundle
+        with FollowupBranch(Path(args.database)).writing() as connection:
+            return pin_study_bundle(connection, args.study_bundle)
     if args.command == "verify":
         report = FollowupBranch(Path(args.database)).verify(deep=not args.light)
         if not report["ok"]:

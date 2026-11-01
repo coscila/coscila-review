@@ -103,7 +103,8 @@ class BrokerJudgeTests(unittest.TestCase):
     def setUp(self):
         type(self).count += 1
         path = self.root / f"branch-{self.count}.sqlite3"
-        FollowupBranch.create(path, self.census["parent"], protocol=F.protocol())
+        # A broker run records the study bundle in every receipt, so the branch pins one (by its sha256 here).
+        FollowupBranch.create(path, self.census["parent"], protocol=F.protocol(), study_bundle="b" * 64)
         self.branch = FollowupBranch(path)
         self.instrument = instruments.load("citation-function@1")
 
@@ -153,6 +154,20 @@ class BrokerJudgeTests(unittest.TestCase):
         messages = citation_function.build_messages([{k: v for k, v in item.items() if k != "provenance"}
                                                      for item in FUNCTION["items"]])
         return messages, {"settings": plan_for(self.instrument, "locus").settings(2)}
+
+    def test_a_broker_run_needs_a_pinned_study_bundle_and_records_it(self):
+        path = self.root / f"unpinned-{self.count}.sqlite3"
+        FollowupBranch.create(path, self.census["parent"], protocol=F.protocol())
+        unpinned = FollowupBranch(path)
+        broker = FakeBroker(installed=[function_digest()])
+        judge = self.judge(broker)
+        with unpinned.writing() as connection, self.assertRaisesRegex(ValidationError, "pin it first"):
+            run_items(connection, self.instrument, FUNCTION["items"], judge, tier="locus", model=F.MODEL)
+        self.assertEqual({}, broker.jobs)
+        self.run_function(judge)
+        with closing(self.branch.connect()) as connection:
+            self.assertEqual({"b" * 64}, {row[0] for row in connection.execute(
+                "SELECT study_bundle_sha256 FROM fu_calls")})
 
     def test_only_verbatim_bundles_the_broker_installed_can_run(self):
         judge = self.judge(FakeBroker(installed=[]))
