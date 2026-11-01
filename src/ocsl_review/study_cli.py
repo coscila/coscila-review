@@ -94,6 +94,11 @@ def add_commands(families, register):
             command.add_argument("--require-fresh-enumeration", action="store_true",
                                  help="prepare only reviews of a verified live enumeration, acquired with provenance")
             command.add_argument("--enumeration", help="enumeration receipt (<manifest>.receipt.json) of study enumerate")
+            command.add_argument("--settle-unprepared", action="store_true",
+                                 help="with --require-fresh-enumeration: record every enumerated review this prepare "
+                                      "cannot prepare, and every enumerated review missing from the input, in coverage as "
+                                      "unavailable with its reason, so the population is complete (the last prepare of "
+                                      "a study, after every acquisition and abstracts pass)")
         if name == "abstracts":
             command.add_argument("--input", required=True, help="JSONL review records")
             command.add_argument("--output", required=True, help="JSONL review records with Europe PMC abstracts")
@@ -459,17 +464,25 @@ def _gate(record: dict[str, Any], enumeration: Any, excluded: frozenset = frozen
     return None
 
 
-def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = None) -> dict[str, Any]:
+def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = None,
+            settle: bool = False) -> dict[str, Any]:
     """Prepare reviews one record at a time; a review that cannot be read or extracted is recorded, not fatal.
 
     With ``caches`` the study pins its byte caches and every cache-hit claim is re-checked against them. With
     ``enumeration`` (a verified fresh enumeration) only enumerated reviews acquired with provenance are prepared,
-    and a cache-hit claim that cannot be re-checked is refused.
+    and a cache-hit claim that cannot be re-checked is refused. With ``settle`` (only with ``enumeration``) every
+    enumerated review still neither in the study nor excluded afterwards, whether this input skipped it or does not
+    hold it, is recorded in coverage as unavailable with the reason it was not prepared (``record_not_prepared``):
+    the population is then complete, and the study reports those reviews as unavailable instead of failing its
+    completeness at the end of a run whose acquisition cannot run again.
     """
     from . import scores_db
-    from .census_inputs import review_provenance, verify_claim
+    from .census_inputs import normal_doi, review_provenance, verify_claim
     from .census_runner import iter_records, read_document, read_table_pages
     from .census_works import works_mismatch
+    if settle and enumeration is None:
+        raise ValidationError("settling unprepared reviews needs a fresh enumeration (--require-fresh-enumeration "
+                              "with --enumeration)")
     if enumeration is None and scores_db.meta(run.connection).get("enumerationSha256"):
         raise ValidationError("this study is pinned to a fresh enumeration; prepare with --require-fresh-enumeration "
                               "and --enumeration naming its receipt (nothing is imported from other manifests)")
@@ -482,6 +495,7 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
     excluded = frozenset((row[0], row[1]) for row in run.connection.execute("SELECT journal, doi FROM exclusions"))
     counts: dict[str, int] = {}
     problems = []
+    skipped: dict[tuple[Any, Any], tuple[str, str, Any]] = {}
     for record in iter_records(source):
         result = _gate(record, enumeration, excluded)
         if result is None:
@@ -511,7 +525,27 @@ def prepare(run: Any, source: Path, *, caches: Any = None, enumeration: Any = No
         counts[result["state"]] = counts.get(result["state"], 0) + 1
         if result["state"] not in ("prepared", "already-prepared"):
             problems.append(result)
+        if str(result["state"]).startswith("skipped-") and result["state"] != "skipped-excluded":
+            acquisition = record.get("acquisition") if isinstance(record.get("acquisition"), dict) else None
+            reason = (f"the Europe PMC lookup of {len(result['works'])} cited work(s) failed"
+                      if result.get("works") else str(result.get("reason") or result.get("next") or result["state"]))
+            skipped.setdefault((record.get("journal"), normal_doi(record.get("doi"))),
+                               (result["state"], reason, acquisition))
+    settled: dict[str, int] = {}
+    if settle:
+        rows = run.connection.execute(
+            "SELECT journal, doi, stratum, first_online, year FROM enumeration e WHERE NOT EXISTS (SELECT 1 FROM reviews r "
+            "WHERE r.journal=e.journal AND r.doi=e.doi) AND NOT EXISTS (SELECT 1 FROM exclusions x WHERE "
+            "x.journal=e.journal AND x.doi=e.doi) ORDER BY journal, doi").fetchall()
+        for journal, doi, stratum, first_online, year in rows:
+            state, reason, claimed = skipped.get((journal, doi)) or (
+                "absent-from-input", "the enumerated review is not in the prepared input", None)
+            outcome = run.record_not_prepared({"journal": journal, "doi": doi, "stratum": stratum,
+                                               "first_online": first_online, "year": year}, state, reason, claimed)
+            if outcome["state"] == "settled-unavailable":
+                settled[state] = settled.get(state, 0) + 1
     return {"prepared": counts.get("prepared", 0), "states": counts, "problems": problems,
+            **({"settled": dict(sorted(settled.items()))} if settle else {}),
             "inputs": (caches.describe() if caches is not None else None),
             "enumeration": ({"sha256": enumeration.sha256, "reviews": len(enumeration.reviews)}
                             if enumeration is not None else None)}
@@ -557,13 +591,17 @@ def command(args) -> Any:
             raise ValidationError("--require-fresh-enumeration needs --enumeration with the receipt of study enumerate")
         if args.enumeration and not args.require_fresh_enumeration:
             raise ValidationError("--enumeration is read only with --require-fresh-enumeration")
+        if args.settle_unprepared and not args.require_fresh_enumeration:
+            raise ValidationError("--settle-unprepared settles enumerated reviews: give --require-fresh-enumeration "
+                                  "and --enumeration")
         enumeration = load_enumeration(Path(args.enumeration)) if args.require_fresh_enumeration else None
         caches = _caches(args)
         try:
             run = _run(args)
             try:
                 bundle = run.pin_study_bundle(args.study_bundle) if args.study_bundle else None
-                result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration)
+                result = prepare(run, Path(args.input), caches=caches, enumeration=enumeration,
+                                 settle=args.settle_unprepared)
                 return {**result, "studyBundle": bundle or ({"studyBundleSha256": run.study_bundle}
                                                             if run.study_bundle else None)}
             finally:
