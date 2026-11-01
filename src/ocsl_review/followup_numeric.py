@@ -13,22 +13,22 @@ Entitled sentences reach only on-premises judges (``followup_judge.run_items`` r
 without the private text copy is recorded as ``text-redacted`` and never sent.
 
 ``numeric-comparison@1`` reads valueText as one number with its stated precision (thousands separators, decimal
-comma, thousand / million / billion, percent, a rate base "per 100,000", ordinals); percent, scale and rate base may
-also come from the parsed unit. The stated precision is the place of the last significant digit as written: every
-written decimal counts, and in a whole number without a decimal mark trailing zeros do not (so "1,200,000" is compared
-at hundreds of thousands and "40" at tens). A valueText with numeric content the rule does not read (a range such as
-"2-3 million", a ratio such as "1 in 8" or "1/3", a second number) is never read as its first number. Condition, metric
-and geography are mapped through the source's versioned synonym lists, then the rule classifies in order: not
-epidemiological -> ``non-epidemiological``; abstained -> unassessable ``abstained``; the cited work is no report of the
-source -> unassessable ``no-matching-table``; no cells for the cited edition -> unassessable ``table-unavailable``; a
-valueText without a number -> unassessable ``invalid-output``; numeric content the rule does not read -> unassessable
-``unsupported-value-form``; a cell of the cited edition for the claimed condition, metric, geography and year whose
-value, rounded to the claim's precision, equals the claim -> ``consistent``; the value of a cell of the cited edition
-for another geography -> ``wrong-geography``; the claimed statistic in a cell of another edition -> ``wrong-edition``;
-a cell for the claimed statistic exists in the cited edition but its value differs -> ``number-absent-or-different``;
-no cell of the source holds the claimed condition, metric, geography and year at all (an unmapped label, a metric the
-tables do not carry such as other or trend) -> unassessable ``no-matching-cell``: a failure to compare is never an
-adverse finding.
+comma, thousand / million / billion, percent, a rate base such as "per" and a number, ordinals); percent, scale and
+rate base may also come from the parsed unit. The stated precision is the place of the last significant digit as
+written: every written decimal counts, and in a whole number without a decimal mark trailing zeros do not (so a count
+written to the hundred thousand is compared at hundreds of thousands, and "40" at tens). A valueText with numeric
+content the rule does not read (a range such as "5-7 million", a ratio such as "1 in 8" or "1/3", a second number) is
+never read as its first number. Condition, metric and geography are mapped through the source's versioned synonym
+lists, then the rule classifies in order: not epidemiological -> ``non-epidemiological``; abstained -> unassessable
+``abstained``; the cited work is no report of the source -> unassessable ``no-matching-table``; no cells for the cited
+edition -> unassessable ``table-unavailable``; a valueText without a number -> unassessable ``invalid-output``; numeric
+content the rule does not read -> unassessable ``unsupported-value-form``; a cell of the cited edition for the claimed
+condition, metric, geography and year whose value, rounded to the claim's precision, equals the claim ->
+``consistent``; the value of a cell of the cited edition for another geography -> ``wrong-geography``; the claimed
+statistic in a cell of another edition -> ``wrong-edition``; a cell for the claimed statistic exists in the cited
+edition but its value differs -> ``number-absent-or-different``; no cell of the source holds the claimed condition,
+metric, geography and year at all (an unmapped label, a metric the tables do not carry such as other or trend) ->
+unassessable ``no-matching-cell``: a failure to compare is never an adverse finding.
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ NO_NUMBER = "no-number"
 @dataclass(frozen=True)
 class ClaimValue:
     """A claimed number: mantissa as written, its stated precision as decimals (negative when trailing zeros of a
-    whole number are not significant), a power-of-ten scale, percent and a rate base ("per 100,000")."""
+    whole number are not significant), a power-of-ten scale, percent and a rate base (the number after "per")."""
     mantissa: Decimal
     decimals: int
     exponent: int = 0
@@ -156,7 +156,7 @@ def read_value(text: Any, unit: Any = "") -> tuple[ClaimValue | None, str | None
     Thousands separators are commas, points (more than one) or spaces between groups of three digits; one comma
     followed by exactly three digits separates thousands, any other single comma is a decimal comma; with both marks the
     later one is the decimal mark. "thousand", "million" and "billion" scale the number; "%", "percent" or "per cent"
-    mark a percentage; "per 100,000" is a rate base; "first" to "tenth" and "1st", "2nd", ... are ranks. The parsed
+    mark a percentage; "per" and a number is a rate base; "first" to "tenth" and "1st", "2nd", ... are ranks. The parsed
     unit supplies percent, scale and rate base when valueText states none. The stated precision is the place of the
     last significant digit as written (``_significant``). Numeric content after the number that the rule does not
     read (a range, a ratio, a second number) makes the form unsupported: the first number alone is never the claim.
@@ -209,7 +209,7 @@ def normalize_value(text: Any, unit: Any = "") -> ClaimValue | None:
 
 def cell_units(unit: Any) -> tuple[int, bool, Decimal | None]:
     """(power-of-ten scale, percent, rate base) a unit declares: "thousand deaths" scales by 10^3, "percent" is a
-    share, "per 100,000 population" is a rate per 100,000."""
+    share, "per" and a number (with or without separators and a scale word) is a rate per that number."""
     folded = followup_tables.fold(unit)
     scale = re.match(r"(thousand|million|billion)s?\b", folded)
     percent = folded in ("%", "percent", "per cent") or "percent" in folded.split() or folded.startswith("%")

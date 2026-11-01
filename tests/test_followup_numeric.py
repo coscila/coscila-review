@@ -90,8 +90,8 @@ class NumberTests(unittest.TestCase):
         self.assertEqual(12500.0, normalize_value("12.5 thousand").value)
 
     def test_forms_the_rule_does_not_read_are_never_read_as_their_first_number(self):
-        for text in ("2-3 million", "2\u20133 million", "1 in 8", "1/3", "2 to 3 million", "in 2019, 12,500",
-                     "between 2 and 3 million", "3rd of 5"):
+        for text in ("5-7 million", "5\u20137 million", "1 in 8", "1/3", "5 to 7 million", "in 2019, 12,500",
+                     "between 5 and 7 million", "3rd of 5"):
             with self.subTest(text=text):
                 self.assertEqual((None, "unsupported-form"), followup_numeric.read_value(text))
         for text in ("about", "", "most"):
@@ -107,7 +107,7 @@ class NumberTests(unittest.TestCase):
         rate = normalize_value("12.3", "per 100,000 population")
         self.assertEqual(Decimal(100000), rate.per)
         self.assertTrue(rate.matches(12.31, "per 100 000"))
-        self.assertFalse(rate.matches(12.31, "per 1,000,000"))
+        self.assertFalse(rate.matches(12.31, "per 500,000"))
         self.assertFalse(rate.matches(12.31, "cases"))
         self.assertTrue(normalize_value("12.3 per 100,000").matches(12.3, "per 100,000 person-years"))
 
