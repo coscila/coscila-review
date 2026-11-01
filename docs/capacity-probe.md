@@ -363,9 +363,10 @@ prepares it, into a scratch census database in the output directory
    is always public). Entitled review text reaches only a judge the operator's
    egress policy names on premises, as in the census: `--on-premises --policy`;
 2. its cited works derived from its own bibliography (`study works`), with
-   title, venue, year and PMCID from the store's Europe PMC records only (`study
-   abstracts` without a live lookup; a work the store has no record for gets no
-   PMCID);
+   title, venue, year and PMCID from the Europe PMC record `study abstracts`
+   selects: the store's record first, else the census's live Europe PMC search
+   (40 DOIs per query, the census inputs' User-Agent, 0.4 s between requests);
+   the dry run stays in the store;
 3. prepared by `CensusRun.prepare_review`, so its loci are the census's own.
 
 Every in-body entry with a resolved identity whose cited work has a PMCID is a
@@ -439,9 +440,9 @@ the instrument. The exit line keeps the census's own share and names the
 hypothetical one beside it.
 
 **Dry run.** `--dry-run --tier full-text` opens the store, counts its reviews for
-the prefixes and prepares the first five offline: nothing is sent and nothing is
-fetched, so only the full texts the store or an existing cache directory hold
-are used. It prints the inputs, the request sizes of those calls and an estimate
+the prefixes and prepares the first five offline: nothing is sent, fetched or
+looked up, so cited works get metadata only from the store's Europe PMC records
+and only the full texts the store or an existing cache directory hold are used. It prints the inputs, the request sizes of those calls and an estimate
 of the reviews and fetch time the target needs.
 
 ## Exit criterion
@@ -550,7 +551,7 @@ duration estimate. `--json` prints the plan as JSON.
   entry with a predeclared expectation.
 - The abstract tier is probed over synthetic entries; the full-text tier over
   real loci that are not the census's escalated entries (the probe never reads a
-  verdict), with metadata from the store's Europe PMC records only.
+  verdict).
 
 ## Tests
 

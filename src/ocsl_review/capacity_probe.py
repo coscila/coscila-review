@@ -42,7 +42,8 @@ reviews of one journal in the operator's literature-evidence@2 projection (the
 store the census reads as a byte cache, opened through the census's own guarded
 reader, so no label or verdict can be read) are prepared exactly as a census
 prepares them (``ReviewAcquirer`` from the store, ``derive_works``, metadata from
-the store's Europe PMC records, ``CensusRun.prepare_review``), every entry whose
+the store's Europe PMC records, else the census's live search, as ``study
+abstracts`` looks works up, ``CensusRun.prepare_review``), every entry whose
 cited work has a PMCID is retrieved and windowed by the tier's own code
 (``CensusRun.prepare_full_text_group``: the store first, then Europe PMC through
 the census's fetcher, with its headers and spacing; fetched full texts are kept
@@ -829,8 +830,8 @@ class _FullTextSource:
 
 
 def _no_live_lookup(params: dict[str, Any]) -> None:
-    """The probe looks cited works up in the store only: a work without a stored Europe PMC record gets no metadata,
-    so no PMCID, and is no candidate (a census would look it up live)."""
+    """The dry run looks cited works up in the store only: a work without a stored Europe PMC record gets no metadata
+    there, so no PMCID (the run looks it up live, as a census does)."""
     return None
 
 
@@ -906,8 +907,9 @@ class FullTextInputs:
     prepare --store``), and it is read only through the census's guarded reader, which refuses every table outside
     the projection's kept tables: no label, verdict, locus or bibliography row can be read. Each
     review is acquired from the store as a census acquires it without a live route (``ReviewAcquirer``), its cited
-    works are derived from its own bibliography (``derive_works``) with title, venue, year and PMCID from the store's
-    Europe PMC records (``fill_record`` without a live lookup), and it is prepared into a scratch census database
+    works are derived from its own bibliography (``derive_works``) with title, venue, year and PMCID from the Europe PMC
+    record ``study abstracts`` selects (``fill_record``: the store first, then the census's live search; the dry run
+    stays in the store), and it is prepared into a scratch census database
     (``CensusRun.prepare_review``), whose loci are the census's own. Every in-body entry with a resolved identity
     whose cited work has a PMCID is a candidate: the census's full-text population is the subset its abstract tier
     escalates, which the probe cannot know and never reads. Each review's candidates are shuffled with the seed
@@ -919,9 +921,12 @@ class FullTextInputs:
     """
 
     def __init__(self, settings: ProbeSettings, *, model: str, revision: str,
-                 emit: Callable[[dict[str, Any]], None] | None = None):
+                 emit: Callable[[dict[str, Any]], None] | None = None,
+                 lookup: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None):
         self.settings, self.model, self.revision = settings, model, revision
         self.emit = emit or (lambda event: None)
+        # The live Europe PMC search of study abstracts (census_abstracts.http_get) for works the store has no record of.
+        self.lookup = lookup or _no_live_lookup
         self.calls: list[tuple[Batch, bytes, list[str]]] = []
         self.record: dict[str, Any] = {}
 
@@ -967,7 +972,14 @@ class FullTextInputs:
         if (record.get("worksDerivation") or {}).get("state") != "derived":
             stats["extractionFailed"] += 1
             return None
-        record = fill_record(record, _no_live_lookup, cache=caches)
+        record = fill_record(record, self.lookup, cache=caches)
+        for work in record["works"].values():
+            stats["works"] += 1
+            source = (work.get("metadataProvenance") or {}).get("provenance")
+            stats["worksFromStore" if source == "cache-hit-public" else "worksLookedUpLive" if source == "live-public"
+                  else "worksLookupFailed" if work.get("europePmcOutcome") == "europe-pmc-failed"
+                  else "worksWithoutRecord"] += 1
+            stats["worksWithPmcid"] += int(bool(work.get("pmcid")))
         try:
             result = run.prepare_review(record, acquisition.body, acquisition.tables,
                                         provenance=(acquisition.provenance, acquisition.detail, None))
@@ -1009,6 +1021,12 @@ class FullTextInputs:
                         "prepared": stats["prepared"], "used": len(kept), "unavailable": stats["unavailable"],
                         "extractionFailed": stats["extractionFailed"], "refused": stats["refused"],
                         "notPrepared": stats["notPrepared"], "acquisitions": dict(sorted(acquired.items()))},
+            "works": {"derived": stats["works"], "metadataFromStore": stats["worksFromStore"],
+                      "metadataLookedUpLive": stats["worksLookedUpLive"], "withoutRecord": stats["worksWithoutRecord"],
+                      "lookupFailed": stats["worksLookupFailed"], "withPmcid": stats["worksWithPmcid"],
+                      "lookup": "the store's Europe PMC records, then the census's live Europe PMC search (study "
+                                "abstracts)" if self.lookup is not _no_live_lookup
+                                else "the store's Europe PMC records only (offline)"},
             "entries": {"target": settings.full_text_entries, "judgeable": stats["judgeableEntries"],
                         "candidates": stats["candidates"], "tried": stats["tried"], "retrieved": stats["retrieved"],
                         "withoutFullText": stats["withoutFullText"], "transient": stats["transient"],
@@ -2527,11 +2545,14 @@ class _CellRun:
 # ----------------------------------------------------------------------------- the probe
 class CapacityProbe:
     def __init__(self, settings: ProbeSettings, *, progress: Callable[[str], None] | None = None,
-                 environ: dict[str, str] | None = None, fetch_xml: Callable[[str], bytes | None] | None = None):
+                 environ: dict[str, str] | None = None, fetch_xml: Callable[[str], bytes | None] | None = None,
+                 lookup: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None):
         self.settings = settings
         self.progress = progress
-        # The full-text tier's Europe PMC fetcher: the census's own (study_cli.europe_pmc_fetcher) unless a test gives one.
+        # The full-text tier's Europe PMC fetcher and search: the census's own (study_cli.europe_pmc_fetcher,
+        # census_abstracts.http_get) unless a test gives them.
         self._fetch_xml = fetch_xml
+        self._lookup = lookup
         self._environ = os.environ if environ is None else environ
         self._key: str | None = None
         self.endpoint: Endpoint | None = None
@@ -2901,10 +2922,12 @@ class CapacityProbe:
             if full_text:
                 # The inputs first (minutes of Europe PMC fetches the first time), then the idle baseline, then the cell.
                 self._write(report, files, final=False)
+                from .census_abstracts import http_get
                 from .study_cli import europe_pmc_fetcher
                 directory = Path(settings.full_text_cache) if settings.full_text_cache else output / FULL_TEXT_CACHE_NAME
                 cache = FullTextCache(directory, self._fetch_xml or europe_pmc_fetcher())
-                inputs = FullTextInputs(settings, model=self.model, revision=revision, emit=self.emit)
+                inputs = FullTextInputs(settings, model=self.model, revision=revision, emit=self.emit,
+                                        lookup=self._lookup or http_get())
                 report["fullTextInputs"] = inputs.prepare(output / FULL_TEXT_INPUTS_NAME, cache)
                 source = _FullTextSource(inputs.calls)
             report["baseline"] = self._baseline()
@@ -3326,6 +3349,10 @@ def _full_text_inputs_lines(inputs: dict[str, Any] | None) -> list[str]:
             f"{reviews['considered']} considered, {reviews['prepared']} prepared, {reviews['used']} used "
             f"(unavailable {reviews['unavailable']}, extraction failed {reviews['extractionFailed']}, refused "
             f"{reviews['refused']}, not prepared {reviews['notPrepared']})",
+            f"- Cited works: {inputs['works']['derived']} derived, metadata from the store {inputs['works']['metadataFromStore']}, "
+            f"looked up live {inputs['works']['metadataLookedUpLive']}, without a Europe PMC record "
+            f"{inputs['works']['withoutRecord']}, lookup failed {inputs['works']['lookupFailed']}; "
+            f"{inputs['works']['withPmcid']} with a PMCID ({_cell(inputs['works']['lookup'])})",
             f"- Entries: {entries['judgeable']} judgeable, {entries['candidates']} with a PMCID, {entries['tried']} tried, "
             f"{entries['retrieved']} retrieved (target {entries['target']}; without a full text {entries['withoutFullText']}, "
             f"left open by a transient failure {entries['transient']}"

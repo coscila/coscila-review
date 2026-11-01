@@ -36,6 +36,8 @@ from test_census_inputs import epmc, lookup
 JOURNAL = "Synthetic Journal of Full Texts"
 PREFIX = "10.5555/ftreview."
 OTHER_REVIEW = "10.5555/otherjournal.1"          # a retained review of another journal: never selected
+LIVE_REVIEW = "10.5555/ftlive.1"                 # a retained review whose cited works the store has no record of
+LIVE_WORKS = (5, 6)                              # its review number in work DOIs and PMCIDs, and its cited works
 REVIEWS = {1: 13, 2: 8, 3: 11}                   # review number -> cited works
 STORED_FULL_TEXT = (2, 1)                        # a cited work whose fullTextXML the store holds
 
@@ -98,6 +100,8 @@ def build_store(root: Path) -> dict:
             db.execute("INSERT INTO papers VALUES(?,?,?,?)", (PREFIX + str(review), f"Review {review}", 2021, path))
         (legacy / "work/corpus/other.xml").write_bytes(review_jats(9, 4, doi=OTHER_REVIEW))
         db.execute("INSERT INTO papers VALUES(?,?,?,?)", (OTHER_REVIEW, "Other review", 2021, "work/corpus/other.xml"))
+        (legacy / "work/corpus/live.xml").write_bytes(review_jats(*LIVE_WORKS, doi=LIVE_REVIEW))
+        db.execute("INSERT INTO papers VALUES(?,?,?,?)", (LIVE_REVIEW, "Live review", 2021, "work/corpus/live.xml"))
     import_legacy_evidence(seed, database, source_root=legacy)
     for review, works in [*REVIEWS.items(), (9, 4)]:
         for k in range(1, works + 1):
@@ -118,6 +122,25 @@ def build_store(root: Path) -> dict:
     projection.parent.mkdir()
     build_projection(seed_root / "corpus-snapshot", projection, workers=1)
     return {"projection": projection, "snapshot": seed_root / "corpus-snapshot"}
+
+
+class Search:
+    """Europe PMC search stand-in (census_abstracts' live lookup): a core record with a PMCID for the live review's
+    odd-numbered works, nothing for the rest; records every query."""
+
+    def __init__(self):
+        self.queries: list[dict] = []
+
+    def __call__(self, params: dict) -> dict:
+        self.queries.append(dict(params))
+        results = []
+        for doi in re.findall(r'DOI:"([^"]+)"', params["query"]):
+            review, k = (int(part) for part in doi.rsplit("/", 1)[1].split(".")[1:3])
+            if review == LIVE_WORKS[0] and k % 2:
+                results.append({"id": "PPR%d" % k, "source": "PPR", "doi": doi, "pmcid": pmcid_of(review, k),
+                                "title": f"Live cited work {k}", "pubYear": "2019",
+                                "abstractText": f"Abstract of live cited work {k}."})
+        return {"resultList": {"result": results}}
 
 
 class Fetcher:
@@ -154,8 +177,9 @@ class FullTextCase(ProbeCase):
     def run_full_text(self, cells: str = "4x5", *, fetcher=None, **overrides) -> dict:
         self.runs += 1
         self.fetcher = fetcher or Fetcher()
+        self.search = Search()
         probe = P.CapacityProbe(self.full_text_settings(cells, **overrides), progress=self.events.append, environ={},
-                                fetch_xml=self.fetcher)
+                                fetch_xml=self.fetcher, lookup=self.search)
         self.output = self.root / ("run-%d" % self.runs)
         return probe.run(self.output)
 
@@ -175,12 +199,15 @@ class RequestTests(FullTextCase):
         report = self.run_full_text(review_prefixes=(PREFIX + "1",))
         inputs = report["fullTextInputs"]
         # Review 1 cites 13 works: 10 carry a PMCID, one of those has no open-access full text.
-        self.assertEqual((4, 1, 1, 13, 10, 10, 9, 1), (
+        self.assertEqual((5, 1, 1, 13, 10, 10, 9, 1), (
             inputs["reviews"]["retainedInStore"], inputs["reviews"]["withPrefix"], inputs["reviews"]["used"],
             inputs["entries"]["judgeable"], inputs["entries"]["candidates"], inputs["entries"]["tried"],
             inputs["entries"]["retrieved"], inputs["entries"]["withoutFullText"]))
         self.assertEqual(10, len(self.fetcher.requests))
         self.assertEqual({"5": 1, "4": 1}, inputs["calls"]["byItems"])
+        self.assertEqual((13, 13, 0), (inputs["works"]["derived"], inputs["works"]["metadataFromStore"],
+                                       inputs["works"]["metadataLookedUpLive"]))
+        self.assertEqual([], self.search.queries, "every cited work has a Europe PMC record in the store")
         payloads = self.judge.payloads
         self.assertEqual(2, len(payloads))
         for payload in payloads:
@@ -225,6 +252,19 @@ class RequestTests(FullTextCase):
         self.assertEqual((fetched, absent), (second["fullTextInputs"]["fullTexts"]["cacheHits"],
                                              second["fullTextInputs"]["fullTexts"]["cachedAbsent"]))
         self.assertEqual(bodies, sorted(record["bodySha256"] for record in self.calls()))
+
+    def test_works_the_store_has_no_record_of_are_looked_up_live_as_study_abstracts_does(self):
+        report = self.run_full_text(review_prefixes=(LIVE_REVIEW,))
+        works = report["fullTextInputs"]["works"]
+        self.assertEqual((6, 0, 3, 3, 3), (works["derived"], works["metadataFromStore"], works["metadataLookedUpLive"],
+                                           works["withoutRecord"], works["withPmcid"]))
+        self.assertEqual(1, len(self.search.queries), "the census's lookup asks for 40 DOIs per query")
+        query = self.search.queries[0]
+        self.assertEqual(("json", "core", 200), (query["format"], query["resultType"], query["pageSize"]))
+        self.assertEqual(sorted(work_doi(5, k) for k in range(1, 7)), sorted(re.findall(r'DOI:"([^"]+)"', query["query"])))
+        self.assertEqual(sorted(pmcid_of(5, k) for k in (1, 3, 5)), sorted(self.fetcher.requests))
+        # PMC5005 has no open-access full text: two entries remain, one call.
+        self.assertEqual((2, 1), (report["fullTextInputs"]["entries"]["retrieved"], len(self.calls())))
 
     def test_the_store_must_be_the_label_free_projection(self):
         with self.assertRaisesRegex(ValidationError, "label-free projection"):
@@ -434,7 +474,8 @@ class EuropePmcTests(FullTextCase):
         self.addCleanup(server.shutdown)
         url = "http://127.0.0.1:%d/%%s/fullTextXML" % server.server_address[1]
         with mock.patch.object(study_cli, "EUROPE_PMC_FULL_TEXT", url):
-            probe = P.CapacityProbe(self.full_text_settings(review_prefixes=(PREFIX + "2",)), environ={})
+            probe = P.CapacityProbe(self.full_text_settings(review_prefixes=(PREFIX + "2",)), environ={},
+                                    lookup=Search())
             self.output = self.root / "default-fetcher"
             report = probe.run(self.output)
         self.assertEqual("completed", report["state"])
