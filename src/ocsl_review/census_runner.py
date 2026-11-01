@@ -466,6 +466,18 @@ def abstract_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, 
     return C.request_payload(messages, model=model, items=len(items), tier="abstract")
 
 
+def full_text_call(items: Sequence[dict[str, Any]], title: str, journal: str, *, model: str) -> dict[str, Any]:
+    """The request of one full-text call, as the census sends it.
+
+    ``items`` are up to the tier's five retrieved entries of one review (a review's last call carries its remainder),
+    each with its claim-targeted window in the FULL TEXT field; reasoning effort and ``max_tokens`` come from the
+    instrument's full-text tier. citation-census@1 has no repair pass at this tier. ``ocsl-review capacity probe
+    --tier full-text`` builds its calls here too, so the shares it measures are those of the census's own requests.
+    """
+    messages = C.build_full_text_messages(items, title, journal)
+    return C.request_payload(messages, model=model, items=len(items), tier="full-text")
+
+
 def steady_throughput(passes: Sequence[Sequence[tuple[float, float, int]]], streams: int) -> dict[str, Any] | None:
     """Entries per second of a judge step in its steady state: what a capacity gate measures.
 
@@ -1513,6 +1525,19 @@ class CensusRun:
                                          "label": label}})
         return doi, journal, title, retrieved, retry
 
+    def prepare_full_text_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]],
+                                fetch_xml: Callable[[str], bytes | None] | None, *, cache: Any = None
+                                ) -> tuple[str, str, str, list[dict[str, Any]], int]:
+        """Retrieval and windows of one review's full-text entries, exactly as the tier prepares them, without judging.
+
+        ``group`` holds citation rows (journal, doi, label, cited_work_key, title) of one review in the tier's order;
+        each work's full text comes from the byte caches first, then ``fetch_xml`` (public sources only: no entitled
+        route), and every retrieved entry carries its claim-targeted window. Returns (doi, journal, title, retrieved
+        entries, entries left open by a transient fetch failure). ``ocsl-review capacity probe --tier full-text``
+        prepares its calls here.
+        """
+        return self._prepare_group(doi, group, works, fetch_xml, None, False, cache)
+
     def _judge_full_text(self, journal: str, doi: str, title: str, index: int, items: list[dict[str, Any]],
                          call_id: str | None = None) -> dict[str, Any]:
         """One full-text call; its entries are written with its receipt. ``call_id`` replays a pending broker call.
@@ -1524,8 +1549,7 @@ class CensusRun:
         if self._stop_reason():
             return {**outcome, "skipped": True}
         labels = [it["label"] for it in items]
-        messages = C.build_full_text_messages(items, title, journal)
-        payload = C.request_payload(messages, model=self.request_model, items=len(items), tier="full-text")
+        payload = full_text_call(items, title, journal, model=self.request_model)
         call_id = call_id or self._call_id(journal, doi, "full-text", "primary", index, "full-text", labels=labels)
         result = self._call(payload, tier="full-text", journal=journal, doi=doi, variant="primary", batch=index,
                             kind="full-text", items=len(items), call_id=call_id, pending=items)
