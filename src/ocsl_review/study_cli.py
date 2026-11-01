@@ -29,10 +29,12 @@ from typing import Any
 from .errors import ValidationError
 
 EUROPE_PMC_FULL_TEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/%s/fullTextXML"
-# The search the census's abstracts step uses; the full-text fetcher asks it for one PMCID's record after a server error.
+# The search the census's abstracts step uses; the full-text fetcher asks it for one PMCID's record after a server error
+# and, when it finds none, for that PMCID and a sentinel PMCID together.
 EUROPE_PMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-# How long a PMCID's answers without any Europe PMC record must span before they decide a miss: longer than one fetch
-# with its retries, so the confirming answer comes from a later pass of the same invocation, a cooldown later.
+# How far apart the first and the deciding joint answer that show Europe PMC's index without a PMCID (the sentinel's
+# record and none of the PMCID) must be before they decide a miss: longer than one fetch with its retries, so the
+# deciding answer comes from a later pass of the same invocation, a cooldown later.
 NO_RECORD_SECONDS = 60.0
 # The sentinel the full-text fetcher names beside such a PMCID when it has seen no other PMCID in Europe PMC's index:
 # a 1922 issue of Public Health Reports that Europe PMC has indexed since 2009 (its lite record, outside the
@@ -257,15 +259,17 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
     - an answer that concludes nothing (a failed or unreadable search, hits without the PMCID, a matching record
       without ``isOpenAccess`` Y or N) leaves the error transient;
     - no record at all (hitCount 0) contradicts the record the PMCID came from, and an empty or rebuilding index
-      answers the same, so on its own it concludes nothing. It is a definitive miss only when this fetcher's answers
-      without a record of the PMCID span at least ``NO_RECORD_SECONDS`` (normally the confirming answer comes from a
-      later pass of the same invocation; the PMCID's own record or full text starts the span over), the fetch was not
-      throttled, and one search for the PMCID and a sentinel together (``PMCID:<id> OR PMCID:<sentinel>``) returns
-      the sentinel's own record and none of the PMCID, every hit on its page: one answer, so one state of the index,
-      speaks for both, and an index that answers some searches from an empty copy cannot close the entry. The
-      sentinel is the newest other PMCID this fetcher saw in the index (a full text it served, or a search that
-      returned that PMCID's own record), else ``NO_RECORD_FALLBACK_SENTINEL``. When that search fails, finds neither
-      or finds the PMCID's record (which ends its absence), nothing is concluded.
+      answers the same, so on its own it concludes nothing. In a fetch that was not throttled it is followed by one
+      search for the PMCID and a sentinel together (``PMCID:<id> OR PMCID:<sentinel>``). An answer that returns the
+      sentinel's own record and none of the PMCID, every hit on its page, shows a non-empty index without the PMCID
+      (one answer, so one state of the index, speaks for both). The first such answer starts the PMCID's absence,
+      and one at least ``NO_RECORD_SECONDS`` later (normally from a later pass of the same invocation) makes it a
+      definitive miss, so both ends of the span show a non-empty index without the PMCID. A zero-hit answer, an
+      answer without the sentinel, a failed search and a throttled fetch neither start nor confirm the span; the
+      PMCID's own record (in the joint answer too) or full text starts it over. An empty index, one that answers some
+      searches from an empty copy, and one rebuilt in place whose partial copy answers fewer than two such searches
+      that far apart close nothing. The sentinel is the newest other PMCID this fetcher saw in the index (a full text
+      it served, or a search that returned that PMCID's own record), else ``NO_RECORD_FALLBACK_SENTINEL``.
 
     Throttling (408, 425, 429), timeouts and dropped connections get no record check. Whatever stays undecided
     after the last attempt raises ``RetryableFetch``, so the entry stays open for the next pass instead of becoming
@@ -287,7 +291,7 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
              None: "; its Europe PMC record could not be checked"}
     throttling = (408, 425, 429)
     lock = threading.Lock()
-    absent_since: dict[str, float] = {}     # PMCID -> when the search first found no record of it since it was seen
+    absent_since: dict[str, float] = {}     # PMCID -> its first joint answer without it, since it was last seen
     sentinels: list[str] = []               # the last two PMCIDs seen in Europe PMC's index, the newest first
 
     def pace() -> None:
@@ -341,7 +345,8 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
         return "not-open-access" if flags == {"N"} else "listed"
 
     def absent_for(pmcid: str) -> float:
-        """Seconds since the search first found no record of ``pmcid`` (0 at the first such answer)."""
+        """Seconds since the first joint answer that showed Europe PMC's index without ``pmcid`` since it was last
+        seen there (0 at that answer). Called only on such an answer (``index_answers``)."""
         now = monotonic()
         with lock:
             return now - absent_since.setdefault(pmcid, now)
@@ -350,7 +355,8 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
         """Whether Europe PMC's index answers while it lacks ``target``: one search for ``target`` and a sentinel
         together returns the sentinel's own record and none of ``target``, every hit on its page. The sentinel is the
         newest PMCID other than ``target`` seen in the index, else NO_RECORD_FALLBACK_SENTINEL (no sentinel, and no
-        search, when that is ``target``). A record of ``target`` in the answer ends its absence."""
+        search, when that is ``target``). A record of ``target`` in the answer ends its absence. Only such an answer
+        starts or confirms ``target``'s absence."""
         with lock:
             sentinel = next((pmcid for pmcid in sentinels if pmcid.upper() != target.upper()), None)
         if sentinel is None and target.upper() != NO_RECORD_FALLBACK_SENTINEL:
@@ -402,16 +408,15 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
                 checkable = status == 200 or status in (401, 403) or 500 <= status < 600
                 if checkable and not checked:
                     # A PMCID outside the open-access subset gets a server error, not 404: Europe PMC's record decides
-                    # whether this is a miss or an outage. No record at all decides only once that absence has lasted
-                    # NO_RECORD_SECONDS, in a fetch that was not throttled, while one search finds the sentinel's
-                    # record and still none of the PMCID.
+                    # whether this is a miss or an outage. No record at all is checked, in a fetch that was not
+                    # throttled, with one search that must find the sentinel's record and still none of the PMCID: the
+                    # first such answer starts the absence, one NO_RECORD_SECONDS later decides.
                     checked = True
                     listed = record_of(pmcid)
                     if listed == "not-open-access":
                         return miss(pmcid, "notOpenAccess")
-                    if listed == "no-record":
-                        lasting = absent_for(pmcid) >= NO_RECORD_SECONDS
-                        if lasting and not throttled and index_answers(pmcid):
+                    if listed == "no-record" and not throttled and index_answers(pmcid):
+                        if absent_for(pmcid) >= NO_RECORD_SECONDS:
                             return miss(pmcid, "noRecord")
                     note = notes.get(listed, notes[None])
             if not last:

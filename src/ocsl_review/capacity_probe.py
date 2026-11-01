@@ -1046,8 +1046,8 @@ class FullTextInputs:
                                       "(its User-Agent, 0.4 s spacing per thread, 3 attempts; a server error is "
                                       "checked against the PMCID's Europe PMC record: a PMCID outside the "
                                       "open-access subset is a definitive miss, one without any record only when the "
-                                      "search finds none for at least 60 s and then one search for it and another "
-                                      "PMCID finds the other's record only, absentNoRecord, which should stay 0; "
+                                      "search finds none and two searches for it and another PMCID together, at least "
+                                      "60 s apart, find the other's record only, absentNoRecord, which should stay 0; "
                                       "otherwise it stays transient)")
                           if live else None,
                           "fetchWorkers": settings.fetch_workers},
