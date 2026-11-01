@@ -1125,6 +1125,7 @@ class FullTextInputs:
                                                                                          cache=caches)
                         stats["tried"] += len(rows)
                         stats["retrieved"] += len(entries)
+                        stats["transient"] += retry
                         sources.update(item["_entry"].get("label") or "supplied" for item in entries)
                         if entries:
                             kept.append((position, doi, title, entries))
@@ -1141,8 +1142,11 @@ class FullTextInputs:
         finally:
             caches.close()
         per_review = stats["candidates"] / stats["prepared"] if stats["prepared"] else None
-        record["entries"]["note"] = ("the dry run fetches nothing: retrieved counts only the full texts the store or the "
-                                     "cache directory hold")
+        # Offline, an entry is without a full text only where the cache directory records Europe PMC's miss; the rest
+        # the store and the directory do not hold would be fetched by the run.
+        record["entries"].update({"withoutFullText": cache.counts["cachedAbsent"], "notFetched": cache.counts["notFetched"],
+                                  "note": "the dry run fetches nothing: retrieved counts only the full texts the store "
+                                          "or the cache directory hold"})
         record["sample"] = {"reviews": min(PLAN_REVIEWS, len(dois)), "candidatesPerReview": _round(per_review, 1),
                             "note": "prepared offline; only full texts the store or the cache directory hold were used"}
         record["estimate"] = {
@@ -3324,7 +3328,9 @@ def _full_text_inputs_lines(inputs: dict[str, Any] | None) -> list[str]:
             f"{reviews['refused']}, not prepared {reviews['notPrepared']})",
             f"- Entries: {entries['judgeable']} judgeable, {entries['candidates']} with a PMCID, {entries['tried']} tried, "
             f"{entries['retrieved']} retrieved (target {entries['target']}; without a full text {entries['withoutFullText']}, "
-            f"left open by a transient failure {entries['transient']}); sources: {sources}",
+            f"left open by a transient failure {entries['transient']}"
+            + (f", not fetched in the dry run {entries['notFetched']}" if "notFetched" in entries else "")
+            + f"); sources: {sources}",
             f"- Full texts: {fetched or 'nothing fetched'}; cache directory {_cell(texts.get('cacheDirectory') or '-')}; "
             f"{texts.get('fetchWorkers')} fetch threads",
             f"- Calls: {calls['count']} (mean {_num(calls['meanItems'], 2)} items; by items "
