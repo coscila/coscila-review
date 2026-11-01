@@ -6,8 +6,11 @@ These are the evidence commands of `ocsl-review followup`, the audit of claims a
 articles described in `docs/followup-audit.md`: status observations, support and function judging, dependency,
 cited-by traversal, facts and exports. Every command works on one follow-up branch database (`--database`), returns
 one JSON result and, with the global `--result-file`, writes it as `ocsl-review-result-v1` for a Study Run step. A
-failure is a non-zero exit with its error class (`validation`, `policy`, `usage`). Judging commands refuse a branch
-whose strata are not frozen (`followup strata --freeze`); so do `dependency` and `citedby`, which read the strata.
+failure is a non-zero exit with its error class (`validation`, `policy`, `usage`, `runtime`). Judging commands refuse a
+branch whose strata are not frozen (`followup strata --freeze`); so do `dependency` and `citedby`, which read the
+strata. A command that can stop before its work is done (a halted broker, items left open, a throttling provider)
+says so in a top-level `state` of `paused` with a `reason` (the census step contract); a finished one reports
+`state` `completed`.
 
 Sizes, shares and rates are never inputs: they come from the run's own data. Every adverse record reads "check
 suggested"; the instruments have no validation set, so their outputs are model measurements with evidence and
@@ -21,7 +24,10 @@ traversal. Each request passes the egress gate with identifiers and paging contr
 `page`, `cursor`, `rows`); `--workspace` names the workspace whose egress ledger records them. The only contact
 identity is the operator's `OCSL_REVIEW_CONTACT_EMAIL`; none is ever inferred. Every response is stored once by its
 sha256 and receipted in `fu_requests` with contact and key parameters removed; a failed request records a failure
-class (`http-<status>`, `timeout`, `malformed-response`, `request-failed`), never response text.
+class (`http-<status>`, `timeout`, `malformed-response`, `request-failed`), never response text. A host that answers
+HTTP 429 or 503 pushes its next request slot by the server's Retry-After (or a capped exponential backoff), and the
+bulk loops (status fetch, cited-by traversal, evidence and second-generation acquisition) stop asking it after
+`followup_net.MAX_CONSECUTIVE_THROTTLES` throttles in a row, with a paused result naming what was left.
 
 ## Status observations
 
@@ -32,10 +38,11 @@ registered as a dataset version (kind `retraction-watch-csv`: sha256, declared v
 version or sha256 other than the protocol's (`status.retractionWatchCsv`) is refused, and so is a protocol that lists
 no `retraction-watch-csv` source. Rows are matched to every cited work of the parent by `OriginalPaperDOI` (lower case)
 or `OriginalPaperPubMedID`; `RetractionNature`, `RetractionDate`, `RetractionDOI`, `RetractionPubMedID`, `Record ID`
-and `Reason` become the observation. A work with a DOI or PMID and no row records `none` (the snapshot covers every
-notice kind); a work with neither records `unknown`. Importing the same snapshot again adds nothing.
+and `Reason` become the observation. A work with a DOI or PMID and no row records `none`; a work with neither records
+`unknown`. The snapshot lists corrections only selectively, so its `none` covers retractions, expressions of concern and
+reinstatements by default (see `status-resolve`). Importing the same snapshot again adds nothing.
 
-### `followup status-fetch [--source S]... [--limit N] [--snapshot ID] [--workspace DIR]`
+### `followup status-fetch [--source S]... [--limit N] [--snapshot ID | --continue] [--workspace DIR]`
 
 Asks every distinct cited work of the parent census (all cited works, not only those in the frame), with the parent's
 identifiers, at each live source; one thread per source keeps each host's interval.
@@ -49,27 +56,34 @@ identifiers, at each live source; one thread per source keeps each host's interv
 A source that cannot answer records `unknown` with its reason (`no-doi`, `no-pmid`, `no-identifier`, `not-found`,
 `no-record`, `no-flag`, a failure class); it never stops the run. One run is one status snapshot
 (`status-<UTC time>`), registered as a dataset version (kind `status-snapshot`, sha256 of the snapshot's canonical
-observation rows). `--snapshot` continues a snapshot: pairs of work and source that answered are skipped, failed ones
-are asked again. `--source` defaults to the protocol's live sources; `--limit` asks only the first works (a smoke
-test).
+observation rows) when every source finished. A source whose host throttles repeatedly stops; the snapshot then stays
+open and the result is paused. `--snapshot` continues a given snapshot and `--continue` the latest one that did not
+finish (a fixed Study Run step passes `--continue`; a new snapshot starts when none is open): pairs of work and source
+that answered are skipped, failed ones are asked again. An unexpected failure leaves the snapshot open and is a
+`runtime` failure, never a refusal. `--source` defaults to the protocol's live sources; `--limit` asks only the first
+works (a smoke test).
 
 ### `followup status-resolve [--snapshot ID]...`
 
 Gives every cited work of the parent exactly one `fu_work_status` row under `status-resolution@1`, from the
-observations of the chosen snapshots (default: the latest live snapshot and the latest Retraction Watch import) and
-the protocol's sources only:
+observations of the chosen snapshots (default: the latest finished live snapshot and the latest Retraction Watch
+import) and the protocol's sources only:
 
 1. retracted when a retraction notice stands; a reinstatement dated later than every dated retraction notice sets
    `reinstated` and the next kind decides (a reinstatement cannot be shown to be later than an undated retraction);
 2. otherwise expression of concern, otherwise corrected;
 3. otherwise `none` when every notice kind (retraction, expression of concern, correction) is covered by a source that
-   answered for the work, otherwise `unknown` with the kinds no answering source covers (`unknown_kinds_json`);
+   answered for the work, otherwise `unknown` with the kinds no answering source covers (`unknown_kinds_json`). The
+   kinds an answer covers come from the protocol (`status.covers`, per source) or the defaults: Crossref every kind,
+   PubMed retraction, expression of concern and correction, Europe PMC retraction, the Retraction Watch snapshot
+   retraction, expression of concern and reinstatement (it records corrections only selectively), so a correction
+   counts as covered through Crossref or PubMed;
 4. the deciding notice is the earliest-dated notice of the deciding kind, dates compared at the coarser of their
    precisions (on a tie the finer date wins; undated notices come last); its DOI, date, precision and source are
    recorded. Disagreeing dates stay in the observations.
 
-`sources_json` lists every source with whether it answered, its statuses, the kinds it covers, its latest retrieval
-time and its notices. The result reports the statuses, the deciding sources, `citedWorksWithoutStatusRow` (the gate
+`sources_json` lists every source with whether it answered, its statuses, the kinds it reports, the kinds counted as
+covered and their basis (`protocol` or `default`), its latest retrieval time and its notices. The result reports the statuses, the deciding sources, `citedWorksWithoutStatusRow` (the gate
 needs none) and a diagnostic: the parent's retraction flag (what the census judge was shown) against the resolved
 status. The flag is never a status source. Resolving again after the freeze is refused.
 
@@ -81,11 +95,14 @@ Options: `--store DIR --store-root ROOT`, `--provider-cache FILE`, `--europe-pmc
 `--transport-retries`, `--transport-cooldown`, `--variant`, `--scope`, `--public-only`, `--limit`).
 
 citation-support@2 runs unchanged, one item per call, on the units of S0, S1, S2, S3 and the co-cited loci at either
-tier. `--scope pilot` takes the pilot units and the co-cited loci of pilot anchors; `--variant replicate` takes the
-replicate units every judging command draws (`followup_strata.replicate_keys`): of the units in scope, the ceiling of
-the protocol's replicate share times their number, ranked by the sha256 of the protocol seed, the instrument id and
-the locus id (the result records the rule; replicate verdicts stay in the judgment ledger and never replace a primary
-row);
+tier, with the request settings the protocol predeclares for the tier (`instruments.supportSettings`: the reasoning
+effort, and optionally the temperature; the instrument declares none). The command refuses to send anything without
+them; every request body carries them, and the result reports them (`requestSettings`). `--scope pilot` takes the
+pilot units and the co-cited loci of pilot anchors; `--variant replicate` takes the replicate units every judging
+command draws (`followup_strata.replicate_keys`): within each replicate group (the unit's first stratum in the order
+S1, S2, S3, S0, co-cited, and within S1 its work's status), the ceiling of the protocol's replicate share times the
+group's number, ranked by the sha256 of the protocol seed, the instrument id, the group and the locus id (the result
+records the rule and the groups; replicate verdicts stay in the judgment ledger and never replace a primary row);
 `--public-only` sends only public items; `--limit` sends at most that many items. Items already accepted under the
 same instrument digest, tier and variant are skipped, so a run resumes where it stopped.
 
@@ -116,6 +133,15 @@ lists as on premises, and the run stops before the first call otherwise.
 `contradicted`, `not-addressed`) with its first exact quote, evidence coverage and provenance, or `assessable = 0`
 with its reason (see the table at the end). An abstention keeps the verdict `abstain` with reason `abstained`.
 
+The result of every judging command (support, function, and numeric and second-gen in the analysis set) carries the
+census step contract at the top level: `state` (`completed`, or `paused` when the run stopped or items are still
+open), a `reason` with the census prefixes (`model_drift: served ..., required ...`, `fidelity: ...`, `transport:
+broker halted: ...`, `transport: N items still open after P further passes`), `resumeAfter` and `transport` (the broker
+transport's description with its halt record) when there are any, and the totals of the invocation: `accepted`,
+`invalid` (items rejected after the repair pass), `calls` (first and repair calls) and `reviews` (the units decided:
+loci or candidate sentences, under the census field name). `run` holds the runner's summary and `judge` names the
+judge. Evidence acquisition stopped by a throttling provider also pauses the support result.
+
 ## Function: `followup function [--documents DIR]` with the judge options
 
 citation-function@1 classifies the units of S0, S1, S2 and S3 (co-cited loci are not classified) as `relies`,
@@ -133,16 +159,23 @@ whose sentence digest matches gives its neighbours, and without a document they 
 instrument's evidence policy says. Ten items go in a call, with one repair pass. `fu_function` gets one row per unit:
 the class with its quote and field, or the reason.
 
-## Dependency: `followup dependency`
+## Dependency: `followup dependency [--scope pilot|all]`
 
 `dependency-aggregation@1` for every S1 and S2 anchor, from the parent's loci of the same citing sentence (so a work
 the frame leaves out can only make the class undetermined): the co-cited works are the distinct other works of the
 sentence (a work cited twice counts once; a locus with an unresolved identity counts as one unassessable
-co-citation). A co-cited work supports the claim when one of its loci has a full-text verdict of `direct-support` or
-`scope-caveat`; it is unassessable without an assessable full-text verdict. The class is `sole` (no other work),
-`redundant` (another work supports), `essential` (every other work assessable, none supports) or `undetermined`
-(otherwise: abstract silence and failed downloads never count as not supporting). `fu_dependency` records the counts,
-the anchor's own full-text verdict and every co-cited locus with its verdict; recomputing gives the same rows.
+co-citation). A co-cited locus is decided when its full-text verdict is in citation-support@2's class map `supported`
+or `adverse` classes; a verdict of the `uncertain` class (`partial-indirect`; an abstention is never assessable) is
+unsettled support and leaves it unassessable, as abstract silence and failed downloads do. A co-cited work supports
+the claim when one of its decided loci is `supported` (`direct-support`, `scope-caveat`), and it is assessable when
+one of its loci is decided. A co-cited work whose own resolved status is one of the protocol's S1 statuses never
+counts as support: a claim resting only on compromised works is not redundant. The class is `sole` (no other work),
+`redundant` (another work without a notice of its own supports), `essential` (every other work assessable, none
+without a notice supports) or `undetermined` (otherwise). `fu_dependency` records the counts, the anchor's own
+full-text verdict and, in `detail_json`, every co-cited work with its status and its loci with their verdicts, the
+support of compromised works (`compromisedSupporting`) and the class each other reading gives (`readings`:
+unsettled support counted as decided non-support; support of compromised works counted), for a predeclared
+sensitivity. Recomputing gives the same rows; `--scope pilot` (re)computes only the pilot anchors' rows.
 
 ## Cited-by: `followup citedby [--source S]... [--limit N] [--widen] [--max-pages N] [--workspace DIR]`
 
@@ -156,7 +189,8 @@ S1 locus. `--source` defaults to the protocol's second-generation sources.
   `unavailable` with its reason and never stops the traversal. An operator key in `OCSL_REVIEW_OPENALEX_API_KEY` is
   sent as OpenAlex expects and never recorded; `mailto` only with the operator's contact address.
 
-Edges of a target are united across sources: records that share any identifier carry one citing key, the DOI, else
+A provider that throttles repeatedly stops the traversal with a paused result naming the targets left (a later run
+traverses again). Edges of a target are united across sources: records that share any identifier carry one citing key, the DOI, else
 the PMID, else the PMCID, else the OpenAlex id (`doi:`, `pmid:`, `pmcid:`, `openalex:`). `fu_citedby_edges` keeps one
 row per target, source and key; `fu_citedby_coverage` one per target and source (state, hit count, edges, reason).
 Every run registers the graph as a dataset version (kind `cited-by-graph`, sha256 of the canonical edge rows).
@@ -168,27 +202,38 @@ broker. Each call is one one-item job naming the instrument's broker digest (`oc
 installed with `pnpm ops broker instruments install` and granted to the run principal) and carrying the request the
 instrument built; the job's idempotency key comes from the request digest. The served model and the fingerprint are
 the judge response's own; another served model stops the run as model drift; a request digest other than the one
-built, or a refusal before any provider call, halts the transport; any other failure leaves the call's items open for
-the further passes. Only the verbatim follow-up instruments run this way: citation-support@2 has no verbatim bundle
-and runs on a judge called directly. The broker judge is on premises only with `--on-premises` and a `--policy` that
+built, or a refusal before any provider call, halts the transport (code `FIDELITY`); any other failure leaves the
+call's items open for the further passes. Once the transport has halted, for any reason (a fidelity stop, the run's
+budget, a provider limit with its `resumeAfter`, a revoked grant, a cancellation), the runner sends nothing more and
+skips its further passes, and the result is paused with the halt record. A broker run records the pinned study bundle
+in every receipt and refuses to start without one. Only the verbatim follow-up instruments run this way:
+citation-support@2 has no verbatim bundle and runs on a judge called directly. The broker judge is on premises only with `--on-premises` and a `--policy` that
 lists the broker provider (and model) in `onPremBrokerProviders`.
 
 ## Facts: `followup facts --output DIR` and `followup verify-facts --facts DIR`
 
-`facts` verifies the branch (the parent digest unchanged), then writes a closed `facts.sqlite3`: the follow-up tables
-copied with `VACUUM INTO`, without stored request and response bodies, evidence units, quotes, parsed verdicts,
-section trails or sentence text, plus `fu_census_counts` (per journal, year and status, the parent's in-body
-identity-resolved loci: the denominators of the compromised share), `fu_census_flags` (the parent's retraction flag
-against the resolved status) and `fact_inputs` (parent, branch and protocol digests, the freeze, instrument digests,
-dataset versions, code revision, the protocol's bootstrap replicates and seeds). `facts.json` (schemaVersion 1) holds
-one scalar SQL query per fact with the file's sha256: `followup.status.*`, `followup.census.*`, `followup.strata.*`,
+`facts` verifies the branch (the parent digest unchanged), then writes a closed `facts.sqlite3` of aggregates only, so
+it stays small at census scale and a fact (which hashes the file) stays cheap to verify: per-family summaries of the
+branch (`fs_work_status`, `fs_status_observations`, `fs_totals`, `fs_strata`, `fs_support`, `fs_support_strata`,
+`fs_function`, `fs_function_strata`, `fs_dependency`, `fs_dependency_strata`, `fs_numeric`, `fs_citedby`,
+`fs_citedby_coverage`, `fs_secondgen`, `fs_calls`, `fs_judgments`, `fs_requests`: each a GROUP BY of the branch table
+it names), the estimates and coverage (`fu_estimates`, `fu_coverage`), the stratum sizes, the protocol freeze, the
+dataset versions, `fu_census_counts` (per journal, year and status, the parent's in-body identity-resolved loci: the
+denominators of the compromised share), `fu_census_flags` (the parent's retraction flag against the resolved status)
+and `fact_inputs` (parent, branch and protocol digests, the freeze, instrument digests, the study bundle, dataset
+versions, code revision, the selection seed and the bootstrap replicates and seed the estimates used). No per-locus
+table and no text of a review or a cited work enters it. `facts.json` (schemaVersion 1) holds one scalar SQL query per
+fact with the file's sha256 and the code revision (a summary fact names its branch query in its derivation); the inputs
+are recorded once, in the provenance. Keys: `followup.status.*`, `followup.census.*`, `followup.strata.*`,
 `followup.support.*`, `followup.function.*`, `followup.dependency.*`, `followup.numeric.*`, `followup.citedby.*`,
 `followup.secondgen.*`, `followup.calls.*`, `followup.requests.*`, `followup.estimates.*` (every `fu_estimates` row
 with its derivation: the estimate key `followup.<estimand>...` becomes `followup.estimates.<estimand>...`, and a share
 that is not measured keeps the value `not-measured`) and
 `followup.coverage.<estimand>.<journal>.<year>.<stratum>.<state>.<reason>.units` and `.weighted` (from `fu_coverage`;
-`*` reads `all` and the reason `-` of assessable units reads `none`). `verify-facts` re-runs every query read-only
-against the snapshot (`corpus_facts.verify_export`).
+`*` reads `all` and the reason `-` of assessable units reads `none`). The estimates must share one bootstrap setting:
+an export over estimates computed with different replicates or seeds is refused, and the provenance says whether the
+setting is the protocol's. `verify-facts` re-runs every query read-only against the snapshot
+(`corpus_facts.verify_export`); the writing companion's `facts` verifier accepts the export too.
 
 ## Export: `followup export --output DIR [--allow-entitled-text]`
 
@@ -197,8 +242,10 @@ Writes into a new directory:
 - `compromised-claims.sqlite3` (closed): `claims` (one row per S1 or S2 locus: the citing sentence, the cited work,
   its status with source and date, the support verdicts and quotes, the function, the dependency and the judge
   receipts), `observations` (the status observations of the cited works), `receipts` (the judge calls behind the
-  verdicts), `adjudications` (empty until a study adjudicates), `meta` and `data_dictionary`;
-- `alerts.jsonl`: one record per affected claim and cited work, also kept in `fu_alerts`: the claim, the cited work,
+  verdicts), `alerts` (the alert records below), `adjudications` (empty until a study adjudicates), `meta` and
+  `data_dictionary`;
+- `alerts.jsonl`: one record per affected claim and cited work, also in the claim database's `alerts` table: the claim,
+  the cited work,
   its status, the evidence (support, function, dependency, timing against the notice, receipts), the confidence
   "check suggested" and a suggested action for the authors of the citing review and for a study team. A claim
   resting on a work with a retraction, expression of concern or correction is affected unless the review notes the
@@ -209,8 +256,10 @@ Writes into a new directory:
   the redaction applied.
 
 A public export drops entitled text: entitled citing sentences become `sha256:<hex>`, their section trails are removed,
-and quotes from entitled sentences or evidence are dropped. `--allow-entitled-text` makes a private export that keeps
-them; never share it.
+and quotes from entitled sentences or evidence are dropped; it needs no text parent. `--allow-entitled-text` makes a
+private export that keeps them (it needs the text parent mounted); never share it. An export writes nothing into the
+branch, so the branch digest a facts export recorded still holds afterwards. An alert of an essential claim whose
+other cited works support it only where they carry a notice themselves says so.
 
 ## Reasons a unit has no verdict
 
@@ -225,6 +274,9 @@ them; never share it.
 | `abstained` | the judge abstained, with its reason |
 | `invalid-output` | the output failed validation after the repair pass |
 | `not-judged` | not sent yet (scope, limit, public only, a call without a response), or no task could be built |
+| `no-matching-table`, `table-unavailable` | numeric checks: the cited work is no report of the table source, or its edition has no cells |
+| `no-matching-cell` | numeric checks: no cell of the table source holds the claimed condition, metric, geography and year |
+| `unsupported-value-form` | numeric checks: the stated number has a form the rule does not read (a range, a ratio, a second number) |
 
 Abstract silence and failed or missing downloads never count as unsupported: an unassessable unit keeps its reason
 and goes into the coverage tables, never into a numerator.
