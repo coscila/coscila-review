@@ -277,7 +277,10 @@ retrieval a cache hit only stands in for a download the run makes for every
 escalated work (`liveRetrieval` in the source's provenance record). Only Europe
 PMC documents are candidates. Each escalated entry records `ft_provenance`: the
 class of the source behind its window, or `unavailable` when no window was
-sent.
+sent. Live fullTextXML requests name the census inputs' User-Agent and ask for
+XML; like every other census request they carry identifiers only. Each fetch
+thread (`--fetch-workers`, 4 by default) spaces its requests 0.4 s apart and
+retries throttling and server errors with backoff.
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and
@@ -438,7 +441,11 @@ report, and nothing of the stored manifest enters the study.
 Before a census commits to a concurrency, `ocsl-review capacity probe` measures
 the entries per second the judge sustains with this instrument's own requests
 over synthetic entries, and whether the judge serves other clients
-([capacity probe](capacity-probe.md)).
+([capacity probe](capacity-probe.md)). `capacity probe --tier full-text`
+measures the full-text tier with its own calls over real loci from the study's
+literature-evidence@2 store: the share of entries without a parseable verdict
+(the full-text tier has no repair pass), tokens per entry and entries per
+second.
 
 ```bash
 ocsl-review study acquire --input inputs/manifest.jsonl --output inputs/reviews.jsonl --store "$STORE" \
