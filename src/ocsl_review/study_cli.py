@@ -130,7 +130,9 @@ def add_commands(families, register):
             command.add_argument("--transport-cooldown", type=float, default=60.0,
                                  help="seconds before the first further pass (doubling for each next pass)")
         if name == "judge":
-            command.add_argument("--limit", type=int)
+            command.add_argument("--limit", type=int, help="judge only the next LIMIT pending reviews")
+            command.add_argument("--journal", help="judge only pending reviews of this journal (its label in the study), "
+                                                   "with --limit the next LIMIT of them")
         if name == "full-text":
             command.add_argument("--europe-pmc", action="store_true",
                                  help="fetch Europe PMC fullTextXML by PMCID (required with --store or --provider-cache)")
@@ -618,7 +620,7 @@ def command(args) -> Any:
         passes = {"transport_retries": args.transport_retries, "cooldown": args.transport_cooldown}
         try:
             if action == "judge":
-                return run.run_abstract(limit=args.limit, **passes)
+                return run.run_abstract(limit=args.limit, journal=args.journal, **passes)
             if action == "full-text":
                 caches = _caches(args)
                 if caches is not None and not args.europe_pmc:
