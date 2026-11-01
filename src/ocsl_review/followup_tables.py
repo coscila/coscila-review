@@ -14,7 +14,9 @@ cells a comparison matched.
 
 Matching of condition, metric and geography is by folded text (case, spacing, typographic punctuation and a leading
 article ignored) mapped through versioned synonym lists: a small built-in list (``table-synonyms@1``) and the
-source's own ``synonyms`` block, which extends or overrides it.
+source's own ``synonyms`` block, which extends or overrides it. The built-in list is domain-neutral (the condition
+"all" and common geography spellings); labels of a particular field (for example the ways a report names all of its
+conditions together) belong in the source's block.
 """
 from __future__ import annotations
 
@@ -34,9 +36,9 @@ LICENSING = ("synthetic", "unverified", "verified")
 KINDS = ("condition", "metric", "geography")
 MAX_BYTES = 64 * 1024 * 1024
 BUILTIN_SYNONYMS_VERSION = "table-synonyms@1"
+# Domain-neutral entries only: condition labels of a particular field belong in the table source's own synonyms block.
 BUILTIN_SYNONYMS: dict[str, dict[str, tuple[str, ...]]] = {
-    "condition": {"all": ("all cancers", "all cancer sites", "all sites", "all sites combined", "all malignancies",
-                          "all malignant neoplasms", "all diseases")},
+    "condition": {"all": ("all diseases", "all conditions")},
     "metric": {},
     "geography": {"world": ("worldwide", "global", "globally", "the world"),
                   "united states": ("usa", "us", "u.s.", "u.s.a.", "united states of america"),

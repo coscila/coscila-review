@@ -19,6 +19,16 @@ def fixture(instrument_id):
 
 
 class RegistryEntryTests(unittest.TestCase):
+    def test_the_shared_builder_module_is_pinned_in_every_follow_up_bundle(self):
+        """followup_items is part of all three registry digests; its sha256 is pinned so instruments verify detects an
+        accidental change instead of silently producing three new instruments."""
+        from ocsl_review import instruments
+        for instrument_id in ("citation-function@1", "numeric-check@1", "claim-match@1"):
+            with self.subTest(instrument=instrument_id):
+                instrument = instruments.load(instrument_id)
+                self.assertEqual(instrument.module_digests()["builder"], instrument.manifest["builder"]["sha256"])
+                self.assertTrue(instruments.verify(instrument)["ok"])
+
     def test_bundles_verify_and_export_verbatim_settings(self):
         available = instruments.available()
         for instrument_id in FOLLOWUP_INSTRUMENTS:

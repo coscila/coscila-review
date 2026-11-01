@@ -85,7 +85,8 @@
     "sha256": "b3d18dacec3501c3db6f7f1ae893e93e836d98a425dec051b7e18f6620c3ee2f"
   },
   "builder": {
-    "module": "ocsl_review.followup_items"
+    "module": "ocsl_review.followup_items",
+    "sha256": "c5c9a0e70232799da9fb6ff592dfc3364f6eb1bf6370e67a9772e8d670c1a9d3"
   },
   "classMap": {
     "id": "claim-match@1",

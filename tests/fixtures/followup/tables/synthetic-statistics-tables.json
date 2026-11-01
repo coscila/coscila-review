@@ -10,7 +10,8 @@
   "condition": {
    "all": [
     "the disease",
-    "disease"
+    "disease",
+    "all sites combined"
    ]
   },
   "geography": {

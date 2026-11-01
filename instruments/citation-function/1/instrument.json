@@ -84,7 +84,8 @@
     "sha256": "035eda7462520f64521d4ce08a605edb38e1fdc61d273551292e4b462caa41f8"
   },
   "builder": {
-    "module": "ocsl_review.followup_items"
+    "module": "ocsl_review.followup_items",
+    "sha256": "c5c9a0e70232799da9fb6ff592dfc3364f6eb1bf6370e67a9772e8d670c1a9d3"
   },
   "classMap": {
     "id": "citation-function@1",

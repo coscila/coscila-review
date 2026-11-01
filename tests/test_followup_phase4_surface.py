@@ -2,7 +2,8 @@
 """The follow-up leaves the census surface byte-identical.
 
 The census instrument's bundle files, its registry digest and broker bundle digests, its builder and validator module,
-the instrument it reuses unchanged (citation-support@2: prompt and output schema) and the fidelity tests with their
+the instrument it reuses unchanged (citation-support@2: prompt, output schema, manifest, its validator and builder
+module and its registry digest) and the fidelity tests with their
 fixtures are pinned here by sha256 as they stand at the follow-up track's base. A change to any of them belongs to the
 census's own track and needs a deliberate re-pin here; the follow-up never makes one.
 """
@@ -23,6 +24,8 @@ PINNED_FILES = {
     "src/ocsl_review/citation_census.py": "f560b4a1e4d4de1bdd5a3d0ef8f990b98dda0da3b9956cffaf23ba860c1ab8c5",
     "prompts/citation-support-v2.txt": "cf075fee7e7aeaad9acd73c25928dcb4f8604fd4c024248983f06e62cab531d6",
     "schemas/corpus-assessment-v2.schema.json": "8547779a0ab620cbc74cf6a25bb015be145a3aa939644524146480aa89521b59",
+    "instruments/citation-support/2/instrument.json": "123c1bf66f80c90b17c1ac107d01d1c411e44b0d2b014dc47469380bf6e8e725",
+    "src/ocsl_review/corpus_assessment.py": "7c6600397dc60e03980966199d991f3df559640d410ad1bfc12d2746a4d7f4cf",
     "tests/test_citation_census_fidelity.py": "38a29fdbb586820e1e8fd14f7f8dae9536116345331ee2a5a893207c6ed5fc50",
     "tests/fixtures/citation_census/judge_items.json": "cab57af1f2ed281077e8ec5f835132a5aa1d9cb91fab77505354e98da38cbfac",
     "tests/fixtures/citation_census/model_outputs.json": "0235d79332ccce2214c45a369da03883f77c7471aaf6f05c7c71b409a0adcc17",
@@ -39,6 +42,8 @@ PINNED_FILES = {
     "tests/fixtures/citation_census/full_texts/ft4.xml": "3610e64eee402bc4f2b68ebd4ebe76ab6b94828d7893434f1404a6f5f325a8f2",
 }
 CENSUS_DIGEST = "4d1d9c0caa0447c7cd2759bf3bc9cf53115cc4877a4759e4c8097b834687c2f7"
+# citation-support@2, reused unchanged: its manifest, its validator and builder module and its registry digest.
+SUPPORT_DIGEST = "1d1fe411c80389d9163c414dbddb2d96b1052c199838a17b53b232068ff3fad1"
 # Broker bundles of both tiers for a neutral journal parameter (the bytes the execution daemon installs).
 BROKER = {
     "abstract": ("acaf22f071bdb80bc7f6907bd39bab701ddafe767207856f8b3f482341b9756e",
@@ -74,6 +79,8 @@ class CensusSurfaceTests(unittest.TestCase):
 
     def test_the_reused_support_instrument_keeps_its_prompt_and_schema(self):
         support = instruments.load("citation-support@2")
+        self.assertEqual(SUPPORT_DIGEST, support.digest)
+        self.assertEqual("ocsl_review.corpus_assessment", support.manifest["validator"]["module"])
         self.assertEqual(PINNED_FILES["prompts/citation-support-v2.txt"], support.manifest["files"]["systemPrompt"]["sha256"])
         self.assertEqual(PINNED_FILES["schemas/corpus-assessment-v2.schema.json"],
                          support.manifest["files"]["outputSchema"]["sha256"])
