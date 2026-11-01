@@ -10,6 +10,10 @@ and a per-call log. The probe only measures: it is no part of any instrument
 digest and never writes a scores database, and its chat requests are the ones
 a census sends, except that their entries are synthetic.
 
+`--tier full-text` probes the full-text tier instead, with real inputs: the
+census's own full-text calls over the loci of real reviews from the study's
+literature-evidence@2 store ([full-text tier](#full-text-tier---tier-full-text)).
+
 It is an operator command: it refuses to run inside a chat workspace, because
 the load it puts on a shared judge is the operator's decision. Run it on the
 host that will run the census, against the same endpoint.
@@ -31,6 +35,12 @@ ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIA
 # The deciding cell with the census's repair pass: invalid outputs before and after it, by items per call.
 ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIABLE \
   --cells 60x40 --cell-seconds 900 --repair --output probes/judge-60x40-repair
+
+# The full-text tier: one cell of 20 streams over real loci of one journal's reviews in the store, each call once.
+ocsl-review capacity probe --base-url "$JUDGE_URL" --api-key-env JUDGE_KEY_VARIABLE --tier full-text \
+  --store "$STORE" --store-root "$STORE_ROOT" --journal "$JOURNAL" --review-doi-prefix "$DOI_PREFIX" \
+  --review-route public --cells 20x5 --full-text-entries 2000 --cell-seconds 900 --drain-seconds 600 \
+  --full-text-cache probes/full-text-cache --hypothetical-repair --output probes/judge-full-text
 
 # With sizes and expected tokens per entry measured on a study's own public inputs (after its pilot).
 ocsl-review capacity profile --database work/census.sqlite3 --output probes/profile.json
@@ -69,6 +79,14 @@ to `--drain-seconds` each; the dry run prints the estimate.
 | `--seed` | 1 | seed of the synthetic entries |
 | `--proxy-pid` | none | process whose resident memory is sampled with the server load (repeatable) |
 | `--repair` | off | also send the census's one repair call per batch and report invalid outputs before and after the [repair pass](#repair-pass---repair) |
+| `--tier` | `abstract` | `full-text`: the census's full-text calls over real loci, one cell (default `20x5`) |
+| `--store`, `--store-root` | none | full-text tier: the literature-evidence@2 projection (absolute path) and the Merkle root it must have |
+| `--review-doi-prefix` | none | full-text tier: DOI prefix of the reviews to use (repeatable); all are labelled with `--journal` |
+| `--review-route` | `entitled` | full-text tier: the journal's route class in the protocol; entitled reviews need `--on-premises --policy` |
+| `--full-text-entries` | 2000 | full-text tier: retrieved entries to prepare and send |
+| `--fetch-workers` | 4 | full-text tier: Europe PMC fetch threads (as `study full-text`) |
+| `--full-text-cache` | `full-text-cache` in `--output` | full-text tier: directory (absolute) that keeps fetched fullTextXML across runs |
+| `--hypothetical-repair` | off | full-text tier: also resend every entry left without a valid verdict alone, reported as hypothetical |
 
 ## What it sends
 
@@ -319,6 +337,113 @@ The markdown adds a table of both shares by items per call, and the exit line
 reads "invalid outputs X before and Y after the repair pass" and applies the
 census limit to Y.
 
+## Full-text tier (`--tier full-text`)
+
+The abstract tier's synthetic entries say nothing about the full-text tier: its
+calls carry five claim-targeted windows of real full texts, at reasoning effort
+`low`, and citation-census@1 has no repair pass there. `--tier full-text`
+therefore sends the census's own full-text calls over real inputs.
+
+**Inputs.** `--store` names a literature-evidence@2 projection, the byte cache a
+census reads (`study prepare --store`), for example the sealed version a study
+binds. It is opened through the census's own guarded reader, which refuses every
+table outside the projection's kept tables and bytes that carry legacy verdict
+vocabulary, so no label, verdict, locus or bibliography row can be read; any
+other store is refused. The reviews are the store's retained
+review captures whose DOI starts with a `--review-doi-prefix` (the store does not
+record journals, so the prefix selects the journal `--journal` names, spelled as
+the census's enumeration spec spells it: it enters the system prompt), in an
+order shuffled with `--seed`. Each review is prepared exactly as a census
+prepares it, into a scratch census database in the output directory
+(`full-text-inputs.sqlite3`):
+
+1. acquired from the store as `study acquire` acquires it without a live route
+   (`ReviewAcquirer`); `--review-route` is the journal's route class in the
+   protocol and decides the class of a retained capture (a Europe PMC document
+   is always public). Entitled review text reaches only a judge the operator's
+   egress policy names on premises, as in the census: `--on-premises --policy`;
+2. its cited works derived from its own bibliography (`study works`), with
+   title, venue, year and PMCID from the store's Europe PMC records only (`study
+   abstracts` without a live lookup; a work the store has no record for gets no
+   PMCID);
+3. prepared by `CensusRun.prepare_review`, so its loci are the census's own.
+
+Every in-body entry with a resolved identity whose cited work has a PMCID is a
+candidate. These are not the census's escalated entries: the full-text tier
+judges only what its abstract tier escalates, which the probe cannot know and
+never reads. Each review's candidates are shuffled with the seed, grouped by
+review as the tier groups them, and retrieved and windowed by the tier itself
+(`CensusRun.prepare_full_text_group`): the store's Europe PMC fullTextXML first,
+then Europe PMC live through the census's own fetcher (`study_cli.europe_pmc_fetcher`:
+the census inputs' User-Agent, 0.4 s between a thread's requests, retries with
+backoff), with `--fetch-workers` threads, review by review until
+`--full-text-entries` entries are retrieved. Fetched full texts are kept in the
+cache directory as Europe PMC served them (`PMC<n>.xml`, mode 0600; a definitive
+miss as `PMC<n>.absent`), so a later run with the same `--full-text-cache`
+fetches nothing it asked for before. The calls are the census's: five retrieved
+entries of one review per call, each review's remainder in its last call
+(`citation_census.full_text_chunks`), built by `census_runner.full_text_call`
+(the windows in the FULL TEXT field, reasoning `low`,
+`max_tokens = max(3000, 700 * items)`, the journal label in the system prompt).
+
+**The cell.** One cell, `STREAMSx5` (default `20x5`). It sends each prepared
+call once, in order, and ends when the last call has been handed out or at
+`--cell-seconds`, whichever comes first; the calls in flight then finish within
+`--drain-seconds`. The steady-state window and the abort rules are the abstract
+tier's; when the calls run out the window ends at the earliest start of the
+calls still in flight. Twenty streams is the default because a census's
+full-text calls arrive at the pace of its Europe PMC retrieval (four fetch
+threads, each spacing its requests 0.4 s apart, and a review's calls only once
+all of its entries are retrieved), not at the abstract tier's sixty streams.
+
+**Measurements.** Per cell, in `cells[].fullText`, over answered calls:
+
+- entries `valid` (an accepted line), `missing` (no line at all: the judge
+  returned fewer lines than items) and `malformed` (a line the validator
+  rejected: a known label with a bad category names its entry; another rejected
+  line counts for one entry still without a valid line), with their shares,
+  overall and by the call's items (1 to 5);
+- calls the judge refused (HTTP 400, 413 or 422): transport failures in the
+  probe, while the census counts their entries as missing; `censusInvalidShare`
+  adds them, and the exit line applies it;
+- per call: calls that were all valid, had a missing or a malformed entry,
+  empty completions, truncated calls (`finish_reason` `length`), and calls by
+  the number of entries they left invalid;
+- tokens per entry (prompt and output) and entries per second;
+- `census`: what citation-census@1 does with an entry left without a parseable
+  verdict. It has no repair pass at this tier: the census records such an
+  entry as missing, never sends it again, and its gate
+  `fullTextInvalidOutputsAtMostOnePercent` counts it; only a call without any
+  response is sent again (whole, in a further pass). The share the probe
+  measures is therefore the census's own share.
+
+The report's `fullTextInputs` records the store version, the reviews and
+entries considered, prepared and retrieved, where each full text came from
+(store, Europe PMC, the cache directory), the calls by items and the window
+sizes. The exit line reads "Full-text tier (census gate
+fullTextInvalidOutputsAtMostOnePercent ...): PASS|FAIL" and applies the census
+limit of 1 % to the entries without a parseable verdict; entries per second are
+reported, never a criterion.
+
+**Hypothetical single-item resend (`--hypothetical-repair`).** So that a
+predeclared repair can be decided with numbers, every entry an answered call
+left without a valid verdict is sent again alone, by the same stream right
+after the call, as the census's own full-text call of one item
+(`census_runner.full_text_call([entry], ...)`: the same system prompt, citing
+sentences and window, reasoning `low`, `max_tokens` 3000); one resend per entry
+and nothing further. A call without any response is not resent. citation-census@1
+sends no such call, so `fullText.hypotheticalRepair` is labelled hypothetical: the
+share after it by items per call, the resend calls (recovered, still invalid,
+tokens, latency) and the entries per second with them. Adopting it would change
+the instrument. The exit line keeps the census's own share and names the
+hypothetical one beside it.
+
+**Dry run.** `--dry-run --tier full-text` opens the store, counts its reviews for
+the prefixes and prepares the first five offline: nothing is sent and nothing is
+fetched, so only the full texts the store or an existing cache directory hold
+are used. It prints the inputs, the request sizes of those calls and an estimate
+of the reviews and fetch time the target needs.
+
 ## Exit criterion
 
 Only one cell decides: the instrument's own geometry (40 items per call, the
@@ -371,6 +496,11 @@ part of the pass. A failing line ends with "the author decides".
   table;
 - `calls.jsonl`: the call log.
 
+With `--tier full-text` it also receives `full-text-inputs.sqlite3`, the
+scratch census database of the prepared reviews (their loci, works and
+windows; nothing in it was judged), and `full-text-cache/` unless
+`--full-text-cache` names another directory.
+
 The report's `state` is `completed`, `aborted` (a rule stopped the grid;
 `abort` names the rule and the cell), `interrupted` or `failed`; each cell's
 `state` is `completed`, `saturated`, `metrics-lost`, `aborted`, `interrupted`
@@ -418,9 +548,19 @@ duration estimate. `--json` prints the plan as JSON.
   wording of real reviews and abstracts; output lengths follow the model's
   answers to synthetic text, which is why the exit line compares tokens per
   entry with a predeclared expectation.
-- Only the abstract tier is probed.
+- The abstract tier is probed over synthetic entries; the full-text tier over
+  real loci that are not the census's escalated entries (the probe never reads a
+  verdict), with metadata from the store's Europe PMC records only.
 
 ## Tests
+
+`tests/test_capacity_probe_full_text.py` builds a literature-evidence@2
+projection with retained reviews and Europe PMC records, and checks that the
+full-text tier's calls are byte for byte those the census's own full-text pass
+sends for the same review, the store-first retrieval and the cache directory,
+the valid, missing and malformed shares per call and overall, the hypothetical
+resend, the refusal of any other store and of entitled reviews without an
+on-premises judge, and a dry run that sends and fetches nothing.
 
 `tests/test_capacity_probe.py` runs the probe against a threaded mock
 OpenAI-compatible server with configurable latency, failures, saturation,
