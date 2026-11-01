@@ -39,10 +39,10 @@ source), the protocol freezes and row counts.
 ## Protocol and freeze
 
 The protocol (`schemas/followup-protocol.schema.json`) holds parameters only: the status sources and the notice kinds
-each covers, the strata definitions and their parameters, the instruments and the request settings of
-citation-support@2, the pinned on-premises judge, the grace days after a notice, the estimands with their numerators,
-denominators, breakdowns and contrasts, the rules and the gates. Sizes and rates are measured from the run's own
-data. `followup strata
+each covers, the strata definitions and their parameters, the instruments (with the request settings of
+citation-support@2 when the protocol pins it for support), the pinned on-premises judge, the grace days after a notice,
+the estimands with their numerators, denominators, breakdowns and contrasts, the rules and the gates. Sizes and rates
+are measured from the run's own data. `followup strata
 --freeze` writes the strata, their sizes, the estimands and the denominators into the protocol digest; judging
 commands refuse a branch without a freeze, and `followup gates` checks that no judge call predates it. What decides
 the strata (`followup status-resolve`, `followup hotspots`, `followup strata`) refuses to run again after the freeze;
@@ -80,16 +80,21 @@ finished; a fetch stopped by a throttling provider or a failure stays open and `
 
 | Instrument | Unit | What the judge sees |
 |---|---|---|
-| citation-support@2 (unchanged) | locus x cited work, abstract and full-text tiers | the claim, its context and the cited work's evidence units |
+| citation-support-verbatim@1, or citation-support@2 (unchanged); the protocol pins one | locus x cited work, abstract and full-text tiers | the claim, its context and the cited work's evidence units |
 | citation-function@1 | locus | the citing sentence with the work's marker, its neighbours, the section, the work's title and year; never its status, the stratum or a verdict |
 | numeric-check@1 | S3 locus | the citing sentence and the work's title and year; the comparison with the tables is deterministic |
 | claim-match@1 | original claim x later sentence | the claim, the review's title, the later sentence with the review's marker |
 
 The follow-up instruments run at temperature zero with reasoning off, send their messages verbatim, validate every
 quote against the field it names, and repair invalid outputs once. `ocsl-review instruments export` prints their broker
-bundles. citation-support@2 declares no request settings and stays unchanged, so the protocol predeclares its reasoning
-effort per tier (`instruments.supportSettings`); every support request carries it and the result reports it. Entitled
-text reaches only judges the operator's policy lists as on premises.
+bundles. Support has two registered forms with the same prompt, output schema, validator and class map:
+citation-support-verbatim@1 declares its request settings per tier (temperature zero, no seed, reasoning off at the
+abstract tier and low at the full-text tier, its output-token rule), one item per call, the served model it requires
+(another served model pauses the run) and the verbatim message transport, and exports one broker bundle per tier;
+citation-support@2 declares no request settings and stays unchanged, so a protocol that pins it predeclares its
+reasoning effort per tier (`instruments.supportSettings`), which a protocol pinning citation-support-verbatim@1 leaves
+out. Every support request carries its settings and the result reports them. Entitled text reaches only judges the
+operator's policy lists as on premises.
 
 ## Runs
 
@@ -113,9 +118,10 @@ open`), `resumeAfter` and the broker `transport` description when there are any,
 runner's summary and `judge` the judge. Once a broker transport halts (a fidelity stop, a budget, provider-limit,
 revocation or cancellation halt) nothing more is sent: no further batch, repair or pass.
 
-The follow-up instruments can run through the run principal's broker socket, one verbatim bundle job per call;
-citation-support@2 has no verbatim bundle and runs on a judge called directly (how a Study Run reaches that judge is a
-decision before the lab-side steps are built). With the census's review documents (`--documents`), the support and
+Every judging command can run through the run principal's broker socket, one verbatim bundle job per call, with an
+instrument that exports broker bundles: citation-function@1, numeric-check@1, claim-match@1 and
+citation-support-verbatim@1 (one bundle per tier). citation-support@2 has no verbatim bundle and runs only on a judge
+called directly. With the census's review documents (`--documents`), the support and
 function judges also see the sentences around each citing sentence; without them the neighbouring sentences are empty.
 `followup dependency --scope pilot` and `followup estimands --scope pilot` give the pilot's results: the judged
 estimands over the pilot subsample, weighted by the pilot probabilities, under `followup.pilot.*` keys.

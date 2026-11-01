@@ -215,10 +215,10 @@ cell without any unit is not written.
 - **Replicate agreement:** for every instrument digest and tier with replicate verdicts, `replicate-agreement` rows
   (`followup.replicate-agreement.<instrument>.<tier>[.<group>].<agreement|kappa>.all.all.<value|lo|hi|n>`): the pairs of
   replicate and primary verdicts of the same item, the raw agreement and Cohen's kappa over the instrument's classes
-  (citation-support@2's class map, the function class, the numeric decision, the match class), overall and per
-  replicate group, with review-clustered percentile intervals; replicate verdicts without a primary verdict are counted
-  as unpaired in the coverage. `followup gates` reports `replicateAgreementReported`. Agreement of two runs of one model
-  measures stability, not accuracy.
+  (citation-support@2's class map, which citation-support-verbatim@1 shares, the function class, the numeric
+  decision, the match class), overall and per replicate group, with review-clustered percentile intervals; replicate
+  verdicts without a primary verdict are counted as unpaired in the coverage. `followup gates` reports
+  `replicateAgreementReported`. Agreement of two runs of one model measures stability, not accuracy.
 - **Keys:** `followup[.pilot].<estimand>[.<variant>][.<level>][.<status>].<journal-slug|all>.<year|all>.<stat>` with
   stat `share`, `lo`, `hi`, `n` (unweighted units in the denominator), `numerator` and `denominator` (weighted); a cell
   without a denominator reports the share as `not-measured`. `detail_json` records the definitions, scope, variant,

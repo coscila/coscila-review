@@ -94,10 +94,17 @@ Options: `--store DIR --store-root ROOT`, `--provider-cache FILE`, `--europe-pmc
 `--base-url`, `--api-key-env`, `--broker-socket`, `--broker-worker`, `--concurrency`, `--on-premises`, `--policy`,
 `--transport-retries`, `--transport-cooldown`, `--variant`, `--scope`, `--public-only`, `--limit`).
 
-citation-support@2 runs unchanged, one item per call, on the units of S0, S1, S2, S3 and the co-cited loci at either
-tier, with the request settings the protocol predeclares for the tier (`instruments.supportSettings`: the reasoning
-effort, and optionally the temperature; the instrument declares none). The command refuses to send anything without
-them; every request body carries them, and the result reports them (`requestSettings`). `--scope pilot` takes the
+The protocol pins the support instrument (`instruments.support`); it runs one item per call on the units of S0, S1,
+S2, S3 and the co-cited loci at either tier. citation-support-verbatim@1 carries citation-support@2's prompt, output
+schema, validator and class map and declares its request settings per tier (temperature zero, no seed, reasoning off at
+the abstract tier and low at the full-text tier, its output-token rule) and the served model it requires: the
+protocol's `model.served` must be that model, and a protocol that also predeclares `instruments.supportSettings` is
+refused. It runs on a judge called directly or through the broker (`--broker-socket`, one bundle per tier; see the
+broker judge below). citation-support@2 runs unchanged on a judge called directly, with the request settings the
+protocol predeclares for the tier (`instruments.supportSettings`: the reasoning effort, and optionally the temperature;
+the instrument declares none); the command refuses to send anything without them. Every request body carries the
+tier's settings, and the result reports them (`requestSettings`: the reasoning effort, temperature, max_tokens and items
+per call, with their source, the protocol or the instrument). `--scope pilot` takes the
 pilot units and the co-cited loci of pilot anchors; `--variant replicate` takes the replicate units every judging
 command draws (`followup_strata.replicate_keys`): within each replicate group (the unit's first stratum in the order
 S1, S2, S3, S0, co-cited, and within S1 its work's status), the ceiling of the protocol's replicate share times the
@@ -206,9 +213,15 @@ built, or a refusal before any provider call, halts the transport (code `FIDELIT
 call's items open for the further passes. Once the transport has halted, for any reason (a fidelity stop, the run's
 budget, a provider limit with its `resumeAfter`, a revoked grant, a cancellation), the runner sends nothing more and
 skips its further passes, and the result is paused with the halt record. A broker run records the pinned study bundle
-in every receipt and refuses to start without one. Only the verbatim follow-up instruments run this way:
-citation-support@2 has no verbatim bundle and runs on a judge called directly. The broker judge is on premises only with `--on-premises` and a `--policy` that
-lists the broker provider (and model) in `onPremBrokerProviders`.
+in every receipt and refuses to start without one. The instruments that export broker bundles run this way:
+citation-function@1, numeric-check@1, claim-match@1 and citation-support-verbatim@1. The two tiers of
+citation-support-verbatim@1 share one prompt and export one bundle each (`ocsl-review instruments export
+citation-support-verbatim@1 --tier abstract`, and `--tier full-text`); a call goes out under the bundle whose settings
+are the call's, so the run principal needs the bundle of every tier it judges installed and granted. The result names
+the bundles the judge required (`judge.bundles`: `<instrument> <tier>` to broker digest). citation-support@2 has no
+verbatim bundle: with `--broker-socket`, support under a protocol that pins it is refused before any call. The broker
+judge is on premises only with `--on-premises` and a `--policy` that lists the broker provider (and model) in
+`onPremBrokerProviders`.
 
 ## Facts: `followup facts --output DIR` and `followup verify-facts --facts DIR`
 

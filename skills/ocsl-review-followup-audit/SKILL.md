@@ -55,11 +55,14 @@ protocol after the strata are frozen.
    function`, and `followup numeric` only when the protocol records verified
    table licensing. Then `followup dependency`. Give support and function the
    census's review documents (`--documents`) so the judge sees the sentences
-   around each citing sentence. Support runs on a judge called directly, with
-   the reasoning effort the protocol predeclares per tier; the other judging
-   commands may use the broker socket. The replicate (`--variant replicate`)
-   follows the primary run of each judging command. A result whose `state` is
-   `paused` names its reason; run the command again to resume.
+   around each citing sentence. Support runs with the instrument the protocol
+   pins: citation-support-verbatim@1 declares its own request settings per tier
+   and may use the broker socket like the other judging commands, with the
+   bundles of both tiers installed and granted; citation-support@2 runs only on
+   a judge called directly, with the reasoning effort the protocol predeclares
+   per tier. The replicate (`--variant replicate`) follows the primary run of
+   each judging command. A result whose `state` is `paused` names its reason;
+   run the command again to resume.
 5. Propagation: `followup citedby`, then `followup second-gen`.
 6. `followup lag`, `followup estimands` (and `--scope pilot` for the pilot's
    results), `followup gates`, `followup facts`, `followup verify-facts` and
@@ -70,10 +73,12 @@ protocol after the strata are frozen.
 - Abstract silence and failed or missing downloads never count as unsupported.
   An unassessable unit keeps its reason and goes into the coverage tables, never
   into a numerator.
-- Instruments run unchanged: citation-support@2 for support, citation-function@1
-  for the citation's function, numeric-check@1 for statistic claims and
-  claim-match@1 for later restatements. A judge abstains rather than infer; an
-  abstention is recorded with its reason.
+- Instruments run unchanged: citation-support@2's prompt, output schema,
+  validator and class map for support (as citation-support-verbatim@1 or as
+  citation-support@2 itself), citation-function@1 for the citation's function,
+  numeric-check@1 for statistic claims and claim-match@1 for later
+  restatements. A judge abstains rather than infer; an abstention is recorded
+  with its reason.
 - The function judge never sees the cited work's status, the stratum or any
   support verdict. Dependency is computed from the full-text verdicts of every
   co-cited work in the same citing sentence; a co-cited work without a decided
