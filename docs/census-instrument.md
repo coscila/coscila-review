@@ -134,7 +134,8 @@ every cited work the abstract of one provider, Europe PMC `resultType=core`, 40
 DOIs per query with a PMID fallback, and records the outcome per work
 (`europePmcOutcome`: `europe-pmc-core`, `europe-pmc-core-pmid`,
 `europe-pmc-no-abstract`, `europe-pmc-no-hit`, `europe-pmc-failed`,
-`no-identifier`); requests carry identifiers only. A Europe PMC abstract
+`no-identifier`); requests carry identifiers only and name the census inputs'
+User-Agent. A Europe PMC abstract
 replaces whatever a work carried; where Europe PMC definitively has none, an
 abstract supplied from another provider is kept as a recorded fallback
 (`abstractSource` `fallback:<provider>`, outside the Europe-PMC-only ladder).
