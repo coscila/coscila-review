@@ -1045,8 +1045,10 @@ class FullTextInputs:
                           "fetcher": ("study_cli.europe_pmc_fetcher: the census's own Europe PMC fullTextXML fetcher "
                                       "(its User-Agent, 0.4 s spacing per thread, 3 attempts; a server error is "
                                       "checked against the PMCID's Europe PMC record: a PMCID outside the "
-                                      "open-access subset is a definitive miss, one without any record only after a "
-                                      "second check, absentNoRecord, which should stay 0)") if live else None,
+                                      "open-access subset is a definitive miss, one without any record only when the "
+                                      "search finds none for at least 60 s while it finds another PMCID's record, "
+                                      "absentNoRecord, which should stay 0; otherwise it stays transient)")
+                          if live else None,
                           "fetchWorkers": settings.fetch_workers},
             "calls": {"count": len(self.calls), "byItems": {str(k): sizes[k] for k in sorted(sizes)},
                       "meanItems": _round(sum(n * c for n, c in sizes.items()) / len(self.calls), 2) if self.calls else None},
