@@ -2093,7 +2093,7 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
                               "inStudy": population["inStudy"], "notInStudy": population["enumerated"] - population["inStudy"],
                               "excluded": population["excluded"], "unexplained": population["unexplained"],
                               "reviewsOutsideEnumeration": outside, "populationSha256": population["sha256"],
-                              "queryRule": meta.get("enumerationQueryRule")}
+                              "queryRule": meta.get("enumerationQueryRule"), "settled": settled_status(c, meta)}
         if scores_db.has_table(c, "manifest_comparisons"):
             columns = scores_db.table_columns(c, "manifest_comparisons")
             digest = "MAX(population_sha256)" if "population_sha256" in columns else "NULL"
@@ -2103,6 +2103,29 @@ def input_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
                 for row in c.execute(f"SELECT label, MIN(run_complete), {digest} FROM manifest_comparisons "
                                      "GROUP BY label ORDER BY label")]
     return out
+
+
+def settled_status(c: Any, meta: Mapping[str, str]) -> dict[str, Any]:
+    """Enumerated reviews settled as unavailable (study prepare --settle-unprepared): overall, per journal and per
+    reason, each share of the enumerated reviews, and the protocol's pinned bound (None when none was pinned)."""
+    enumerated = {row[0]: row[1] for row in c.execute("SELECT journal, COUNT(*) FROM enumeration GROUP BY journal")}
+    settled: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    if scores_db.has_table(c, "input_provenance"):
+        for journal, reason, count in c.execute(
+                "SELECT journal, COALESCE(json_extract(detail_json, '$.state'), 'unrecorded'), COUNT(*) FROM "
+                "input_provenance WHERE kind='review' AND COALESCE(json_extract(detail_json, '$.settled'), 0) = 1 "
+                "GROUP BY journal, 2 ORDER BY journal, 2"):
+            settled[journal] = settled.get(journal, 0) + count
+            reasons[reason] = reasons.get(reason, 0) + count
+    total, population_size = sum(settled.values()), sum(enumerated.values())
+    bound = meta.get("settleMaxPercent")
+    return {"total": total, "share": round(total / population_size, 6) if population_size else None,
+            "byJournal": {journal: {"settled": settled.get(journal, 0), "enumerated": count,
+                                    "share": round(settled.get(journal, 0) / count, 6) if count else None}
+                          for journal, count in sorted(enumerated.items())},
+            "byReason": dict(sorted(reasons.items())),
+            "maxPercent": float(bound) if bound is not None else None}
 
 
 def record_exclusions(database: Path, records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
