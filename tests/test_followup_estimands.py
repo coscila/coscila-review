@@ -301,6 +301,44 @@ class EstimandTests(unittest.TestCase):
         self.assertAlmostEqual(2 / 3, values["followup.cited-after-notice.all.all.share"])
         self.assertAlmostEqual(1 / 4, values["followup.cited-after-notice.grace-400d.all.all.share"])
 
+    def test_replicate_agreement_per_instrument_tier_and_group_with_kappa(self):
+        self.assertEqual((0.75, 0.5), followup_estimands.cohen_kappa([("a", "a"), ("b", "b"), ("a", "a"), ("b", "a")]))
+        self.assertEqual((1.0, None), followup_estimands.cohen_kappa([("a", "a"), ("a", "a")]))
+        self.assertEqual((None, None), followup_estimands.cohen_kappa([]))
+        branch = hand_built_branch(self.root, "estimands-replicate.sqlite3", estimands_protocol(), self.census)
+        from ocsl_review import instruments
+        function = instruments.load("citation-function@1")
+        outputs = {lid(JA, A1, "1"): ("relies", "relies"), lid(JA, A2, "2"): ("notes-retraction", "notes-retraction"),
+                   lid(JB, B1, "2"): ("relies", "background"), lid(JA, A1, "4"): ("background", "background")}
+        with branch.writing() as connection:
+            for unit, verdicts in outputs.items():
+                for variant, verdict in zip(("primary", "replicate"), verdicts):
+                    connection.execute(
+                        "INSERT INTO fu_judgments(instrument_id, instrument_digest, tier, variant, item_key, call_id, "
+                        "outcome, verdict_json, created_at) VALUES(?,?,?,?,?,NULL,'accepted',?,'t')",
+                        (function.id, function.digest, "locus", variant, unit, json.dumps({"function": verdict})))
+        result = followup_estimands.cmd_estimands(SimpleNamespace(database=str(branch.path), b=None,
+                                                                  bootstrap_seed=None))
+        self.assertEqual([{"instrument": "citation-function@1", "digest": function.digest, "tier": "locus",
+                           "pairs": 4, "unpaired": 0, "rows": result["replicateAgreement"][0]["rows"]}],
+                         result["replicateAgreement"])
+        values = {key: row for key, row in self.estimates(branch).items() if key.startswith("followup.replicate")}
+        prefix = "followup.replicate-agreement.citation-function-1.locus"
+        self.assertAlmostEqual(0.75, values[f"{prefix}.agreement.all.all.value"]["value"])
+        observed, kappa = followup_estimands.cohen_kappa([("relies", "relies"), ("notes-retraction", "notes-retraction"),
+                                                          ("relies", "background"), ("background", "background")])
+        self.assertAlmostEqual(kappa, values[f"{prefix}.kappa.all.all.value"]["value"])
+        self.assertIn(f"{prefix}.kappa.all.all.lo", values)
+        groups = {key.split(".")[4] for key in values if key.count(".") == 8}
+        self.assertLessEqual({"s1-retracted", "s0"}, groups)
+        detail = json.loads(values[f"{prefix}.kappa.all.all.value"]["detail_json"])
+        self.assertEqual((function.digest, 4), (detail["instrumentDigest"], detail["pairs"]))
+        from ocsl_review.followup_cli import gates
+        self.assertTrue(gates(branch.path)["checks"]["replicateAgreementReported"])
+        with branch.writing() as connection:
+            connection.execute("DELETE FROM fu_estimates WHERE estimand='replicate-agreement'")
+        self.assertFalse(gates(branch.path)["checks"]["replicateAgreementReported"])
+
     def test_estimands_need_a_freeze(self):
         unfrozen = make_branch(self.root, "estimands-unfrozen.sqlite3", estimands_protocol(), census=self.census)
         with self.assertRaisesRegex(ValidationError, "not frozen"):

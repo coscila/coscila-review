@@ -123,6 +123,12 @@ def gates(database: Path) -> dict[str, Any]:
             "SELECT COUNT(*) FROM fu_calls WHERE study_bundle_sha256 IS NULL OR study_bundle_sha256!=?",
             (bundle or "",)).fetchone()[0]
         pins = instrument_pins(connection)
+        replicated = {tuple(row) for row in connection.execute(
+            "SELECT DISTINCT instrument_digest, tier FROM fu_judgments WHERE variant='replicate' AND outcome='accepted'")}
+        agreement = set()
+        for (detail,) in connection.execute("SELECT detail_json FROM fu_estimates WHERE estimand='replicate-agreement'"):
+            value = json.loads(detail)
+            agreement.add((value.get("instrumentDigest"), value.get("tier")))
         off_pin = sum(count for instrument_id, digest, count in connection.execute(
             "SELECT instrument_id, instrument_digest, COUNT(*) FROM fu_calls GROUP BY instrument_id, instrument_digest")
             if any(pinned != digest for pinned in pins.get(instrument_id, {}).values()))
@@ -148,6 +154,10 @@ def gates(database: Path) -> dict[str, Any]:
         checks["everyReceiptCarriesTheStudyBundle"] = without_bundle == 0
     if pins:
         checks["instrumentDigestsAsPinned"] = off_pin == 0
+    if replicated:
+        # The replicate gate (as in the census): agreement with the primary verdicts reported for every replicated
+        # instrument and tier (followup estimands writes it).
+        checks["replicateAgreementReported"] = replicated <= agreement
     if not checks["parentComplete"]:
         notes.append("the parent census records an incomplete run (followup init --allow-incomplete-parent)")
     if not responded[0]:

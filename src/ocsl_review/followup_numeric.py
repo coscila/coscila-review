@@ -47,7 +47,7 @@ from .followup_branch import FollowupBranch, register_dataset, require_freeze
 from .followup_judge import (accepted, block_items, close_judge, judge_from_args, judge_summary, prepare_judge,
                              run_items, step_result)
 from .followup_model import NUMERIC_RULE, TableCell, WorkRef, canonical
-from .followup_strata import protocol_of, replicate_keys
+from .followup_strata import protocol_of, replicate_groups, replicate_keys
 
 RULE = NUMERIC_RULE
 TIER = numeric_check.TIER
@@ -436,7 +436,9 @@ def run_numeric(branch: FollowupBranch, tables: Path, *, judge: Any, policy: Any
                    for unit in selected if unit["sentence"] is None]
         items = [item_of(unit) for unit in selected if unit["sentence"] is not None]
         if variant == "replicate":
-            keep = set(replicate_keys(protocol, [item["id"] for item in items], scope_parts=(instrument.id,)))
+            ids = [item["id"] for item in items]
+            keep = set(replicate_keys(protocol, ids, scope_parts=(instrument.id,),
+                                      groups=replicate_groups(connection, ids)))
             items = [item for item in items if item["id"] in keep]
         if public_only:
             items = [item for item in items if item["provenance"] == "public"]

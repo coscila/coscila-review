@@ -152,22 +152,56 @@ def share_count(share: Any, n: int) -> int:
     return min(n, math.ceil(exact(share) * n))
 
 
-REPLICATE_RULE = ("the first ceil(share x n) of the n units in scope, ranked by sha256 of the protocol seed, "
-                  "'replicate', the instrument id and the unit key (strata.replicate.share)")
+REPLICATE_RULE = ("within each replicate group of the units in scope (the unit's first stratum in the order S1, S2, "
+                  "S3, S0, co-cited, and within S1 its work's status), the first ceil(share x n) of the group's n "
+                  "units, ranked by sha256 of the protocol seed, 'replicate', the instrument id, the group and the "
+                  "unit key (strata.replicate.share)")
+REPLICATE_ORDER = ("S1", "S2", "S3", "S0", "co-cited")
 
 
-def replicate_keys(protocol: Mapping[str, Any], keys: Iterable[str], *, scope_parts: Sequence[Any] = ()) -> list[str]:
+def replicate_group(strata: Iterable[str], status: str | None) -> str:
+    """The replicate group of a unit: its first stratum in REPLICATE_ORDER, S1 split by its work's status."""
+    members = set(strata)
+    for stratum in REPLICATE_ORDER:
+        if stratum in members:
+            return f"S1:{status or 'unknown'}" if stratum == "S1" else stratum
+    return "unstratified"
+
+
+def replicate_groups(connection: sqlite3.Connection, loci: Iterable[str]) -> dict[str, str]:
+    """The replicate group of every given frame locus (``replicate_group``)."""
+    wanted = set(loci)
+    strata: dict[str, set[str]] = defaultdict(set)
+    statuses: dict[str, str | None] = {}
+    for locus, stratum, status in connection.execute(
+            "SELECT s.locus_id, s.stratum, w.status FROM fu_strata s JOIN fu_frame f ON f.locus_id=s.locus_id "
+            "LEFT JOIN fu_work_status w ON w.work_key=f.work_key"):
+        if locus in wanted:
+            strata[locus].add(stratum)
+            statuses[locus] = status
+    return {locus: replicate_group(strata.get(locus, ()), statuses.get(locus)) for locus in wanted}
+
+
+def replicate_keys(protocol: Mapping[str, Any], keys: Iterable[str], *, scope_parts: Sequence[Any] = (),
+                   groups: Mapping[str, str] | None = None) -> list[str]:
     """The blind-replicate subsample of ``keys`` (protocol seed and strata.replicate.share), in the given order.
 
-    Judging commands call this with ``--variant replicate``; the selection depends on the seed, the scope and the set
-    of keys only, so every command and every rerun draws the same units.
+    ``groups`` maps a key to its replicate group (``replicate_groups``); the draw is made within each group, so every
+    stratum and every S1 status present gets its share of replicate units (a non-empty group at least one). Judging
+    commands call this with ``--variant replicate``; the selection depends on the seed, the scope, the groups and the
+    set of keys only, so every command and every rerun draws the same units.
     """
     replicate = (protocol.get("strata") or {}).get("replicate")
     if not replicate:
         raise ValidationError("the protocol declares no replicate share (strata.replicate.share)")
     ordered = list(dict.fromkeys(keys))
-    chosen = set(seeded_sample(protocol["seed"], ("replicate", *scope_parts), ordered,
-                               share_count(replicate["share"], len(ordered))))
+    by_group: dict[str, list[str]] = defaultdict(list)
+    for key in ordered:
+        by_group[(groups or {}).get(key, "unstratified")].append(key)
+    chosen: set[str] = set()
+    for group, members in sorted(by_group.items()):
+        chosen.update(seeded_sample(protocol["seed"], ("replicate", *scope_parts, group), members,
+                                    share_count(replicate["share"], len(members))))
     return [key for key in ordered if key in chosen]
 
 

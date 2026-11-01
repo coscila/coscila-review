@@ -190,8 +190,12 @@ class FunctionTests(unittest.TestCase):
         self.assertEqual((2, 2), (result["selection"]["pilotUnits"], result["sent"]))
         replicate = self.run_function(branch, judge, variant="replicate")
         units = [locus(name) for name in ("a1/1", "a2/1", "a2/2", "b1/1", "b1/2", "a1/4", "a2/3")]
-        drawn = followup_strata.replicate_keys(F.PROTOCOL, units, scope_parts=(FN.INSTRUMENT_ID,))
-        self.assertEqual(4, len(drawn), "the ceiling of the protocol's share of the units in scope")
+        with closing(branch.connect()) as connection:
+            groups = followup_strata.replicate_groups(connection, units)
+        drawn = followup_strata.replicate_keys(F.PROTOCOL, units, scope_parts=(FN.INSTRUMENT_ID,), groups=groups)
+        # the ceiling of the protocol's share in each replicate group: three of five S1 loci, one of two S0 loci
+        self.assertEqual(4, len(drawn))
+        self.assertEqual({"S0": 1, "S1:unknown": 3}, replicate["selection"]["replicateGroups"])
         self.assertEqual((len(drawn), followup_strata.REPLICATE_RULE, [FN.INSTRUMENT_ID]),
                          (replicate["selection"]["replicateUnits"], replicate["selection"]["replicateRule"],
                           replicate["selection"]["replicateScope"]))

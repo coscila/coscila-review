@@ -65,17 +65,20 @@ def select_units(connection: Any, strata: Sequence[str], *, scope: str = "all", 
         rows = [row for row in rows if row["locus_id"] in pilots]
         selection["pilotUnits"] = len(rows)
     if variant == "replicate":
-        from .followup_strata import REPLICATE_RULE, replicate_keys
+        from .followup_strata import REPLICATE_RULE, replicate_groups, replicate_keys
         share = ((((protocol or {}).get("strata") or {}).get("replicate") or {}).get("share"))
         seed = (protocol or {}).get("seed")
         if share is None or seed is None:
             raise ValidationError("the protocol declares no replicate share and seed")
         if not instrument_id:
             raise ValidationError("a replicate selection needs the instrument id as its scope")
-        keep = set(replicate_keys(protocol, [row["locus_id"] for row in rows], scope_parts=(instrument_id,)))
+        groups = replicate_groups(connection, [row["locus_id"] for row in rows])
+        keep = set(replicate_keys(protocol, [row["locus_id"] for row in rows], scope_parts=(instrument_id,),
+                                  groups=groups))
         rows = [row for row in rows if row["locus_id"] in keep]
         selection.update(replicateRule=REPLICATE_RULE, replicateScope=[instrument_id], seed=seed, share=share,
-                         replicateUnits=len(rows))
+                         replicateUnits=len(rows),
+                         replicateGroups=dict(sorted(Counter(groups[row["locus_id"]] for row in rows).items())))
     return rows, selection
 
 

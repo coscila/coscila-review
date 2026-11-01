@@ -158,8 +158,10 @@ class PipelineTests(unittest.TestCase):
         functions = [row["locus_id"] for row in self.rows("SELECT DISTINCT locus_id FROM fu_strata WHERE stratum IN "
                                                           "('S0','S1','S2','S3')")]
         replicate = self.invoke("function", *database, *JUDGE, "--variant", "replicate")
+        with closing(FollowupBranch(self.database).connect()) as connection:
+            groups = followup_strata.replicate_groups(connection, functions)
         self.assertEqual((followup_strata.REPLICATE_RULE, len(followup_strata.replicate_keys(
-            pipeline_protocol(), functions, scope_parts=("citation-function@1",)))),
+            pipeline_protocol(), functions, scope_parts=("citation-function@1",), groups=groups))),
             (replicate["selection"]["replicateRule"], replicate["selection"]["replicateUnits"]))
         self.invoke("dependency", *database)
         dependency = {row["locus_id"]: row["class"] for row in self.rows("SELECT locus_id, class FROM fu_dependency")}
@@ -187,6 +189,13 @@ class PipelineTests(unittest.TestCase):
         self.invoke("estimands", *database)
         gates = self.invoke("gates", *database)
         self.assertTrue(gates["ok"], gates)
+        # the replicate gate: agreement of the function replicate with the primary verdicts is reported
+        self.assertTrue(gates["checks"]["replicateAgreementReported"])
+        agreement = {row["key"]: row["value"] for row in self.rows(
+            "SELECT key, value FROM fu_estimates WHERE estimand='replicate-agreement'")}
+        self.assertEqual(1.0, agreement["followup.replicate-agreement.citation-function-1.locus.agreement.all.all.value"])
+        self.assertEqual(replicate["selection"]["replicateUnits"],
+                         agreement["followup.replicate-agreement.citation-function-1.locus.agreement.all.all.n"])
         facts = self.invoke("facts", *database, "--output", str(self.root / "facts"))
         verified = self.invoke("verify-facts", "--facts", str(self.root / "facts"))
         self.assertEqual(facts["count"], verified["facts"])

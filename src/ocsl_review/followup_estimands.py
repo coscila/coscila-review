@@ -36,6 +36,7 @@ denominator>``; contrasts ``followup.<estimand>.journal-ratio|journal-difference
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
@@ -505,6 +506,120 @@ def distortion(connection: sqlite3.Connection, protocol: Mapping[str, Any], decl
     return {"units": len(units), "assessable": 0, "awaitingLabels": len(units), "rows": rows}
 
 
+# ----------------------------------------------------------------------------- replicate agreement
+AGREEMENT = "replicate-agreement"
+AGREEMENT_FIELDS = {"citation-function@1": "function", "numeric-check@1": "decision", "claim-match@1": "match"}
+
+
+def agreement_label(instrument_id: str, verdict: Mapping[str, Any]) -> str | None:
+    """The class a replicate is compared on: citation-support@2's class map (supported, adverse, uncertain); the
+    class or decision field of the follow-up instruments (abstain is its own class)."""
+    if instrument_id == "citation-support@2":
+        from .followup_dependency import support_classes
+        value = verdict.get("supportVerdict")
+        return next((name for name, members in support_classes().items() if value in members), None)
+    field = AGREEMENT_FIELDS.get(instrument_id)
+    return verdict.get(field) if field else None
+
+
+def cohen_kappa(pairs: Sequence[tuple[str, str]]) -> tuple[float | None, float | None]:
+    """(raw agreement, Cohen's kappa) of (primary, replicate) class pairs; kappa None when chance agreement is 1."""
+    if not pairs:
+        return None, None
+    n = len(pairs)
+    observed = sum(1 for a, c in pairs if a == c) / n
+    first, second = defaultdict(int), defaultdict(int)
+    for a, c in pairs:
+        first[a] += 1
+        second[c] += 1
+    expected = sum(first[label] * second.get(label, 0) for label in first) / (n * n)
+    return observed, ((observed - expected) / (1 - expected) if expected < 1 else None)
+
+
+def replicate_agreement(connection: sqlite3.Connection, protocol: Mapping[str, Any], *, b: int,
+                        seed: Any) -> dict[str, Any]:
+    """Agreement of every replicate verdict with the primary verdict of the same item, per instrument digest and
+    tier, overall and per replicate group: pairs, raw agreement and Cohen's kappa over the instrument's classes, with
+    percentile intervals from a bootstrap that resamples reviews within journal. A replicate measures stability across
+    two runs of one model, not accuracy."""
+    from .followup_strata import replicate_groups
+    clear_estimates(connection, AGREEMENT)
+    journals = list(protocol["journals"])
+    frame = {row[0]: (row[1], row[2]) for row in connection.execute("SELECT locus_id, journal, doi FROM fu_frame")}
+    reported = []
+    for instrument_id, instrument_digest, tier in connection.execute(
+            "SELECT DISTINCT instrument_id, instrument_digest, tier FROM fu_judgments WHERE variant='replicate' AND "
+            "outcome='accepted' ORDER BY instrument_id, instrument_digest, tier").fetchall():
+        verdicts = {}
+        for variant in ("primary", "replicate"):
+            verdicts[variant] = {row[0]: json.loads(row[1]) for row in connection.execute(
+                "SELECT item_key, verdict_json FROM fu_judgments WHERE instrument_digest=? AND tier=? AND variant=? "
+                "AND outcome='accepted'", (instrument_digest, tier, variant))}
+        loci = {key: key.split("|")[0] for key in verdicts["replicate"]}
+        groups = replicate_groups(connection, set(loci.values()))
+        pairs: list[tuple[tuple[str, str], str, str, str]] = []
+        unpaired = 0
+        for key, verdict in sorted(verdicts["replicate"].items()):
+            primary = verdicts["primary"].get(key)
+            locus = loci[key]
+            first = agreement_label(instrument_id, primary) if primary else None
+            second = agreement_label(instrument_id, verdict)
+            if first is None or second is None or locus not in frame:
+                unpaired += 1
+                continue
+            pairs.append((frame[locus], groups.get(locus, "unstratified"), first, second))
+        name = census_estimands_slug(instrument_id)
+        rows = 0
+        for group in [None, *sorted({pair[1] for pair in pairs})]:
+            selected = [pair for pair in pairs if group is None or pair[1] == group]
+            observed, kappa = cohen_kappa([(pair[2], pair[3]) for pair in selected])
+            clusters: dict[str, dict[tuple[str, str], list[tuple[str, str]]]] = defaultdict(dict)
+            for cluster, _, first, second in selected:
+                clusters[cluster[0]].setdefault(cluster, []).append((first, second))
+            nested = [[clusters[journal][key] for key in sorted(clusters[journal])] for journal in sorted(clusters)]
+            scope_parts = (AGREEMENT, name, tier, group or ALL)
+            generator = rng(seed, *scope_parts)
+            agreements, kappas = [], []
+            if selected:
+                for _ in range(int(b)):
+                    drawn = [pair for journal in nested
+                             for index in generator.choices(range(len(journal)), k=len(journal))
+                             for pair in journal[index]]
+                    value, coefficient = cohen_kappa(drawn)
+                    if value is not None:
+                        agreements.append(value)
+                    if coefficient is not None:
+                        kappas.append(coefficient)
+            detail = {"estimand": AGREEMENT, "instrument": instrument_id, "instrumentDigest": instrument_digest,
+                      "tier": tier, "group": group, "pairs": len(selected), "unpaired": unpaired if group is None else
+                      None, "classes": sorted({label for pair in selected for label in pair[2:]}),
+                      "classMap": "citation-support@2 class map" if instrument_id == "citation-support@2" else
+                      AGREEMENT_FIELDS.get(instrument_id), "interval": INTERVAL, "b": b, "seed": seed,
+                      "scope": list(scope_parts), "replicates": len(kappas),
+                      "interpretation": "agreement of two runs of one model: stability, not accuracy"}
+            qualifiers = [name, tier, census_estimands_slug(group) if group else None]
+            rows += write_value_rows(connection, estimand=AGREEMENT, qualifiers=[*qualifiers, "agreement"],
+                                     journal=None, slug=ALL, year=None, stratum=group, value=observed,
+                                     bounds=census_estimands.percentile_bounds(agreements) if observed is not None
+                                     else (None, None), units=len(selected), detail=detail)
+            rows += write_value_rows(connection, estimand=AGREEMENT, qualifiers=[*qualifiers, "kappa"],
+                                     journal=None, slug=ALL, year=None, stratum=group, value=kappa,
+                                     bounds=census_estimands.percentile_bounds(kappas) if kappa is not None
+                                     else (None, None), units=len(selected), detail=detail)
+        write_coverage(connection, f"{AGREEMENT}.{name}.{tier}", None, None, "*",
+                       {key: value for key, value in {("assessable", "-"): (len(pairs), float(len(pairs))),
+                                                      ("unassessable", "unpaired"): (unpaired, float(unpaired))}.items()
+                        if value[0]})
+        reported.append({"instrument": instrument_id, "digest": instrument_digest, "tier": tier,
+                         "pairs": len(pairs), "unpaired": unpaired, "rows": rows})
+    return {"journals": journals, "reported": reported}
+
+
+def census_estimands_slug(value: str) -> str:
+    from .corpus_facts import slug
+    return slug(value)
+
+
 def run_estimands(connection: sqlite3.Connection, protocol: Mapping[str, Any], *, b: int, seed: Any,
                   scope: str = "all") -> dict[str, Any]:
     require_freeze(connection)
@@ -526,9 +641,11 @@ def run_estimands(connection: sqlite3.Connection, protocol: Mapping[str, Any], *
             results[item["id"]] = distortion(connection, protocol, item, b=b, seed=seed)
         else:
             results[item["id"]] = compute(connection, protocol, item, b=b, seed=seed, scope=scope)
+    agreement = replicate_agreement(connection, protocol, b=b, seed=seed) if scope == "all" else None
     return {"estimands": results, "scope": scope, "b": b, "seed": seed,
             "weights": PILOT_WEIGHTS if scope == "pilot" else WEIGHTS, "interval": INTERVAL,
-            **({"noPilotForm": skipped} if skipped else {})}
+            **({"noPilotForm": skipped} if skipped else {}),
+            **({"replicateAgreement": agreement["reported"]} if agreement is not None else {})}
 
 
 def cmd_estimands(args: Any) -> dict[str, Any]:

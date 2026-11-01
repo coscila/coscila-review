@@ -41,7 +41,7 @@ from .followup_judge import (accepted, close_judge, judge_from_args, judge_summa
                              step_result)
 from .followup_model import canonical, digest
 from .followup_net import record_request
-from .followup_strata import protocol_of, replicate_keys, seeded_sample
+from .followup_strata import protocol_of, replicate_groups, replicate_keys, seeded_sample
 from .retrieval import EvidenceIndex, EvidenceUnit, normalise_identifier
 from .scholarly import EUROPE_PMC
 
@@ -440,7 +440,10 @@ def confirm(connection: sqlite3.Connection, branch: FollowupBranch, protocol: Ma
             sleep: Callable[[float], None], code_revision: str | None) -> dict[str, Any]:
     items = judge_items(connection, branch, anchor_ids)
     if variant == "replicate":
-        keep = set(replicate_keys(protocol, [item["id"] for item in items], scope_parts=(instrument.id,)))
+        anchors_of = {item["id"]: item["id"].split("|")[0] for item in items}
+        groups = replicate_groups(connection, set(anchors_of.values()))
+        keep = set(replicate_keys(protocol, [item["id"] for item in items], scope_parts=(instrument.id,),
+                                  groups={key: groups[anchor] for key, anchor in anchors_of.items()}))
         items = [item for item in items if item["id"] in keep]
     if public_only:
         items = [item for item in items if item["provenance"] == "public"]

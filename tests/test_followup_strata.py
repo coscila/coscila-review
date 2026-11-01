@@ -315,6 +315,16 @@ class StrataTests(unittest.TestCase):
         del no_share["strata"]["replicate"]
         with self.assertRaisesRegex(ValidationError, "replicate"):
             followup_strata.replicate_keys(no_share, keys)
+        # Stratified: every replicate group gets the ceiling of its share, so a small stratum or status is never
+        # left without replicate units.
+        groups = {key: ("S1:retracted" if index < 2 else "S0") for index, key in enumerate(keys)}
+        stratified = followup_strata.replicate_keys(protocol_with(replicate={"share": 0.1}), keys, groups=groups)
+        self.assertEqual({"S1:retracted": 1, "S0": 4}, {group: sum(1 for key in stratified if groups[key] == group)
+                                                       for group in ("S1:retracted", "S0")})
+        self.assertEqual("S1:expression-of-concern",
+                         followup_strata.replicate_group({"co-cited", "S1"}, "expression-of-concern"))
+        self.assertEqual("S2", followup_strata.replicate_group({"co-cited", "S2", "S0"}, None))
+        self.assertEqual("co-cited", followup_strata.replicate_group({"co-cited"}, "none"))
 
     def test_family_rules_must_be_defined_and_valid(self):
         protocol = protocol_with(S2={"excludeFamilies": ["registry-report"]})
