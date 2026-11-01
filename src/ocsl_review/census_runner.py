@@ -121,8 +121,8 @@ class RetryableFetch(ReviewError):
 
 # Why a full-text fetcher found no open-access full text (study_cli.europe_pmc_fetcher's ``miss_reason``): Europe PMC
 # answered fullTextXML with 404, 410 or another definitive client error; its record of the PMCID says the work is
-# outside the open-access subset; or its search found no record of the PMCID at all over at least 60 s
-# (study_cli.NO_RECORD_SECONDS) and then one search for the PMCID and another PMCID found the other's record only.
+# outside the open-access subset; or its search found no record of the PMCID at all, and two searches for the PMCID
+# and another PMCID together, at least 60 s apart (study_cli.NO_RECORD_SECONDS), each found the other's record only.
 FULL_TEXT_MISS_REASONS = ("notFound", "notOpenAccess", "noRecord")
 # Escalated entries one full-text invocation closed without a window, by reason (``withoutFullText`` of its result):
 # the cited work has no PMCID; the fetcher's reasons above; entitled text for a judge that is not on premises; any
