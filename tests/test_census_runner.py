@@ -19,7 +19,7 @@ import io
 from contextlib import redirect_stdout
 
 from ocsl_review import citation_census as C
-from ocsl_review import estimands, scores_db
+from ocsl_review import corpus_facts, estimands, scores_db
 from ocsl_review.census_runner import (CensusRun, HttpChatTransport, RetryableFetch, TransportError, execute,
                                        steady_throughput)
 from ocsl_review.cli import main
@@ -924,8 +924,37 @@ class FreezeExportTests(RunnerTestCase):
             self.assertEqual("1", scores_db.meta(c)["frozen"])
             self.assertGreater(c.execute("SELECT COUNT(*) FROM data_dictionary").fetchone()[0], 100)
             self.assertEqual(1, c.execute("SELECT COUNT(*) FROM review_scores").fetchone()[0])
-        with self.assertRaises(ValidationError):
+        # The same freeze again (a step submitted again after its process stopped) returns the copy it wrote; other
+        # options or a database that changed since are refused.
+        again = scores_db.freeze(self.database, frozen)
+        self.assertEqual((True, report["sha256"], report["scored"]), (again["alreadyFrozen"], again["sha256"],
+                                                                      again["scored"]))
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            scores_db.freeze(self.database, frozen, keep_text=True)
+        # Facts: the same export again returns it; another bootstrap is refused; an export stopped before its
+        # facts.json is written again.
+        facts = self.root / "facts"
+        exported = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        repeated = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        self.assertEqual((True, exported["databaseSha256"], exported["count"]),
+                         (repeated["alreadyExported"], repeated["databaseSha256"], repeated["count"]))
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=4, code_revision="test")
+        (facts / "facts.json").unlink()
+        rewritten = corpus_facts.export_facts(frozen, facts, [JOURNAL], b=20, seed=3, code_revision="test")
+        self.assertNotIn("alreadyExported", rewritten)
+        self.assertTrue((facts / "facts.json").is_file())
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute("UPDATE reviews SET full_text_state='pending'")
+        with self.assertRaisesRegex(ValidationError, "already exists"):
             scores_db.freeze(self.database, frozen)
+        with closing(sqlite3.connect(self.database)) as c, c:
+            c.execute("UPDATE reviews SET full_text_state='completed'")
+        # A copy an earlier freeze left unfinished beside a new output never stands in for it.
+        fresh = self.root / "frozen" / "fresh.sqlite3"
+        (fresh.parent / ".fresh.sqlite3.incoming").write_bytes(b"cut off")
+        self.assertNotIn("alreadyFrozen", scores_db.freeze(self.database, fresh))
+        self.assertFalse((fresh.parent / ".fresh.sqlite3.incoming").exists())
         manifest = scores_db.export(frozen, self.root / "export")
         names = {f["path"] for f in manifest["files"]}
         self.assertIn("citations.tsv", names)
