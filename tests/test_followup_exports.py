@@ -101,9 +101,15 @@ class ExportTests(unittest.TestCase):
         text = (self.public / "alerts.jsonl").read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"\bfor (a |the )?publishers?\b|\bpublisher[- ](service|facing)", text, re.I),
                           "alerts address the authors of the citing work and study teams")
-        with closing(self.branch.connect()) as connection:
-            rows = connection.execute("SELECT confidence, COUNT(*) FROM fu_alerts GROUP BY confidence").fetchall()
+        claims = (self.public / "compromised-claims.sqlite3").resolve().as_uri() + "?mode=ro&immutable=1"
+        with closing(sqlite3.connect(claims, uri=True)) as connection:
+            rows = connection.execute("SELECT confidence, COUNT(*) FROM alerts GROUP BY confidence").fetchall()
         self.assertEqual([("check suggested", 4)], [tuple(row) for row in rows])
+
+    def test_an_export_leaves_the_branch_unchanged(self):
+        before = scores_db.file_sha256(self.branch.path)
+        export(self.branch.path, self.root / "again")
+        self.assertEqual(before, scores_db.file_sha256(self.branch.path))
 
     def test_the_propagation_graph(self):
         kinds = {node["kind"] for node in self.graph["nodes"]}

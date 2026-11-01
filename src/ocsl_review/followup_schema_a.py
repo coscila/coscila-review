@@ -23,11 +23,6 @@ CREATE INDEX IF NOT EXISTS ix_fu_evidence_work ON fu_evidence(work_key, unit);
 CREATE TABLE IF NOT EXISTS fu_evidence_units(
   evidence_id TEXT NOT NULL REFERENCES fu_evidence(evidence_id), unit_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
   kind TEXT NOT NULL, locator TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, PRIMARY KEY(evidence_id, unit_id));
-CREATE TABLE IF NOT EXISTS fu_alerts(
-  alert_id TEXT PRIMARY KEY, journal TEXT NOT NULL, doi TEXT NOT NULL, claim_id TEXT NOT NULL, locus_id TEXT NOT NULL,
-  work_key TEXT NOT NULL, status TEXT NOT NULL, notice_date TEXT, function_class TEXT, dependency_class TEXT,
-  support_json TEXT NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}', confidence TEXT NOT NULL,
-  suggested_action TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
@@ -47,14 +42,4 @@ DICTIONARY: dict[str, dict[str, str]] = {
     "fu_evidence_units": {"evidence_id": "evidence", "unit_id": "unit id", "ordinal": "document order",
                           "kind": "abstract, paragraph, caption or table", "locator": "section trail of the unit",
                           "text": "unit text"},
-    "fu_alerts": {
-        "alert_id": "alert id (digest of claim and cited work)", "journal": "journal of the citing review",
-        "doi": "citing review DOI", "claim_id": "citing sentence", "locus_id": "frame locus",
-        "work_key": "compromised cited work", "status": "status of the cited work", "notice_date": "notice date",
-        "function_class": "citation function", "dependency_class": "dependency class",
-        "support_json": "support verdicts with quotes (entitled quotes only in a private export)",
-        "evidence_json": "status source and date, timing, function, dependency and the judge receipts",
-        "confidence": "check suggested (no calibration set measures a positive predictive value)",
-        "suggested_action": "suggested action for the authors of the citing work or a study team",
-        "created_at": "time created"},
 }

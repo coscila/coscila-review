@@ -8,9 +8,11 @@
   without support): the citing sentence, the cited work, its status with source and date, the support verdicts with
   their quotes, the citation function, the dependency, an adjudication-history table (empty until a study adjudicates)
   and the judge receipts behind every verdict;
-- ``alerts.jsonl`` and ``fu_alerts``: one record per affected claim and cited work, for the authors of the citing
-  review and for study teams: the claim, the cited work, its status, the evidence, the confidence "check suggested"
-  and a suggested action. A review that notes the notice itself (function notes-retraction) gets no alert;
+- ``alerts.jsonl`` and the ``alerts`` table of the claim database: one record per affected claim and cited work, for
+  the authors of the citing review and for study teams: the claim, the cited work, its status, the evidence, the
+  confidence "check suggested" and a suggested action. A review that notes the notice itself (function
+  notes-retraction) gets no alert. The export writes nothing into the branch, so the branch digest a facts export
+  recorded still holds after an export;
 - ``propagation-graph.json``: compromised works, the claims citing them, and the later articles whose sentences restate
   a claim on the review's authority (confirmed second-generation matches);
 - ``manifest.json``: the sha256 and size of every file, the branch and parent digests and the redaction applied.
@@ -102,6 +104,16 @@ DICTIONARY = {
                  "request_sha256": "stored request body (in the private branch)", "response_sha256": "stored response "
                  "body (in the private branch)", "outcome": "call outcome", "started_at": "call start",
                  "finished_at": "call end"},
+    "alerts": {
+        "alert_id": "alert id (digest of claim and cited work)", "journal": "journal of the citing review",
+        "doi": "citing review DOI", "claim_id": "citing sentence", "locus_id": "frame locus",
+        "work_key": "compromised cited work", "status": "status of the cited work", "notice_date": "notice date",
+        "function_class": "citation function", "dependency_class": "dependency class",
+        "support_json": "support verdicts with quotes (entitled quotes only in a private export)",
+        "evidence_json": "status source and date, timing, function, dependency and the judge receipts",
+        "confidence": "check suggested (no calibration set measures a positive predictive value)",
+        "suggested_action": "suggested action for the authors of the citing work or a study team",
+        "created_at": "time created"},
     "adjudications": {"locus_id": "locus", "label": "adjudicated label", "label_source": "who adjudicated "
                       "(adjudication)", "decided_at": "time decided", "detail_json": "adjudication record"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "meaning": "meaning"},
@@ -331,8 +343,19 @@ def propagation_graph(connection: Any, rows: Sequence[Mapping[str, Any]], units:
                        "edges": len(edges)}}
 
 
+def alert_rows(alerts: Sequence[Mapping[str, Any]], created: str) -> list[tuple]:
+    """The ``alerts`` table rows of the claim database (one per alert record)."""
+    return [(alert["alertId"], alert["claim"]["journal"], alert["claim"]["reviewDoi"], alert["claim"]["claimId"],
+             alert["claim"]["locusId"], alert["citedWork"]["workKey"], alert["status"]["status"] or "unknown",
+             alert["status"]["noticeDate"], alert["evidence"]["function"]["class"],
+             alert["evidence"]["dependency"]["class"], canonical(alert["evidence"]["support"]),
+             canonical({key: value for key, value in alert["evidence"].items() if key != "support"}),
+             alert["confidence"], alert["suggestedAction"]["authors"] + " " + alert["suggestedAction"]["studyTeam"],
+             created) for alert in alerts]
+
+
 def write_claims_database(path: Path, rows: Sequence[Mapping[str, Any]], connection: Any,
-                          meta: Mapping[str, str]) -> dict[str, int]:
+                          meta: Mapping[str, str], alerts: Sequence[tuple] = ()) -> dict[str, int]:
     works = sorted({row["work_key"] for row in rows if row["work_key"]})
     calls = sorted({call for row in rows for call in json.loads(row["judgments"])})
     with closing(sqlite3.connect(path)) as target:
@@ -358,6 +381,9 @@ def write_claims_database(path: Path, rows: Sequence[Mapping[str, Any]], connect
                 tuple(row) for row in connection.execute(
                     f"SELECT {', '.join(receipt_columns)} FROM fu_calls WHERE call_id IN "
                     f"({','.join('?' for _ in chunk)}) ORDER BY call_id", chunk)])
+        alert_columns = tuple(DICTIONARY["alerts"])
+        target.execute(f"CREATE TABLE alerts({', '.join(alert_columns)}, PRIMARY KEY(alert_id))")
+        target.executemany(f"INSERT INTO alerts VALUES({','.join('?' for _ in alert_columns)})", list(alerts))
         target.execute("CREATE TABLE adjudications(locus_id TEXT NOT NULL, label TEXT NOT NULL, label_source TEXT NOT "
                        "NULL, decided_at TEXT NOT NULL, detail_json TEXT NOT NULL)")
         target.execute("CREATE TABLE data_dictionary(table_name TEXT NOT NULL, column_name TEXT NOT NULL, meaning TEXT "
@@ -367,7 +393,7 @@ def write_claims_database(path: Path, rows: Sequence[Mapping[str, Any]], connect
             for column, meaning in columns.items()])
         target.commit()
         counts = {table: target.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                  for table in ("claims", "observations", "receipts")}
+                  for table in ("claims", "observations", "receipts", "alerts")}
         target.execute("VACUUM")
     for suffix in ("-wal", "-shm", "-journal"):
         if Path(str(path) + suffix).exists():
@@ -390,7 +416,7 @@ def export(database: Path, output: Path, *, allow_entitled_text: bool = False) -
     redactor = Redactor(allow_entitled_text)
     branch_meta = branch.meta()
     created = now()
-    with branch.writing() as connection:
+    with closing(branch.connect()) as connection:
         units = claim_units(connection)
         rows = [claim_row(branch, connection, unit, redactor) for unit in units]
         freeze = connection.execute("SELECT freeze_id FROM fu_protocol_freeze ORDER BY frozen_at DESC LIMIT 1"
@@ -406,17 +432,9 @@ def export(database: Path, output: Path, *, allow_entitled_text: bool = False) -
                 continue
             seen.add((row["claim_id"], row["work_key"]))
             alerts.append(alert_record(row, unit, created))
-        connection.execute("DELETE FROM fu_alerts")
-        connection.executemany("INSERT INTO fu_alerts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
-            (alert["alertId"], alert["claim"]["journal"], alert["claim"]["reviewDoi"], alert["claim"]["claimId"],
-             alert["claim"]["locusId"], alert["citedWork"]["workKey"], alert["status"]["status"] or "unknown",
-             alert["status"]["noticeDate"], alert["evidence"]["function"]["class"],
-             alert["evidence"]["dependency"]["class"], canonical(alert["evidence"]["support"]),
-             canonical({key: value for key, value in alert["evidence"].items() if key != "support"}),
-             alert["confidence"], alert["suggestedAction"]["authors"] + " " + alert["suggestedAction"]["studyTeam"],
-             created) for alert in alerts])
         graph = propagation_graph(connection, rows, units)
-        counts = write_claims_database(output / "compromised-claims.sqlite3", rows, connection, meta)
+        counts = write_claims_database(output / "compromised-claims.sqlite3", rows, connection, meta,
+                                       alert_rows(alerts, created))
     with (output / "alerts.jsonl").open("w", encoding="utf-8") as handle:
         for alert in alerts:
             handle.write(json.dumps(alert, ensure_ascii=False, sort_keys=True) + "\n")
