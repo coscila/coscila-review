@@ -212,8 +212,8 @@ class SecondGenerationTests(unittest.TestCase):
 
     def test_sentences_beyond_k_are_not_judged_and_never_different(self):
         protocol = second_generation_protocol(edges=4, k=1)
-        protocol["estimands"].append({"id": "second-generation", "numerator": "restating sentences",
-                                      "denominator": "judged sentences", "by": ["journal"],
+        protocol["estimands"].append({"id": "second-generation", "numerator": "restating articles",
+                                      "denominator": "sampled articles with judged candidates", "by": ["journal"],
                                       "weights": "realised-inclusion-probability"})
         branch = self.branch(protocol)
         judge = F.ScriptedJudge(answer)
@@ -235,9 +235,10 @@ class SecondGenerationTests(unittest.TestCase):
                 "SELECT * FROM fu_coverage WHERE estimand='second-generation' AND journal='*' AND year='*'")}
             share = connection.execute("SELECT value FROM fu_estimates WHERE key=?",
                                        ("followup.second-generation.all.all.share",)).fetchone()[0]
-        self.assertEqual({("assessable", "-"): 1, ("unassessable", "not-judged"): 1,
-                          ("unassessable", "no-open-full-text"): 1, ("unassessable", "citation-not-located"): 2,
-                          ("unassessable", "fetch-failed"): 1}, coverage)
+        # one unit per sampled article: the article whose top candidate restates the claim (its other sentence lies
+        # beyond the cut, a non-candidate), and the articles that were not read or did not locate the citation
+        self.assertEqual({("assessable", "-"): 1, ("unassessable", "no-open-full-text"): 1,
+                          ("unassessable", "citation-not-located"): 2, ("unassessable", "fetch-failed"): 1}, coverage)
         self.assertEqual(1.0, share)
 
     def test_items_carry_only_the_declared_fields_and_routing(self):

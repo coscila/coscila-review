@@ -45,8 +45,13 @@ def add_commands(commands: Any, register: Any) -> None:
     parsers["lag"] = commands.add_parser("lag", help="retraction-lag rows and the lag model")
     parsers["estimands"] = commands.add_parser(
         "estimands", help="the predeclared estimands with coverage tables (weighted, review-clustered bootstrap)")
-    parsers["estimands"].add_argument("--b", type=int, help="bootstrap replicates (default: the protocol's)")
-    parsers["estimands"].add_argument("--bootstrap-seed", type=int, help="bootstrap seed (default: the protocol's)")
+    parsers["estimands"].add_argument("--b", type=int, help="bootstrap replicates (default: the protocol's; another "
+                                                            "value makes exploratory estimates, never a study run)")
+    parsers["estimands"].add_argument("--bootstrap-seed", type=int,
+                                      help="bootstrap seed (default: the protocol's; as --b)")
+    parsers["estimands"].add_argument("--scope", choices=("pilot", "all"), default="all",
+                                      help="pilot: the judged estimands over the pilot subsample, weighted by the "
+                                           "pilot probabilities, under followup.pilot.* keys")
     for name, parser in parsers.items():
         parser.add_argument("--database", required=True, help="follow-up branch database")
         if name in ("numeric", "second-gen"):

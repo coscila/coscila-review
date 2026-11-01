@@ -59,8 +59,13 @@ def hand_built_branch(root: Path, name: str, protocol, census) -> object:
                            (lid(JA, A2, "2"),))
         connection.execute("INSERT INTO fu_function(locus_id, class, assessable, reason) VALUES(?,NULL,0,'abstained')",
                            (lid(JB, B1, "2"),))
+        # co-cited loci, and the anchors' own full-text verdicts (sole-or-essential needs an assessable one)
         for unit, verdict, assessable, reason in ((lid(JA, A1, "2"), "contradicted", 1, None),
-                                                  (lid(JB, B1, "3"), "direct-support", 1, None)):
+                                                  (lid(JB, B1, "3"), "direct-support", 1, None),
+                                                  (lid(JA, A1, "1"), "direct-support", 1, None),
+                                                  (lid(JA, A2, "2"), "contradicted", 1, None),
+                                                  (lid(JB, B1, "2"), "direct-support", 1, None),
+                                                  (lid(JA, A2, "1"), "partial-indirect", 1, None)):
             connection.execute("INSERT INTO fu_support(locus_id, tier, verdict, assessable, reason) "
                                "VALUES(?,'full-text',?,?,?)", (unit, verdict, assessable, reason))
         connection.execute("INSERT INTO fu_support(locus_id, tier, verdict, assessable, reason) "
@@ -78,9 +83,12 @@ def hand_built_branch(root: Path, name: str, protocol, census) -> object:
                                "reliance, assessable, reason, quote, inclusion_probability) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                (anchor_id, sentence, "doi:10.5555/fu.later.1", 1 if match else None, match, reliance,
                                 int(match is not None), reason, "quoted words" if match else None, probability))
-        connection.execute("INSERT INTO fu_secondgen_sample(anchor_locus_id, edge_id, citing_key, target_doi, available, "
-                           "sampled, inclusion_probability, seed, selected_at) VALUES(?,?,?,?,4,2,0.5,'s','t')",
-                           (anchor, "edge-9", "doi:10.5555/fu.later.9", A1))
+        for anchor_id, edge, citing, target, probability in ((anchor, "edge-1", "doi:10.5555/fu.later.1", A1, 0.5),
+                                                             (other, "edge-2", "doi:10.5555/fu.later.1", A2, 1.0),
+                                                             (anchor, "edge-9", "doi:10.5555/fu.later.9", A1, 0.5)):
+            connection.execute("INSERT INTO fu_secondgen_sample(anchor_locus_id, edge_id, citing_key, target_doi, "
+                               "available, sampled, inclusion_probability, seed, selected_at) VALUES(?,?,?,?,4,2,?,'s',"
+                               "'t')", (anchor_id, edge, citing, target, probability))
         connection.execute("INSERT INTO fu_secondgen_candidates(anchor_locus_id, citing_key, state, reason, k, sentences, "
                            "candidates, created_at) VALUES(?,?,'no-sentences','fetch-failed',3,0,0,'t')",
                            (anchor, "doi:10.5555/fu.later.9"))
@@ -116,19 +124,28 @@ class EstimandTests(unittest.TestCase):
             return {(row["state"], row["reason"]): (row["units"], row["weighted"]) for row in connection.execute(
                 "SELECT * FROM fu_coverage WHERE estimand=? AND journal=? AND year=?", (estimand, journal, year))}
 
-    def test_compromised_share_over_loci_with_a_known_status(self):
-        self.assertAlmostEqual(5 / 10, self.value("followup.compromised-share.all.all.share"))
-        self.assertEqual((5.0, 10.0, 10), tuple(self.value(f"followup.compromised-share.all.all.{stat}")
+    def test_compromised_share_over_every_identity_resolved_locus_and_the_available_case(self):
+        # The design's estimand: a locus whose work's status is unknown stays in the denominator (coverage notes it).
+        self.assertAlmostEqual(5 / 11, self.value("followup.compromised-share.all.all.share"))
+        self.assertEqual((5.0, 11.0, 11), tuple(self.value(f"followup.compromised-share.all.all.{stat}")
                                                 for stat in ("numerator", "denominator", "n")))
-        self.assertAlmostEqual(3 / 10, self.value("followup.compromised-share.retracted.all.all.share"))
-        self.assertAlmostEqual(1 / 10, self.value("followup.compromised-share.corrected.all.all.share"))
-        # review a2: two compromised works and one work of unknown status (coverage, not denominator)
-        self.assertAlmostEqual(1.0, self.value(f"followup.compromised-share.{SLUG_A}.2023.share"))
-        self.assertEqual({("assessable", "-"): (2, 2.0), ("unassessable", "status-unknown"): (1, 1.0)},
+        self.assertAlmostEqual(3 / 11, self.value("followup.compromised-share.retracted.all.all.share"))
+        self.assertAlmostEqual(1 / 11, self.value("followup.compromised-share.corrected.all.all.share"))
+        # review a2: two compromised works and one work of unknown status
+        self.assertAlmostEqual(2 / 3, self.value(f"followup.compromised-share.{SLUG_A}.2023.share"))
+        self.assertEqual({("assessable", "-"): (2, 2.0), ("assessable", "status-unknown"): (1, 1.0)},
                          self.coverage("compromised-share", JA, "2023"))
         self.assertAlmostEqual(2 / 4, self.value(f"followup.compromised-share.{SLUG_B}.all.share"))
-        self.assertEqual({("assessable", "-"): (10, 10.0), ("unassessable", "status-unknown"): (1, 1.0)},
+        self.assertEqual({("assessable", "-"): (10, 10.0), ("assessable", "status-unknown"): (1, 1.0)},
                          self.coverage("compromised-share"))
+        # The labelled sensitivity: loci with a known status only (unknown status in coverage).
+        self.assertAlmostEqual(5 / 10, self.value("followup.compromised-share.available-case.all.all.share"))
+        self.assertAlmostEqual(1.0, self.value(f"followup.compromised-share.available-case.{SLUG_A}.2023.share"))
+        self.assertAlmostEqual(3 / 10, self.value("followup.compromised-share.available-case.retracted.all.all.share"))
+        self.assertEqual({("assessable", "-"): (10, 10.0), ("unassessable", "status-unknown"): (1, 1.0)},
+                         self.coverage("compromised-share.available-case"))
+        variant = json.loads(self.values["followup.compromised-share.available-case.all.all.share"]["detail_json"])
+        self.assertEqual("available-case", variant["variant"])
         self.assertIsNone(self.values["followup.compromised-share.all.all.share"]["stratum"])
         detail = json.loads(self.values["followup.compromised-share.retracted.all.all.share"]["detail_json"])
         self.assertEqual(("retracted", "numerator", 200, 13), (detail["level"], detail["levelRole"], detail["b"],
@@ -139,6 +156,8 @@ class EstimandTests(unittest.TestCase):
         self.assertAlmostEqual(2 / 3, self.value("followup.sole-or-essential.all.all.share"))
         self.assertEqual((2.0, 3.0, 3), tuple(self.value(f"followup.sole-or-essential.all.all.{stat}")
                                               for stat in ("numerator", "denominator", "n")))
+        # of the sole or essential anchors, the one whose own work supports the claim (a2's sole anchor contradicts)
+        self.assertAlmostEqual(1 / 3, self.value("followup.sole-or-essential.anchor-supported.all.all.share"))
         self.assertEqual({("assessable", "-"): (3, 3.0), ("unassessable", "undetermined"): (1, 1.0),
                           ("unassessable", "not-judged"): (1, 1.0)}, self.coverage("sole-or-essential"))
         self.assertAlmostEqual(2 / 3, self.value("followup.sole-or-essential.retracted.all.all.share"))
@@ -164,15 +183,18 @@ class EstimandTests(unittest.TestCase):
         self.assertEqual({("assessable", "-"): (1, 1.0), ("unassessable", "abstained"): (1, 1.0)},
                          self.coverage("acknowledges-notice"))
 
-    def test_second_generation_is_weighted_by_the_edge_sample(self):
-        # judged sentences: s1 (restates, w 2), s2 (another claim, w 2), s4 (cites the review otherwise, w 1)
-        self.assertAlmostEqual(2 / 5, self.value("followup.second-generation.all.all.share"))
-        self.assertEqual((2.0, 5.0, 3), tuple(self.value(f"followup.second-generation.all.all.{stat}")
+    def test_second_generation_counts_sampled_articles_weighted_by_the_edge_sample(self):
+        # edges: a1's later article restates the claim (s1, w 2; s3 lies beyond the cut), a2's does not (s4, w 1);
+        # a1's other sampled article was not read (coverage)
+        self.assertAlmostEqual(2 / 3, self.value("followup.second-generation.all.all.share"))
+        self.assertEqual((2.0, 3.0, 2), tuple(self.value(f"followup.second-generation.all.all.{stat}")
                                               for stat in ("numerator", "denominator", "n")))
-        self.assertEqual({("assessable", "-"): (3, 5.0), ("unassessable", "not-judged"): (1, 2.0),
-                          ("unassessable", "fetch-failed"): (1, 2.0)}, self.coverage("second-generation"))
+        self.assertEqual({("assessable", "-"): (2, 3.0), ("unassessable", "fetch-failed"): (1, 2.0)},
+                         self.coverage("second-generation"))
         detail = json.loads(self.values["followup.second-generation.all.all.share"]["detail_json"])
         self.assertIn("inclusion probability", detail["weights"])
+        self.assertEqual(("sampled cited-by edge (a later article)", 1), (detail["unit"],
+                                                                          detail["edgesWithSentencesBeyondK"]))
 
     def test_distortion_type_is_not_measured_and_counts_the_loci_awaiting_labels(self):
         self.assertEqual("not-measured", self.value("followup.distortion-type.all.all.share"))
@@ -235,6 +257,49 @@ class EstimandTests(unittest.TestCase):
         self.assertIn(f"followup.sole-or-essential.{SLUG_B}.all.share", keys)
         self.assertFalse(any(".2021." in key or "retracted" in key for key in keys))
         self.assertFalse(any(key.startswith("followup.compromised-share") for key in keys))
+
+    def test_a_pilot_scope_weights_the_pilot_units_by_their_pilot_probability(self):
+        followup_estimands.cmd_estimands(SimpleNamespace(database=str(self.branch.path), b=None, bootstrap_seed=None,
+                                                         scope="pilot"))
+        values = self.estimates(self.branch)
+        with closing(self.branch.connect()) as connection:
+            pilot = {row[0]: row[1] for row in connection.execute(
+                "SELECT locus_id, pilot_probability FROM fu_strata WHERE stratum='S1' AND pilot=1")}
+        self.assertTrue(pilot)
+        units = {lid(JA, A1, "1"): True, lid(JA, A2, "2"): True, lid(JB, B1, "2"): False}
+        weights = {unit: 1 / pilot[unit] for unit in units if unit in pilot}
+        key = "followup.pilot.sole-or-essential.all.all"
+        if weights:
+            expected = sum(weight for unit, weight in weights.items() if units[unit]) / sum(weights.values())
+            self.assertAlmostEqual(expected, values[f"{key}.share"]["value"])
+            self.assertAlmostEqual(sum(weights.values()), values[f"{key}.denominator"]["value"])
+        detail = json.loads(values[f"{key}.share"]["detail_json"])
+        self.assertEqual(("pilot", "1/realised pilot probability (Hajek ratio over the pilot subsample)"),
+                         (detail["scope"], detail["weights"]))
+        self.assertEqual("pilot.sole-or-essential", values[f"{key}.share"]["estimand"])
+        self.assertFalse([name for name in values if name.startswith("followup.pilot.compromised-share")])
+        # The full-scope estimates are left as they were.
+        self.assertEqual(self.values["followup.sole-or-essential.all.all.share"]["value"],
+                         values["followup.sole-or-essential.all.all.share"]["value"])
+
+    def test_journal_contrasts_and_the_grace_sensitivity_are_predeclared(self):
+        protocol = estimands_protocol()
+        protocol["timing"] = {"graceDays": 0, "sensitivityGraceDays": 400}
+        protocol["estimands"] = [declared("sole-or-essential", contrasts=["journal"]),
+                                 declared("cited-after-notice")]
+        branch = hand_built_branch(self.root, "estimands-contrasts.sqlite3", protocol, self.census)
+        followup_estimands.cmd_estimands(SimpleNamespace(database=str(branch.path), b=None, bootstrap_seed=None))
+        values = {key: row["value"] for key, row in self.estimates(branch).items()}
+        pair = f"{SLUG_B}-vs-{SLUG_A}"
+        share_a = values[f"followup.sole-or-essential.{SLUG_A}.all.share"]
+        share_b = values[f"followup.sole-or-essential.{SLUG_B}.all.share"]
+        self.assertAlmostEqual(share_b - share_a, values[f"followup.sole-or-essential.journal-difference.{pair}.all.value"])
+        self.assertIn(f"followup.sole-or-essential.journal-difference.{pair}.all.lo", values)
+        self.assertIn(f"followup.sole-or-essential.journal-ratio.{pair}.all.value", values)
+        # the second reading: the article online 259 days after the notice is within 400 grace days, and the one in
+        # the month of the concern notice (undecidable without grace days) is decidably within them
+        self.assertAlmostEqual(2 / 3, values["followup.cited-after-notice.all.all.share"])
+        self.assertAlmostEqual(1 / 4, values["followup.cited-after-notice.grace-400d.all.all.share"])
 
     def test_estimands_need_a_freeze(self):
         unfrozen = make_branch(self.root, "estimands-unfrozen.sqlite3", estimands_protocol(), census=self.census)

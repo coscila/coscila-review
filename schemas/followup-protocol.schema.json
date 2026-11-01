@@ -146,7 +146,9 @@
                           "second-generation", "distortion-type", "numeric-classes"]},
           "numerator": {"type": "string", "minLength": 1},
           "denominator": {"type": "string", "minLength": 1},
-          "by": {"type": "array", "uniqueItems": true, "items": {"enum": ["journal", "year", "status", "stratum"]}},
+          "by": {"type": "array", "uniqueItems": true, "items": {"enum": ["journal", "year", "status"]}},
+          "contrasts": {"type": "array", "uniqueItems": true, "items": {"enum": ["journal"]},
+                        "description": "journal: every later journal against the first, ratio and difference of the shares with bootstrap intervals"},
           "weights": {"const": "realised-inclusion-probability"},
           "labelSource": {"enum": ["instrument", "adjudication"]}
         }

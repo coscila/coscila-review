@@ -237,6 +237,14 @@ class PipelineTests(unittest.TestCase):
         judged = [(json.loads(messages[1]["content"]).get("evidenceTier"), item["id"])
                   for messages, _ in self.judge.requests for item in json.loads(messages[1]["content"])["items"]]
         self.assertEqual(len(judged), len(set(judged)), "the full run judges again no item the pilot judged")
+        self.invoke("dependency", *database, "--scope", "pilot")
+        self.assertLessEqual({row["locus_id"] for row in self.rows("SELECT locus_id FROM fu_dependency")}, pilot)
+        estimates = self.invoke("estimands", *database, "--scope", "pilot")
+        self.assertEqual(("pilot", ["compromised-share", "distortion-type", "numeric-classes"]),
+                         (estimates["scope"], sorted(estimates["noPilotForm"])))
+        keys = {row["key"] for row in self.rows("SELECT key FROM fu_estimates")}
+        self.assertIn("followup.pilot.sole-or-essential.all.all.n", keys)
+        self.assertFalse([key for key in keys if not key.startswith("followup.pilot.")])
         self.invoke("dependency", *database)
         self.invoke("gates", *database)
 
