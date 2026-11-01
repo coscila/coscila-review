@@ -68,6 +68,8 @@ def add_commands(commands: Any, register: Any) -> None:
                                                          "sentences before and after each citing sentence")
     parsers["dependency"] = commands.add_parser(
         "dependency", help="sole, essential, redundant or undetermined support per S1 and S2 locus")
+    parsers["dependency"].add_argument("--scope", choices=("pilot", "all"), default="all",
+                                       help="pilot: (re)compute only the rows of the pilot anchors")
     parsers["citedby"] = commands.add_parser(
         "citedby", help="works citing the affected reviews (Europe PMC citations, OpenAlex when available)")
     parsers["citedby"].add_argument("--source", action="append", choices=("europe-pmc", "openalex"),

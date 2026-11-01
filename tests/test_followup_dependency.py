@@ -146,6 +146,63 @@ class DependencyTests(unittest.TestCase):
         row = D.classify(anchor, unresolved, {**verdicts, "b2": ("direct-support", 1, None)})
         self.assertEqual("redundant", row["class"])
 
+    def test_unsettled_support_of_a_co_cited_work_leaves_the_dependency_undetermined(self):
+        """citation-support@2's class map puts partial-indirect next to abstain (uncertain): it is never decided
+        non-support, so the anchor is not essential; the other reading is kept for a sensitivity."""
+        self.assertEqual(("partial-indirect", "abstain"), D.support_classes()["uncertain"])
+        self.assertEqual(("direct-support", "scope-caveat"), D.support_classes()["supported"])
+        anchor = {"locus_id": "a", "claim_id": "c", "work_key": "w"}
+        loci = [{"locusId": "a", "label": "1", "seq": 1, "workKey": "w", "identity": "resolved"},
+                {"locusId": "b", "label": "2", "seq": 1, "workKey": "x", "identity": "resolved"}]
+        row = D.classify(anchor, loci, {"a": ("direct-support", 1, None), "b": ("partial-indirect", 1, None)})
+        detail = json.loads(row["detail_json"])
+        self.assertEqual(("undetermined", 0, 1), (row["class"], row["cocited_supporting"], row["cocited_unassessable"]))
+        self.assertEqual("unsettled-support", detail["cocitedWorks"][0]["loci"][0]["reason"])
+        self.assertEqual("partial-indirect", detail["cocitedWorks"][0]["loci"][0]["verdict"])
+        self.assertEqual("essential", detail["readings"]["unsettledSupportAsNonSupport"])
+        # A decided verdict of another locus of the same work settles it.
+        loci.append({"locusId": "b2", "label": "2", "seq": 2, "workKey": "x", "identity": "resolved"})
+        row = D.classify(anchor, loci, {"b": ("partial-indirect", 1, None), "b2": ("contradicted", 1, None)})
+        self.assertEqual("essential", row["class"])
+
+    def test_support_from_a_co_cited_work_with_a_notice_of_its_own_does_not_count(self):
+        """A sentence that cites only works carrying a notice rests on compromised evidence: neither anchor is
+        redundant, and the detail records the support and the statuses."""
+        loci = [{"locusId": "LA", "label": "1", "seq": 1, "workKey": "wA", "identity": "resolved"},
+                {"locusId": "LB", "label": "2", "seq": 1, "workKey": "wB", "identity": "resolved"}]
+        verdicts = {"LA": ("direct-support", 1, None), "LB": ("direct-support", 1, None)}
+        statuses = {"wA": "retracted", "wB": "retracted"}
+        for anchor in ({"locus_id": "LA", "claim_id": "C", "work_key": "wA"},
+                       {"locus_id": "LB", "claim_id": "C", "work_key": "wB"}):
+            row = D.classify(anchor, loci, verdicts, statuses=statuses, compromised=("retracted",))
+            detail = json.loads(row["detail_json"])
+            self.assertEqual(("essential", 0), (row["class"], row["cocited_supporting"]))
+            self.assertEqual(1, detail["compromisedSupporting"])
+            self.assertEqual(("retracted", True, False), (detail["cocitedWorks"][0]["status"],
+                                                          detail["cocitedWorks"][0]["supports"],
+                                                          detail["cocitedWorks"][0]["countsAsSupport"]))
+            self.assertEqual("redundant", detail["readings"]["compromisedSupportCounts"])
+        # A status outside the protocol's S1 statuses (or none) counts as support as before.
+        row = D.classify({"locus_id": "LA", "claim_id": "C", "work_key": "wA"}, loci, verdicts,
+                         statuses={"wB": "corrected"}, compromised=("retracted",))
+        self.assertEqual("redundant", row["class"])
+
+    def test_the_command_uses_the_protocol_statuses_and_a_pilot_scope(self):
+        with self.branch.writing() as connection:
+            insert_frame(connection, pilot=["a1/1"])
+            connection.execute("INSERT INTO fu_work_status(work_key, status, sources_json, checked_at, snapshot_id, "
+                               "rule_version, resolved_at) VALUES('w-plain-1','retracted','[]','t','s','r','t')")
+            support(connection, "a1/2", "full-text", "direct-support")
+            support(connection, "b1/3", "full-text", "direct-support")
+            pilot = D.compute_dependency(connection, scope="pilot")
+            self.assertEqual((1, "pilot"), (pilot["anchors"], pilot["scope"]))
+            self.assertEqual([locus("a1/1")], [row[0] for row in connection.execute("SELECT locus_id FROM fu_dependency")])
+            # w-plain-1 carries a retraction of its own here, so its support does not make a1/1 redundant.
+            self.assertEqual("essential", connection.execute("SELECT class FROM fu_dependency").fetchone()[0])
+            full = D.compute_dependency(connection)
+            self.assertEqual(5, full["anchors"])
+            self.assertEqual(["retracted", "expression-of-concern", "corrected"], full["compromisedStatuses"])
+
     def test_the_command_needs_the_freeze(self):
         def invoke(name):
             target = self.root / f"result-{self.count}-{name}.json"

@@ -53,9 +53,13 @@ ACTIONS = {
 DEPENDENCY_NOTES = {
     "sole": "the sentence cites no other work for this claim",
     "essential": "no other work cited in the sentence supports the claim at full text",
-    "redundant": "another work cited in the sentence supports the claim at full text",
+    "redundant": "another work cited in the sentence, which carries no notice of its own, supports the claim at full "
+                 "text",
     "undetermined": "whether another work cited in the sentence supports the claim could not be assessed",
 }
+# An essential claim whose other cited works support it only where they carry a notice themselves.
+COMPROMISED_ONLY_NOTE = ("the other works cited in the sentence that support the claim at full text carry a "
+                         "retraction, expression of concern or correction themselves")
 CLAIM_COLUMNS = (
     "locus_id", "claim_id", "basis", "strata", "journal", "review_doi", "label", "seq", "section", "sentence",
     "sentence_sha256", "provenance_class", "review_first_online", "work_key", "cited_doi", "cited_pmid", "cited_title",
@@ -222,11 +226,24 @@ def affected(unit: Mapping[str, Any]) -> bool:
     return (unit["support"].get("full-text") or {}).get("verdict") in ADVERSE
 
 
+def _compromised_supporting(dependency: Mapping[str, Any] | None) -> int:
+    """Co-cited works that support the claim but carry a notice themselves (dependency-aggregation@1 detail)."""
+    try:
+        detail = json.loads((dependency or {}).get("detail_json") or "{}")
+    except ValueError:
+        return 0
+    value = detail.get("compromisedSupporting") if isinstance(detail, dict) else None
+    return value if isinstance(value, int) else 0
+
+
 def alert_record(row: Mapping[str, Any], unit: Mapping[str, Any], created: str) -> dict[str, Any]:
     reason = unit["basis"] if unit["basis"] == "systematic-miscitation" else unit["status"]
     dependency = (unit.get("dependency") or {}).get("class")
     action = ACTIONS[reason]
     note = DEPENDENCY_NOTES.get(dependency or "")
+    compromised_support = _compromised_supporting(unit.get("dependency"))
+    if dependency == "essential" and compromised_support:
+        note = COMPROMISED_ONLY_NOTE
     authors = f"For the authors of the citing review: {action}" + (f" ({note})." if note else ".")
     team = ("For a study team: treat the claim as resting on compromised evidence until it is checked; the record is a "
             "model measurement with its evidence, not an established finding.")
@@ -253,7 +270,8 @@ def alert_record(row: Mapping[str, Any], unit: Mapping[str, Any], created: str) 
                                   "quote": row["function_quote"]},
                      "dependency": {"class": dependency, "cocited": row["cocited"],
                                     "cocitedSupporting": row["cocited_supporting"],
-                                    "cocitedUnassessable": row["cocited_unassessable"]},
+                                    "cocitedUnassessable": row["cocited_unassessable"],
+                                    "cocitedCompromisedSupporting": compromised_support},
                      "timing": {"reviewFirstOnline": row["review_first_online"], "noticeDate": row["notice_date"],
                                 "citedAfterNotice": after},
                      "receipts": json.loads(row["judgments"])},
