@@ -149,10 +149,11 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual({lid(JA, A1, "1"), lid(JA, A2, "1"), lid(JA, A2, "2"), lid(JB, B1, "1"), lid(JB, B1, "2")},
                          s1)
         # judging on the frozen strata; the full-text verdicts decide the dependency
-        self.invoke("support", *database, "--tier", "abstract", *JUDGE, routes=support_routes())
+        judged = [self.invoke("support", *database, "--tier", "abstract", *JUDGE, routes=support_routes())]
         full_text = {**support_routes(), FULL_TEXT.format("PMC900004"): (200, PLAIN_FULL_TEXT)}
-        self.invoke("support", *database, "--tier", "full-text", "--europe-pmc", *JUDGE, routes=full_text)
-        self.invoke("function", *database, *JUDGE)
+        judged.append(self.invoke("support", *database, "--tier", "full-text", "--europe-pmc", *JUDGE,
+                                  routes=full_text))
+        judged.append(self.invoke("function", *database, *JUDGE))
         # every judging command draws its replicate units with the one rule of the strata module
         functions = [row["locus_id"] for row in self.rows("SELECT DISTINCT locus_id FROM fu_strata WHERE stratum IN "
                                                           "('S0','S1','S2','S3')")]
@@ -165,11 +166,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual({lid(JA, A1, "1"): "essential", lid(JA, A2, "1"): "sole", lid(JA, A2, "2"): "sole",
                           lid(JB, B1, "1"): "sole", lid(JB, B1, "2"): "redundant"}, dependency)
         numeric = self.invoke("numeric", *database, "--tables", str(TABLES), "--allow-synthetic-tables", *JUDGE)
+        judged.append(numeric)
         self.assertEqual({"consistent"}, {row["class"] for row in self.rows(
             "SELECT class FROM fu_numeric WHERE locus_id=?", lid(JA, A1, "3"))}, numeric)
         # propagation: the affected reviews' citing works, then the later articles that restate the claim
         self.invoke("citedby", *database, routes=citedby_routes())
-        self.invoke("second-gen", *database, *JUDGE, routes=SECONDGEN_ROUTES)
+        judged.append(self.invoke("second-gen", *database, *JUDGE, routes=SECONDGEN_ROUTES))
+        # every judging command returns the census step contract at the top level
+        for result in judged:
+            self.assertEqual("completed", result["state"], result.get("reason"))
+            self.assertEqual(result["run"]["accepted"], result["accepted"])
+            self.assertEqual(result["accepted"] + result["invalid"], result["reviews"])
+            self.assertEqual(result["run"]["calls"] + result["run"]["repairCalls"], result["calls"])
+            self.assertGreater(result["calls"], 0)
         confirmed = self.rows("SELECT anchor_locus_id, citing_key FROM fu_secondgen_matches WHERE assessable=1 AND "
                               "match='same-claim' AND reliance='cites-review-for-claim'")
         self.assertEqual([{"anchor_locus_id": lid(JA, A1, "1"), "citing_key": "doi:10.5555/fu.later.1"}], confirmed)

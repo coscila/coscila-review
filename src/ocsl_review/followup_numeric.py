@@ -45,7 +45,7 @@ from .census_extraction import MARK_PATTERN, marker_name
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, register_dataset, require_freeze
 from .followup_judge import (accepted, block_items, close_judge, judge_from_args, judge_summary, prepare_judge,
-                             run_items)
+                             run_items, step_result)
 from .followup_model import NUMERIC_RULE, TableCell, WorkRef, canonical
 from .followup_strata import protocol_of, replicate_keys
 
@@ -449,7 +449,7 @@ def run_numeric(branch: FollowupBranch, tables: Path, *, judge: Any, policy: Any
         rows = write_rows(connection, units, source, dataset, instrument) if variant == "primary" else None
     return {"database": str(branch.path), "rule": RULE, "tableSource": dataset, "licensing": source.licensing,
             "units": len(units), "sent": len(items), "blocked": len(blocked), "newlyBlocked": newly_blocked,
-            "judging": summary, "rows": rows, "judge": judge_summary(judge)}
+            "run": summary, "rows": rows, "judge": judge_summary(judge), **step_result(summary, judge)}
 
 
 def cmd_numeric(args: Any) -> dict[str, Any]:

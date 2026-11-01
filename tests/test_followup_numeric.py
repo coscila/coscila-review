@@ -263,7 +263,7 @@ class NumericCommandTests(unittest.TestCase):
         self.assertEqual(["table 1"], [cell["locator"] for cell in json.loads(consistent["matched_json"])["cells"]])
         self.assertEqual(0, rows[lid(JA, A1, "7")]["epidemiological"])
         self.assertIsNone(rows[lid(JB, B1, "5")]["matched_json"])
-        self.assertEqual((7, 7, 0), (result["units"], result["judging"]["accepted"], result["judging"]["rejected"]))
+        self.assertEqual((7, 7, 0), (result["units"], result["run"]["accepted"], result["run"]["rejected"]))
         for messages, _ in judge.requests:
             body = messages[1]["content"]
             for item in json.loads(body)["items"]:
@@ -351,12 +351,12 @@ class NumericCommandTests(unittest.TestCase):
             return json.dumps({"items": items})
         first = self.run_numeric(branch, F.ScriptedJudge(bad))
         # rejected in the first call and again in its repair call
-        self.assertEqual((6, 2, 1), (first["judging"]["accepted"], first["judging"]["rejected"],
-                                     first["judging"]["repairCalls"]))
+        self.assertEqual((6, 2, 1), (first["run"]["accepted"], first["run"]["rejected"],
+                                     first["run"]["repairCalls"]))
         self.assertEqual((None, "invalid-output"), (self.rows(branch)[lid(JA, A1, "5")]["class"],
                                                     self.rows(branch)[lid(JA, A1, "5")]["reason"]))
         again = self.run_numeric(branch, F.ScriptedJudge(answer))
-        self.assertEqual((6, 1), (again["judging"]["skipped"], again["judging"]["accepted"]))
+        self.assertEqual((6, 1), (again["run"]["skipped"], again["run"]["accepted"]))
         self.assertEqual("wrong-geography", self.rows(branch)[lid(JA, A1, "5")]["class"])
         before = self.rows(branch)
         judge = F.ScriptedJudge(answer)
@@ -382,7 +382,7 @@ class NumericCommandTests(unittest.TestCase):
                              "--base-url", "http://judge.example/v1", "--on-premises", "--transport-retries", "0"])
         record = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(0, code, record)
-        self.assertEqual(7, record["result"]["judging"]["accepted"])
+        self.assertEqual(7, record["result"]["run"]["accepted"])
         self.assertTrue(built.call_args.args[0].allow_synthetic_tables)
         with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
             code = main(["--result-file", str(target), "followup", "numeric", "--database", str(branch.path),

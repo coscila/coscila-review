@@ -206,8 +206,8 @@ class SecondGenerationTests(unittest.TestCase):
         redacted = [row for row in self.table(branch, "fu_secondgen_candidates")
                     if row["anchor_locus_id"] == lid(JA, A2, "2")]
         self.assertEqual([("no-sentences", "citation-not-located")], [(row["state"], row["reason"]) for row in redacted])
-        self.assertEqual((2, 2, 0), (result["judge"]["sent"], result["judge"]["judging"]["accepted"],
-                                     result["judge"]["judging"]["rejected"]))
+        self.assertEqual((2, 2, 0), (result["confirm"]["sent"], result["run"]["accepted"],
+                                     result["run"]["rejected"]))
         self.assertTrue(branch.verify()["ok"], branch.verify()["problems"])
 
     def test_sentences_beyond_k_are_not_judged_and_never_different(self):
@@ -253,7 +253,7 @@ class SecondGenerationTests(unittest.TestCase):
             self.assertTrue(item["id"].startswith(lid(JA, A1, "1") + "|sentence-"))
         external = F.ScriptedJudge(answer, location="external")
         public = self.run_stages(self.branch(), judge=external, public_only=True)
-        self.assertEqual(2, public["judge"]["sent"])
+        self.assertEqual(2, public["confirm"]["sent"])
 
     def test_rejections_replicates_reruns_and_the_pinned_model(self):
         branch = self.branch()
@@ -263,14 +263,14 @@ class SecondGenerationTests(unittest.TestCase):
                                           "rationale": "Compared.", "abstainReason": ""}
                                          for item in F.items_of(messages)]})
         first = self.run_stages(branch, judge=F.ScriptedJudge(unquoted))
-        self.assertEqual(0, first["judge"]["judging"]["accepted"])
+        self.assertEqual(0, first["run"]["accepted"])
         reasons = {row["reason"] for row in self.table(branch, "fu_secondgen_matches") if row["rank"]}
         self.assertEqual({"invalid-output"}, reasons)
         again = self.run_stages(branch, ["candidates", "judge"])
-        self.assertEqual(2, again["judge"]["judging"]["accepted"])
+        self.assertEqual(2, again["run"]["accepted"])
         replicate = self.run_stages(branch, ["judge"], variant="replicate")
-        self.assertEqual(1, replicate["judge"]["sent"])
-        self.assertIsNone(replicate["judge"]["verdictsApplied"])
+        self.assertEqual(1, replicate["confirm"]["sent"])
+        self.assertIsNone(replicate["confirm"]["verdictsApplied"])
         refreshed = self.run_stages(branch, ["candidates"])
         self.assertEqual(2, refreshed["candidates"]["verdictsApplied"])
         with self.assertRaisesRegex(ValidationError, "model.served"):
@@ -327,7 +327,7 @@ class SecondGenerationTests(unittest.TestCase):
         # prepared before the first provider request and the first judge call, closed after the last call
         self.assertEqual([("prepare", "claim-match@1", 0, 0), ("close", len(judge.requests))], events)
         self.assertEqual({"name": judge.name, "location": "on-prem", "stopped": None},
-                         record["result"]["judge"]["judge"])
+                         record["result"]["judge"])
 
         class Refusing(F.ScriptedJudge):
             def prepare(self, instrument, tier):

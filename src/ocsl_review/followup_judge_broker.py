@@ -104,11 +104,13 @@ class BrokerJudge:
         return exported
 
     # ------------------------------------------------------------------ calls
-    def _halt(self, reason: str, code: str) -> None:
-        self.stopped = self.stopped or code
+    def _halt(self, reason: str, stop: str) -> None:
+        """A fidelity stop: the judge records which (``request_mismatch`` or ``fidelity``) and the transport halts with
+        the census's FIDELITY code, so the result pauses as the census does."""
+        self.stopped = self.stopped or stop
         halt = getattr(self.transport, "halt", None)
         if callable(halt):
-            halt(reason, code=code)
+            halt(reason, code="FIDELITY")
 
     def complete(self, messages: list[dict[str, str]], *, settings: Mapping[str, Any]) -> JudgeReply:
         exported = self.bundle_for(messages)

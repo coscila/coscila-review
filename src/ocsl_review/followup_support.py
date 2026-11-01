@@ -35,7 +35,7 @@ from .errors import ValidationError
 from .followup_branch import FollowupBranch, now, require_freeze
 from .followup_function import (ReviewDocuments, block_new, check_model, citation_target, cited_work, judgment_state,
                                 provenance_of, reason_of, resolve_marker, sanitize, select_units, sentence_targets)
-from .followup_judge import close_judge, judge_summary, prepare_judge
+from .followup_judge import close_judge, judge_summary, prepare_judge, step_result
 from .followup_model import canonical, digest
 from .followup_status import ProviderSession, Recorder, normal_doi, normal_pmid
 
@@ -619,7 +619,7 @@ def run_support(connection: Any, branch: FollowupBranch, judge: Any, policy: Any
             "blockedRecorded": blocks, "evidence": dict(sorted(fetched.items())), "unsent": dict(unsent),
             "contexts": dict(documents.counts), "retrieval": {"k": k, "maxEvidenceCharacters": window},
             "requests": session.recorder.summary() if session else {}, "run": summary,
-            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge)}
+            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge)}
 
 
 def cmd_support(args: Any) -> dict[str, Any]:

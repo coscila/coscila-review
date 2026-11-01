@@ -37,7 +37,8 @@ from xml.etree import ElementTree
 from . import census_extraction, claim_match
 from .errors import ConfidentialityError, ProviderError, ReviewError, ValidationError
 from .followup_branch import FollowupBranch, now, read_artifact, require_freeze, store_artifact
-from .followup_judge import accepted, close_judge, judge_from_args, judge_summary, prepare_judge, run_items
+from .followup_judge import (accepted, close_judge, judge_from_args, judge_summary, prepare_judge, run_items,
+                             step_result)
 from .followup_model import canonical, digest
 from .followup_net import record_request
 from .followup_strata import protocol_of, replicate_keys, seeded_sample
@@ -449,7 +450,7 @@ def confirm(connection: sqlite3.Connection, branch: FollowupBranch, protocol: Ma
                         concurrency=concurrency, code_revision=code_revision, transport_retries=transport_retries,
                         cooldown=cooldown, sleep=sleep)
     applied = refresh_matches(connection, instrument) if variant == "primary" else None
-    return {"sent": len(items), "judging": summary, "verdictsApplied": applied, "judge": judge_summary(judge_)}
+    return {"sent": len(items), "verdictsApplied": applied, "run": summary}
 
 
 # ----------------------------------------------------------------------------- command
@@ -478,12 +479,15 @@ def run_second_gen(branch: FollowupBranch, *, stages: Sequence[str] = STAGES, cl
             result["acquire"] = acquire(connection, client, anchor_ids)
         if "candidates" in stages:
             result["candidates"] = candidates(connection, branch, protocol, anchor_ids, instrument)
+        summary = None
         if "judge" in stages:
-            result["judge"] = confirm(connection, branch, protocol, instrument, judge_, policy, model,
-                                      anchor_ids=anchor_ids, variant=variant, public_only=public_only, limit=limit,
-                                      concurrency=concurrency, transport_retries=transport_retries, cooldown=cooldown,
-                                      sleep=sleep, code_revision=code_revision)
-    return result
+            confirmed = confirm(connection, branch, protocol, instrument, judge_, policy, model,
+                                anchor_ids=anchor_ids, variant=variant, public_only=public_only, limit=limit,
+                                concurrency=concurrency, transport_retries=transport_retries, cooldown=cooldown,
+                                sleep=sleep, code_revision=code_revision)
+            summary = confirmed.pop("run")
+            result.update(confirm=confirmed, run=summary, judge=judge_summary(judge_))
+    return {**result, **step_result(summary, judge_ if summary is not None else None)}
 
 
 def cmd_second_gen(args: Any) -> dict[str, Any]:

@@ -29,10 +29,11 @@ class FakeBroker:
     """The routes of a run principal's socket a one-item verbatim job uses; every job settles at once."""
 
     def __init__(self, *, installed=(), served=F.MODEL, model=F.MODEL, digest_offset="", refuse=None, state="completed",
-                 http_status=200, attempts=1):
+                 http_status=200, attempts=1, pause=None, resume_after=None):
         self.installed, self.served, self.model = list(installed), served, model
         self.digest_offset, self.refuse, self.state = digest_offset, refuse, state
         self.http_status, self.attempts = http_status, attempts
+        self.pause, self.resume_after = pause, resume_after
         self.requests: list[tuple[str, str, object]] = []
         self.jobs: dict[str, dict] = {}
         self.keys: dict[str, str] = {}
@@ -51,7 +52,7 @@ class FakeBroker:
             key = payload["idempotencyKey"]
             if key in self.keys:
                 job = self.jobs[self.keys[key]]
-                return {key_: job[key_] for key_ in ("jobId", "state", "instrumentDigest")}
+                return {key_: job[key_] for key_ in ("jobId", "state", "instrumentDigest", "resumeAfter", "error")}
             item = payload["items"][0]
             data = dict(item["input"])
             messages = data["messages"]
@@ -60,7 +61,9 @@ class FakeBroker:
             output = json.dumps({"items": [entry for entry in FUNCTION["response"]["items"] if entry["id"] in ids]})
             result = {"id": item["id"], "state": self.state, "attempts": self.attempts, "httpStatus": self.http_status,
                       "usage": {"input": 100, "output": 20}, "finishReason": "stop"}
-            if self.refuse:
+            if self.pause:
+                result = {"id": item["id"], "state": "paused", "attempts": 1, "errorCode": self.pause}
+            elif self.refuse:
                 result.update(state="failed", errorCode=self.refuse, attempts=0)
             elif self.state == "completed":
                 result.update(output=output, servedModel=self.served, systemFingerprint="fp-broker",
@@ -68,12 +71,13 @@ class FakeBroker:
             else:
                 result.update(errorCode="PROVIDER_UNAVAILABLE")
             job_id = f"job-{len(self.jobs) + 1}"
-            self.jobs[job_id] = {"jobId": job_id, "state": "completed" if self.state == "completed" or self.refuse
-                                 else "failed", "instrumentDigest": payload["instrumentDigest"], "result": result,
-                                 "payload": payload}
+            state = "paused" if self.pause else ("completed" if self.state == "completed" or self.refuse else "failed")
+            self.jobs[job_id] = {"jobId": job_id, "state": state, "instrumentDigest": payload["instrumentDigest"],
+                                 "result": result, "payload": payload, "resumeAfter": self.resume_after,
+                                 "error": self.pause}
             self.keys[key] = job_id
             job = self.jobs[job_id]
-            return {key_: job[key_] for key_ in ("jobId", "state", "instrumentDigest")}
+            return {key_: job[key_] for key_ in ("jobId", "state", "instrumentDigest", "resumeAfter", "error")}
         if method == "GET" and "/results" in route:
             job = self.jobs[route.split("/")[2]]
             return {"results": [job["result"]], "hasMore": False, "nextCursor": None}
@@ -175,6 +179,63 @@ class BrokerJudgeTests(unittest.TestCase):
                 self.assertEqual((0, 1, 2), (summary["accepted"], summary["failedCalls"], summary["open"]))
                 self.assertEqual(code, judge.stopped)
                 self.assertIsNotNone(judge.transport.halted)
+
+    def items(self, count):
+        """``count`` citation-function@1 items (copies of the fixture's first item under new ids)."""
+        return [{**FUNCTION["items"][0], "id": f"locus-copy-{number}"} for number in range(count)]
+
+    def test_a_halted_transport_stops_scheduling_and_skips_the_further_passes(self):
+        """A budget halt with a resumeAfter: one call, no further batch, repair or pass, no cooldown, every other
+        item left open, and a paused result that carries the halt code and resumeAfter for the Study Run."""
+        from ocsl_review.followup_judge import step_result
+        broker = FakeBroker(installed=[function_digest()], pause="BUDGET_EXHAUSTED",
+                            resume_after="2999-01-01T00:00:00Z")
+        judge = self.judge(broker)
+        sleeps = []
+        with self.branch.writing() as connection:
+            summary = run_items(connection, self.instrument, self.items(25), judge, tier="locus", model=F.MODEL,
+                                transport_retries=3, cooldown=60.0, sleep=sleeps.append)
+        self.assertEqual((1, 1, 0, 25, "transport"), (summary["calls"], summary["failedCalls"], summary["passes"],
+                                                      summary["open"], summary["stopped"]))
+        self.assertEqual([], sleeps)
+        self.assertEqual(1, len(broker.jobs))
+        self.assertEqual(("BUDGET_EXHAUSTED", "2999-01-01T00:00:00Z"),
+                         (summary["halted"]["code"], summary["halted"]["resumeAfter"]))
+        result = step_result(summary, judge)
+        self.assertEqual("paused", result["state"])
+        self.assertTrue(result["reason"].startswith("transport: broker halted: "), result["reason"])
+        self.assertEqual("2999-01-01T00:00:00Z", result["resumeAfter"])
+        self.assertEqual("BUDGET_EXHAUSTED", result["transport"]["halted"]["code"])
+        self.assertEqual((0, 0, 1, 0), (result["accepted"], result["invalid"], result["calls"], result["reviews"]))
+
+    def test_a_fidelity_refusal_pauses_with_the_census_prefix_and_code(self):
+        from ocsl_review.followup_judge import step_result
+        judge = self.judge(FakeBroker(installed=[function_digest()], refuse="INSTRUMENT_MESSAGE_MISMATCH"))
+        sleeps = []
+        with self.branch.writing() as connection:
+            summary = run_items(connection, self.instrument, self.items(25), judge, tier="locus", model=F.MODEL,
+                                transport_retries=2, cooldown=30.0, sleep=sleeps.append)
+        self.assertEqual((1, "fidelity", [], 25), (summary["calls"], summary["stopped"], sleeps, summary["open"]))
+        result = step_result(summary, judge)
+        self.assertTrue(result["reason"].startswith("fidelity: "), result["reason"])
+        self.assertEqual("FIDELITY", result["transport"]["halted"]["code"])
+
+    def test_drift_and_open_items_pause_and_a_clean_run_completes(self):
+        from ocsl_review.followup_judge import step_result
+        drift = self.judge(FakeBroker(installed=[function_digest()], served="another-model"))
+        result = step_result(self.run_function(drift), drift)
+        self.assertEqual("paused", result["state"])
+        self.assertTrue(result["reason"].startswith("model_drift: served 'another-model', required "), result["reason"])
+        failing = self.judge(FakeBroker(installed=[function_digest()], state="failed", http_status=503))
+        result = step_result(self.run_function(failing), failing)
+        self.assertEqual(("paused", None), (result["state"], result["transport"]["halted"]))
+        self.assertTrue(result["reason"].startswith("transport: 2 items still open after 0 further passes"))
+        clean = self.judge(FakeBroker(installed=[function_digest()]))
+        clean.prepare(self.instrument, "locus")
+        result = step_result(self.run_function(clean), clean)
+        self.assertEqual(("completed", 2, 0, 1, 2), (result["state"], result["accepted"], result["invalid"],
+                                                     result["calls"], result["reviews"]))
+        self.assertNotIn("reason", result)
 
     def test_a_failed_item_is_a_call_without_a_response(self):
         judge = self.judge(FakeBroker(installed=[function_digest()], state="failed", http_status=503))

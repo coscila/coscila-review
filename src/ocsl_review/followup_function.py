@@ -25,7 +25,7 @@ from typing import Any, Mapping, Sequence
 
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, require_freeze
-from .followup_judge import close_judge, judge_summary, prepare_judge
+from .followup_judge import close_judge, judge_summary, prepare_judge, step_result
 from .followup_model import sentence_digest
 from .followup_schema import UNASSESSABLE
 
@@ -367,7 +367,7 @@ def run_function(connection: Any, branch: FollowupBranch, judge: Any, policy: An
             "selection": selection, "items": len(items), "sent": len(pending),
             "withheldEntitled": len(items) - len(sendable), "blocked": dict(Counter(code for _, code, _ in blocked)),
             "blockedRecorded": blocks, "markers": dict(methods), "contexts": dict(documents.counts), "run": summary,
-            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge)}
+            "rows": dict(sorted(rows.items())), "judge": judge_summary(judge), **step_result(summary, judge)}
 
 
 def cmd_function(args: Any) -> dict[str, Any]:

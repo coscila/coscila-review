@@ -11,7 +11,16 @@ numeric-check@1, claim-match@1), whose validator modules expose ``build_messages
 - batches items with the instrument's geometry and request settings, stores every request and response by sha256,
   writes one receipt per call (served model, fingerprint, tokens, finish reason) and one judgment per item;
 - sends items without a valid output once more in a repair call when the instrument declares a repair pass;
-- stops at the first response from a model other than the pinned one (``model-drift``), leaving open items open.
+- stops at the first response from a model other than the pinned one (``model-drift``), and sends nothing more once a
+  broker judge's transport has halted (a fidelity stop, a budget, provider-limit, revocation or cancellation halt),
+  leaving open items open for the next invocation.
+
+``step_result`` gives every judging command the result contract of the census steps at the top level: ``state``
+(completed, or paused when the run stopped or items are still open), a ``reason`` with the census prefixes
+(``model_drift:``, ``fidelity:``, ``transport: broker halted:``, ``transport: N items still open``), ``resumeAfter``
+and ``transport`` (the broker transport's description, with its halt record) when there are any, and the totals
+``accepted``, ``invalid``, ``calls`` and ``reviews`` of the invocation (``reviews`` counts the units decided, which
+are loci or candidate sentences here, under the census field name).
 
 Judges follow ``claim_check.Judge`` (``complete(messages, settings=...) -> JudgeResponse``); ``FollowupHttpJudge`` adds
 the response fingerprint and the exact request bytes to it. A judge reached through the run principal's broker socket
@@ -40,6 +49,9 @@ from .followup_model import canonical, digest
 
 REPAIR_NOTE_KEY = "repair"
 PROVENANCE_KEY = "provenance"
+# How a broker judge names its own fidelity stops, and the halt codes the census treats as fidelity stops.
+FIDELITY_STOPS = frozenset({"fidelity", "request_mismatch"})
+FIDELITY_CODES = frozenset({"FIDELITY", "INSTRUMENT_MISMATCH", "INSTRUMENT_MESSAGE_MISMATCH", "WORKER_KEY_CONFLICT"})
 
 
 @dataclass(frozen=True)
@@ -223,6 +235,9 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
         return judge.complete(messages, settings=settings)
 
     left_open: list[dict[str, Any]] = []
+    outcomes: dict[str, str] = {}
+    if summary["stopped"] is None and pending:
+        summary["stopped"] = judge_stop(judge)
     with ThreadPoolExecutor(max_workers=max(1, int(concurrency))) as pool:
         while True:
             while queue or in_flight:
@@ -238,8 +253,11 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
                     batch, kind, messages, settings, started = in_flight.pop(future)
                     retry, failed = _record(connection, instrument, plan, judge, policy, model, batch, kind, messages,
                                             settings, started, future, summary, module=module, variant=variant,
-                                            code_revision=code_revision, study_bundle=study_bundle)
+                                            code_revision=code_revision, study_bundle=study_bundle, outcomes=outcomes)
                     left_open.extend(failed)
+                    if summary["stopped"] is None:
+                        # A halted broker transport sends nothing more: no further batch, repair or pass.
+                        summary["stopped"] = judge_stop(judge)
                     if retry and kind == "first" and plan.repair_passes > 0 and summary["stopped"] is None:
                         queue.append((retry, "repair"))
                 connection.commit()
@@ -247,6 +265,10 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
                 break
             sleep(float(cooldown) * (2 ** summary["passes"]))
             summary["passes"] += 1
+            if summary["stopped"] is None:
+                summary["stopped"] = judge_stop(judge)
+                if summary["stopped"] is not None:
+                    break
             again, left_open = left_open, []
             queue.extend((again[start:start + plan.items_per_call], "first")
                          for start in range(0, len(again), plan.items_per_call))
@@ -254,11 +276,67 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
         "SELECT DISTINCT item_key FROM fu_judgments WHERE instrument_digest=? AND tier=? AND variant=? AND outcome IN "
         "('accepted','rejected')", (instrument_digest, tier, variant))}
     summary["open"] = sum(1 for item in pending if item["id"] not in decided)
+    summary["invalid"] = sum(1 for outcome in outcomes.values() if outcome == "rejected")
+    summary["halted"] = transport_halted(judge)
     return summary
 
 
+def transport_halted(judge: Any) -> dict[str, Any] | None:
+    """The halt record (reason, code, resumeAfter) of a broker judge's transport, or None."""
+    halted = getattr(getattr(judge, "transport", None), "halted", None)
+    return dict(halted) if isinstance(halted, Mapping) and halted else None
+
+
+def judge_stop(judge: Any) -> str | None:
+    """Why a judge sends nothing more: ``fidelity`` (a broker judge's own stop or a fidelity halt code),
+    ``model-drift`` (the broker paused on another served model) or ``transport`` (any other halt), else None."""
+    stopped = getattr(judge, "stopped", None)
+    if stopped:
+        return "fidelity" if stopped in FIDELITY_STOPS else str(stopped)
+    halted = transport_halted(judge)
+    if not halted:
+        return None
+    code = halted.get("code")
+    if code == "MODEL_DRIFT":
+        return "model-drift"
+    return "fidelity" if code in FIDELITY_CODES else "transport"
+
+
+def step_result(summary: Mapping[str, Any] | None, judge: Any = None) -> dict[str, Any]:
+    """The census step contract of one judging invocation (see the module docstring)."""
+    summary = summary or {}
+    accepted = int(summary.get("accepted") or 0)
+    invalid = int(summary.get("invalid") or 0)
+    result: dict[str, Any] = {"state": "completed", "accepted": accepted, "invalid": invalid,
+                              "calls": int(summary.get("calls") or 0) + int(summary.get("repairCalls") or 0),
+                              "reviews": accepted + invalid}
+    halted = summary.get("halted") or (transport_halted(judge) if judge is not None else None)
+    stopped = summary.get("stopped")
+    left = int(summary.get("open") or 0)
+    reason = None
+    if stopped == "model-drift":
+        drift = summary.get("drift") or {}
+        reason = (f"model_drift: served {drift.get('served')!r}, required {drift.get('required')!r}" if drift else
+                  "model_drift: " + str((halted or {}).get("reason") or "the broker paused on another served model"))
+    elif stopped == "fidelity":
+        reason = "fidelity: " + str((halted or {}).get("reason") or "the broker refused the instrument call or "
+                                    "reported another request than the instrument built")
+    elif stopped == "transport" or halted:
+        reason = "transport: broker halted: " + str((halted or {}).get("reason") or "the transport halted")
+    elif left:
+        reason = f"transport: {left} items still open after {int(summary.get('passes') or 0)} further passes"
+    if reason:
+        result.update(state="paused", reason=reason + "; run the command again to resume")
+        if halted and halted.get("resumeAfter"):
+            result["resumeAfter"] = halted["resumeAfter"]
+    describe = getattr(getattr(judge, "transport", None), "describe", None)
+    if callable(describe):
+        result["transport"] = describe()
+    return result
+
+
 def _record(connection, instrument, plan, judge, policy, model, batch, kind, messages, settings, started, future,
-            summary, *, module, variant, code_revision, study_bundle) -> tuple[list, list]:
+            summary, *, module, variant, code_revision, study_bundle, outcomes=None) -> tuple[list, list]:
     """Write the receipt and judgments of one finished call; returns the items to repair and the items left open."""
     request = _request_bytes(judge, messages, settings)
     request_sha = store_artifact(connection, request, "judge-request", "application/json")
@@ -278,6 +356,7 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
     elif served != model or not policy.served_model_allowed(judge, served):
         outcome, error = "model-drift", f"served model {served!r} differs from the pinned model"
         summary["stopped"] = "model-drift"
+        summary["drift"] = {"served": served, "required": model}
     usage = getattr(reply, "usage", None) or {}
     classes = sorted({item.get(PROVENANCE_KEY) for item in batch})
     connection.execute(
@@ -296,9 +375,11 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
     result = module.validate_response([_sendable(item) for item in batch], reply.text)
     created = now()
     retry = []
+    outcomes = outcomes if outcomes is not None else {}
     for item in batch:
         key = item["id"]
         if key in result["accepted"]:
+            outcomes[key] = "accepted"
             connection.execute("INSERT INTO fu_judgments(instrument_id, instrument_digest, tier, variant, item_key, "
                                "call_id, outcome, verdict_json, error_code, error, created_at) "
                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -312,6 +393,8 @@ def _record(connection, instrument, plan, judge, policy, model, batch, kind, mes
                            (instrument.id, instrument.digest, plan.tier, variant, key, call_id, "rejected", None,
                             failure.get("code"), str(failure.get("message"))[:300], created))
         summary["rejected"] += 1
+        if outcomes.get(key) != "accepted":
+            outcomes[key] = "rejected"
         if failure.get("retryable"):
             retry.append(item)
     return retry, []
