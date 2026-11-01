@@ -57,6 +57,9 @@ class MockJudge:
         self.drop_first_labels: set[str] = set()     # left out of first calls only (a repair call answers them)
         self.never_labels: set[str] = set()          # never answered
         self.repair_requests: list[dict] = []
+        self.drop_multi_labels: set[str] = set()     # left out of calls with more than one item (a single-item call answers)
+        self.malformed_labels: set[str] = set()      # answered with a line the validator rejects (a bad category)
+        self.dropped_lines = self.malformed_lines = 0
 
     def answer(self, k: int, payload: dict) -> tuple[str, str]:
         user = payload["messages"][1]["content"]
@@ -64,8 +67,13 @@ class MockJudge:
         repair = user.split("\n")[1] == C.repair_note()
         if repair:
             self.repair_requests.append(payload)
-        labels = [label for label in labels if label not in self.never_labels
-                  and (repair or label not in self.drop_first_labels)]
+        multi = len(labels) > 1
+        kept = [label for label in labels if label not in self.never_labels
+                and (repair or label not in self.drop_first_labels)
+                and not (multi and label in self.drop_multi_labels)]
+        self.dropped_lines += sum(1 for label in labels if multi and label in self.drop_multi_labels
+                                  and label not in self.never_labels)
+        labels = kept
         if self.empty_every and k % self.empty_every == 0:
             self.empty += 1
             return "", "stop"
@@ -76,8 +84,9 @@ class MockJudge:
         if self.length_every and k % self.length_every == 0:
             self.truncated += 1
             finish = "length"
-        lines = [json.dumps({"l": label, "c": "T", "v": "direct", "q": "", "e": 0, "r": "mock rationale"})
-                 for label in labels]
+        lines = [json.dumps({"l": label, "c": "Q" if label in self.malformed_labels else "T", "v": "direct", "q": "",
+                             "e": 0, "r": "mock rationale"}) for label in labels]
+        self.malformed_lines += sum(1 for label in labels if label in self.malformed_labels)
         return "\n".join(lines), finish
 
     def metrics(self) -> tuple[int, bytes]:

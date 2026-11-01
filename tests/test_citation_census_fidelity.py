@@ -11,14 +11,16 @@ study inputs.
 Setting OCSL_REVIEW_CENSUS_FIDELITY_RECORDS to a JSON-lines file of recorded
 calls (title, journal, items, note, and any of systemSha256, userSha256 and
 messagesSha256, the sha256 of the JSON message list) adds a check against a
-private record set. Every digest a record carries must match the rebuilt call;
-a record whose user digest is the digest of an empty string holds no rebuilt
-prompt and is counted as unusable, never as a pass, and the check needs at least
-one usable record for every journal it holds. Records for each journal have to
-come from that journal's own recorded calls. The check reports, per journal, the
-records, the usable and passing ones, the failing ones by digest, the usable ones
-by items per call and those with a cut abstract or a repair note, plus the sha256
-of the record file; it goes to standard error and, with
+private record set. Every digest a record carries must match the rebuilt call.
+A record whose user digest is the digest of an empty string holds no recorded
+user prompt: it is checked on its system digest alone (counted as system-only,
+never as a full pass), and a record without any other digest is unusable. The
+check needs at least one checked record for every journal it holds and reports
+whether any user prompt was verified. Records for each journal have to come from
+that journal's own recorded calls. The check reports, per journal, the records,
+the usable (full) and passing ones, the system-only ones, the failing ones by
+digest, the usable ones by items per call and those with a cut abstract or a
+repair note, plus the sha256 of the record file; it goes to standard error and, with
 OCSL_REVIEW_CENSUS_FIDELITY_REPORT set, to that file (counts and journal names
 only, never record content). It runs offline:
 
@@ -374,14 +376,19 @@ DIGESTS = ("systemSha256", "userSha256", "messagesSha256")
 
 
 def record_outcome(record: dict) -> tuple[str, list[str]]:
-    """('unusable', []) for an empty recorded prompt, else ('pass' or 'fail', the digests that differ).
+    """The outcome of one record and the digests that differ.
 
     A record carries any of systemSha256, userSha256 and messagesSha256 (sha256 of the JSON message list,
-    ensure_ascii=False). A user digest equal to the digest of the empty string means that no prompt was
-    rebuilt when the record was made; such a record cannot check anything and is counted apart.
+    ensure_ascii=False). Outcomes: 'pass' or 'fail' when the user prompt was recorded; 'system-pass' or
+    'system-fail' when the user digest is the digest of the empty string (no user prompt was recorded) but a
+    system digest is, which is then the only digest checked; 'unusable' when neither remains.
     """
     if record.get("userSha256") == EMPTY_SHA256:
-        return "unusable", []
+        system = record.get("systemSha256")
+        if not system or system == EMPTY_SHA256:
+            return "unusable", []
+        messages = C.build_abstract_messages(record["items"], record["title"], record["journal"], note=record.get("note", ""))
+        return ("system-fail", ["systemSha256"]) if C.digests(messages)["systemSha256"] != system else ("system-pass", [])
     if not any(record.get(name) for name in DIGESTS):
         raise AssertionError("a fidelity record carries no digest")
     messages = C.build_abstract_messages(record["items"], record["title"], record["journal"], note=record.get("note", ""))
@@ -391,13 +398,14 @@ def record_outcome(record: dict) -> tuple[str, list[str]]:
 
 
 def check_record(record: dict) -> str:
-    """'checked' when every digest a record carries matches the rebuilt call; 'unusable' for an empty recorded prompt."""
+    """'checked' when every digest a record carries matches the rebuilt call, 'system-checked' when only its system
+    digest could be checked and matches, 'unusable' when nothing can be checked."""
     outcome, differs = record_outcome(record)
     if outcome == "unusable":
         return "unusable"
     if differs:
         raise AssertionError(f"{differs[0]} differs for a recorded {record['journal']} call")
-    return "checked"
+    return "system-checked" if outcome == "system-pass" else "checked"
 
 
 ITEM_BUCKETS = (("1", 1, 1), ("2-9", 2, 9), ("10-39", 10, 39), ("40", 40, None))
@@ -417,6 +425,7 @@ def check_records(lines) -> dict:
         record = json.loads(line)
         row = journals.setdefault(str(record.get("journal")), {
             "records": 0, "unusable": 0, "usable": 0, "passing": 0, "failing": 0,
+            "systemOnly": 0, "systemOnlyPassing": 0, "systemOnlyFailing": 0,
             "failingBy": {name: 0 for name in DIGESTS},
             "usableByItemsPerCall": {name: 0 for name, _, _ in ITEM_BUCKETS},
             "usableWithCutAbstract": 0, "usableRepairCalls": 0})
@@ -424,6 +433,14 @@ def check_records(lines) -> dict:
         outcome, differs = record_outcome(record)
         if outcome == "unusable":
             row["unusable"] += 1
+            continue
+        if outcome in ("system-pass", "system-fail"):
+            row["systemOnly"] += 1
+            if outcome == "system-pass":
+                row["systemOnlyPassing"] += 1
+            else:
+                row["systemOnlyFailing"] += 1
+                row["failingBy"]["systemSha256"] += 1
             continue
         row["usable"] += 1
         items = record.get("items") or []
@@ -439,16 +456,23 @@ def check_records(lines) -> dict:
             row["failing"] += 1
             for name in differs:
                 row["failingBy"][name] += 1
+    for row in journals.values():
+        row["userPromptVerified"] = row["passing"] > 0
     problems = [f"{journal}: {row['failing']} of {row['usable']} usable records differ"
                 for journal, row in sorted(journals.items()) if row["failing"]]
+    problems += [f"{journal}: {row['systemOnlyFailing']} of {row['systemOnly']} system-only records differ"
+                 for journal, row in sorted(journals.items()) if row["systemOnlyFailing"]]
     problems += [f"{journal}: no usable record ({row['unusable']} unusable)"
-                 for journal, row in sorted(journals.items()) if not row["usable"]]
+                 for journal, row in sorted(journals.items()) if not row["usable"] and not row["systemOnly"]]
     if not journals:
         problems.append("the record set holds no record")
     return {"format": "ocsl-census-fidelity-check@1", "ok": not problems, "problems": problems,
             "records": sum(row["records"] for row in journals.values()),
             "usable": sum(row["usable"] for row in journals.values()),
-            "passing": sum(row["passing"] for row in journals.values()), "journals": journals}
+            "passing": sum(row["passing"] for row in journals.values()),
+            "systemOnly": sum(row["systemOnly"] for row in journals.values()),
+            "userPromptVerified": all(row["userPromptVerified"] for row in journals.values()) if journals else False,
+            "journals": journals}
 
 
 def run_record_check(path: Path, report: Path | None = None, *, echo: bool = True) -> dict:
@@ -494,14 +518,19 @@ class RecordCheckTests(unittest.TestCase):
         self.assertEqual("checked", check_record({**self.base, "note": C.repair_note(),
                                                   "messagesSha256": C.digests(repair)["messagesSha256"]}))
 
-    def test_an_empty_recorded_prompt_is_unusable_not_a_pass(self):
-        self.assertEqual("unusable", check_record({**self.base, "userSha256": EMPTY_SHA256, "systemSha256": "0" * 64}))
+    def test_an_empty_recorded_prompt_checks_the_system_digest_alone_never_a_full_pass(self):
+        system = C.digests(self.messages)["systemSha256"]
+        self.assertEqual("system-checked", check_record({**self.base, "userSha256": EMPTY_SHA256, "systemSha256": system}))
+        with self.assertRaises(AssertionError):
+            check_record({**self.base, "userSha256": EMPTY_SHA256, "systemSha256": "0" * 64})
+        self.assertEqual("unusable", check_record({**self.base, "userSha256": EMPTY_SHA256}))
+        self.assertEqual("unusable", check_record({**self.base, "userSha256": EMPTY_SHA256, "systemSha256": EMPTY_SHA256}))
         with self.assertRaises(AssertionError):
             check_record(dict(self.base))
 
     def synthetic_record_set(self) -> list[dict]:
         """Records of two journals built from the synthetic fixture: batches of 1, 3, 12 and 40 items, one with a cut
-        abstract, one repair call, and one unusable record per journal."""
+        abstract, one repair call, one system-only record (no recorded user prompt) and one unusable record per journal."""
         items = load("judge_items.json")["papers"][0]["items"]
         long = {**items[0], "abstract": "Synthetic abstract sentence. " * 200}
         records = []
@@ -518,6 +547,7 @@ class RecordCheckTests(unittest.TestCase):
                             "userSha256": C.digests(C.build_repair_messages(repair, REVIEW_TITLE, journal))["userSha256"]})
             records.append({"title": REVIEW_TITLE, "journal": journal, "items": items[:2], "userSha256": EMPTY_SHA256,
                             "systemSha256": SYSTEM[journal]})
+            records.append({"title": REVIEW_TITLE, "journal": journal, "items": items[:2], "userSha256": EMPTY_SHA256})
         return records
 
     def test_a_synthetic_record_set_is_reported_per_journal_offline(self):
@@ -529,14 +559,17 @@ class RecordCheckTests(unittest.TestCase):
             self.assertEqual(result, json.loads(report.read_text()))
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), result["recordFile"]["sha256"])
         self.assertTrue(result["ok"], result["problems"])
-        self.assertEqual((14, 12, 12), (result["records"], result["usable"], result["passing"]))
+        self.assertEqual((16, 12, 12, 2), (result["records"], result["usable"], result["passing"], result["systemOnly"]))
+        self.assertTrue(result["userPromptVerified"])
         cut = sum(1 for r in records if r["journal"] == "Frontiers in Oncology" and r.get("userSha256") != EMPTY_SHA256
                   and any(len(item["abstract"] or "") > C.abstract_cut() for item in r["items"]))
         self.assertGreater(cut, 0)
         for journal in ("Frontiers in Oncology", "Nature Reviews Clinical Oncology"):
             row = result["journals"][journal]
-            self.assertEqual({"records": 7, "unusable": 1, "usable": 6, "passing": 6, "failing": 0},
-                             {k: row[k] for k in ("records", "unusable", "usable", "passing", "failing")})
+            self.assertEqual({"records": 8, "unusable": 1, "usable": 6, "passing": 6, "failing": 0, "systemOnly": 1,
+                              "systemOnlyPassing": 1, "systemOnlyFailing": 0},
+                             {k: row[k] for k in ("records", "unusable", "usable", "passing", "failing", "systemOnly",
+                                                  "systemOnlyPassing", "systemOnlyFailing")})
             self.assertEqual({"1": 1, "2-9": 3, "10-39": 1, "40": 1}, row["usableByItemsPerCall"])
             self.assertEqual((cut, 1), (row["usableWithCutAbstract"], row["usableRepairCalls"]))
         self.assertNotIn(REVIEW_TITLE, json.dumps(result), "the report carries no record content")
@@ -548,11 +581,22 @@ class RecordCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(1, result["journals"]["Frontiers in Oncology"]["failingBy"]["userSha256"])
         self.assertIn("Frontiers in Oncology: 1 of 6 usable records differ", result["problems"])
-        only_unusable = [r for r in self.synthetic_record_set() if r.get("userSha256") == EMPTY_SHA256]
+        only_unusable = [r for r in self.synthetic_record_set() if r.get("userSha256") == EMPTY_SHA256 and not r.get("systemSha256")]
         result = check_records(json.dumps(r) for r in only_unusable)
         self.assertFalse(result["ok"])
         self.assertIn("Nature Reviews Clinical Oncology: no usable record (1 unusable)", result["problems"])
         self.assertFalse(check_records([])["ok"])
+
+    def test_system_only_records_check_the_system_prompt_and_say_no_user_prompt_was_verified(self):
+        system_only = [r for r in self.synthetic_record_set() if r.get("userSha256") == EMPTY_SHA256 and r.get("systemSha256")]
+        result = check_records(json.dumps(r) for r in system_only)
+        self.assertTrue(result["ok"], result["problems"])
+        self.assertEqual((2, 0, 2), (result["records"], result["usable"], result["systemOnly"]))
+        self.assertFalse(result["userPromptVerified"])
+        wrong = [{**system_only[0], "systemSha256": SYSTEM["Nature Reviews Clinical Oncology"]}, system_only[1]]
+        result = check_records(json.dumps(r) for r in wrong)
+        self.assertFalse(result["ok"])
+        self.assertIn("Frontiers in Oncology: 1 of 1 system-only records differ", result["problems"])
 
 
 @unittest.skipUnless(os.environ.get("OCSL_REVIEW_CENSUS_FIDELITY_RECORDS"), "private fidelity records not configured")
