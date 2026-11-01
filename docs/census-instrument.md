@@ -290,20 +290,41 @@ body) is therefore checked against Europe PMC's record of the PMCID
 at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
 a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
 without that field, hits that list other PMCIDs only, or a search without a
-usable answer keep the error transient. No record at all (zero hits)
-contradicts the Europe PMC record the PMCID came from, so it concludes nothing
-at first: the record is checked again at the next server error before the last
-attempt, and only a second answer without a record is a definitive miss. A 404,
-a 410 or another client error is Europe PMC's own definitive answer; throttling
-(408, 425, 429), timeouts and dropped connections get no record check. Each
-`study full-text` result counts the escalated entries that invocation closed
-without a window by reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`,
-`noRecord`, `notFound` (404, 410 or another client error), `entitledBlocked`
-and `other` (an unreadable fullTextXML, no live retrieval, a fetcher that names
-no reason). `noRecord` should stay 0, because every PMCID of the census comes
-from a Europe PMC record; a non-zero count points to a fault of Europe PMC's
-search, and `--retry-failed` reopens those entries (with every other
-`fetch-failed` entry).
+usable answer keep the error transient. Each fetch checks the record once. No
+record at all (zero hits) contradicts the Europe PMC record the PMCID came
+from, and an empty or rebuilding search index answers the same, so one such
+answer concludes nothing. The fetcher (one per `study full-text` invocation,
+shared by its fetch threads) remembers when its search first found no record of
+each PMCID, and such a PMCID is a definitive miss only when all of this holds:
+its answers without a record span at least 60 s, which normally takes a later
+pass of the same invocation (the first further pass starts a
+`--transport-cooldown` of 60 s after the one before), while its own record or
+full text in between starts the span over; the fetch was not throttled; and one
+search for the PMCID and a sentinel together (`PMCID:<id> OR PMCID:<sentinel>`)
+returns the sentinel's own record and none of the PMCID, with every hit on its
+page. The sentinel is the newest other PMCID the fetcher saw in Europe PMC's
+index during the invocation (a full text it served, or a search that returned
+that PMCID's own record); a fetcher that has seen none names PMC2000001, a 1922
+record Europe PMC has indexed since 2009 (a sentinel needs a record, not a full
+text). The PMCID's absence and the sentinel's record thus come from one answer,
+so from one state of the index. When that search fails (a server error,
+throttling, a timeout), finds neither PMCID, or finds the PMCID's own record
+(which starts its span over), the entry stays open. An empty index therefore
+closes nothing, nor does one that answers some searches from an empty copy; an
+index rebuilt piecemeal can close a PMCID it has lacked for at least 60 s while
+it held the sentinel. With `--transport-retries 0`, or cooldowns far below 60 s,
+a PMCID without any record stays open instead. A 404, a 410 or another client
+error is Europe PMC's own definitive answer; throttling (408, 425, 429),
+timeouts and dropped connections get no record check. Each `study full-text`
+result counts the escalated entries that invocation closed without a window by
+reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`, `noRecord`, `notFound`
+(404, 410 or another client error), `entitledBlocked` and `other` (an unreadable
+fullTextXML, no live retrieval, a fetcher that names no reason). `noRecord`
+should stay 0, because every PMCID of the census comes from a Europe PMC record;
+a non-zero count means Europe PMC's search lacked those PMCIDs for at least 60 s
+and then held another PMCID's record but not theirs in one answer (a withdrawn
+record, or an index rebuilt piecemeal), and `--retry-failed` reopens those
+entries (with every other `fetch-failed` entry).
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and

@@ -31,6 +31,13 @@ from .errors import ValidationError
 EUROPE_PMC_FULL_TEXT = "https://www.ebi.ac.uk/europepmc/webservices/rest/%s/fullTextXML"
 # The search the census's abstracts step uses; the full-text fetcher asks it for one PMCID's record after a server error.
 EUROPE_PMC_SEARCH = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+# How long a PMCID's answers without any Europe PMC record must span before they decide a miss: longer than one fetch
+# with its retries, so the confirming answer comes from a later pass of the same invocation, a cooldown later.
+NO_RECORD_SECONDS = 60.0
+# The sentinel the full-text fetcher names beside such a PMCID when it has seen no other PMCID in Europe PMC's index:
+# a 1922 issue of Public Health Reports that Europe PMC has indexed since 2009 (its lite record, outside the
+# open-access subset, is the recorded answer in tests/fixtures/europe_pmc). A sentinel needs a record, not a full text.
+NO_RECORD_FALLBACK_SENTINEL = "PMC2000001"
 
 
 def add_commands(families, register):
@@ -236,54 +243,72 @@ def _caches(args):
 
 
 def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tuple[float, ...] = (2.0, 5.0, 10.0),
-                       opener: Any = None, sleep: Any = time.sleep):
+                       opener: Any = None, sleep: Any = time.sleep, clock: Any = None):
     """Fetch fullTextXML by PMCID; each fetching thread pauses ``spacing`` seconds between its requests.
 
     A 404, a 410 or another definitive client error means there is no open-access full text (None). Europe PMC serves
     fullTextXML for its open-access subset only and answers every other PMCID (free-to-read articles and author
     manuscripts included) with HTTP 500, not 404. So a server error (and a 401 or 403 from the service's edge, or a
-    200 with an empty body) is checked against Europe PMC's own record of the PMCID (``PMCID:<id>`` on the search
-    the census's abstracts step uses), at the census's spacing:
+    200 with an empty body) is checked once per fetch against Europe PMC's own record of the PMCID (``PMCID:<id>`` on
+    the search the census's abstracts step uses), at the census's spacing:
 
     - a record whose ``isOpenAccess`` is ``N`` (outside the open-access subset) is a definitive miss (None);
     - a record whose ``isOpenAccess`` is ``Y`` makes the error an outage, retried with backoff;
     - an answer that concludes nothing (a failed or unreadable search, hits without the PMCID, a matching record
       without ``isOpenAccess`` Y or N) leaves the error transient;
-    - no record at all (hitCount 0) contradicts the record the PMCID came from, so it concludes nothing either: the
-      record is checked again on the next server error before the last attempt, and only a second answer without a
-      record makes the PMCID a definitive miss.
+    - no record at all (hitCount 0) contradicts the record the PMCID came from, and an empty or rebuilding index
+      answers the same, so on its own it concludes nothing. It is a definitive miss only when this fetcher's answers
+      without a record of the PMCID span at least ``NO_RECORD_SECONDS`` (normally the confirming answer comes from a
+      later pass of the same invocation; the PMCID's own record or full text starts the span over), the fetch was not
+      throttled, and one search for the PMCID and a sentinel together (``PMCID:<id> OR PMCID:<sentinel>``) returns
+      the sentinel's own record and none of the PMCID, every hit on its page: one answer, so one state of the index,
+      speaks for both, and an index that answers some searches from an empty copy cannot close the entry. The
+      sentinel is the newest other PMCID this fetcher saw in the index (a full text it served, or a search that
+      returned that PMCID's own record), else ``NO_RECORD_FALLBACK_SENTINEL``. When that search fails, finds neither
+      or finds the PMCID's record (which ends its absence), nothing is concluded.
 
     Throttling (408, 425, 429), timeouts and dropped connections get no record check. Whatever stays undecided
     after the last attempt raises ``RetryableFetch``, so the entry stays open for the next pass instead of becoming
     a failed retrieval. After a definitive miss ``fetch.miss_reason(pmcid)`` names why in the fetching thread
     (``census_runner.FULL_TEXT_MISS_REASONS``: notFound, notOpenAccess, noRecord), so the census counts its entries
-    without a full text by reason. Every request names the census inputs' User-Agent and asks for XML (the record
-    check for JSON); it carries identifiers only (no contact address, no credentials, no cookies), as the census's
-    other Europe PMC requests do.
+    without a full text by reason. The fetching threads share the absences and sentinels, which last as long as the
+    fetcher (one ``study full-text`` invocation). Every request names the census inputs' User-Agent and asks for XML
+    (the record check for JSON); it carries identifiers only (no contact address, no credentials, no cookies), as the
+    census's other Europe PMC requests do.
     """
     from .census_inputs import USER_AGENT
     from .census_runner import RetryableFetch
     state = threading.local()
+    monotonic = clock or time.monotonic
     headers = {"Accept": "application/xml", "User-Agent": USER_AGENT}
     search_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     notes = {"open-access": "; Europe PMC lists it as open access",
-             "no-record": "; Europe PMC's search found no record of it in one check",
+             "no-record": "; Europe PMC's search found no record of it, not confirmed",
              None: "; its Europe PMC record could not be checked"}
+    throttling = (408, 425, 429)
+    lock = threading.Lock()
+    absent_since: dict[str, float] = {}     # PMCID -> when the search first found no record of it since it was seen
+    sentinels: list[str] = []               # the last two PMCIDs seen in Europe PMC's index, the newest first
 
     def pace() -> None:
-        wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
+        wait = getattr(state, "last", 0.0) + spacing - monotonic()
         if wait > 0:
             sleep(wait)
-        state.last = time.monotonic()
+        state.last = monotonic()
 
-    def record_of(pmcid: str) -> str | None:
-        """Europe PMC's record of ``pmcid``: "open-access" or "not-open-access" when a matching record says
-        ``isOpenAccess`` Y (any of them) or N (all of them), "no-record" when the search found nothing (hitCount 0),
-        and None when the answer concludes nothing."""
+    def seen(pmcid: str) -> None:
+        """``pmcid`` is in Europe PMC's index: a sentinel for other PMCIDs, and any absence of it is over."""
+        with lock:
+            absent_since.pop(pmcid, None)
+            sentinels[:] = [pmcid, *[other for other in sentinels if other != pmcid][:1]]
+
+    def search(query: str, page_size: int) -> tuple[int, list[Any]] | None:
+        """One paced search of Europe PMC: its hitCount and the page's results, or None for a failed or unreadable
+        answer."""
         pace()
-        query = urllib.parse.urlencode({"query": f"PMCID:{pmcid}", "format": "json", "resultType": "lite",
-                                        "pageSize": 5})
-        request = urllib.request.Request(EUROPE_PMC_SEARCH + "?" + query, headers=search_headers)
+        parameters = urllib.parse.urlencode({"query": query, "format": "json", "resultType": "lite",
+                                             "pageSize": page_size})
+        request = urllib.request.Request(EUROPE_PMC_SEARCH + "?" + parameters, headers=search_headers)
         try:
             with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                 if getattr(response, "status", 200) != 200:
@@ -295,14 +320,55 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
         results = listing.get("result") if isinstance(listing, dict) else None
         if not isinstance(results, list) or not isinstance(answer.get("hitCount"), int):
             return None
+        return answer["hitCount"], results
+
+    def record_of(pmcid: str) -> str | None:
+        """Europe PMC's record of ``pmcid``: "open-access" or "not-open-access" when a matching record says
+        ``isOpenAccess`` Y (any of them) or N (all of them), "listed" for matching records without either, "no-record"
+        when the search found nothing (hitCount 0), and None when the answer concludes nothing."""
+        answer = search(f"PMCID:{pmcid}", 5)
+        if answer is None:
+            return None
+        hits, results = answer
         records = [record for record in results
                    if isinstance(record, dict) and str(record.get("pmcid") or "").upper() == pmcid.upper()]
         if not records:
-            return "no-record" if answer["hitCount"] == 0 and not results else None
+            return "no-record" if hits == 0 and not results else None
+        seen(pmcid)
         flags = {record.get("isOpenAccess") for record in records}
         if "Y" in flags:
             return "open-access"
-        return "not-open-access" if flags == {"N"} else None
+        return "not-open-access" if flags == {"N"} else "listed"
+
+    def absent_for(pmcid: str) -> float:
+        """Seconds since the search first found no record of ``pmcid`` (0 at the first such answer)."""
+        now = monotonic()
+        with lock:
+            return now - absent_since.setdefault(pmcid, now)
+
+    def index_answers(target: str) -> bool:
+        """Whether Europe PMC's index answers while it lacks ``target``: one search for ``target`` and a sentinel
+        together returns the sentinel's own record and none of ``target``, every hit on its page. The sentinel is the
+        newest PMCID other than ``target`` seen in the index, else NO_RECORD_FALLBACK_SENTINEL (no sentinel, and no
+        search, when that is ``target``). A record of ``target`` in the answer ends its absence."""
+        with lock:
+            sentinel = next((pmcid for pmcid in sentinels if pmcid.upper() != target.upper()), None)
+        if sentinel is None and target.upper() != NO_RECORD_FALLBACK_SENTINEL:
+            sentinel = NO_RECORD_FALLBACK_SENTINEL
+        if sentinel is None:
+            return False
+        answer = search(f"PMCID:{target} OR PMCID:{sentinel}", 10)
+        if answer is None:
+            return False
+        hits, results = answer
+        listed = {str(record.get("pmcid") or "").upper() for record in results if isinstance(record, dict)}
+        if target.upper() in listed:
+            seen(target)
+            return False
+        if sentinel.upper() not in listed or hits > len(results):
+            return False
+        seen(sentinel)
+        return True
 
     def miss(pmcid: str, reason: str) -> None:
         state.miss = (pmcid, reason)
@@ -310,7 +376,7 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
 
     def fetch(pmcid: str) -> bytes | None:
         state.miss = None
-        error, note, checks, unlisted = "no attempt", "", 0, False
+        error, note, checked, throttled = "no attempt", "", False, False
         tries = max(1, attempts)
         for attempt in range(tries):
             last = attempt + 1 >= tries
@@ -326,22 +392,27 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as failure:
                 error = type(failure).__name__
             if status == 200 and body.strip():
+                seen(pmcid)
                 return body
             if status is not None:
                 error = "HTTP 200 with an empty body" if status == 200 else f"HTTP {status}"
-                if 400 <= status < 500 and status not in (401, 403, 408, 425, 429):
+                throttled = throttled or status in throttling
+                if 400 <= status < 500 and status not in (401, 403, *throttling):
                     return miss(pmcid, "notFound")
                 checkable = status == 200 or status in (401, 403) or 500 <= status < 600
-                if checkable and (checks == 0 or (unlisted and not last)):
+                if checkable and not checked:
                     # A PMCID outside the open-access subset gets a server error, not 404: Europe PMC's record decides
-                    # whether this is a miss or an outage; no record at all decides only when a second check agrees.
-                    checks += 1
+                    # whether this is a miss or an outage. No record at all decides only once that absence has lasted
+                    # NO_RECORD_SECONDS, in a fetch that was not throttled, while one search finds the sentinel's
+                    # record and still none of the PMCID.
+                    checked = True
                     listed = record_of(pmcid)
                     if listed == "not-open-access":
                         return miss(pmcid, "notOpenAccess")
-                    if listed == "no-record" and unlisted:
-                        return miss(pmcid, "noRecord")
-                    unlisted = listed == "no-record"
+                    if listed == "no-record":
+                        lasting = absent_for(pmcid) >= NO_RECORD_SECONDS
+                        if lasting and not throttled and index_answers(pmcid):
+                            return miss(pmcid, "noRecord")
                     note = notes.get(listed, notes[None])
             if not last:
                 sleep(backoff[min(attempt, len(backoff) - 1)])
