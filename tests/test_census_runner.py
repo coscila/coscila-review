@@ -814,8 +814,11 @@ class RetryableFetchTests(RunnerTestCase):
         run = self.run_census()
         self.prepare(run)
         run.run_abstract()
-        run.run_full_text(fetch_xml=lambda pmcid: None)
+        missed = run.run_full_text(fetch_xml=lambda pmcid: None)
         self.assertEqual(3, self.rows("SELECT COUNT(*) AS n FROM citations WHERE ft_retrieval='fetch-failed'")[0]["n"])
+        # A fetcher that names no reason for its misses: the entries count as other failed retrievals.
+        self.assertEqual({"noPmcid": 2, "notOpenAccess": 0, "noRecord": 0, "notFound": 0, "entitledBlocked": 0,
+                          "other": 3}, missed["withoutFullText"])
         self.assertEqual(0, run.run_full_text(fetch_xml=full_text_fetcher([]))["retrieved"])
         again = run.run_full_text(fetch_xml=full_text_fetcher([]), retry_failed=True)
         self.assertEqual(("completed", 3), (again["state"], again["retrieved"]))
@@ -930,6 +933,8 @@ class RetryableFetchTests(RunnerTestCase):
                                    cooldown=0)
         self.assertEqual(("completed", 1, 0, 1), (result["state"], result["retrieved"], result["fetchRetries"],
                                                  result["passes"]))
+        self.assertEqual({"noPmcid": 2, "notOpenAccess": 1, "noRecord": 1, "notFound": 0, "entitledBlocked": 0,
+                          "other": 0}, result["withoutFullText"])
         self.assertEqual({"PMC900007", "PMC900015"}, {pmcid for pmcid, in self.rows_of(
             "SELECT w.pmcid FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
             "WHERE c.ft_retrieval='fetch-failed' AND c.ft_provenance='unavailable'")})
@@ -937,6 +942,10 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual(sorted(["fullTextXML PMC900005", "fullTextXML PMC900007", "search PMC900007",
                                  "fullTextXML PMC900015", "search PMC900015", "fullTextXML PMC900015",
                                  "search PMC900015"]), sorted(europe_pmc.log))
+        # The next invocation finds nothing open: it closes nothing.
+        again = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+                                  cooldown=0)
+        self.assertEqual(dict.fromkeys(result["withoutFullText"], 0), again["withoutFullText"])
 
     def test_a_europe_pmc_outage_keeps_full_text_entries_open(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
