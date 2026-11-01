@@ -1324,8 +1324,16 @@ def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable
     spec = _spec(spec_value)
     output = Path(output)
     receipt_path = Path(str(output) + ".receipt.json")
-    if output.exists() or receipt_path.exists():
-        raise ValidationError("enumeration output already exists; enumerate into a new path")
+    if receipt_path.exists():
+        # The receipt is written last: the enumeration finished. The same spec again (a step submitted again after its
+        # process stopped) returns it, verified against its kept pages; anything else is refused.
+        existing = _enumerated_already(spec, output, receipt_path)
+        if existing is None:
+            raise ValidationError("enumeration output already exists; enumerate into a new path")
+        return existing
+    # A manifest without its receipt: an enumeration stopped before it finished, enumerated again (the kept pages are
+    # content-addressed and stay).
+    output.unlink(missing_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     pages_dir = Path(str(output) + ".pages")
     pages_dir.mkdir(exist_ok=True)
@@ -1378,9 +1386,34 @@ def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable
                "reviewsSha256": hashlib.sha256(canonical(reviews).encode()).hexdigest(),
                "manifest": {"path": output.name, "sha256": sha256_bytes(output.read_bytes()), "records": len(manifest)},
                "pages": pages_dir.name}
-    receipt_path.write_text(json.dumps(receipt, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    partial = Path(str(receipt_path) + ".incoming")
+    partial.write_text(json.dumps(receipt, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(partial, receipt_path)
     return {"output": str(output), "receipt": str(receipt_path), "records": len(manifest),
             "groups": [{k: g[k] for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")} for g in groups]}
+
+
+def _enumerated_already(spec: Mapping[str, Any], output: Path, receipt_path: Path) -> dict[str, Any] | None:
+    """The result of an enumeration that finished with this spec (receipt and manifest as written, pages verified), or
+    None."""
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(receipt, dict) or json.dumps(receipt.get("spec"), sort_keys=True) != json.dumps(spec, sort_keys=True)
+            or not output.is_file()):
+        return None
+    try:
+        load_enumeration(receipt_path)
+    except ValidationError:
+        return None
+    manifest = receipt.get("manifest") or {}
+    if manifest.get("sha256") != sha256_bytes(output.read_bytes()):
+        return None
+    return {"output": str(output), "receipt": str(receipt_path), "records": manifest.get("records"),
+            "groups": [{k: g.get(k) for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")}
+                       for g in receipt.get("groups") or []],
+            "alreadyEnumerated": True}
 
 
 @dataclass
