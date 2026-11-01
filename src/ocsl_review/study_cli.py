@@ -237,10 +237,14 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
 
     A 404 or another definitive client error means there is no open-access full text (None). Throttling
     (429), server errors, timeouts and dropped connections are retried with backoff and then raise
-    ``RetryableFetch``, so the entry stays open for the next run instead of becoming a failed retrieval.
+    ``RetryableFetch``, so the entry stays open for the next run instead of becoming a failed retrieval. Every
+    request names the census inputs' User-Agent and asks for XML; it carries identifiers only (no contact address,
+    no credentials, no cookies), as the census's other Europe PMC requests do.
     """
+    from .census_inputs import USER_AGENT
     from .census_runner import RetryableFetch
     state = threading.local()
+    headers = {"Accept": "application/xml", "User-Agent": USER_AGENT}
 
     def fetch(pmcid: str) -> bytes | None:
         error = "no attempt"
@@ -249,8 +253,9 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
             if wait > 0:
                 sleep(wait)
             state.last = time.monotonic()
+            request = urllib.request.Request(EUROPE_PMC_FULL_TEXT % pmcid, headers=headers)
             try:
-                with (opener or urllib.request.urlopen)(EUROPE_PMC_FULL_TEXT % pmcid, timeout=90) as response:
+                with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     body = response.read()
                     status = getattr(response, "status", 200)
                 if status == 200:
