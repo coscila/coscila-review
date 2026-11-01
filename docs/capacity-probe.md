@@ -378,10 +378,14 @@ review as the tier groups them, and retrieved and windowed by the tier itself
 then Europe PMC live through the census's own fetcher (`study_cli.europe_pmc_fetcher`:
 the census inputs' User-Agent, 0.4 s between a thread's requests, retries with
 backoff), with `--fetch-workers` threads, review by review until
-`--full-text-entries` entries are retrieved. Fetched full texts are kept in the
-cache directory as Europe PMC served them (`PMC<n>.xml`, mode 0600; a definitive
-miss as `PMC<n>.absent`), so a later run with the same `--full-text-cache`
-fetches nothing it asked for before. The calls are the census's: five retrieved
+`--full-text-entries` entries are retrieved. Europe PMC answers fullTextXML with
+HTTP 500 for every PMCID outside its open-access subset; the fetcher checks the
+first server error once against the PMCID's Europe PMC record, so such a PMCID
+costs two requests and is a definitive miss, while a server error for a PMCID
+in the subset stays transient (`left open by a transient failure`). Fetched full
+texts are kept in the cache directory as Europe PMC served them (`PMC<n>.xml`,
+mode 0600; a definitive miss as `PMC<n>.absent`), so a later run with the same
+`--full-text-cache` fetches nothing it asked for before. The calls are the census's: five retrieved
 entries of one review per call, each review's remainder in its last call
 (`citation_census.full_text_chunks`), built by `census_runner.full_text_call`
 (the windows in the FULL TEXT field, reasoning `low`,

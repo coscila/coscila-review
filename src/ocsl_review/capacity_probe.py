@@ -1034,7 +1034,9 @@ class FullTextInputs:
             "fullTexts": {"cacheDirectory": str(cache.directory) if cache.directory else None, "live": live,
                           **dict(sorted(cache.counts.items())),
                           "fetcher": ("study_cli.europe_pmc_fetcher: the census's own Europe PMC fullTextXML fetcher "
-                                      "(its User-Agent, 0.4 s spacing per thread, 3 attempts)") if live else None,
+                                      "(its User-Agent, 0.4 s spacing per thread, 3 attempts; a server error is "
+                                      "checked once against the PMCID's Europe PMC record, and a PMCID outside the "
+                                      "open-access subset is a definitive miss)") if live else None,
                           "fetchWorkers": settings.fetch_workers},
             "calls": {"count": len(self.calls), "byItems": {str(k): sizes[k] for k in sorted(sizes)},
                       "meanItems": _round(sum(n * c for n, c in sizes.items()) / len(self.calls), 2) if self.calls else None},
@@ -1171,7 +1173,8 @@ class FullTextInputs:
             "reviewsForTarget": math.ceil(settings.full_text_entries / per_review) if per_review else None,
             "fetchSecondsAtLeast": round(settings.full_text_entries * 0.4 / settings.fetch_workers),
             "note": ("one Europe PMC request per candidate the store and the cache directory do not hold, until the "
-                     "target is retrieved (target / share of PMCIDs with an open-access full text); each fetch thread "
+                     "target is retrieved (target / share of PMCIDs with an open-access full text), and a second one, "
+                     "the record check, for each PMCID outside the open-access subset; each fetch thread "
                      "spaces its requests 0.4 s apart, so fetching takes at least target x 0.4 s / threads plus the "
                      "downloads, and a rerun with the same cache directory fetches nothing it fetched before")}
         return record
