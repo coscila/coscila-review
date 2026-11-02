@@ -23,6 +23,11 @@ only by the commands that read citing sentences (support, function, numeric, the
 second-gen, a private export): those refuse while a branch made with it does not see it mounted, every other command
 runs without it, and `verify` notes it as not mounted instead of failing.
 
+`init` makes a branch once. Asked again with the inputs that made the branch (the same parent and private copy by
+path and digest, protocol digest, incomplete-parent allowance and study bundle), as when its step is sent again after
+its result was lost, it reports that branch (`alreadyMade`) and changes nothing; any other input is refused. An SQLite
+file without any schema object at the branch path, which an init killed before its commit leaves, is replaced.
+
 `followup init --study-bundle <bundle file or sha256>` (or `followup pin-bundle` before the first judge call) pins the
 study bundle (`ocsl-study-bundle-v1`): a bundle file must name the branch's protocol and pin every instrument the
 protocol names at its registry digest. Every receipt records the pinned bundle, a broker run needs one, and before any

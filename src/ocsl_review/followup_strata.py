@@ -29,6 +29,7 @@ the seed, the scope and the set of keys (never on row order or the Python versio
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sqlite3
@@ -517,6 +518,14 @@ def cmd_strata(args: Any) -> dict[str, Any]:
     branch = FollowupBranch(Path(args.database))
     protocol = protocol_of(branch)
     with branch.writing() as connection:
+        if getattr(args, "freeze", False) and frozen(connection):
+            # A freeze asked again (a step sent again after its result was lost) reports the freeze the branch holds;
+            # the strata are never built again.
+            row = connection.execute("SELECT * FROM fu_protocol_freeze ORDER BY frozen_at DESC LIMIT 1").fetchone()
+            return {"database": str(branch.path), **json.loads(row["sizes_json"]), "alreadyFrozen": True,
+                    "freeze": {"freezeId": row["freeze_id"], "protocolSha256": row["protocol_sha256"],
+                               "strataSha256": row["strata_sha256"], "statusSnapshot": row["status_snapshot"],
+                               "parentSha256": row["parent_sha256"], "frozenAt": row["frozen_at"]}}
         built = build(connection, protocol)
         result = {"database": str(branch.path), **built}
         if getattr(args, "freeze", False):

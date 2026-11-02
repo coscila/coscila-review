@@ -124,6 +124,41 @@ class BranchTests(unittest.TestCase):
         with closing(branch.connect()) as connection:
             self.assertTrue(branch.sentence(connection, F.JOURNAL_A, "10.5555/fu.review.a2", "2", 1)[0])
 
+    def test_an_init_asked_again_with_its_inputs_reports_the_branch_it_made(self):
+        # A step sent again after its result was lost: the same inputs report the branch unchanged; any other input,
+        # and a branch made without a text parent, is still refused.
+        path = self.root / "again.sqlite3"
+        bundle = "c" * 64
+        first = FollowupBranch.create(path, self.census["parent"], parent_text=self.census["text"],
+                                      protocol=F.protocol(), study_bundle=bundle)
+        before = scores_db.file_sha256(path)
+        again = FollowupBranch.create(path, self.census["parent"], parent_text=self.census["text"],
+                                      protocol=F.protocol(), study_bundle=bundle)
+        self.assertTrue(again["alreadyMade"])
+        self.assertEqual((first["database"], first["protocolSha256"], bundle),
+                         (again["database"], again["protocolSha256"], again["studyBundle"]["studyBundleSha256"]))
+        self.assertEqual(before, scores_db.file_sha256(path), "the branch is left as it was")
+        for changed in ({"parent_text": None}, {"protocol": F.protocol(seed=12)}, {"study_bundle": "d" * 64},
+                        {"study_bundle": None}):
+            options = {"parent_text": self.census["text"], "protocol": F.protocol(), "study_bundle": bundle, **changed}
+            with self.subTest(changed=sorted(changed)), self.assertRaisesRegex(ValidationError, "already exists"):
+                FollowupBranch.create(path, self.census["parent"], **options)
+
+    def test_an_init_killed_before_its_commit_leaves_nothing_that_blocks_the_next(self):
+        path = self.root / "killed.sqlite3"
+        with closing(sqlite3.connect(path)) as connection:   # an SQLite file without any schema object
+            connection.execute("PRAGMA user_version=0")
+        self.assertTrue(path.is_file())
+        result = FollowupBranch.create(path, self.census["parent"], protocol=F.protocol())
+        self.assertNotIn("alreadyMade", result)
+        self.assertTrue(FollowupBranch(path).verify()["ok"])
+        unrelated = self.root / "unrelated.sqlite3"
+        with closing(sqlite3.connect(unrelated)) as connection:
+            connection.execute("CREATE TABLE notes(text TEXT)")
+            connection.commit()
+        with self.assertRaisesRegex(ValidationError, "already exists"):
+            FollowupBranch.create(unrelated, self.census["parent"])
+
     def test_create_refuses_unusable_parents(self):
         with self.assertRaisesRegex(ValidationError, "frozen"):
             FollowupBranch.create(self.root / "working.sqlite3", self.census["working"])
@@ -133,7 +168,8 @@ class BranchTests(unittest.TestCase):
             FollowupBranch.create(self.root / "notext.sqlite3", self.census["parent"], parent_text=self.census["parent"])
         self.branch("exists.sqlite3")
         with self.assertRaisesRegex(ValidationError, "already exists"):
-            FollowupBranch.create(self.root / "exists.sqlite3", self.census["parent"])
+            FollowupBranch.create(self.root / "exists.sqlite3", self.census["parent"],
+                                  protocol=F.protocol(seed=12))
         with self.assertRaisesRegex(ValidationError, "protocol"):
             FollowupBranch.create(self.root / "badprotocol.sqlite3", self.census["parent"],
                                   protocol=F.protocol(seed="eleven"))

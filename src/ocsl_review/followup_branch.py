@@ -253,6 +253,15 @@ def require_freeze(connection: sqlite3.Connection) -> dict[str, Any]:
     return dict(row)
 
 
+def _empty_database(path: Path) -> bool:
+    """Whether ``path`` is an SQLite database without any schema object."""
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            return connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    except sqlite3.DatabaseError:
+        return False
+
+
 class FollowupBranch:
     """An existing follow-up branch database."""
 
@@ -274,7 +283,16 @@ class FollowupBranch:
                allow_incomplete: bool = False, code_revision: str | None = None,
                study_bundle: Any = None) -> dict[str, Any]:
         path = Path(path)
+        if path.exists() and _empty_database(path):
+            # What an init killed before its commit leaves: an SQLite file without any schema object (its journal
+            # rolled back when it was opened). It holds nothing, so the branch is made in its place.
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                Path(str(path) + suffix).unlink(missing_ok=True)
         if path.exists():
+            made = cls._made_before(path, parent, parent_text=parent_text, protocol=protocol,
+                                    allow_incomplete=allow_incomplete, study_bundle=study_bundle)
+            if made is not None:
+                return made
             raise ValidationError("the follow-up branch database already exists; branch into a new path")
         if not path.parent.is_dir():
             raise ValidationError(f"the branch directory is missing: {path.parent}")
@@ -325,6 +343,41 @@ class FollowupBranch:
         return {"database": str(branch.path), "parent": info, "parentText": text_info,
                 "protocolSha256": loaded[1] if loaded else None, "schemaVersion": followup_schema.SCHEMA_VERSION,
                 "studyBundle": pinned}
+
+    @classmethod
+    def _made_before(cls, path: Path, parent: Path, *, parent_text: Path | None, protocol: Any,
+                     allow_incomplete: bool, study_bundle: Any) -> dict[str, Any] | None:
+        """An init asked again with the inputs that made the branch at ``path`` (a step sent again after its result
+        was lost): the same parent and text parent (path and digest), protocol digest, incomplete-parent allowance and
+        study bundle pin. Returns the init result marked ``alreadyMade``, or None when any input differs."""
+        try:
+            branch = cls(path)
+        except ValidationError:
+            return None
+        meta = branch.meta()
+        info = inspect_parent(Path(parent), allow_incomplete=allow_incomplete)
+        if (meta.get("parentPath"), meta.get("parentSha256")) != (info["path"], info["sha256"]):
+            return None
+        text_info = None
+        if parent_text is not None:
+            text_info = inspect_parent(Path(parent_text), allow_incomplete=allow_incomplete, require_text=True)
+            if (meta.get("parentTextPath"), meta.get("parentTextSha256")) != (text_info["path"], text_info["sha256"]):
+                return None
+        elif meta.get("parentTextPath"):
+            return None
+        loaded = load_protocol(protocol) if protocol is not None else None
+        if (loaded[1] if loaded else None) != (meta.get("protocolSha256") or None):
+            return None
+        if bool(meta.get("parentIncompleteAllowed")) != bool(allow_incomplete and info["meta"].get("complete") != "1"):
+            return None
+        bundle = load_study_bundle(study_bundle)[1] if study_bundle is not None else None
+        if bundle != (meta.get("studyBundleSha256") or None):
+            return None
+        pinned = ({"studyBundleSha256": bundle, "contentVerified": bool(meta.get("studyBundle")), "alreadyPinned": True}
+                  if bundle else None)
+        return {"database": str(branch.path), "parent": info, "parentText": text_info,
+                "protocolSha256": loaded[1] if loaded else None, "schemaVersion": followup_schema.SCHEMA_VERSION,
+                "studyBundle": pinned, "alreadyMade": True}
 
     # ---------------------------------------------------------------- access
     def meta(self) -> dict[str, str]:

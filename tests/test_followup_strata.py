@@ -269,9 +269,17 @@ class StrataTests(unittest.TestCase):
             self.assertEqual(F.PROTOCOL["estimands"], json.loads(row["estimands_json"]))
             self.assertEqual(first.meta()["parentSha256"], row["parent_sha256"])
             self.assertEqual(first.meta()["protocolSha256"], row["protocol_sha256"])
-        for freeze in (False, True):
-            with self.assertRaisesRegex(ValidationError, "frozen"):
-                followup_strata.cmd_strata(SimpleNamespace(database=str(first.path), freeze=freeze))
+        with self.assertRaisesRegex(ValidationError, "frozen"):
+            followup_strata.cmd_strata(SimpleNamespace(database=str(first.path), freeze=False))
+        # A freeze asked again (its step sent again after the result was lost) reports the branch's freeze unchanged.
+        again = followup_strata.cmd_strata(SimpleNamespace(database=str(first.path), freeze=True))
+        self.assertTrue(again["alreadyFrozen"])
+        self.assertEqual({key: one[key] for key in ("freezeId", "strataSha256", "protocolSha256", "frozenAt")},
+                         {key: again["freeze"][key] for key in ("freezeId", "strataSha256", "protocolSha256",
+                                                                "frozenAt")})
+        with closing(first.connect()) as connection:
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM fu_protocol_freeze").fetchone()[0])
+            self.assertEqual(one["strataSha256"], followup_strata.strata_digest(connection))
         with self.assertRaisesRegex(ValidationError, "frozen"):
             followup_stats.cmd_hotspots(SimpleNamespace(database=str(first.path)))
         other = self.branch(protocol_with(S0={"size": 3, "matchOn": ["journal", "year"]}))

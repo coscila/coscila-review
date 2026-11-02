@@ -83,7 +83,9 @@ The frame, the strata, their inclusion probabilities and sizes, and the freeze.
 - **`--freeze`** rebuilds the strata from the current inputs and writes `fu_protocol_freeze`: the protocol digest, a
   digest over the ordered membership rows (strata and co-cited pairs), the status snapshot the strata used, the parent
   digest (recomputed; a changed parent refuses the freeze), the protocol's estimands with their numerators and
-  denominators, and the sizes. After a freeze the strata (and the hotspot test) cannot be built again.
+  denominators, and the sizes. After a freeze the strata (and the hotspot test) cannot be built again; `--freeze`
+  asked again (its step sent again after the result was lost) reports the branch's freeze (`alreadyFrozen`) and builds
+  nothing.
 
 ## followup numeric --tables <source> [--allow-synthetic-tables]
 
