@@ -8,11 +8,11 @@ Hooks (installed through core.hooksPath):
 CI:
   guard.py ci --range A..B        the same checks for each commit in the range, merges included
 
-Excluded-project names are matched by length:sha256 over word-start windows, so this file does not contain them. Findings
-print rule ids and locations only, never the matched text.
+Findings print rule ids and locations only, never the matched text.
 
-Local rules: guard_private.py next to this file, when present, adds content rules that only the local hooks apply. The
-repository mirrors of this file do not carry that module, so CI runs without those rules.
+Local rules: guard_private.py next to this file, when present, adds content rules that only the local hooks apply: the
+excluded-project table (length:sha256 over word-start windows, matched by hashed_hit below) and further line and message
+rules. The repository mirrors of this file do not carry that module, so CI runs without those rules.
 
 Process notes: repository text describes the system in technical terms. Added lines (pre-commit, ci) and commit messages
 (commit-msg, ci) must not cite the development process: plan step ids and phases, review rounds, workflow ids, dated
@@ -37,11 +37,6 @@ MAX_BYTES = 5 * 1024 * 1024
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 ZERO_SHA = "0" * 40
 
-EXCLUDED = {
-    7: "0fd19fb4647c9b55ee7f950c035f33d888b7b10d40deb5eb1317d170da89965a",
-    10: "5ac4a1bd0b4a831a5fcd76d0dbe03e2b33038f8058d41faec7cc296d7706d070",
-    15: "aac427a207938b0684e5c8945e509ccb6d0c076f997421258a3456c8b6eb2f9d",
-}
 # Process notes. Every alternative needs a form that ordinary prose, identifiers and numbers do not take: a step id only
 # after "plan", a round only with its number and a review context, a decision or an incident only with its date (a
 # decision also in parentheses).
@@ -168,6 +163,7 @@ def load_local_rules():
 
 
 LOCAL = load_local_rules()
+EXCLUDED = getattr(LOCAL, "EXCLUDED", {})
 
 
 def hashed_hit(text, table):
