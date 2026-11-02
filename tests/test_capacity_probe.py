@@ -918,7 +918,7 @@ class RepairTests(ProbeCase):
         self.assertEqual(sum(r["items"] for r in answered), before["entries"])
         self.assertEqual(sum(r["missing"] for r in answered), before["invalid"])
         self.assertEqual(cell["invalidOutputShare"], before["share"])
-        self.assertEqual(cell["entries"]["answered"], before["entries"], "the first calls' statistics are E0's")
+        self.assertEqual(cell["entries"]["answered"], before["entries"], "the cell's measurements are the first calls'")
         self.assertEqual(sum(r["missing"] for r in repairs.values() if r["outcome"] == "answered"), after["invalid"])
         self.assertEqual(after["share"], cell["invalidOutputShareAfterRepair"])
         self.assertLess(after["share"], before["share"])

@@ -2341,7 +2341,7 @@ class _CellRun:
     def summarize(self, *, started_at: str, window_end: float, tail: dict[str, Any], cut: Sequence[float],
                   drained: float, abandoned_in_flight: int, pool: dict[str, int], unjoined: int) -> dict[str, Any]:
         settings, every = self.settings, list(self.records)
-        # The first calls give every statistic E0 compares (a repair call, with --repair, is reported apart); every
+        # The first calls give every measurement of the cell (a repair call, with --repair, is reported apart); every
         # call counts for our concurrency, the server counters and the served model.
         records = [r for r in every if r.get("kind", "first") == "first"]
         abort = self.monitor.fired
@@ -3243,7 +3243,7 @@ def full_text_exit(report: dict[str, Any], settings: ProbeSettings) -> dict[str,
                  f"{_percent(after.get('share'), 2)} after it ({after.get('open')} open), "
                  f"{_num(hypothetical.get('entriesPerSecondWithRepair'), 2)} entries/s with it")
         result["hypotheticalShareAfter"] = after.get("share")
-    result["line"] = line + ("." if passes else "; the author decides in D1.")
+    result["line"] = line + ("." if passes else "; the author decides.")
     return result
 
 
