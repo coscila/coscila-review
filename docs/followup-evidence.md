@@ -199,8 +199,12 @@ S1 locus. `--source` defaults to the protocol's second-generation sources.
   `unavailable` with its reason and never stops the traversal. An operator key in `OCSL_REVIEW_OPENALEX_API_KEY` is
   sent as OpenAlex expects and never recorded; `mailto` only with the operator's contact address.
 
-A provider that throttles repeatedly stops the traversal with a paused result naming the targets left (a later run
-traverses again). Edges of a target are united across sources: records that share any identifier carry one citing key, the DOI, else
+A source whose host throttles repeatedly is asked nothing more in that run, while the other source goes on; the result
+is then paused and names the targets each throttled source left (`targetsLeft`). The paused run leaves its traversal
+open (`fu_meta` key `citedby.unfinished`: the options and the start), and the next run with the same options resumes
+it: a target and source covered since that start with a final state (`complete`, `truncated`, `no-identifier`) are not
+asked again, while `error` and `unavailable` are. A run that finishes closes the traversal, so the run after it
+traverses every target again. Every result counts the targets and sources it wrote (`traversed`). Edges of a target are united across sources: records that share any identifier carry one citing key, the DOI, else
 the PMID, else the PMCID, else the OpenAlex id (`doi:`, `pmid:`, `pmcid:`, `openalex:`). `fu_citedby_edges` keeps one
 row per target, source and key; `fu_citedby_coverage` one per target and source (state, hit count, edges, reason).
 Every run registers the graph as a dataset version (kind `cited-by-graph`, sha256 of the canonical edge rows).

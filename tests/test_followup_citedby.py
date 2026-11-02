@@ -134,6 +134,39 @@ class CitedByTests(unittest.TestCase):
         self.assertEqual(3, len(self.edges()), "Europe PMC edges are kept when only OpenAlex is traversed again")
         self.assertEqual({"complete": 1, "no-identifier": 2}, result["states"]["europe-pmc"])
 
+    def test_a_throttled_source_stops_alone_and_the_next_run_resumes_what_it_left(self):
+        # OpenAlex throttles the first target's work lookup and is asked nothing more; Europe PMC covers every target.
+        # The run pauses with the targets OpenAlex left; the next run asks only those (and the unavailable one), and
+        # the run after a finished one traverses everything again.
+        throttling = F.FixtureTransport(routes(**{OPENALEX_WORK: (429, b"{}")}))
+        with mock.patch.object(followup_net, "MAX_CONSECUTIVE_THROTTLES", 1):
+            first = self.traverse(throttling)
+        self.assertEqual(("paused", {"openalex": 2}, 4), (first["state"], first["targetsLeft"], first["traversed"]))
+        self.assertTrue(first["reason"].startswith("transport: provider throttled (openalex: 2 targets not traversed)"))
+        self.assertEqual({"complete": 1, "no-identifier": 2}, first["states"]["europe-pmc"])
+        self.assertEqual(1, sum(request["url"].startswith("https://api.openalex.org") for request in throttling.requests))
+        coverage = self.coverage()
+        self.assertEqual({"europe-pmc"}, {source for (doi, source) in coverage if doi != "10.5555/fu.review.a1"})
+        answering = F.FixtureTransport(routes())
+        second = self.traverse(answering)
+        self.assertEqual(("completed", True, 3, {}), (second["state"], second["resumed"], second["traversed"],
+                                                      second["targetsLeft"]))
+        self.assertEqual([], [request for request in answering.requests if request["url"].startswith(EPMC)],
+                         "Europe PMC's coverage of this traversal is final, so it is not asked again")
+        self.assertEqual({"complete": 1, "unavailable": 2}, second["states"]["openalex"])
+        self.assertEqual(5, len(self.edges()), "the Europe PMC edges of the first run are kept beside OpenAlex's")
+        third = self.traverse(F.FixtureTransport(routes()))
+        self.assertEqual(("completed", False, 6), (third["state"], third["resumed"], third["traversed"]))
+        self.assertTrue(self.branch.verify()["ok"])
+
+    def test_a_run_with_other_options_starts_a_traversal_of_its_own(self):
+        with mock.patch.object(followup_net, "MAX_CONSECUTIVE_THROTTLES", 1):
+            self.traverse(F.FixtureTransport(routes(**{OPENALEX_WORK: (429, b"{}")})))
+        transport = F.FixtureTransport(routes())
+        widened = self.traverse(transport, widen=True)
+        self.assertFalse(widened["resumed"])
+        self.assertTrue(any(request["url"].startswith(EPMC) for request in transport.requests))
+
     def test_the_page_cap_truncates(self):
         result = self.traverse(F.FixtureTransport(routes()), sources=["europe-pmc"], max_pages=1)
         state = self.coverage()[("10.5555/fu.review.a1", "europe-pmc")]

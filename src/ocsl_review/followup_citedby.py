@@ -18,11 +18,20 @@ Edges of one target are united by identifier across sources: a citing work's key
 PMCID, else its OpenAlex id (``doi:``, ``pmid:``, ``pmcid:``, ``openalex:``; ``europe-pmc:<source>/<id>`` for a record
 with none of them). ``fu_citedby_edges`` keeps one row per target, source and citing key; ``fu_citedby_coverage``
 one per target and source; every run registers the graph as a dataset version (kind ``cited-by-graph``).
+
+Throttling: a source whose recent requests were all throttled (``followup_net.throttled``) is asked nothing more in this
+run, while the other source goes on. The run is then paused, and the traversal it started stays open (``fu_meta``
+``citedby.unfinished``: its options and start). The next run with the same options resumes it: a target and source
+whose coverage was written since that start with a final state (complete, truncated, no-identifier) is not asked again;
+``error`` and ``unavailable`` are asked again. A run that finishes closes the traversal, so the run after it traverses
+every target again. The result counts the targets and sources written (``traversed``) and the targets each throttled
+source left (``targetsLeft``).
 """
 from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import urllib.parse
@@ -44,6 +53,9 @@ OPENALEX_PER_PAGE = 200
 OPENALEX_KEY_ENV = "OCSL_REVIEW_OPENALEX_API_KEY"
 SOURCES = ("europe-pmc", "openalex")
 KEY_ORDER = ("doi", "pmid", "pmcid", "openalex")
+# Coverage a resumed traversal does not ask again; error and unavailable are asked again.
+FINAL_STATES = ("complete", "truncated", "no-identifier")
+UNFINISHED_KEY = "citedby.unfinished"
 
 
 def make_client(workspace: Path | None = None) -> Any:
@@ -346,21 +358,42 @@ def traverse(connection: Any, scholarly: Any, *, sources: Sequence[str], widen: 
     chosen = targets(connection, widen=widen)
     if limit:
         chosen = chosen[:limit]
+    options = {"sources": sorted(sources), "widen": bool(widen), "limit": limit, "maxPages": int(max_pages)}
+    started = unfinished_since(connection, options)
+    resumed = started is not None
+    if started is None:
+        started = now()
+        connection.execute("INSERT OR REPLACE INTO fu_meta VALUES(?, ?)",
+                           (UNFINISHED_KEY, canonical({"options": options, "startedAt": started})))
+        connection.commit()
+    covered = final_coverage(connection, started) if resumed else set()
     states: dict[str, Counter] = {source: Counter() for source in sources}
     found: dict[str, int] = {source: 0 for source in sources}
-    throttled: dict[str, int] = {}
-    for position, target in enumerate(chosen):
-        hot = [source for source in sources if followup_net.throttled(scholarly, source)]
-        if hot:
-            # A provider throttled every recent request: stop the traversal (a later run traverses again).
-            throttled = {source: len(chosen) - position for source in hot}
+    asking = list(sources)
+    traversed = 0
+    for target in chosen:
+        # A source that throttled every recent request is asked nothing more in this run; the other one goes on.
+        asking = [source for source in asking if not followup_net.throttled(scholarly, source)]
+        if not asking:
             break
-        results = [adapter.citing(target) for adapter in adapters]
+        due = [adapter for adapter in adapters if adapter.name in asking and (target.doi, adapter.name) not in covered]
+        if not due:
+            continue
+        results = [adapter.citing(target) for adapter in due]
         write_target(connection, target, results)
         for result in results:
             states[result.source][result.state] += 1
             found[result.source] += len(result.edges)
+        traversed += len(results)
         connection.commit()
+    written = coverage_since(connection, started)
+    throttled = {source: left for source in sources if source not in asking
+                 and (left := sum(1 for target in chosen if (target.doi, source) not in written))}
+    if throttled:
+        connection.execute("INSERT OR REPLACE INTO fu_meta VALUES(?, ?)",
+                           (UNFINISHED_KEY, canonical({"options": options, "startedAt": started})))
+    else:
+        connection.execute("DELETE FROM fu_meta WHERE key=?", (UNFINISHED_KEY,))
     sha, rows = graph_digest(connection)
     dataset = register_dataset(connection, kind="cited-by-graph", name="cited-by-graph", declared_version=now(),
                                sha256=sha, rows=rows, detail={"sources": list(sources), "widen": widen,
@@ -373,12 +406,39 @@ def traverse(connection: Any, scholarly: Any, *, sources: Sequence[str], widen: 
               "notes": notes,
               "states": {source: dict(sorted(count.items())) for source, count in states.items()}, "edges": found,
               "graphEdges": rows, "unitedCitingWorks": united, "dataset": dataset, "requests": recorder.summary(),
+              "resumed": resumed, "traversed": traversed, "targetsLeft": dict(sorted(throttled.items())),
               "state": "completed"}
     if throttled:
         left = ", ".join(f"{source}: {count} targets" for source, count in sorted(throttled.items()))
         result.update(state="paused", throttled=throttled,
                       reason=f"transport: provider throttled ({left} not traversed); run citedby again to resume")
     return result
+
+
+def unfinished_since(connection: Any, options: Mapping[str, Any]) -> str | None:
+    """The start of the traversal a paused run left open with the same options, or None."""
+    row = connection.execute("SELECT value FROM fu_meta WHERE key=?", (UNFINISHED_KEY,)).fetchone()
+    try:
+        record = json.loads(row[0]) if row else None
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("options") != dict(options):
+        return None
+    started = record.get("startedAt")
+    return started if isinstance(started, str) and started else None
+
+
+def coverage_since(connection: Any, started: str) -> set[tuple[str, str]]:
+    """Targets and sources whose coverage was written since ``started``, in any state."""
+    return {(row[0], row[1]) for row in connection.execute(
+        "SELECT target_doi, source FROM fu_citedby_coverage WHERE checked_at >= ?", (started,))}
+
+
+def final_coverage(connection: Any, started: str) -> set[tuple[str, str]]:
+    """Targets and sources whose coverage was written since ``started`` with a final state."""
+    return {(row[0], row[1]) for row in connection.execute(
+        "SELECT target_doi, source FROM fu_citedby_coverage WHERE checked_at >= ? AND state IN "
+        f"({','.join('?' for _ in FINAL_STATES)})", (started, *FINAL_STATES))}
 
 
 def cmd_citedby(args: Any) -> dict[str, Any]:
