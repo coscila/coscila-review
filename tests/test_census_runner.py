@@ -1700,6 +1700,40 @@ class NoRecordDecisionTests(unittest.TestCase):
         self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
                           "fullTextXML PMC9"], europe_pmc.log, "the joint answer only starts the absence")
 
+    def test_a_joint_answer_one_hit_beyond_its_page_or_without_its_hit_count_starts_no_absence(self):
+        # The first joint answer lists only the sentinel's record, with a hitCount one above the records on its page
+        # (the target's record may be the hit off the page) or without a hitCount: no absence starts. A joint answer
+        # that holds every hit on its page 67 s later only starts it.
+        for change in ("one hit beyond the page", "no hit count"):
+            with self.subTest(change=change):
+                europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"}, server_errors={"PMC9"},
+                                              records={"PMC5": "Y"})
+                altered = [1]
+
+                def opener(request, timeout=None, europe_pmc=europe_pmc, altered=altered, change=change):
+                    response = europe_pmc(request, timeout)
+                    if "+OR+" not in request.full_url or not altered[0]:
+                        return response
+                    altered[0] -= 1
+                    answer = json.loads(response.read())
+                    self.assertEqual(["PMC5"], [record["pmcid"] for record in answer["resultList"]["result"]])
+                    if change == "no hit count":
+                        del answer["hitCount"]
+                    else:
+                        answer["hitCount"] = len(answer["resultList"]["result"]) + 1
+                    return EuropePmcResponse(json.dumps(answer).encode())
+                clock = FakeClock()
+                fetch = self.fetcher(europe_pmc, clock, opener)
+                fetch("PMC5")
+                europe_pmc.log.clear()
+                self.assertOpen(fetch, "PMC9")
+                self.assertEqual(0, altered[0], "the first joint answer was altered")
+                clock.sleep(60)                 # 67 s after that joint answer
+                europe_pmc.log.clear()
+                self.assertOpen(fetch, "PMC9")
+                self.assertEqual(["fullTextXML PMC9", "search PMC9", "search PMC9 OR PMC5", "fullTextXML PMC9",
+                                  "fullTextXML PMC9"], europe_pmc.log, "the joint answer only starts the absence")
+
     def test_without_a_seen_sentinel_the_fallback_sentinel_stands_in(self):
         from ocsl_review.study_cli import NO_RECORD_FALLBACK_SENTINEL
         self.assertEqual("PMC2000001", NO_RECORD_FALLBACK_SENTINEL)
