@@ -628,6 +628,16 @@ class FollowupBlindnessTests(unittest.TestCase):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], FIGURES.findall(normalize(path.read_text(encoding="utf-8"))))
 
+    def test_the_lab_copy_of_the_design_digests_is_this_one(self):
+        # coscila scans lab-facing follow-up text (chat template prompts, the follow-up controller reference) with a
+        # verbatim copy of these digests (packages/lab/src/leakage-audit/followup-blindness.ts), pinned by the same
+        # fingerprint: sha256 of the sorted digests joined by newlines, and their number.
+        import hashlib
+        digests = sorted({digest for table in (FIGURE_DIGESTS, FOLLOWUP_FIGURE_DIGESTS) for group in table.values()
+                          for digest in group})
+        self.assertEqual(("c79380d31bd07eb518f6d6c6d647cf79799d701f52b0f1eba51328bd7387abc7", 443),
+                         (hashlib.sha256("\n".join(digests).encode("ascii")).hexdigest(), len(digests)))
+
     def test_the_scans_detect_hidden_and_respelled_figures_and_phrases(self):
         import hashlib
         table = {7: {hashlib.sha256("4,321 %".encode()).hexdigest()}}
