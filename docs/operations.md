@@ -271,9 +271,10 @@ when newly launched agents do not have the review tools registered.
 
 No web rebuild is required for companion-only changes. New agent/MCP processes
 load the refreshed package; existing processes can retain earlier code or skill
-context. Do not interrupt active chats merely to refresh them. Current core6
-staging also re-attests the configured Codex providers, so verify its actual
-result rather than rerunning an obsolete, hard-coded provider identifier.
+context. Do not interrupt active chats merely to refresh them. Where the
+deployment's staging command also re-attests the configured Codex providers,
+check its reported result instead of re-attesting a provider by a fixed
+identifier.
 
 ## Status and verification
 
