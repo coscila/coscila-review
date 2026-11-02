@@ -408,6 +408,112 @@ class DaemonCheckTests(unittest.TestCase):
         self.assertEqual("paused", result["state"])
         self.assertTrue(result["reason"].startswith("model_drift: served 'another-model'"), result["reason"])
 
+    @staticmethod
+    def answers_after(invalid: int):
+        """A judge whose first ``invalid`` answers cannot be read and whose later answers are valid."""
+        valid = quoting()
+        given: list[int] = []
+
+        def answer(messages, settings):
+            given.append(1)
+            return "not json" if len(given) <= invalid else valid(messages, settings)
+        return answer, given
+
+    def test_a_repair_call_starts_a_job_of_its_own_and_reaches_the_model(self):
+        answer, given = self.answers_after(1)
+        broker = DaemonBroker(exported_bundles(), answer=answer)
+        judge = self.judge(broker)
+        judge.prepare(self.instrument, "abstract")
+        summary = self.run_tier(judge, "abstract", support_items("abstract", 1))
+        self.assertEqual((1, 1, 1, 0), (summary["calls"], summary["repairCalls"], summary["accepted"],
+                                        summary["invalid"]))
+        self.assertEqual((2, 2, 2), (len(broker.jobs), len(broker.sent), len(given)),
+                         "the repair call is a new broker job and a new request to the model")
+        with closing(self.branch.connect()) as connection:
+            responses = connection.execute("SELECT kind, response_sha256 FROM fu_calls ORDER BY kind").fetchall()
+        self.assertEqual(["first", "repair"], [row[0] for row in responses])
+        self.assertNotEqual(responses[0][1], responses[1][1])
+
+    def test_a_later_invocation_judges_an_item_left_invalid_again(self):
+        answer, given = self.answers_after(2)
+        broker = DaemonBroker(exported_bundles(), answer=answer)
+        items = support_items("abstract", 1)
+        outcomes = []
+        for _ in range(2):
+            judge = self.judge(broker)
+            judge.prepare(self.instrument, "abstract")
+            summary = self.run_tier(judge, "abstract", items)
+            outcomes.append((summary["accepted"], summary["invalid"]))
+        self.assertEqual([(0, 1), (1, 0)], outcomes)
+        self.assertEqual((3, 3), (len(broker.sent), len(given)),
+                         "the second invocation's first call reaches the model instead of replaying the first answer")
+
+    def test_a_replicate_starts_jobs_of_its_own_and_is_judged_afresh(self):
+        valid, abstaining = quoting(), quoting("abstain")
+        seen: dict[str, int] = {}
+
+        def answer(messages, settings):
+            # The model answers a request it has answered before with an abstention: replicate verdicts can differ.
+            key = request_sha256({"messages": messages})
+            seen[key] = seen.get(key, 0) + 1
+            return (valid if seen[key] == 1 else abstaining)(messages, settings)
+        broker = DaemonBroker(exported_bundles(), answer=answer)
+        items = support_items("abstract", 2)
+        primary_judge = self.judge(broker)
+        primary_judge.prepare(self.instrument, "abstract")
+        self.run_tier(primary_judge, "abstract", items)
+        jobs, sent = len(broker.jobs), len(broker.sent)
+        replicate_judge = self.judge(broker)
+        replicate_judge.prepare(self.instrument, "abstract")
+        with self.branch.writing() as connection:
+            run_items(connection, self.instrument, items, replicate_judge, tier="abstract", model=MODEL,
+                      variant="replicate")
+        self.assertEqual((jobs + 2, sent + 2), (len(broker.jobs), len(broker.sent)),
+                         "every replicate call is a new broker job and a new request to the model")
+        with closing(self.branch.connect()) as connection:
+            verdicts = {(row[0], row[1]): json.loads(row[2])["supportVerdict"] for row in connection.execute(
+                "SELECT variant, item_key, verdict_json FROM fu_judgments WHERE outcome='accepted'")}
+            shared = connection.execute(
+                "SELECT COUNT(*) FROM fu_calls r JOIN fu_calls p ON p.response_sha256=r.response_sha256 "
+                "WHERE r.variant='replicate' AND p.variant='primary'").fetchone()[0]
+        self.assertEqual(0, shared, "no replicate receipt carries a primary answer")
+        for item in items:
+            self.assertEqual("abstain", verdicts[("replicate", item["id"])])
+            self.assertNotEqual("abstain", verdicts[("primary", item["id"])])
+
+    def test_a_call_that_never_settled_meets_its_job_on_the_next_invocation(self):
+        class PausedFirst(DaemonBroker):
+            """The first job pauses on a provider limit that lifts only later; the next submission of its key finds it
+            completed."""
+            def _settle(self, payload):
+                job_id = super()._settle(payload)
+                if len(self.jobs) == 1:
+                    job = self.jobs[job_id]
+                    self.held = (job_id, job["state"], dict(job["result"]))
+                    job.update(state="paused", resumeAfter="2999-01-01T00:00:00Z", error="PROVIDER_LIMIT")
+                    job["result"] = {**job["result"], "state": "paused", "errorCode": "PROVIDER_LIMIT"}
+                return job_id
+
+            def lift(self):
+                job_id, state, result = self.held
+                self.jobs[job_id].update(state=state, resumeAfter=None, error=None, result=result)
+
+        broker = PausedFirst(exported_bundles())
+        items = support_items("abstract", 1)
+        judge = self.judge(broker)
+        judge.prepare(self.instrument, "abstract")
+        first = self.run_tier(judge, "abstract", items)
+        self.assertEqual((0, "transport"), (first["accepted"], first["stopped"]))
+        with closing(self.branch.connect()) as connection:
+            (error,) = connection.execute("SELECT error FROM fu_calls").fetchone()
+        self.assertTrue(error.startswith("CallOpen: broker paused"), error)
+        broker.lift()
+        judge = self.judge(broker)
+        judge.prepare(self.instrument, "abstract")
+        second = self.run_tier(judge, "abstract", items)
+        self.assertEqual(1, second["accepted"])
+        self.assertEqual(1, len(broker.jobs), "the second invocation met the job the first call left at the broker")
+
 
 class SupportCommandTests(unittest.TestCase):
     """``followup support`` with the verbatim instrument: through ``--broker-socket`` like function, numeric and
@@ -634,8 +740,12 @@ class BrokerPipelineTests(unittest.TestCase):
             (VERBATIM, "abstract"): self.invoke("support", *database, "--tier", "abstract", *judge, routes=routes()),
             (VERBATIM, "full-text"): self.invoke("support", *database, "--tier", "full-text", "--europe-pmc", *judge,
                                                  routes=full_text)}
+        jobs_before, sent_before = len(self.broker.jobs), len(self.broker.sent)
         replicate = self.invoke("support", *database, "--tier", "full-text", "--variant", "replicate", *judge,
                                 routes=full_text)
+        # the replicate's agreement compares fresh answers: every replicate call is a broker job and a model request
+        self.assertEqual((replicate["calls"], replicate["calls"]),
+                         (len(self.broker.jobs) - jobs_before, len(self.broker.sent) - sent_before))
         judged[("citation-function@1", "locus")] = self.invoke("function", *database, *judge)
         self.invoke("dependency", *database)
         judged[("numeric-check@1", None)] = self.invoke("numeric", *database, "--tables", str(TABLES),

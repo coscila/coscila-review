@@ -19,7 +19,7 @@ from ocsl_review.census_broker import BrokerTransport, idempotency_key, request_
 from ocsl_review.claim_check import ConfidentialPolicy
 from ocsl_review.errors import ConfidentialityError, ValidationError
 from ocsl_review.followup_branch import FollowupBranch
-from ocsl_review.followup_judge import judge_from_args, run_items
+from ocsl_review.followup_judge import call_identity, judge_from_args, run_items
 
 FUNCTION = json.loads((F.FIXTURES / "judge" / "citation-function-1.json").read_text(encoding="utf-8"))
 PROVIDER = "synthetic-onprem-provider"
@@ -144,9 +144,16 @@ class BrokerJudgeTests(unittest.TestCase):
                           call["prompt_tokens"], call["completion_tokens"]))
         self.assertTrue(call["judge"].startswith("broker-judge:"))
         messages, options = self._messages()
-        reply = judge.complete(messages, **options)
+        with closing(self.branch.connect()) as connection:
+            identity = call_identity(connection, self.instrument.digest, "locus", "primary", "first",
+                                     [item["id"] for item in FUNCTION["items"]])
+        self.assertEqual(1, identity["attempt"], "the settled call advanced the identity of the next call")
+        self.assertEqual(B.BrokerJudge.item_id(expected, {**identity, "attempt": 0}), submitted["items"][0]["id"])
+        reply = judge.complete(messages, **options, call={**identity, "attempt": 0})
         self.assertEqual(F.MODEL, reply.model)
-        self.assertEqual(1, len(broker.jobs), "the same request meets the job the broker already holds")
+        self.assertEqual(1, len(broker.jobs), "the same call meets the job the broker already holds")
+        judge.complete(messages, **options, call=identity)
+        self.assertEqual(2, len(broker.jobs), "the next call of the same items is a broker job of its own")
 
     def _messages(self):
         from ocsl_review import citation_function

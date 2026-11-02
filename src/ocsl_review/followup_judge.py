@@ -12,6 +12,10 @@ verbatim version citation-support-verbatim@1 (the same planner and validator, wi
 - batches items with the instrument's geometry and request settings, stores every request and response by sha256,
   writes one receipt per call (served model, fingerprint, tokens, finish reason) and one judgment per item;
 - sends items without a valid output once more in a repair call when the instrument declares a repair pass;
+- names every call to a judge that keys its calls (the broker judge) by its identity: instrument digest, tier, variant,
+  call kind, item keys, the branch and its attempt, the number of earlier calls of that identity that settled. A call
+  that never settled (``CallOpen``) keeps its attempt, so the next call of the same items meets the broker job that
+  already holds it; a replicate, a repair call and a call after a settled one each get a job and an answer of their own;
 - stops at the first response from a model other than the pinned one (``model-drift``), and sends nothing more once a
   broker judge's transport has halted (a fidelity stop, a budget, provider-limit, revocation or cancellation halt),
   leaving open items open for the next invocation.
@@ -53,6 +57,15 @@ PROVENANCE_KEY = "provenance"
 # How a broker judge names its own fidelity stops, and the halt codes the census treats as fidelity stops.
 FIDELITY_STOPS = frozenset({"fidelity", "request_mismatch"})
 FIDELITY_CODES = frozenset({"FIDELITY", "INSTRUMENT_MISMATCH", "INSTRUMENT_MESSAGE_MISMATCH", "WORKER_KEY_CONFLICT"})
+
+
+class CallOpen(ReviewError):
+    """A call that got no settlement: the judge holds no answer for it yet (a broker job still queued, running or
+    paused, a broker that could not be reached, or a transport that halted before the call). Its receipt records it
+    as failed with this class name, and its identity keeps its attempt (``call_identity``)."""
+
+
+OPEN_CALL_ERROR = CallOpen.__name__ + ":"
 
 
 @dataclass(frozen=True)
@@ -206,6 +219,23 @@ def _sendable(item: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in item.items() if key != PROVENANCE_KEY}
 
 
+def call_identity(connection: sqlite3.Connection, instrument_digest: str, tier: str, variant: str, kind: str,
+                  item_keys: Sequence[str]) -> dict[str, Any]:
+    """The identity of the next call of these items: instrument digest, tier, variant, kind (first or repair), item
+    keys in call order, the branch (its creation instant) and the attempt, the number of earlier receipts of the same
+    identity whose call settled. A receipt of a call that never settled (``CallOpen``) does not count, so a call
+    repeated after one meets the job that already holds it; every other receipt (an answer, model drift, a settled
+    failure) advances the attempt."""
+    keys = list(item_keys)
+    settled = connection.execute(
+        "SELECT COUNT(*) FROM fu_calls WHERE instrument_digest=? AND tier=? AND variant=? AND kind=? AND item_keys_json=? "
+        "AND NOT (outcome='failed' AND error LIKE ?)",
+        (instrument_digest, tier, variant, kind, canonical(keys), OPEN_CALL_ERROR + "%")).fetchone()[0]
+    created = connection.execute("SELECT value FROM fu_meta WHERE key='createdAt'").fetchone()
+    return {"branch": created[0] if created else None, "instrumentDigest": instrument_digest, "tier": tier,
+            "variant": variant, "kind": kind, "items": keys, "attempt": int(settled)}
+
+
 def _request_bytes(judge: Any, messages: list[dict[str, str]], settings: Mapping[str, Any]) -> bytes:
     body = getattr(judge, "body", None)
     if callable(body):
@@ -257,7 +287,11 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
         (pending[start:start + plan.items_per_call], "first") for start in range(0, len(pending), plan.items_per_call))
     in_flight: dict[Future, tuple[list[dict[str, Any]], str, list[dict[str, str]], dict[str, Any], str]] = {}
 
-    def call(messages: list[dict[str, str]], settings: dict[str, Any]) -> Any:
+    keyed = bool(getattr(judge, "keys_calls", False))
+
+    def call(messages: list[dict[str, str]], settings: dict[str, Any], identity: dict[str, Any]) -> Any:
+        if keyed:
+            return judge.complete(messages, settings=settings, call=identity)
         return judge.complete(messages, settings=settings)
 
     left_open: list[dict[str, Any]] = []
@@ -271,7 +305,10 @@ def run_items(connection: sqlite3.Connection, instrument: Any, items: Sequence[M
                     batch, kind = queue.popleft()
                     messages = module.build_messages([_sendable(item) for item in batch], tier)
                     settings = plan.settings(len(batch))
-                    in_flight[pool.submit(call, messages, settings)] = (batch, kind, messages, settings, now())
+                    identity = (call_identity(connection, instrument_digest, tier, variant, kind,
+                                              [item["id"] for item in batch]) if keyed else {})
+                    in_flight[pool.submit(call, messages, settings, identity)] = (batch, kind, messages, settings,
+                                                                                  now())
                 if not in_flight:
                     break
                 finished, _ = wait(list(in_flight), return_when=FIRST_COMPLETED)

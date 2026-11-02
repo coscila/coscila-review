@@ -5,15 +5,19 @@
 ``census_broker.BrokerTransport``. Each call is one one-item bulk job that names the instrument's broker digest (the
 bundle ``ocsl-review instruments export`` prints and ``pnpm ops broker instruments install`` installs) and carries the
 request the instrument built: its messages unchanged and its settings, which the broker checks against the installed
-bundle and the worker's model before any provider call. The job's idempotency key comes from the request digest, so a
-repeated call meets the job the broker already holds. As in ``census_runner.execute_broker``:
+bundle and the worker's model before any provider call. The job's idempotency key comes from the call's identity
+(``followup_judge.call_identity``: instrument digest, tier, variant, call kind, item keys, branch and attempt) and the
+request digest. A call repeated after a crash, or after a pass in which it never settled, meets the job the broker
+already holds; a replicate, a repair call and a call after a settled one carry another identity, so each starts a job of
+its own and reaches the model, as the census's call ids do. As in ``census_runner.execute_broker``:
 
 - the served model and the fingerprint are what the judge's own response named (``servedModel``,
   ``systemFingerprint``); another served model is model drift, which stops the run;
 - a completed item counts only when its reported request digest equals the canonical digest of the request built;
   otherwise, and when the broker refuses the item before any provider call, the transport halts (a fidelity stop);
-- every other failure (a pause, an outage, a timeout, an upstream error) is a call without a response: its items stay
-  open for the runner's further passes.
+- a call that did not settle (a pause, an outage, a timeout, a halted transport) raises ``followup_judge.CallOpen``
+  and keeps its identity; a settled failure (an upstream error after the broker's attempts) is a call without a
+  response that advances it. Either way its items stay open for the runner's further passes.
 
 Only the verbatim follow-up instruments can run here (``followup_model.BROKER_INSTRUMENTS``: citation-function@1,
 numeric-check@1, claim-match@1 and citation-support-verbatim@1, the verbatim version of citation-support@2, which
@@ -31,9 +35,9 @@ import threading
 from typing import Any, Mapping
 
 from . import instruments
-from .census_broker import BrokerTransport, idempotency_key, request_sha256
+from .census_broker import BrokerTransport, canonical_json, idempotency_key, request_sha256
 from .errors import ConfidentialityError, ReviewError, ValidationError
-from .followup_judge import JudgeReply
+from .followup_judge import CallOpen, JudgeReply
 from .followup_model import BROKER_INSTRUMENTS
 
 MISSING_MODEL = "(no model named in the response)"
@@ -72,6 +76,8 @@ class BrokerJudge:
 
     # A broker run records the pinned study bundle in every receipt (followup_judge.run_items refuses without one).
     requires_study_bundle = True
+    # followup_judge.run_items passes every call's identity (complete(..., call=...)), which keys its broker job.
+    keys_calls = True
 
     def __init__(self, transport: Any, *, model: str, location: str = "external",
                  wait_seconds: float | None = None):
@@ -169,12 +175,20 @@ class BrokerJudge:
         if callable(halt):
             halt(reason, code="FIDELITY")
 
-    def complete(self, messages: list[dict[str, str]], *, settings: Mapping[str, Any]) -> JudgeReply:
+    @staticmethod
+    def item_id(expected: str, call: Mapping[str, Any] | None) -> str:
+        """The broker item id of a call: its identity and request digest (the request digest alone without one)."""
+        if not call:
+            return "followup-" + expected[:40]
+        return "followup-" + hashlib.sha256(f"{canonical_json(dict(call))}\n{expected}".encode("utf-8")).hexdigest()[:40]
+
+    def complete(self, messages: list[dict[str, str]], *, settings: Mapping[str, Any],
+                 call: Mapping[str, Any] | None = None) -> JudgeReply:
         exported = self.bundle_for(messages, settings)
         self._require(exported)
         payload = {"model": self.model, "messages": messages, **dict(settings)}
         expected = request_sha256(payload)
-        item_id = "followup-" + expected[:40]
+        item_id = self.item_id(expected, call)
         outcome = self.transport.call(item_id=item_id, messages=messages, item_count=_items_of(messages),
                                       digest=exported["digest"], key=idempotency_key(item_id, expected),
                                       settings={key: value for key, value in payload.items() if key != "messages"},
@@ -192,7 +206,7 @@ class BrokerJudge:
         if outcome.kind == "drift" and item is not None:
             return JudgeReply(text, served or MISSING_MODEL, usage, item.get("finishReason"), fingerprint)
         if outcome.kind != "settled" or item is None:
-            raise ReviewError(f"broker {outcome.kind}: {outcome.error or outcome.code or 'no settlement'}")
+            raise CallOpen(f"broker {outcome.kind}: {outcome.error or outcome.code or 'no settlement'}")
         status = item.get("httpStatus") if isinstance(item.get("httpStatus"), int) else None
         if item.get("state") == "completed":
             if served != self.model:

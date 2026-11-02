@@ -207,8 +207,11 @@ Every run registers the graph as a dataset version (kind `cited-by-graph`, sha25
 With `--broker-socket` (or `OCSL_BROKER_SOCKET`) a judging command reaches its judge through the run principal's
 broker. Each call is one one-item job naming the instrument's broker digest (`ocsl-review instruments export`,
 installed with `pnpm ops broker instruments install` and granted to the run principal) and carrying the request the
-instrument built; the job's idempotency key comes from the request digest. The served model and the fingerprint are
-the judge response's own; another served model stops the run as model drift; a request digest other than the one
+instrument built. The job's idempotency key comes from the call's identity (instrument digest, tier, variant, call
+kind, item keys, the branch and the number of earlier calls of that identity that settled) and the request digest: a
+call that never settled (a paused or queued job, an unreachable broker) is sent again under the same key and meets the
+job the broker already holds, while a replicate, a repair call and a call after a settled one each start a job of their
+own and reach the model. The served model and the fingerprint are the judge response's own; another served model stops the run as model drift; a request digest other than the one
 built, or a refusal before any provider call, halts the transport (code `FIDELITY`); any other failure leaves the
 call's items open for the further passes. Once the transport has halted, for any reason (a fidelity stop, the run's
 budget, a provider limit with its `resumeAfter`, a revoked grant, a cancellation), the runner sends nothing more and
