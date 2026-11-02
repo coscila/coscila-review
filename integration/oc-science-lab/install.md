@@ -85,10 +85,10 @@ Removal first verifies that installed skill files, rollback backups, and owned M
 Registering the two MCP servers changes the tool set the deployment's Codex
 tool-schema attestation covers, so the staging command alone is not sufficient.
 After `integrate install` succeeds, re-attest the affected relay provider and
-confirm the new tool count, e.g. on core6:
+confirm the new tool count, for example from the laboratory checkout:
 
 ```bash
-tsx scripts/attest-codex-tool-schema.ts remote_glm52 --force
+tsx scripts/attest-codex-tool-schema.ts <provider-id> --force
 ```
 
 Skipping this leaves the attestation describing a smaller tool set than the
