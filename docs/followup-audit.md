@@ -81,7 +81,7 @@ finished; a fetch stopped by a throttling provider or a failure stays open and `
 | Instrument | Unit | What the judge sees |
 |---|---|---|
 | citation-support-verbatim@1, or citation-support@2 (unchanged); the protocol pins one | locus x cited work, abstract and full-text tiers | the claim, its context and the cited work's evidence units |
-| citation-function@1 | locus | the citing sentence with the work's marker, its neighbours, the section, the work's title and year; never its status, the stratum or a verdict |
+| citation-function@1 | locus | the citing sentence with the work's marker, its neighbours, the section, the work's title (without status markers) and year; never its status, the stratum or a verdict |
 | numeric-check@1 | S3 locus | the citing sentence and the work's title and year; the comparison with the tables is deterministic |
 | claim-match@1 | original claim x later sentence | the claim, the review's title, the later sentence with the review's marker |
 

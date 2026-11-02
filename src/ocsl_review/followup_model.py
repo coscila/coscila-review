@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -50,6 +52,32 @@ def canonical(value: Any) -> str:
 
 def digest(*parts: Any) -> str:
     return hashlib.sha256(canonical(list(parts)).encode("utf-8")).hexdigest()
+
+
+# The status markers publishers and indexes add to a retracted, withdrawn, corrected or flagged work's title: a leading
+# "RETRACTED:", "Retracted article:", "WITHDRAWN:", "Retraction note:", "Notice of retraction:", "Expression of
+# concern:", "Correction to:", "Erratum:" or "Corrigendum:", and a trailing "[Retracted]" or "(Retracted article. See
+# ...)". The judges never see a cited work's status, so every cited title leaves without them, in every stratum alike.
+_TITLE_STATUS_LEAD = re.compile(
+    r"^\s*(?:(?:retracted|withdrawn)(?:\s+(?:article|paper|publication|chapter))?"
+    r"|(?:notice\s+of\s+)?(?:retraction|withdrawal)(?:\s+(?:note|notice|statement))?(?:\s+(?:to|of|for))?"
+    r"|(?:editorial\s+)?(?:expression|notice)\s+of\s+concern(?:\s+(?:to|for|regarding|about|on))?"
+    r"|(?:correction|erratum|corrigendum)(?:\s+(?:to|of|for))?)\s*[:\uff1a.\-\u2013\u2014]+\s*",
+    re.IGNORECASE)
+_TITLE_STATUS_TRAIL = re.compile(
+    r"\s*[\[(][^\[\]()]*\b(?:retract\w*|withdrawn|withdrawal|expression\s+of\s+concern|erratum|corrigendum|correction)"
+    r"\b[^\[\]()]*[\])]\s*\.?\s*$", re.IGNORECASE)
+
+
+def status_blind_title(title: Any) -> str:
+    """A cited work's title as a judge may see it: without invisible format characters and without the status markers
+    above (repeatedly, so "RETRACTED: Retraction note: ..." loses both)."""
+    text = "".join(character for character in str(title or "") if unicodedata.category(character) != "Cf").strip()
+    while True:
+        stripped = _TITLE_STATUS_TRAIL.sub("", _TITLE_STATUS_LEAD.sub("", text, count=1), count=1).strip()
+        if stripped == text:
+            return text
+        text = stripped
 
 
 def locus_id(journal: str, doi: str, label: str, seq: int) -> str:

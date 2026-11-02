@@ -43,7 +43,7 @@ from .followup_branch import FollowupBranch, now, require_freeze
 from .followup_function import (ReviewDocuments, block_new, check_model, citation_target, cited_work, judgment_state,
                                 provenance_of, reason_of, resolve_marker, sanitize, select_units, sentence_targets)
 from .followup_judge import close_judge, judge_summary, prepare_judge, step_result
-from .followup_model import SUPPORT_INSTRUMENTS, canonical, digest
+from .followup_model import SUPPORT_INSTRUMENTS, canonical, digest, status_blind_title
 from .followup_status import ProviderSession, Recorder, normal_doi, normal_pmid
 
 INSTRUMENT_ID = "citation-support@2"
@@ -533,7 +533,7 @@ def build_task(connection: Any, unit: Mapping[str, Any], sentence: str, evidence
     context = [text for text in (sanitize(before, "context"), sanitize(after, "context")) if text]
     marker, _ = resolve_marker(claim, citation_target(connection, unit), sentence_targets(connection, unit))
     title, year = cited_work(connection, unit["work_key"])
-    cited: dict[str, Any] = {"title": sanitize(title, "cited-title")}
+    cited: dict[str, Any] = {"title": status_blind_title(sanitize(title, "cited-title"))}
     if str(year or "").strip().isdigit():
         cited["year"] = int(str(year).strip())
     units = [{"id": item.unit_id, "text": text} for item in selection.units

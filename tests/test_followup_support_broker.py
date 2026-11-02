@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -24,14 +25,16 @@ from pathlib import Path
 from unittest import mock
 
 import followup_fixtures as F
-from ocsl_review import corpus_assessment, followup_judge_broker as B, followup_net, followup_support as SP, instruments
+from ocsl_review import (corpus_assessment, followup_judge_broker as B, followup_net, followup_support as SP, instruments,
+                         scores_db)
 from ocsl_review.census_broker import BrokerTransport, request_sha256
 from ocsl_review.cli import main
 from ocsl_review.errors import ValidationError
 from ocsl_review.followup_branch import FollowupBranch, protocol_instruments, read_artifact
 from ocsl_review.followup_estimands import agreement_label
 from ocsl_review.followup_judge import module_for, plan_for, run_items, step_result
-from ocsl_review.followup_model import BROKER_INSTRUMENTS, SUPPORT_INSTRUMENTS, VERBATIM_SUPPORT_INSTRUMENT
+from ocsl_review.followup_model import (BROKER_INSTRUMENTS, SUPPORT_INSTRUMENTS, VERBATIM_SUPPORT_INSTRUMENT,
+                                        status_blind_title)
 
 from test_followup_citedby import routes as citedby_routes
 from test_followup_dependency import insert_frame, locus
@@ -661,16 +664,20 @@ class SupportCommandTests(unittest.TestCase):
                                  (result["run"]["instrument"], result["requestSettings"]["source"]))
 
 
-class BrokerPipelineTests(unittest.TestCase):
-    """The audit end to end with every judging command on one run principal's broker socket: the protocol pins
-    citation-support-verbatim@1 and every registry digest, the study bundle pins the four instruments, and the fake
-    socket applies the daemon's verbatim check to every call before it answers with the pipeline's scripted judge."""
+class BrokerPipelineCase(unittest.TestCase):
+    """A follow-up branch, protocol, study bundle and one run principal's broker socket for the audit end to end: the
+    protocol pins citation-support-verbatim@1 and every registry digest, the study bundle pins the four instruments,
+    and the fake socket applies the daemon's verbatim check to every call before it answers with the pipeline's
+    scripted judge."""
+
+    def make_parent(self, root: Path) -> dict[str, Path]:
+        return F.make_parent(root)
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.census = F.make_parent(self.root)
+        self.census = self.make_parent(self.root)
         self.database = self.root / "followup.sqlite3"
         protocol = pipeline_protocol()
         protocol["model"] = {"served": MODEL, "location": "on-premises"}
@@ -723,6 +730,79 @@ class BrokerPipelineTests(unittest.TestCase):
     def rows(self, sql: str, *params) -> list[dict]:
         with closing(FollowupBranch(self.database).connect()) as connection:
             return [dict(row) for row in connection.execute(sql, params)]
+
+    def prepare_strata(self) -> tuple[tuple[str, str], tuple[str, ...]]:
+        """Init, status, hotspots and frozen strata; returns the database and judge options of the judging commands."""
+        database = ("--database", str(self.database))
+        judge = ("--model", MODEL, "--broker-socket", str(self.root / "run-principal.sock"), "--on-premises",
+                 "--policy", str(self.policy))
+        self.invoke("init", *database, "--parent", str(self.census["parent"]), "--parent-text",
+                    str(self.census["text"]), "--protocol", str(self.protocol), "--study-bundle", str(self.bundle))
+        self.invoke("status-import", *database, "--csv", str(RW_CSV), "--declared-version", "synthetic-snapshot")
+        self.invoke("status-fetch", *database, routes=status_routes())
+        self.invoke("status-resolve", *database)
+        self.invoke("hotspots", *database)
+        self.invoke("strata", *database, "--freeze")
+        return database, judge
+
+
+class StatusBlindTitleTests(BrokerPipelineCase):
+    """Publishers put a work's status into its title ("RETRACTED: ...", "... [Retracted]"), and the parent census
+    keeps the title its sources recorded. The judges never see a cited work's status, so the support, function and
+    numeric judges get every cited title without its status markers."""
+
+    MARKED = ("RETRACTED: Retraction note: {title} [Retracted]", "Expression of Concern: {title}",
+              "WITHDRAWN: {title} (Retracted article. See vol. 1, pg. 2, 2020)")
+
+    def make_parent(self, root: Path) -> dict[str, Path]:
+        working = F.make_working_census(root / "census-working.sqlite3")
+        with closing(sqlite3.connect(working)) as connection:
+            keys = [row[0] for row in connection.execute("SELECT work_key FROM works ORDER BY work_key")]
+            for number, key in enumerate(keys):
+                (title,) = connection.execute("SELECT title FROM works WHERE work_key=?", (key,)).fetchone()
+                connection.execute("UPDATE works SET title=? WHERE work_key=?",
+                                   (self.MARKED[number % len(self.MARKED)].format(title=title), key))
+            connection.commit()
+        parent, text = root / "census-frozen.sqlite3", root / "census-frozen-text.sqlite3"
+        scores_db.freeze(working, parent)
+        scores_db.freeze(working, text, keep_text=True)
+        return {"working": working, "parent": parent, "text": text}
+
+    def test_status_markers_leave_the_title_and_the_title_stays(self):
+        for marked, title in (("RETRACTED ARTICLE: A cohort", "A cohort"), ("Retracted: A cohort", "A cohort"),
+                              ("Notice of Retraction: A cohort", "A cohort"), ("Correction to: A cohort", "A cohort"),
+                              ("Editorial Expression of Concern regarding: A cohort", "A cohort"),
+                              ("Erratum: A cohort", "A cohort"), ("Corrigendum to: A cohort", "A cohort"),
+                              ("A cohort [RETRACTED]", "A cohort"), ("A cohort (Retracted article. See 1:2)", "A cohort"),
+                              ("RET\u200bRACTED: A cohort", "A cohort"), ("RETRACTED: Retraction note: A cohort", "A cohort"),
+                              ("Correction of scoliosis: a review", "Correction of scoliosis: a review"),
+                              ("Opioid withdrawal: outcomes", "Opioid withdrawal: outcomes"),
+                              ("Retractions in science: a study", "Retractions in science: a study"), (None, "")):
+            with self.subTest(marked=marked):
+                self.assertEqual(title, status_blind_title(marked))
+
+    def test_no_judge_sees_a_status_marker_in_a_cited_title(self):
+        database, judge = self.prepare_strata()
+        self.invoke("support", *database, "--tier", "abstract", *judge, routes=routes())
+        self.invoke("function", *database, *judge)
+        self.invoke("numeric", *database, "--tables", str(TABLES), "--allow-synthetic-tables", *judge)
+        titles = {work[3] for work in F.WORKS}
+        seen: dict[str, list[str]] = {}
+        for bundle_digest, request in self.broker.sent:
+            payload = json.loads(request["messages"][-1]["content"])
+            for item in payload.get("items", []):
+                seen.setdefault(bundle_digest, []).append(item["citedWork"]["title"])
+        support, function, numeric = (self.exported[key]["digest"] for key in (
+            (VERBATIM, "abstract"), ("citation-function@1", "locus"), ("numeric-check@1", "claim")))
+        self.assertTrue(all(seen.get(key) for key in (support, function, numeric)), sorted(seen))
+        # every title the judges saw is the work's own title, without the markers the parent recorded around it
+        for bundle_digest, sent in seen.items():
+            for title in sent:
+                self.assertIn(title, titles, bundle_digest)
+
+
+class BrokerPipelineTests(BrokerPipelineCase):
+    """The audit end to end with every judging command on one run principal's broker socket."""
 
     def test_every_judging_command_runs_through_the_broker_and_every_gate_holds(self):
         database = ("--database", str(self.database))

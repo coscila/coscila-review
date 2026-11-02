@@ -130,7 +130,10 @@ each file must hash to its recorded digest, and its evidence has provenance `ent
 Each task is what `corpus_assessment.TaskPlanner` expects: `id` `<locus id>|<tier>`, the citing sentence as `claim`,
 the neighbouring sentences as `context` (with `--documents`), the marker and section in `citationLocus`, the cited
 work's title and year, the evidence units, completeness and the source digest. No identifier of the cited work is
-sent. The evidence is the whole document when it fits claim-check@1's window, otherwise the claim-targeted window of
+sent, and neither is its status: the status markers publishers and indexes put into a title (a leading `RETRACTED:`,
+`Retracted article:`, `WITHDRAWN:`, `Retraction note:`, `Expression of concern:`, `Correction to:`, `Erratum:` or
+`Corrigendum:`, a trailing `[Retracted]` or `(Retracted article. See ...)`) are removed from every cited title, in
+every stratum, before the support, function and numeric judges see it (`followup_model.status_blind_title`). The evidence is the whole document when it fits claim-check@1's window, otherwise the claim-targeted window of
 `claim_check.select_evidence` over a retrieval index of the work (claim-check@1's k and window size). Every text
 passes the sanitizer first. The item's provenance (entitled when the citing sentence comes from the text parent or the
 evidence is entitled) travels beside it and is never sent; entitled items reach only a judge the operator's policy
@@ -154,8 +157,8 @@ judge. Evidence acquisition stopped by a throttling provider also pauses the sup
 citation-function@1 classifies the units of S0, S1, S2 and S3 (co-cited loci are not classified) as `relies`,
 `background`, `critical` or `notes-retraction`, with an exact quote from the field it names, or abstains with a
 reason. The judge sees the named work's marker, the citing sentence, the sentences before and after it, the section
-and the cited work's title and year; never its status, the stratum, support verdicts, identifiers or the journal, so
-S0 and S1 loci are judged alike.
+and the cited work's title (without status markers) and year; never its status, the stratum, support verdicts,
+identifiers or the journal, so S0 and S1 loci are judged alike.
 
 The marker is the census's rendering of the work's bibliography target (`⟨rid⟩`, or the publisher-HTML target
 without its `ref-` prefix); a sentence with one marker names that one; when the sentence's targets match none of its

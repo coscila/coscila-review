@@ -46,7 +46,7 @@ from .errors import ValidationError
 from .followup_branch import FollowupBranch, register_dataset, require_freeze
 from .followup_judge import (accepted, block_items, close_judge, judge_from_args, judge_summary, prepare_judge,
                              run_items, step_result)
-from .followup_model import NUMERIC_RULE, TableCell, WorkRef, canonical
+from .followup_model import NUMERIC_RULE, TableCell, WorkRef, canonical, status_blind_title
 from .followup_strata import protocol_of, replicate_groups, replicate_keys
 
 RULE = NUMERIC_RULE
@@ -362,7 +362,8 @@ def numeric_units(connection: sqlite3.Connection, branch: FollowupBranch, *,
 def item_of(unit: Mapping[str, Any]) -> dict[str, Any]:
     work = unit["work"]
     return {"id": unit["locus_id"], "marker": unit["marker"], "citingSentence": unit["sentence"],
-            "citedWork": {"title": work.title or "", "year": _year(work.year)}, "provenance": unit["provenance"]}
+            "citedWork": {"title": status_blind_title(work.title), "year": _year(work.year)},
+            "provenance": unit["provenance"]}
 
 
 def _block_new(connection: sqlite3.Connection, instrument: Any, blocked: Sequence[tuple[str, str, str]],

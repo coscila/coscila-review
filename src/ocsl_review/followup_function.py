@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 from .errors import ValidationError
 from .followup_branch import FollowupBranch, require_freeze
 from .followup_judge import close_judge, judge_summary, prepare_judge, step_result
-from .followup_model import sentence_digest
+from .followup_model import sentence_digest, status_blind_title
 from .followup_schema import UNASSESSABLE
 
 INSTRUMENT_ID = "citation-function@1"
@@ -296,7 +296,8 @@ def function_items(connection: Any, branch: FollowupBranch, units: Sequence[Mapp
         items.append(build_item(key, marker=marker, citing_sentence=sentence,
                                 context_before=sanitize(before, "context"), context_after=sanitize(after, "context"),
                                 section=sanitize(unit.get("section"), "section"),
-                                title=sanitize(title, "cited-title"), year=year, provenance=provenance_of(unit)))
+                                title=status_blind_title(sanitize(title, "cited-title")), year=year,
+                                provenance=provenance_of(unit)))
     return items, blocked, methods
 
 
