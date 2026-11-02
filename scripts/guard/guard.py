@@ -8,14 +8,25 @@ Hooks (installed through core.hooksPath):
 CI:
   guard.py ci --range A..B        the same checks for each commit in the range, merges included
 
-Excluded-project names and the publisher name are matched by length:sha256 over word-start windows, so this file does not
-contain them. Findings print rule ids and locations only, never the matched text.
+Excluded-project names are matched by length:sha256 over word-start windows, so this file does not contain them. Findings
+print rule ids and locations only, never the matched text.
+
+Local rules: guard_private.py next to this file, when present, adds content rules that only the local hooks apply. The
+repository mirrors of this file do not carry that module, so CI runs without those rules.
+
+Process notes: repository text describes the system in technical terms. Added lines (pre-commit, ci) and commit messages
+(commit-msg, ci) must not cite the development process: plan step ids and phases, review rounds, workflow ids, dated
+internal decisions and incidents, or the private knowledge base. Vendored, licence, data-fixture, migration and
+generated paths are exempt. In a merge the rule skips added lines that one of the merged revisions already contains,
+since its author did not write them, and checks the rest: conflict resolutions and extra edits. pre-push does not apply
+this rule: it re-checks commits that commit-msg and pre-commit already passed.
 
 Waiver: a comment on the same line containing "guard: allow <rule>[,<rule>...]" lets that reviewed line pass the named
 content rules. Excluded-project findings, forbidden files and file sizes cannot be waived.
 """
 
 import hashlib
+import importlib.util
 import os
 import re
 import subprocess
@@ -31,46 +42,45 @@ EXCLUDED = {
     10: "5ac4a1bd0b4a831a5fcd76d0dbe03e2b33038f8058d41faec7cc296d7706d070",
     15: "aac427a207938b0684e5c8945e509ccb6d0c076f997421258a3456c8b6eb2f9d",
 }
-PUBLISHER = {8: "c1f35ffd9e5268dec53413e3d2d88b306788f5b95b747812f2a479241f742bf9"}
-
-# Checker and integrity feature paths: only here, and in commit messages touching them, the publisher-framing and
-# correspondence rules apply. Publisher and journal names elsewhere (writing skills, vendored skills, the journal-policy
-# skill, bio lines) are fine. The paths are repository-relative; test_guard.py checks a sample against the real checkouts.
-CHECKER_SKILLS = (  # coscila-review skills, whole directories (assets, prompts, references, scripts)
-    "ocsl-review-reference-integrity",
-    "ocsl-review-claim-source-verification",
-    "ocsl-review-citation-census",
-    "ocsl-review-citation-completeness",
-    "ocsl-review-reference-analysis",
-)
-CHECKER_MODULES = ("citations", "census", "claim_inventory", r"corpus_\w+", "literature", "scholarly")  # src/ocsl_review
-PLANNED_MODULES = ("claim_check", "integrity", "screen", "sanitize", "author_year", "retrieval")
-CHECKER_TESTS = ("citations", "census", "claim_inventory", "corpus", "literature", "scholarly") + PLANNED_MODULES
-CHECKER_PATHS = re.compile(
+# Process notes. Every alternative needs a form that ordinary prose, identifiers and numbers do not take: a step id only
+# after "plan", a round only with its number and a review context, a decision or an incident only with its date (a
+# decision also in parentheses).
+PLAN_STEP = r"(?:[HSPRETM]\d[a-z]?|UI-[A-Z]|AUTH(?:-\d)?|PRIV-\d[a-z]?|Phase\s+\d+)"
+PROCESS_NOTE = re.compile(
     "|".join(
         [
-            r"^skills/(?:%s)/" % "|".join(CHECKER_SKILLS),
-            r"^skills/ocsl-review-(?:claim-check|integrity|screen|sanitize|author-year|retrieval)[^/]*/",
-            r"^src/ocsl_review/(?:%s)\.py$" % "|".join(CHECKER_MODULES),
-            r"^src/ocsl_review/(?:%s)(?:\.[^/]+|/)" % "|".join(PLANNED_MODULES),  # any extension, or a package
-            r"^tests/test_(?:%s)(?:_\w+)?\.py$" % "|".join(CHECKER_TESTS),
-            r"^tests/fixtures/citation_census",
-            r"^docs/(?:citation-census|corpus-review)\.md$",
-            r"^docs/(?:claim[-_]check|integrity|screen|sanitize|author[-_]year|retrieval)[^/]*$",
-            r"^prompts/",
-            r"^scripts/rollout-meta-literature-preset",  # coscila
+            r"\b[Pp]lans?\s+(?:(?:items?|steps?|tracks?)\s+)?%s(?![\w-])" % PLAN_STEP,
+            r"\b[Pp]hase\s+\d+[a-z]?\s+(?:review|readiness|prep|rehearsal|runbook)\b",
+            r"\b[Rr]eadiness\s+rounds?\b|\b(?:[Rr]eview|[Rr]eadiness)\s+round[- ]?\d",
+            r"\b(?:review|readiness)\s*,\s*round[- ]?\d+[a-z]?\s*\)",
+            r"\b[Rr]ound[- ](?:\d+[a-z]?|[A-Za-z])"
+            r"(?:['\u2019]s\b|\s+(?:fix(?:es)?|findings?|finds|verifier|blockers?)\b)",
+            r"(?<![\w.~/-])kb/(?!(?:\d+(?:\.\d+)?|(?i:s|sec|ms|min|h|bp|kbp|kb|mb|gb|tb))(?![\w-]|\.\w))[\w.-]",
+            r"\bPROGRESS\.md\b|\bDESIGN_\w*\.md\b|\bDESIGN_[a-z]\w*",
+            r"\bISSUES\s+[A-Z]{2,5}-\d+\b|\brunbook\s+[A-Z]\d+(?:\.\d+)*\b",
+            r"\bwf_[0-9a-f]{8,}\b",
+            r"\b(?:operator|author|user|owner)\s+decision\s+(?:(?:of|on)\s+)?(?:\d{4}-)?\d\d-\d\d\b",
+            r"\bdecision\s+(?:(?:of|on)\s+)?\d{4}-\d\d-\d\d\b|\b\d{4}-\d\d-\d\d\s+(?:operator|author|user)\s+decision\b",
+            r"\(\s*(?:operator|user)\s+decision\s*[:;)]|\bbinding\s+(?:operator|user)\s+decision\b",
+            r"\b(?:\d{4}-)?\d\d-\d\d\s+incident\b",
+            r"\b[Ii]ncident\s+(?:regression|repair)\b[^\n]{0,40}?\b\d{4}-\d\d-\d\d\b",
         ]
     )
 )
-PUBLISHER_FRAMING = re.compile(
-    r"\bfor (a |the )?publishers?\b|\bpublisher[- ](service|facing|partner|partnership|integration|pilot|customer|use[- ]case)s?\b"
-    r"|\b(editorial|submission)[- ]system integration\b|\bsold to publishers\b",
-    re.I,
+# Text the repositories carry but do not author: vendored trees, licences, data fixtures and snapshots, verbatim copies of
+# earlier sources that rollback tests load (fixtures/legacy), migrations (their checksums are recorded once applied) and
+# generated code.
+PROCESS_NOTE_EXEMPT = re.compile(
+    r"^(?:upstream|sources|translations|licenses|LICENSES)/"
+    r"|(?:^|/)(?:LICEN[CS]E|COPYING|NOTICE)(?:[.-][^/]*)?$"
+    r"|(?:^|/)fixtures/legacy/"
+    r"|(?:^|/)(?:fixtures?|__fixtures__|testdata|golden)/(?:[^/]+/)*[^/]+\."
+    r"(?:json|jsonl|ndjson|xml|html?|tsv|csv|txt|md|ya?ml|bib|ris|nbib|tex|svg|snap)$"
+    r"|\.snap$"
+    r"|^packages/db/prisma/migrations/|^packages/db/src/generated/"
 )
-CORRESPONDENCE = re.compile(
-    r"\b(e-?mail|mail) (exchange|thread|conversation|correspondence)\b|\bas discussed (by|via|over) (e-?)?mail\b"
-    r"|\bour correspondence\b|\bper (your|their|our) (e-?)?mail\b",
-    re.I,
+PROCESS_NOTE_HINT = (
+    "guard: describe the system in technical terms; plan ids, rounds, kb references are not allowed in repository text."
 )
 
 SECRETS = [
@@ -146,6 +156,20 @@ UNWAIVABLE = {"excluded-project"}
 DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short", "-U0"]
 
 
+def load_local_rules():
+    """The module guard_private.py next to this file, or None where it is absent (the repository mirrors)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard_private.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("guard_private", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+LOCAL = load_local_rules()
+
+
 def hashed_hit(text, table):
     low = text.lower().replace("_", "-")
     for match in WORD_START.finditer(low):
@@ -191,7 +215,7 @@ def editor_message(message):
     return "\n".join(lines)
 
 
-def message_problems(message):
+def message_problems(message, notes=True):
     lines = message.split("\n")
     while lines and not lines[-1].strip():
         lines.pop()
@@ -207,6 +231,8 @@ def message_problems(message):
         problems.append("msg-attribution")
     if hashed_hit(body, EXCLUDED):
         problems.append("msg-excluded-project")
+    if notes and PROCESS_NOTE.search(body):
+        problems.append("msg-process-note")
     return problems
 
 
@@ -256,7 +282,7 @@ def waived(line):
     return rules
 
 
-def line_problems(path, line):
+def line_problems(path, line, notes=True):
     problems = [name for name, pattern in SECRETS if _secret_hit(name, pattern, line)]
     if kv_secret(line):
         problems.append("kv-secret")
@@ -264,11 +290,10 @@ def line_problems(path, line):
         problems.append("npmrc-auth")
     if hashed_hit(line, EXCLUDED):
         problems.append("excluded-project")
-    if CHECKER_PATHS.search(path):
-        if hashed_hit(line, PUBLISHER) or PUBLISHER_FRAMING.search(line):
-            problems.append("publisher-framing")
-        if CORRESPONDENCE.search(line):
-            problems.append("correspondence")
+    if LOCAL is not None:
+        problems += LOCAL.line_problems(path, line, hashed_hit)
+    if notes and not PROCESS_NOTE_EXEMPT.search(path) and PROCESS_NOTE.search(line):
+        problems.append("process-note")
     if problems and "guard:" in line:
         allowed = waived(line)
         problems = [rule for rule in problems if rule in UNWAIVABLE or rule not in allowed]
@@ -338,29 +363,47 @@ def added_lines(diff_args):
             number += 1
 
 
-def change_problems(entries, diff_command, prefix=""):
-    """File, path and added-line checks for the entries of one change; each file is diffed on its own (literal pathspec)."""
+def revision_lines(revisions, path):
+    """Every line of path in the given revisions; a revision without the file contributes none."""
+    lines = set()
+    for revision in revisions:
+        code, out, _ = run_git(["cat-file", "blob", f"{revision}:{path}"])
+        if code == 0:
+            lines.update(text(out).split("\n"))
+    return lines
+
+
+def change_problems(entries, diff_command, prefix="", notes=True, merged=()):
+    """File, path and added-line checks for the entries of one change; each file is diffed on its own (literal pathspec).
+    notes=False leaves out the process-note rule. merged names the revisions a merge brings together: an added line that
+    one of them already contains is merged text, which the process-note rule skips."""
     found = []
     sizes = blob_sizes(blob for _, blob, gitlink in entries if not gitlink)
     for path, blob, gitlink in entries:
         for rule in file_problems(path, None if gitlink else sizes.get(blob)):
             found.append((rule, f"{prefix}{path}"))
+        merged_lines = None
         for number, line in added_lines([*diff_command, "--", literal(path)]):
-            for rule in line_problems(path, line):
+            rules = line_problems(path, line, notes)
+            if merged and "process-note" in rules:
+                if merged_lines is None:
+                    merged_lines = revision_lines(merged, path)
+                if line in merged_lines:
+                    rules = [rule for rule in rules if rule != "process-note"]
+            for rule in rules:
                 found.append((rule, f"{prefix}{path}:{number}"))
     return found
 
 
-def checker_message_problems(message, paths):
-    if any(CHECKER_PATHS.search(p) for p in paths):
-        if hashed_hit(message, PUBLISHER) or PUBLISHER_FRAMING.search(message) or CORRESPONDENCE.search(message):
-            return ["msg-publisher-framing"]
-    return []
+def local_message_problems(message, paths):
+    return LOCAL.message_problems(message, paths, hashed_hit) if LOCAL is not None else []
 
 
 def report(found):
     for rule, where in found:
         print(f"guard: {rule}\t{where}", file=sys.stderr)
+    if any(rule in ("process-note", "msg-process-note") for rule, _ in found):
+        print(PROCESS_NOTE_HINT, file=sys.stderr)
     return 1 if found else 0
 
 
@@ -372,8 +415,8 @@ def cmd_commit_msg(path):
     with open(path, encoding="utf-8", errors="replace") as handle:
         message = editor_message(handle.read())
     found = [(rule, "commit message") for rule in message_problems(message)]
-    found += [(rule, "commit message") for rule in checker_message_problems(message, staged_paths())]
-    if found:
+    found += [(rule, "commit message") for rule in local_message_problems(message, staged_paths())]
+    if any(rule != "msg-process-note" for rule, _ in found):
         print("guard: commit messages are exactly one line, without trailers or attribution.", file=sys.stderr)
     return report(found)
 
@@ -383,17 +426,32 @@ def ident(var):
     return re.sub(r"\s+\d+\s+[+-]\d{4}\s*$", "", value.strip())
 
 
+def merge_heads():
+    """The revisions a merge being concluded brings in (MERGE_HEAD, several for an octopus merge); empty otherwise."""
+    code, out, _ = run_git(["rev-parse", "--git-path", "MERGE_HEAD"])
+    if code != 0:
+        return []
+    try:
+        with open(text(out).strip(), encoding="utf-8") as handle:
+            return [line.split()[0] for line in handle if line.strip()]
+    except OSError:
+        return []
+
+
 def cmd_pre_commit():
     found = []
     for var in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
         if ident(var) != IDENTITY:
             found.append(("identity", var))
     entries = parse_raw(git("diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames"))
-    found += change_problems(entries, ["diff", "--cached", *DIFF_OPTIONS])
+    heads = merge_heads()
+    found += change_problems(entries, ["diff", "--cached", *DIFF_OPTIONS], merged=["HEAD", *heads] if heads else ())
     return report(found)
 
 
-def commit_problems(sha):
+def commit_problems(sha, notes=True):
+    """Every check for one commit; notes=False leaves out the process-note rule. In a merge that rule checks only the
+    added lines that none of its parents contains."""
     short = sha[:12]
     found = []
     header = text(git("show", "-s", "--format=%an <%ae>%n%cn <%ce>%n%P", sha)).split("\n")
@@ -402,7 +460,7 @@ def commit_problems(sha):
     if header[1] != IDENTITY:
         found.append(("identity-committer", short))
     message = text(git("show", "-s", "--format=%B", sha))
-    found += [(rule, short) for rule in message_problems(message)]
+    found += [(rule, short) for rule in message_problems(message, notes)]
     parents = header[2].split() if len(header) > 2 else []
     first = parents[0] if parents else EMPTY_TREE
     entries = None
@@ -417,8 +475,9 @@ def commit_problems(sha):
         entries = parse_raw(git("diff", "--raw", "-z", "--no-abbrev", "--no-renames", first, sha))
         diff_command = ["diff", *DIFF_OPTIONS, first, sha]
     touched = [os.fsdecode(p) for p in git("diff", "--name-only", "-z", "--no-renames", first, sha).split(b"\0") if p]
-    found += [(rule, short) for rule in checker_message_problems(message, touched)]
-    found += change_problems(entries, diff_command, prefix=f"{short} ")
+    found += [(rule, short) for rule in local_message_problems(message, touched)]
+    found += change_problems(entries, diff_command, prefix=f"{short} ", notes=notes,
+                             merged=parents if len(parents) >= 2 else ())
     return found
 
 
@@ -435,7 +494,7 @@ def cmd_pre_push(lines):
             found.append(("push-main", remote_ref))
             continue
         for sha in text(git("rev-list", local_sha, "--not", "--remotes")).split():
-            found += commit_problems(sha)
+            found += commit_problems(sha, notes=False)
     return report(found)
 
 
