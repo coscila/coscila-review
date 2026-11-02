@@ -1363,7 +1363,8 @@ class NoRecordDecisionTests(unittest.TestCase):
         # probability p and otherwise the full copy, which holds the sentinel PMC5 and the open-access target PMC9,
         # whose fullTextXML keeps failing. In one invocation of four passes (60, 120 and 240 s cooldowns) PMC9 is
         # never closed: a joint answer from the empty copy lacks the sentinel, one from the full copy holds PMC9.
-        # (A search for the sentinel on its own, round 7's first rule, closed some of these entries.)
+        # (A separate search for the sentinel would close some of these entries: it can reach the full copy while the
+        # target's search reaches the empty one. One joint answer comes from one copy and speaks for both.)
         import random
         import urllib.parse
         empty = (EUROPE_PMC_FIXTURES / "search-pmcid-no-record.json").read_bytes()
@@ -1430,8 +1431,8 @@ class NoRecordDecisionTests(unittest.TestCase):
         # open-access target PMC9, then full; PMC9's fullTextXML fails throughout. One invocation fetches PMC9 in four
         # passes (cooldowns 60, 120 and 240 s, 7 s of backoff in each fetch), at 0, 67, 194 and 441 s. An answer from
         # the empty copy starts nothing, so the entry stays open unless two joint answers at least 60 s apart reach the
-        # partial copy. (Round 7's rule started the absence at the first zero-hit answer, from the empty copy, and
-        # closed the first three in passes 2, 2 and 3.)
+        # partial copy. (Starting the absence at the first zero-hit answer, which the empty copy gives as well, would
+        # close the first three cases in passes 2, 2 and 3.)
         for empty, partial, closed_in, joint in ((60, 10, None, 2), (50, 20, None, 2), (190, 10, None, 3), (0, 75, 2, 2),
                                                  (60, 140, 3, 3)):
             with self.subTest(empty=empty, partial=partial):

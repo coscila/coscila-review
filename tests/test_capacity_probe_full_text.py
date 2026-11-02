@@ -306,7 +306,7 @@ class ShareTests(FullTextCase):
         exit_line = report["exitCriterion"]["line"]
         self.assertFalse(report["exitCriterion"]["passes"])
         self.assertIn("FAIL - 4x5: invalid", exit_line)
-        self.assertTrue(exit_line.endswith("the author decides in D1."))
+        self.assertTrue(exit_line.endswith("; the author decides."))
         self.assertNotIn("hypothetical", exit_line)
         self.assertIn("a probe setting and no census one", report["allowedConcurrency"]["line"])
         markdown = (self.output / P.MARKDOWN_NAME).read_text()
