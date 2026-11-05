@@ -144,9 +144,10 @@ command looks up exactly the works whose lookup failed again, in sweeps after
 1, 5, 15 and 60 minutes while any is left (the result lists them under
 `sweeps`), and writes its output once; a work still failing after the last
 sweep keeps `europe-pmc-failed`, running the command again on its output looks
-it up, and `study prepare` skips a review with a failed lookup until then. Records stream one line at a time into
-`<output>.partial`, which an interrupted run resumes; the output appears when
-every record is written.
+it up, and `study prepare` skips a review with a failed lookup until then.
+Records stream one line at a time into `<output>.partial`, which an
+interrupted run resumes; the output appears once every record is written and
+the sweeps are done.
 
 Document paths are relative to the manifest. A review without a document, or
 whose document cannot be read (missing file, digest mismatch, an inconsistent
@@ -237,9 +238,10 @@ sign-in redirects set (a client without cookies ends on
 `?error=cookies_not_supported`), and the jar accepts and returns cookies for
 nature.com and its subdomains alone (RFC 6265 domain matching), so doi.org and
 every other host of a redirect chain never see one. Publisher pages are
-fetched one per second. The same identity and article checks apply. Linked table pages of an HTML review come from the store, the
-provider cache or the route, in that order; a table page that declares a DOI
-must declare the review's. Without a route a journal is read from the caches
+fetched one per second. The same identity and article checks apply. Linked
+table pages of an HTML review come from the store, the provider cache or the
+route, in that order; a table page that declares a DOI must declare the
+review's. Without a route a journal is read from the caches
 only. Documents are written content-addressed to `documents/` beside the output
 (keep the study's later manifests, such as the abstracts output, in the same
 directory so the document paths resolve), records stream through
@@ -338,9 +340,11 @@ PMCID without any record stays open instead. A 404, a 410 or another client
 error is Europe PMC's own definitive answer; throttling (408, 425, 429),
 timeouts and dropped connections get no record check. Each `study full-text`
 result counts the escalated entries that invocation closed without a window by
-reason, in `withoutFullText`: `noPmcid`, `notOpenAccess`, `noRecord`, `notFound`
-(404, 410 or another client error), `entitledBlocked` and `other` (an unreadable
-fullTextXML, no live retrieval, a fetcher that names no reason). `noRecord`
+reason, in `withoutFullText` (and per journal in `withoutFullTextByJournal`):
+`noPmcid`, `notOpenAccess`, `noRecord`, `notFound` (404, 410 or another client
+error), `entitledBlocked`, `persistentError` (a fetch that kept failing in
+transport, below) and `other` (an unreadable fullTextXML, no live retrieval, a
+fetcher that names no reason). `noRecord`
 should stay 0, because every PMCID of the census comes from a Europe PMC record;
 a non-zero count means that two searches at least 60 s apart each held another
 PMCID's record but not theirs (a withdrawn record, or a copy of the index that
@@ -576,7 +580,24 @@ server errors of a PMCID Europe PMC lists as open access or whose record could
 not be checked, timeouts, dropped connections) keep their entries open the same
 way; a 404, and a server error for a PMCID outside the open-access subset or
 without a record in two checks, is a failed retrieval, and `--retry-failed`
-reopens those. `replicate`
+reopens those.
+
+An item that keeps failing in transport while other items succeed closes with
+a recorded outcome, so its step can end: once three invocations counted its
+failure, the first and the last at least 2 h apart. An escalated entry whose
+fetch failed counts in an invocation in which another fetch returned a full
+text; when none has yet, one fetch of a full text the census already read tells
+a failure of that work from an outage. It closes as `fetch-failed` with reason
+`persistentError`, never a support verdict. An abstract-tier batch no call
+answered counts in every invocation except one in which other batches went
+unanswered and none was answered (an outage), and closes only when another
+batch was answered in one of its counted invocations: its open entries become
+`invalid:no-response`, unsure and invalid outputs, outside the sensitivity
+samples (no call answered them). An item that fails only during an outage
+therefore never closes. The database keeps every such item in
+`persistent_failures` (invocations counted, first and last failure, outcome),
+`status` reports the closed ones by journal (`persistentFailures`) and `gates`
+notes them. `replicate`
 re-runs whole primary batches, unchanged, in a sample stratified by journal and
 first-online year and allocated in proportion to judged entries; its verdicts go
 to the history as variant `replicate`, and the estimands report category and
