@@ -15,11 +15,13 @@ from .config import resolve_paths
 from .errors import (
     EXIT_POLICY,
     EXIT_RUNTIME,
+    EXIT_TRANSIENT,
     EXIT_TRUST,
     EXIT_USAGE,
     EXIT_VALIDATION,
     ConfidentialityError,
     ReviewError,
+    TransientError,
     TrustBoundaryError,
     ValidationError,
 )
@@ -594,6 +596,10 @@ def _run(raw: list[str], outcome: dict[str, Any], *, keep_exit: bool) -> int:
         failed("validation", exc)
         print(f"validation: {exc}", file=sys.stderr)
         return EXIT_VALIDATION
+    except TransientError as exc:
+        failed("transient", exc)
+        print(f"transient: {exc}", file=sys.stderr)
+        return EXIT_TRANSIENT
     except ReviewError as exc:
         failed("usage", exc)
         print(f"error: {exc}", file=sys.stderr)

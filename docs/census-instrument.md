@@ -402,9 +402,14 @@ a fresh population. `study enumerate` pages through Europe PMC search with
 cursors, keeps every raw page content-addressed in `<output>.pages/` and writes
 the manifest and, last, the receipt `<output>.receipt.json` (spec, query rule,
 effective queries, hit counts, page digests and the population digest). A
-population that is not exhausted or whose hit count changes while paging is
-refused; a review listed twice is kept once and records without a DOI are
-listed by provider id. Requests carry identifiers only.
+group whose search fails or whose paging glitches (a page that is no result
+list, a hit count that changes while paging, a population that is not
+exhausted) is paged again from its first page after 30, 60 and 120 s, and the
+receipt records each restart with its reason (`restarts` per group). When the
+third restart fails too, the command exits with error kind `transient` (exit
+code 75) and writes no receipt, so the same command can run again later. A
+review listed twice is kept once and records without a DOI are listed by
+provider id. Requests carry identifiers only.
 
 `study acquire` for a fresh study runs with `--live` and a `--route` for every
 journal: its byte caches then only stand in for downloads, so what a cache
