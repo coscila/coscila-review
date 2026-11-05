@@ -147,7 +147,14 @@ sweep keeps `europe-pmc-failed`, running the command again on its output looks
 it up, and `study prepare` skips a review with a failed lookup until then.
 Records stream one line at a time into `<output>.partial`, which an
 interrupted run resumes; the output appears once every record is written and
-the sweeps are done.
+the sweeps are done. Four records are looked up at a time and written in the
+input's order, so the output, and the partial file a stopped run leaves, hold
+exactly what one record at a time writes; every lookup keeps the census's
+Europe PMC rate. A DOI that a lookup of the invocation answered (with a record
+or without one) is answered from that lookup for every later work citing it,
+with its retrieval time; a failed lookup, an answer without a result list and
+a page that lists fewer records than its hit count leave the DOIs they did not
+list to be asked again, and PMID lookups are always asked.
 
 Document paths are relative to the manifest. A review without a document, or
 whose document cannot be read (missing file, digest mismatch, an inconsistent
@@ -251,14 +258,17 @@ such copy, or only copies whose JATS names another DOI, the publisher page is
 tried next (the reasons go to `rejected`).
 The enumeration and its kept pages are unchanged: Europe PMC lists the copy
 there as a record without a DOI. On an entitled route the publisher page and
-its linked table pages share one session cookie jar per
-`study acquire` run, held in memory and never written, logged or recorded:
-nature.com serves a licensed page only to a client that returns the cookie its
+its linked table pages share one session cookie jar per `study acquire` run,
+held in memory and never written, logged or recorded, and fetched one after
+another, so two sign-in redirect chains never interleave in it: nature.com
+serves a licensed page only to a client that returns the cookie its
 sign-in redirects set (a client without cookies ends on
 `?error=cookies_not_supported`), and the jar accepts and returns cookies for
 nature.com and its subdomains alone (RFC 6265 domain matching), so doi.org and
 every other host of a redirect chain never see one. Publisher pages are
-fetched one per second. The same identity and article checks apply. Linked
+fetched one per second for the whole command (a page's redirects counted with
+it), whatever the number of records acquired at a time. The same identity and
+article checks apply. Linked
 table pages of an HTML review come from the store, the provider cache or the
 route, in that order; a table page that declares a DOI must declare the
 review's. Without a route a journal is read from the caches
@@ -267,6 +277,9 @@ only. Documents are written content-addressed to `documents/` beside the output
 directory so the document paths resolve), records stream through
 `<output>.partial` and resume, a throttled or failing route leaves the record
 in state `retry`, and `--retry-unavailable` tries the unavailable ones again.
+Four records are acquired at a time and written in the input's order, so the
+output, and the partial file a stopped run leaves, hold exactly what one record
+at a time writes.
 After the main pass the records in state `retry` are acquired again in up to
 four sweeps that wait 1, 5, 15 and 60 minutes before each while any is left (the
 result lists them under `sweeps`), and the output is written once; a record still failing after the

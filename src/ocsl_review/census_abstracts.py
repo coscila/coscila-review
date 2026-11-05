@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -61,33 +62,71 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def fetch_abstracts(works: Mapping[str, Mapping[str, Any]], get: Callable[[dict[str, Any]], dict[str, Any] | None]
-                    ) -> dict[str, dict[str, Any]]:
+class DoiRecords:
+    """Europe PMC's answers by DOI within one invocation, shared by its threads: the record a lookup selected for a
+    DOI (or none) and when it was retrieved. A failed lookup leaves nothing here."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._answers: dict[str, tuple[Mapping[str, Any] | None, str]] = {}
+
+    def get(self, doi: str) -> tuple[Mapping[str, Any] | None, str] | None:
+        with self._lock:
+            return self._answers.get(doi)
+
+    def put(self, doi: str, record: Mapping[str, Any] | None, retrieved_at: str) -> None:
+        with self._lock:
+            self._answers.setdefault(doi, (record, retrieved_at))
+
+
+def _doi_outcome(hit: Mapping[str, Any] | None) -> str:
+    if hit is None:
+        return "europe-pmc-no-hit"
+    return "europe-pmc-core" if hit.get("abstractText") else "europe-pmc-no-abstract"
+
+
+def fetch_abstracts(works: Mapping[str, Mapping[str, Any]], get: Callable[[dict[str, Any]], dict[str, Any] | None], *,
+                    memo: DoiRecords | None = None) -> dict[str, dict[str, Any]]:
     """Return {work key: {"abstract", "abstractSource", "abstractRetrievedAt", "record"}} for every work.
 
-    ``record`` is the Europe PMC record the lookup selected (None without a hit).
+    ``record`` is the Europe PMC record the lookup selected (None without a hit). With ``memo`` a DOI an earlier
+    lookup of the invocation answered is answered from it (the same record, retrieved when it was), and only the
+    other DOIs are asked; an answer that is no result list, or a page that lists fewer records than its hitCount,
+    leaves the DOIs it did not list to be asked again.
     """
     out: dict[str, dict[str, Any]] = {}
-    with_doi = [(key, str(work["doi"]).lower()) for key, work in works.items() if work.get("doi")]
+    with_doi = []
+    for key, work in works.items():
+        if not work.get("doi"):
+            continue
+        doi = str(work["doi"]).lower()
+        known = memo.get(doi) if memo is not None else None
+        if known is None:
+            with_doi.append((key, doi))
+            continue
+        hit, retrieved = known
+        out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": _doi_outcome(hit),
+                    "abstractRetrievedAt": retrieved, "record": hit}
     for start in range(0, len(with_doi), DOIS_PER_QUERY):
         chunk = with_doi[start:start + DOIS_PER_QUERY]
         query = " OR ".join('DOI:"%s"' % doi.replace('"', "") for _, doi in chunk)
         response = get({"query": query, "format": "json", "resultType": "core", "pageSize": 200})
         hits: dict[str, Mapping[str, Any]] = {}
-        for result in ((response or {}).get("resultList") or {}).get("result") or []:
+        results = ((response or {}).get("resultList") or {}).get("result") or []
+        for result in results:
             doi = (result.get("doi") or "").lower()
             if doi and doi not in hits:
                 hits[doi] = result
+        # Kept for the invocation: the records of a result list, and no hit only from a page that holds every hit.
+        listed = isinstance(response, dict) and isinstance((response.get("resultList") or {}).get("result"), list)
+        complete = listed and not (isinstance(response.get("hitCount"), int) and response["hitCount"] > len(results))
         for key, doi in chunk:
             hit = hits.get(doi)
-            if response is None:
-                source = "europe-pmc-failed"
-            elif hit is None:
-                source = "europe-pmc-no-hit"
-            else:
-                source = "europe-pmc-core" if hit.get("abstractText") else "europe-pmc-no-abstract"
+            source = "europe-pmc-failed" if response is None else _doi_outcome(hit)
             out[key] = {"abstract": (hit or {}).get("abstractText"), "abstractSource": source, "abstractRetrievedAt": _now(),
                         "record": hit}
+            if memo is not None and listed and (hit is not None or complete):
+                memo.put(doi, hit, out[key]["abstractRetrievedAt"])
     for key, work in works.items():
         if key in out:
             continue
@@ -116,7 +155,7 @@ def _text_sha256(text: str | None) -> str:
 
 
 def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[str, Any] | None], *,
-                overwrite: bool = False, cache: Any = None) -> dict[str, Any]:
+                overwrite: bool = False, cache: Any = None, memo: DoiRecords | None = None) -> dict[str, Any]:
     """A review record whose works carry Europe PMC abstracts, the one provider for every journal.
 
     Every work not yet looked up (all works with ``overwrite``) is looked up: in the study's byte caches
@@ -126,7 +165,8 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
     ``europePmcOutcome`` and is retried on the next run. ``abstractProvenance`` records cache-hit-public,
     live-public, supplied (a fallback) or unavailable, with the digest of the text it vouches for. A work derived
     from the review's bibliography (``study works``) also takes its title, venue, year, PMCID and retraction flag
-    from the same record (``metadataProvenance``, bound to the digest of those fields).
+    from the same record (``metadataProvenance``, bound to the digest of those fields). ``memo`` holds the
+    invocation's answers by DOI (``fetch_abstracts``).
     """
     from .census_works import apply_metadata
     works = {key: dict(work) for key, work in (record.get("works") or {}).items()}
@@ -148,7 +188,7 @@ def fill_record(record: Mapping[str, Any], get: Callable[[dict[str, Any]], dict[
             if derived(work):
                 apply_metadata(work, hit.get("record"), hit["provenance"])
             del wanted[key]
-    for key, found in fetch_abstracts(wanted, get).items():
+    for key, found in fetch_abstracts(wanted, get, memo=memo).items():
         work, outcome = works[key], found["abstractSource"]
         work["europePmcOutcome"] = outcome
         if outcome == "europe-pmc-failed":

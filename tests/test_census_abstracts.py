@@ -83,6 +83,34 @@ class AbstractTests(unittest.TestCase):
         self.assertEqual(("Abstract of 10.5555/n.1.", "europe-pmc-core"), (retried["abstract"], retried["abstractSource"]))
 
 
+    def test_answers_by_doi_are_kept_for_the_invocation_only_from_a_complete_result_list(self):
+        from ocsl_review.census_abstracts import DoiRecords
+        memo, asked = DoiRecords(), []
+        answers = [
+            # A page cut at its size: work a's record is kept, work b's missing hit is no answer.
+            {"hitCount": 300, "resultList": {"result": [{"doi": "10.5555/a", "abstractText": "Abstract a."}]}},
+            {"unexpected": "body"},                                   # no result list: nothing is kept
+            {"hitCount": 0, "resultList": {"result": []}},            # a complete page: b has no hit
+        ]
+
+        def get(params):
+            asked.append(sorted(part.split('"')[1] for part in params["query"].split(" OR ")))
+            return answers.pop(0)
+        works = {"a": {"doi": "10.5555/A"}, "b": {"doi": "10.5555/b"}}
+        first = fetch_abstracts(works, get, memo=memo)
+        self.assertEqual(("europe-pmc-core", "europe-pmc-no-hit"),
+                         (first["a"]["abstractSource"], first["b"]["abstractSource"]))
+        fetch_abstracts(works, get, memo=memo)
+        last = fetch_abstracts(works, get, memo=memo)
+        self.assertEqual([["10.5555/a", "10.5555/b"], ["10.5555/b"], ["10.5555/b"]], asked)
+        self.assertEqual(("Abstract a.", first["a"]["abstractRetrievedAt"], "europe-pmc-no-hit"),
+                         (last["a"]["abstract"], last["a"]["abstractRetrievedAt"], last["b"]["abstractSource"]))
+        fetch_abstracts(works, get, memo=memo)
+        self.assertEqual(3, len(asked), "both DOIs are answered for the rest of the invocation")
+        # A failed lookup (no answer) is never kept.
+        failed = fetch_abstracts({"c": {"doi": "10.5555/c"}}, lambda params: None, memo=memo)
+        self.assertEqual(("europe-pmc-failed", None), (failed["c"]["abstractSource"], memo.get("10.5555/c")))
+
     def test_live_lookups_name_the_census_user_agent_and_carry_identifiers_only(self):
         import io
         import json

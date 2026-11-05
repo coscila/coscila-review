@@ -1464,7 +1464,8 @@ class LicensedPageTests(unittest.TestCase):
         self.waits = []
 
     def live(self, session=True):
-        return LiveSources(publisher=census_inputs.page_fetcher(spacing=1.0, sleep=self.waits.append),
+        pages = census_inputs.RateLimit(1.0, sleep=self.waits.append)
+        return LiveSources(publisher=census_inputs.page_fetcher(sleep=self.waits.append, limit=pages),
                            session=census_inputs.session_cookies() if session else None)
 
     def acquire(self, live, route="entitled"):
@@ -1518,7 +1519,7 @@ class LicensedPageTests(unittest.TestCase):
 
     def test_cookies_stay_on_nature_com_hosts_by_domain_matching(self):
         jar = census_inputs.session_cookies()
-        fetch = census_inputs.page_fetcher(spacing=0, sleep=lambda seconds: None)
+        fetch = census_inputs.page_fetcher(sleep=lambda seconds: None, limit=unpaced())
         body, final = fetch("https://doi.org/" + LICENSED_REVIEW, cookies=jar)
         self.assertEqual((html_review(LICENSED_REVIEW), ARTICLE), (body, final))
         # Neither the sibling subdomain's nor another site's cookie was taken from idp.nature.com.
@@ -1553,7 +1554,7 @@ class LiveFetchTests(unittest.TestCase):
             if isinstance(outcome, Exception):
                 raise outcome
             return outcome
-        fetch = census_inputs.page_fetcher(spacing=0, opener=opener, sleep=lambda seconds: None)
+        fetch = census_inputs.page_fetcher(opener=opener, sleep=lambda seconds: None, limit=unpaced())
         script[:] = [FakeResponse(200, b"<html/>", "https://publisher.example/final")]
         self.assertEqual((b"<html/>", "https://publisher.example/final"), fetch("https://doi.org/10.5555/x"))
         self.assertNotIn("@", json.dumps(requests), "requests carry no contact address")
@@ -1770,6 +1771,241 @@ class PmcCopyTests(RunnerTestCase):
         self.assertEqual(({"live-public": 2}, 1), (result["provenance"], result["pmcCopies"]))
         rows = [json.loads(line) for line in output.read_text().splitlines()]
         self.assertEqual([COPY_PMCID, None], [(row["acquisition"].get("link") or {}).get("pmcid") for row in rows])
+
+
+class Stopped(Exception):
+    """The process stops in the middle of a step (a crash or a kill), outside any failure the step handles."""
+
+
+class ParallelAcquisitionTests(CacheTestCase):
+    """Four records at a time in study acquire and study abstracts, written in the input's order: the output, and the
+    partial file a stopped run leaves, are what one record at a time writes."""
+
+    STAMP = "2026-11-05T00:00:00Z"
+
+    def live_sources(self, stop_at=None):
+        """Live routes that answer later records sooner (so four workers finish out of order) and count the fetches in
+        flight; ``stop_at`` names a DOI whose fetch stops the process."""
+        import threading
+        import time
+        state = {"flight": 0, "most": 0}
+        lock = threading.Lock()
+
+        def timed(number, answer):
+            with lock:
+                state["flight"] += 1
+                state["most"] = max(state["most"], state["flight"])
+            try:
+                time.sleep(0.003 * (12 - number))
+                return answer()
+            finally:
+                with lock:
+                    state["flight"] -= 1
+
+        def europe_pmc(pmcid):
+            number = int(pmcid[-2:])
+            return timed(number, lambda: copy_jats(pmcid, None if number == 99 else f"10.5555/live.{number}"))
+
+        def publisher(url):
+            doi = urllib.parse.unquote(url.rsplit("doi.org/", 1)[-1])
+            if doi == stop_at:
+                raise Stopped(doi)
+            if "flaky" in doi:
+                raise RetryableFetch("HTTP 503")
+            return timed(int(doi.rsplit(".", 1)[-1]), lambda: (html_review(doi), PUBLISHER + doi.rsplit("/", 1)[-1]))
+        copies = PmcCopies([pmc_record(COPY_PMCID)], {COPY_PMCID: copy_jats(COPY_PMCID, COPY_REVIEW)})
+
+        def fetch(pmcid):
+            return copies.fetch(pmcid) if pmcid == COPY_PMCID else europe_pmc(pmcid)
+        return LiveSources(europe_pmc=fetch, publisher=publisher, search=copies.search), state
+
+    def source(self):
+        rows = [{"journal": JOURNAL, "doi": JATS_REVIEW}, {"journal": JOURNAL, "doi": HTML_REVIEW},
+                {"journal": SECOND, "doi": CACHED_REVIEW},
+                *({"journal": JOURNAL, "doi": f"10.5555/live.{n}", "pmcid": f"PMC9000{n:02d}"} for n in range(1, 7)),
+                *({"journal": SECOND, "doi": f"10.5555/page.{n}"} for n in range(7, 10)),
+                {"journal": SECOND, "doi": "10.5555/flaky.10"},
+                {"journal": JOURNAL, "doi": COPY_REVIEW, "enumeratedTitle": COPY_TITLE},
+                {**record(doi="10.5555/supplied.review"), "document": {"path": "review.xml", "kind": "jats"}}]
+        source = self.root / "input" / "reviews.jsonl"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return source, rows
+
+    def acquire(self, output, workers, stop_at=None):
+        live, state = self.live_sources(stop_at)
+        acquirer = ReviewAcquirer(self.caches(), routes=parse_routes([f"{JOURNAL}=public", f"{SECOND}=entitled"]),
+                                  live=live)
+        with mock.patch.object(census_inputs, "utc_now", return_value=self.STAMP):
+            result = acquire_records(self.source()[0], output, acquirer, sleep=lambda seconds: None, workers=workers)
+        return result, state
+
+    @staticmethod
+    def documents(output):
+        return {path.name: path.read_bytes() for path in (output.parent / "documents").iterdir()}
+
+    def test_in_order_keeps_the_items_order_and_stops_where_an_item_fails(self):
+        import threading
+        import time
+        started, lock = [], threading.Lock()
+
+        def square(item):
+            with lock:
+                started.append(item)
+            time.sleep(0.001 * (item % 5))
+            if item == 13:
+                raise ValueError("item 13")
+            return item * item
+        self.assertEqual([item * item for item in range(13)], list(census_inputs.in_order(range(13), square, workers=4)))
+        started.clear()
+        seen = []
+        with self.assertRaisesRegex(ValueError, "item 13"):
+            for value in census_inputs.in_order(range(40), square, workers=4):
+                seen.append(value)
+        self.assertEqual([item * item for item in range(13)], seen)
+        self.assertLessEqual(max(started), 13 + 2 * 4 - 1, "at most twice the workers start ahead of the next result")
+        # One worker computes each item when it is asked for.
+        started.clear()
+        lazy = census_inputs.in_order(range(5), square, workers=1)
+        self.assertEqual((0, [0]), (next(lazy), started))
+
+    def test_four_workers_write_what_one_record_at_a_time_writes(self):
+        one, sequential = self.acquire(self.root / "one" / "reviews.jsonl", workers=1)
+        four, parallel = self.acquire(self.root / "four" / "reviews.jsonl", workers=4)
+        self.assertEqual((1, 4), (sequential["most"], parallel["most"]), "four live fetches were in flight at once")
+        written = (self.root / "one" / "reviews.jsonl").read_bytes()
+        self.assertEqual(written, (self.root / "four" / "reviews.jsonl").read_bytes())
+        self.assertEqual(self.documents(self.root / "one" / "reviews.jsonl"),
+                         self.documents(self.root / "four" / "reviews.jsonl"))
+        self.assertEqual({key: value for key, value in one.items() if key not in ("output", "documents")},
+                         {key: value for key, value in four.items() if key not in ("output", "documents")})
+        self.assertEqual(({"cache-hit-entitled": 1, "cache-hit-public": 2, "live-entitled": 3, "live-public": 7,
+                           "retry": 1, "supplied": 1}, 1, 4),
+                         (four["provenance"], four["pmcCopies"], len(four["sweeps"])))
+        self.assertEqual([row["doi"] for row in self.source()[1]],
+                         [json.loads(line)["doi"] for line in written.decode().splitlines()])
+
+    def test_a_stopped_run_leaves_a_prefix_of_the_output_and_resumes_to_the_same_output(self):
+        self.acquire(self.root / "one" / "reviews.jsonl", workers=1)
+        expected = (self.root / "one" / "reviews.jsonl").read_bytes().splitlines(keepends=True)
+        output = self.root / "four" / "reviews.jsonl"
+        with self.assertRaises(Stopped):
+            self.acquire(output, workers=4, stop_at="10.5555/page.8")
+        stopped_at = [row["doi"] for row in self.source()[1]].index("10.5555/page.8")
+        self.assertEqual(expected[:stopped_at], Path(str(output) + ".partial").read_bytes().splitlines(keepends=True))
+        resumed, _ = self.acquire(output, workers=4)
+        self.assertEqual(stopped_at, resumed["resumed"])
+        self.assertEqual(b"".join(expected), output.read_bytes())
+
+    def test_four_workers_look_up_what_one_record_at_a_time_looks_up_and_ask_each_doi_once_in_order(self):
+        import collections
+        import threading
+        import time
+        # Six reviews cite the same works and one work of their own each; a later review's lookup is answered sooner.
+        rows = [record(doi=f"10.5555/review.{n}") for n in range(1, 7)]
+        for number, row in enumerate(rows, 1):
+            row["works"][f"own-{number}"] = {"doi": f"10.5555/own.{number}", "title": f"Own work {number}"}
+        source = self.root / "input" / "reviews.jsonl"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        asked, lock = collections.Counter(), threading.Lock()
+
+        def get(params):
+            dois = [part.split('"')[1] for part in params["query"].split(" OR ") if '"' in part]
+            own = [int(doi.rsplit(".", 1)[-1]) for doi in dois if doi.startswith("10.5555/own.")]
+            time.sleep(0.004 * (7 - own[0]) if own else 0.001)
+            with lock:
+                asked.update(dois or [params["query"]])
+            return lookups(params)
+        outputs = {}
+        for workers in (1, 4):
+            asked.clear()
+            output = self.root / f"abstracts-{workers}.jsonl"
+            with mock.patch.object(census_abstracts, "_now", return_value=self.STAMP):
+                fill_abstracts(source, output, get, overwrite=True, workers=workers)
+            outputs[workers] = output.read_bytes()
+            dois = {doi for doi in asked if doi.startswith("10.")}
+            if workers == 1:
+                # Each DOI is asked once in the invocation, and every later review takes that answer.
+                self.assertEqual({1}, {asked[doi] for doi in dois})
+                self.assertEqual(len(rows), asked["EXT_ID:100003 AND SRC:MED"], "PMID lookups are not kept")
+            else:
+                self.assertLessEqual(max(asked[doi] for doi in dois), 4)
+        self.assertEqual(outputs[1], outputs[4])
+        filled = [json.loads(line) for line in outputs[4].decode().splitlines()]
+        self.assertEqual([row["doi"] for row in rows], [row["doi"] for row in filled])
+        work = filled[-1]["works"]["work-1"]
+        self.assertEqual(("live-public", "Live abstract.", self.STAMP),
+                         (work["abstractProvenance"]["provenance"], work["abstract"], work["abstractRetrievedAt"]))
+
+    def test_the_pages_of_one_sign_in_session_are_fetched_one_after_another(self):
+        import threading
+        import time
+        state, lock = {"flight": 0, "most": 0}, threading.Lock()
+        both = threading.Barrier(2, timeout=5)
+
+        def publisher(url, cookies=None):
+            with lock:
+                state["flight"] += 1
+                state["most"] = max(state["most"], state["flight"])
+            try:
+                if cookies is None:
+                    both.wait()                   # two public pages are in flight together
+                else:
+                    time.sleep(0.01)
+                return b"<html/>", url
+            finally:
+                with lock:
+                    state["flight"] -= 1
+        live = LiveSources(publisher=publisher, session=census_inputs.session_cookies())
+
+        def fetch_all(route):
+            threads = [threading.Thread(target=lambda: [live.page("https://doi.org/10.5555/x", route) for _ in range(3)])
+                       for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        fetch_all(census_inputs.Route("entitled"))
+        self.assertEqual(1, state["most"], "two sign-in redirect chains never interleave in the session's jar")
+        state["most"] = 0
+        threads = [threading.Thread(target=live.page, args=("https://doi.org/10.5555/y", census_inputs.Route("public")))
+                   for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(2, state["most"], "pages of a public route need no session turn")
+
+    def test_publisher_pages_keep_one_a_second_across_threads(self):
+        import threading
+        starts, lock = [], threading.Lock()
+
+        def sleep(seconds):                       # the clock stands still: a fetch starts when its sleep ends
+            with lock:
+                starts.append(seconds)
+        fetch = census_inputs.page_fetcher(
+            opener=lambda request, timeout, allow_cross_origin, **session: FakeResponse(200, b"<html/>", request.full_url),
+            sleep=lambda seconds: None, limit=census_inputs.RateLimit(1.0, clock=lambda: 0.0, sleep=sleep))
+        threads = [threading.Thread(target=lambda: [fetch("https://doi.org/10.5555/x") for _ in range(3)])
+                   for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([float(second) for second in range(1, 12)], sorted(starts))
+        turns = []
+
+        class Recording:
+            def wait(self):
+                turns.append("wait")
+
+            def hold(self, status, headers):
+                return None
+        with mock.patch.object(census_inputs, "PUBLISHER_LIMIT", Recording()):
+            census_inputs.page_fetcher(opener=lambda request, timeout, allow_cross_origin, **session: FakeResponse(
+                200, b"<html/>", request.full_url))("https://doi.org/10.5555/x")
+        self.assertEqual(["wait"], turns, "every page fetch of a command shares one publisher rate")
 
 
 class EuropePmcRateTests(unittest.TestCase):
