@@ -575,8 +575,14 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
 
 
 def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = False, cache: Any = None,
-                   sleep: Any = None) -> dict[str, Any]:
+                   sleep: Any = None, workers: int | None = None) -> dict[str, Any]:
     """Stream records through the Europe PMC ladder into ``<output>.partial``; resume it; sweep; rename when complete.
+
+    ``workers`` records (census_inputs.ACQUISITION_WORKERS by default) are looked up at the same time and written in
+    the input's order (census_inputs.in_order), so the output, and the partial file an interrupted run leaves, hold
+    exactly what one record at a time would have written; every lookup keeps the census's Europe PMC rate. A DOI one
+    lookup of the invocation answered (a record, or none) is answered from that lookup for every later work citing it
+    (census_abstracts.DoiRecords); a failed lookup is asked again.
 
     ``cache`` (census_inputs.InputCaches) is asked before the live lookup for every work. Works whose lookup failed in
     transport are looked up again, and only they, in sweeps after the main pass (census_inputs.sweep_partial: waiting
@@ -584,9 +590,11 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
     the last sweep keeps its failed outcome and is looked up again when the command runs on its own output.
     """
     import json
-    from .census_abstracts import fill_record
-    from .census_inputs import sweep_partial
+    from .census_abstracts import DoiRecords, fill_record
+    from .census_inputs import ACQUISITION_WORKERS, in_order, sweep_partial
     from .census_runner import abstract_lookup_failed, iter_records
+    workers = ACQUISITION_WORKERS if workers is None else workers
+    memo = DoiRecords()
     if output.resolve() == source.resolve():
         raise ValidationError("write enriched records to a new file")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -616,21 +624,26 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
             label = (work.get("abstractProvenance") or {}).get("provenance") or "not-looked-up"
             provenance[label] = provenance.get(label, 0) + sign
     counts = {"records": 0, "resumed": len(done)}
-    with partial.open("a", encoding="utf-8") as handle:
+
+    def remaining():
         for index, record in enumerate(iter_records(source)):
             if index < len(done):
                 if (record.get("journal"), record.get("doi")) != done[index]:
                     raise ValidationError(f"{partial} does not continue this input (record {index + 1} differs)")
-            else:
-                filled = fill_record(record, get, overwrite=overwrite, cache=cache)
-                handle.write(json.dumps(filled, ensure_ascii=False) + "\n")
-                handle.flush()
-                tally(filled, 1)
+                counts["records"] += 1
+                continue
+            yield record
+    with partial.open("a", encoding="utf-8") as handle:
+        for filled in in_order(remaining(), lambda record: fill_record(record, get, overwrite=overwrite, cache=cache,
+                                                                       memo=memo), workers=workers):
+            handle.write(json.dumps(filled, ensure_ascii=False) + "\n")
+            handle.flush()
+            tally(filled, 1)
             counts["records"] += 1
         handle.flush()
         os.fsync(handle.fileno())
     swept = sweep_partial(partial, output, failures=lambda record: len(abstract_lookup_failed(record)), sleep=sleep,
-                          redo=lambda record: fill_record(record, get, cache=cache))
+                          workers=workers, redo=lambda record: fill_record(record, get, cache=cache, memo=memo))
     for index, (before, after) in swept["redone"].items():
         if index >= len(done):
             tally(before, -1)

@@ -22,6 +22,8 @@ the fresh population afterwards and never imported.
 """
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import csv
 import email.utils
 import hashlib
@@ -41,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from xml.etree import ElementTree as ET
 
 from .errors import ProviderError, ReviewError, TransientError, ValidationError
@@ -683,6 +685,39 @@ class RateLimit:
 
 # One per process: every Europe PMC request of a command shares it.
 EUROPE_PMC_LIMIT = RateLimit(EUROPE_PMC_REQUESTS_PER_SECOND)
+# Publisher pages (doi.org and the hosts its redirects reach, nature.com among them): one page a second for the whole
+# command, from every thread, the redirects of one page counted with it.
+PUBLISHER_LIMIT = RateLimit(1.0)
+
+# Records a command acquires or looks up at the same time; their requests keep the hosts' rates above.
+ACQUISITION_WORKERS = 4
+
+
+def in_order(items: Iterable[Any], function: Callable[[Any], Any], *,
+             workers: int = ACQUISITION_WORKERS) -> Iterator[Any]:
+    """``function(item)`` for every item, on ``workers`` threads, yielded in the items' order.
+
+    At most twice ``workers`` items are started ahead of the one yielded next, so a slow item holds back only that
+    many. An exception surfaces where its item's result would be yielded; the items not yet started are dropped, and
+    the ones running finish first. One worker computes each item when it is asked for, as a plain loop does.
+    """
+    if workers <= 1:
+        for item in items:
+            yield function(item)
+        return
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    pending: collections.deque = collections.deque()
+    try:
+        for item in items:
+            pending.append(pool.submit(function, item))
+            if len(pending) >= 2 * workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+    finally:
+        for future in pending:
+            future.cancel()
+        pool.shutdown(wait=True)
 
 
 # ----------------------------------------------------------------------------- live routes
@@ -732,29 +767,28 @@ def session_cookies() -> http.cookiejar.CookieJar:
     return http.cookiejar.CookieJar(policy)
 
 
-def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[float] = (2.0, 5.0, 10.0),
-                 timeout: float = 90.0, opener: Callable[..., Any] | None = None, sleep: Callable[[float], None] = time.sleep):
+def page_fetcher(*, attempts: int = 3, backoff: Sequence[float] = (2.0, 5.0, 10.0), timeout: float = 90.0,
+                 opener: Callable[..., Any] | None = None, sleep: Callable[[float], None] = time.sleep,
+                 limit: RateLimit | None = None):
     """GET a page over public HTTPS: ``(body, final URL)``, a reason string for a definitive miss, or RetryableFetch.
 
     The default opener (``fulltext.open_public_https``) reaches public hosts only, follows a bounded number of
     redirects and never sends proxies' credentials or contact addresses. ``fetch(url, cookies=jar)`` takes an
     in-memory session jar (``session_cookies``) through every hop of the chain; without one no cookie is sent. 404,
     410 and other client errors are definitive (``http-403`` for a page the licence does not open); throttling, server
-    errors, timeouts and dropped connections are retried with backoff and then raise ``RetryableFetch``. Pages are
-    fetched ``spacing`` seconds apart in each thread.
+    errors, timeouts and dropped connections are retried with backoff and then raise ``RetryableFetch``. Every
+    attempt waits its turn at ``limit`` (default PUBLISHER_LIMIT: one page a second for the whole command, from every
+    thread, its redirects counted with it).
     """
     from .census_runner import RetryableFetch
     from .fulltext import MAX_DOCUMENT_BYTES, open_public_https
-    state = threading.local()
+    rate = limit or PUBLISHER_LIMIT
 
     def fetch(url: str, cookies: http.cookiejar.CookieJar | None = None):
         error = "no attempt"
         session = {} if cookies is None else {"cookies": cookies}
         for attempt in range(max(1, attempts)):
-            wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
-            if wait > 0:
-                sleep(wait)
-            state.last = time.monotonic()
+            rate.wait()
             request = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": USER_AGENT})
             try:
                 with (opener or open_public_https)(request, timeout=timeout, allow_cross_origin=True,
@@ -815,14 +849,16 @@ class LiveSources:
     ``pmc_copy``) and the publisher page through doi.org.
 
     ``session`` (``session_cookies``) goes with every publisher fetch of an entitled route, a review's page and its
-    linked table pages alike, and with no other fetch; one acquisition holds one jar. ``search`` asks Europe PMC's
-    search (``search_pages``: raw pages, ProviderError after its last attempt).
+    linked table pages alike, and with no other fetch; one acquisition holds one jar, and its fetches run one after
+    another whatever the number of workers, so two sign-in redirect chains never interleave in it. ``search`` asks
+    Europe PMC's search (``search_pages``: raw pages, ProviderError after its last attempt).
     """
 
     europe_pmc: Callable[[str], bytes | None] | None = None
     publisher: Callable[..., Any] | None = None
     session: http.cookiejar.CookieJar | None = None
     search: Callable[[Mapping[str, Any]], bytes] | None = None
+    _session_turn: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     @classmethod
     def default(cls) -> "LiveSources":
@@ -880,9 +916,10 @@ class LiveSources:
         return "pmc-copy-unconfirmed: " + "; ".join(refused)
 
     def page(self, url: str, route: Route):
-        """A publisher page on the journal's route; entitled routes send the session's cookies."""
+        """A publisher page on the journal's route; entitled routes send the session's cookies, one fetch at a time."""
         if route.klass == "entitled" and self.session is not None:
-            return self.publisher(url, cookies=self.session)
+            with self._session_turn:
+                return self.publisher(url, cookies=self.session)
         return self.publisher(url)
 
     def attempts(self, route: Route, doi: str, identifiers: Mapping[str, str],
@@ -1176,16 +1213,17 @@ SWEEP_WAITS = (60.0, 300.0, 900.0, 3600.0)
 
 
 def sweep_partial(partial: Path, output: Path, *, failures: Callable[[Mapping[str, Any]], int],
-                  redo: Callable[[dict[str, Any]], dict[str, Any]],
-                  sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
+                  redo: Callable[[dict[str, Any]], dict[str, Any]], sleep: Callable[[float], None] | None = None,
+                  workers: int = ACQUISITION_WORKERS) -> dict[str, Any]:
     """Finish a step whose main pass wrote all its records to ``partial``: sweep the transport failures, then write
     ``output`` once.
 
     ``failures(record)`` counts a record's items that failed in transport. While any is left, the next of SWEEP_WAITS
-    is waited and every such record is done again with ``redo``, which retries only its failed items. ``output`` is
-    then the partial file with every redone record in its place, written in one sequential copy, fsynced and renamed
-    (a partial without redone records is renamed as it is). Returns the sweeps (wait, records and items swept,
-    items recovered), the records still failing and {line index: (record before, record after)} of the redone ones.
+    is waited and every such record is done again with ``redo`` (``workers`` at a time), which retries only its failed
+    items. ``output`` is then the partial file with every redone record in its place, written in one sequential copy,
+    fsynced and renamed (a partial without redone records is renamed as it is). Returns the sweeps (wait, records and
+    items swept, items recovered), the records still failing and {line index: (record before, record after)} of the
+    redone ones.
     """
     wait = sleep or time.sleep
     pending: dict[int, dict[str, Any]] = {}
@@ -1201,8 +1239,8 @@ def sweep_partial(partial: Path, output: Path, *, failures: Callable[[Mapping[st
             break
         wait(seconds)
         swept, items = len(pending), sum(failures(record) for record in pending.values())
-        for index in list(pending):
-            after = redo(pending[index])
+        indexes = list(pending)
+        for index, after in zip(indexes, in_order([pending[index] for index in indexes], redo, workers=workers)):
             redone[index] = (redone[index][0] if index in redone else pending[index], after)
             if failures(after):
                 pending[index] = after
@@ -1237,9 +1275,13 @@ def _pmc_copy(record: Mapping[str, Any]) -> int:
 
 
 def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, retry_unavailable: bool = False,
-                    sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
+                    sleep: Callable[[float], None] | None = None,
+                    workers: int = ACQUISITION_WORKERS) -> dict[str, Any]:
     """Stream review records through the acquirer into ``<output>.partial``; resume it; sweep; rename when complete.
 
+    ``workers`` records are acquired at the same time (``in_order``) and written in the input's order, so the output,
+    and the partial file an interrupted run leaves, hold exactly what one record at a time would have written: a run
+    resumed after a stop continues it. The hosts' rates (EUROPE_PMC_LIMIT, PUBLISHER_LIMIT) hold across the workers.
     Documents are written content-addressed into ``documents/`` beside the output, so every manifest of the
     study should live in that directory. Records with a supplied document pass through unchanged. Records whose
     acquisition failed transiently (state retry) are acquired again in sweeps after the main pass (``sweep_partial``),
@@ -1257,19 +1299,23 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
     done = _resume_partial(partial)
     counts: dict[str, int] = {"records": 0, "resumed": len(done), "acquired": 0, "passedThrough": 0, "pmcCopies": 0}
     provenance: dict[str, int] = {}
-    with partial.open("a", encoding="utf-8") as handle:
+
+    def remaining() -> Iterator[dict[str, Any]]:
         for index, record in enumerate(iter_records(source)):
             if index < len(done):
                 if (record.get("journal"), record.get("doi")) != done[index]:
                     raise ValidationError(f"{partial} does not continue this input (record {index + 1} differs)")
                 counts["records"] += 1
                 continue
-            if needs_acquisition(record, retry_unavailable=retry_unavailable):
-                result = acquired_record(record, acquirer.acquire(record), documents)
-                counts["acquired"] += 1
-            else:
-                result = dict(record)
-                counts["passedThrough"] += 1
+            yield record
+
+    def acquire(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        if needs_acquisition(record, retry_unavailable=retry_unavailable):
+            return acquired_record(record, acquirer.acquire(record), documents), True
+        return dict(record), False
+    with partial.open("a", encoding="utf-8") as handle:
+        for result, acquired in in_order(remaining(), acquire, workers=workers):
+            counts["acquired" if acquired else "passedThrough"] += 1
             label = _acquisition_label(result)
             provenance[label] = provenance.get(label, 0) + 1
             counts["pmcCopies"] += _pmc_copy(result)
@@ -1278,7 +1324,7 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
             counts["records"] += 1
         handle.flush()
         os.fsync(handle.fileno())
-    swept = sweep_partial(partial, output, failures=acquisition_retry, sleep=sleep,
+    swept = sweep_partial(partial, output, failures=acquisition_retry, sleep=sleep, workers=workers,
                           redo=lambda record: acquired_record(record, acquirer.acquire(record), documents))
     for index, (before, after) in swept["redone"].items():
         if index >= len(done):
