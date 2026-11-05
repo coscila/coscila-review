@@ -227,6 +227,23 @@ class CommandLineTests(RunnerTestCase):
         self.assertEqual("Abstract of 10.5555/n.2.", lines[1]["works"]["w"]["abstract"])
         self.assertEqual([output.name], [path.name for path in output.parent.iterdir()])
 
+    def test_lookups_a_stopped_run_left_failed_are_swept_when_the_command_resumes(self):
+        from ocsl_review.study_cli import fill_abstracts
+        source, records = self.abstracts_source()
+        output = self.root / "out" / "reviews.abstracts.jsonl"
+        output.parent.mkdir()
+        # The run stopped after writing its first record, whose lookup had failed.
+        failed = {**records[0], "works": {"w": {"doi": "10.5555/n.1", "europePmcOutcome": "europe-pmc-failed"}}}
+        Path(str(output) + ".partial").write_text(json.dumps(failed) + "\n")
+        queries, waits = [], []
+        result = fill_abstracts(source, output, self.lookups_failing("x", 0, queries), sleep=waits.append)
+        self.assertEqual((3, 1, 0, [60.0]), (result["records"], result["resumed"], result["lookupFailed"], waits))
+        self.assertEqual(["10.5555/n.2", "10.5555/n.3", "10.5555/n.1"], queries)
+        self.assertEqual({"europe-pmc-core": 3}, result["abstractSources"], "the swept record counts once")
+        lines = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(["Abstract of 10.5555/n.%d." % i for i in (1, 2, 3)],
+                         [line["works"]["w"]["abstract"] for line in lines])
+
     def test_a_lookup_that_fails_through_every_sweep_is_left_for_the_next_run(self):
         from ocsl_review.study_cli import fill_abstracts
         source, records = self.abstracts_source()
