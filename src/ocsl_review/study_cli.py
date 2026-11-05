@@ -576,9 +576,9 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
     """Stream records through the Europe PMC ladder into ``<output>.partial``; resume it; sweep; rename when complete.
 
     ``cache`` (census_inputs.InputCaches) is asked before the live lookup for every work. Works whose lookup failed in
-    transport are looked up again, and only they, in sweeps after the main pass (census_inputs.sweep_partial: after 1,
-    5, 15 and 60 minutes while any is left), and the output is written once. A work still failing after the last
-    sweep keeps its failed outcome and is looked up again when the command runs on its own output.
+    transport are looked up again, and only they, in sweeps after the main pass (census_inputs.sweep_partial: waiting
+    1, 5, 15 and 60 minutes before each while any is left), and the output is written once. A work still failing after
+    the last sweep keeps its failed outcome and is looked up again when the command runs on its own output.
     """
     import json
     from .census_abstracts import fill_record
