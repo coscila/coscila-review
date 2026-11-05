@@ -557,14 +557,18 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
     return {"ok": all(checks.values()), "checks": checks, "notes": notes, "status": status}
 
 
-def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = False, cache: Any = None) -> dict[str, Any]:
-    """Stream records through the Europe PMC ladder into ``<output>.partial``; resume it; rename when complete.
+def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = False, cache: Any = None,
+                   sleep: Any = None) -> dict[str, Any]:
+    """Stream records through the Europe PMC ladder into ``<output>.partial``; resume it; sweep; rename when complete.
 
-    ``cache`` (census_inputs.InputCaches) is asked before the live lookup for every work.
+    ``cache`` (census_inputs.InputCaches) is asked before the live lookup for every work. Works whose lookup failed in
+    transport are looked up again, and only they, in sweeps after the main pass (census_inputs.sweep_partial: after 1,
+    5, 15 and 60 minutes while any is left), and the output is written once. A work still failing after the last
+    sweep keeps its failed outcome and is looked up again when the command runs on its own output.
     """
     import json
-    import os
     from .census_abstracts import fill_record
+    from .census_inputs import sweep_partial
     from .census_runner import abstract_lookup_failed, iter_records
     if output.resolve() == source.resolve():
         raise ValidationError("write enriched records to a new file")
@@ -587,28 +591,36 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
             handle.truncate(kept)
     sources: dict[str, int] = {}
     provenance: dict[str, int] = {}
-    counts = {"records": 0, "resumed": len(done), "lookupFailed": 0}
+
+    def tally(record: dict[str, Any], sign: int) -> None:
+        for work in record.get("works", {}).values():
+            name = work.get("abstractSource") or "none"
+            sources[name] = sources.get(name, 0) + sign
+            label = (work.get("abstractProvenance") or {}).get("provenance") or "not-looked-up"
+            provenance[label] = provenance.get(label, 0) + sign
+    counts = {"records": 0, "resumed": len(done)}
     with partial.open("a", encoding="utf-8") as handle:
         for index, record in enumerate(iter_records(source)):
             if index < len(done):
                 if (record.get("journal"), record.get("doi")) != done[index]:
                     raise ValidationError(f"{partial} does not continue this input (record {index + 1} differs)")
-                filled = record
             else:
                 filled = fill_record(record, get, overwrite=overwrite, cache=cache)
                 handle.write(json.dumps(filled, ensure_ascii=False) + "\n")
                 handle.flush()
-                counts["lookupFailed"] += bool(abstract_lookup_failed(filled))
-                for work in filled.get("works", {}).values():
-                    name = work.get("abstractSource") or "none"
-                    sources[name] = sources.get(name, 0) + 1
-                    label = (work.get("abstractProvenance") or {}).get("provenance") or "not-looked-up"
-                    provenance[label] = provenance.get(label, 0) + 1
+                tally(filled, 1)
             counts["records"] += 1
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(partial, output)
-    return {**counts, "output": str(output), "abstractSources": sources, "abstractProvenance": dict(sorted(provenance.items())),
+    swept = sweep_partial(partial, output, failures=lambda record: len(abstract_lookup_failed(record)), sleep=sleep,
+                          redo=lambda record: fill_record(record, get, cache=cache))
+    for index, (before, after) in swept["redone"].items():
+        if index >= len(done):
+            tally(before, -1)
+        tally(after, 1)
+    counts["lookupFailed"] = swept["failing"]
+    return {**counts, "output": str(output), "abstractSources": {name: n for name, n in sources.items() if n},
+            "abstractProvenance": {label: n for label, n in sorted(provenance.items()) if n}, "sweeps": swept["sweeps"],
             "next": "run study abstracts again on the output for works whose lookup failed" if counts["lookupFailed"] else None}
 
 

@@ -10,6 +10,7 @@ import sys
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from ocsl_review import corpus_facts, scores_db
 from ocsl_review.census_runner import load_records, read_document
@@ -182,6 +183,65 @@ class CommandLineTests(RunnerTestCase):
         Path(str(output) + ".partial").write_text(json.dumps({"journal": JOURNAL, "doi": "10.5555/other"}) + "\n")
         with self.assertRaisesRegex(ValidationError, "does not continue this input"):
             fill_abstracts(source, output, get)
+
+    def abstracts_source(self):
+        source = self.root / "reviews.jsonl"
+        records = [{"journal": JOURNAL, "doi": "10.5555/r%d" % i, "works": {"w": {"doi": "10.5555/n.%d" % (i + 1)}}}
+                   for i in range(3)]
+        source.write_text("".join(json.dumps(item) + "\n" for item in records))
+        return source, records
+
+    @staticmethod
+    def lookups_failing(doi: str, times: int, queries: list):
+        """Europe PMC answers with an abstract for every DOI, except ``times`` failed lookups of ``doi`` first."""
+        failed = []
+
+        def get(params):
+            asked = params["query"].split('"')[1]
+            queries.append(asked)
+            if asked == doi and len(failed) < times:
+                failed.append(asked)
+                return None
+            return {"resultList": {"result": [{"doi": asked, "abstractText": "Abstract of %s." % asked}]}}
+        return get
+
+    def test_failed_lookups_are_swept_after_the_main_pass_and_the_output_is_written_once(self):
+        from ocsl_review.study_cli import fill_abstracts
+        source, records = self.abstracts_source()
+        output = self.root / "out" / "reviews.abstracts.jsonl"
+        queries, waits = [], []
+        get = self.lookups_failing("10.5555/n.2", 2, queries)
+        with mock.patch("os.replace", wraps=os.replace) as replaced:
+            result = fill_abstracts(source, output, get, sleep=waits.append)
+        self.assertEqual([60.0, 300.0], waits)
+        self.assertEqual(["10.5555/n.1", "10.5555/n.2", "10.5555/n.3", "10.5555/n.2", "10.5555/n.2"], queries,
+                         "the sweeps look up only the work whose lookup failed")
+        self.assertEqual([(60.0, 1, 1, 0), (300.0, 1, 1, 1)],
+                         [(s["waitSeconds"], s["records"], s["items"], s["recovered"]) for s in result["sweeps"]])
+        self.assertEqual((3, 0, None), (result["records"], result["lookupFailed"], result["next"]))
+        self.assertEqual({"europe-pmc-core": 3}, result["abstractSources"])
+        self.assertEqual({"live-public": 3}, result["abstractProvenance"])
+        self.assertEqual(1, sum(1 for call in replaced.call_args_list if Path(call.args[1]) == output))
+        lines = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual([r["doi"] for r in records], [line["doi"] for line in lines])
+        self.assertEqual("Abstract of 10.5555/n.2.", lines[1]["works"]["w"]["abstract"])
+        self.assertEqual([output.name], [path.name for path in output.parent.iterdir()])
+
+    def test_a_lookup_that_fails_through_every_sweep_is_left_for_the_next_run(self):
+        from ocsl_review.study_cli import fill_abstracts
+        source, records = self.abstracts_source()
+        output = self.root / "out" / "reviews.abstracts.jsonl"
+        queries, waits = [], []
+        result = fill_abstracts(source, output, self.lookups_failing("10.5555/n.3", 5, queries), sleep=waits.append)
+        self.assertEqual([60.0, 300.0, 900.0, 3600.0], waits)
+        self.assertEqual((1, "europe-pmc-failed"), (result["lookupFailed"],
+                                                    json.loads(output.read_text().splitlines()[2])["works"]["w"]
+                                                    ["europePmcOutcome"]))
+        self.assertIsNotNone(result["next"])
+        self.assertEqual({"europe-pmc-core": 2, "none": 1}, result["abstractSources"])
+        again = fill_abstracts(output, self.root / "out" / "again.jsonl", self.lookups_failing("x", 0, queries),
+                               sleep=waits.append)
+        self.assertEqual((0, []), (again["lookupFailed"], again["sweeps"]))
 
     def test_on_premises_needs_a_policy_that_lists_the_judge(self):
         from ocsl_review.errors import ConfidentialityError

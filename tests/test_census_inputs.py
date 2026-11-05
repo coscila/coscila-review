@@ -341,24 +341,39 @@ class ReviewAcquisitionTests(CacheTestCase):
         with self.assertRaises(ValidationError):
             parse_routes(["J=public", "J=entitled"])
 
-    def test_acquire_records_writes_documents_and_resumes_transient_failures(self):
+    def acquire_source(self):
         source = self.root / "input" / "reviews.jsonl"
-        source.parent.mkdir()
+        source.parent.mkdir(exist_ok=True)
         rows = [{"journal": JOURNAL, "doi": JATS_REVIEW}, {"journal": JOURNAL, "doi": HTML_REVIEW},
                 {"journal": SECOND, "doi": "10.5555/flaky.review"}, {"journal": JOURNAL, "doi": "10.5555/absent.review"},
                 {**record(doi="10.5555/supplied.review"), "document": {"path": "review.xml", "kind": "jats"}}]
         source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return source
+
+    def flaky_acquirer(self, failures):
         attempts = []
 
         def flaky(url):
-            attempts.append(url)
-            if len(attempts) == 1:
-                raise RetryableFetch("HTTP 503")
+            if "flaky" in url:
+                attempts.append(url)
+                if len(attempts) <= failures:
+                    raise RetryableFetch("HTTP 503")
             return html_review("10.5555/flaky.review"), PUBLISHER + "flaky"
-        acquirer = self.acquirer(LiveSources(publisher=flaky), routes=(f"{JOURNAL}=public", f"{SECOND}=entitled:html"))
+        return self.acquirer(LiveSources(publisher=flaky), routes=(f"{JOURNAL}=public", f"{SECOND}=entitled:html")), attempts
+
+    def test_acquire_records_writes_documents_and_resumes_transient_failures(self):
+        source = self.acquire_source()
+        # The publisher fails through the main pass and all four sweeps.
+        acquirer, attempts = self.flaky_acquirer(failures=5)
         output = self.root / "acquired" / "reviews.jsonl"
-        first = acquire_records(source, output, acquirer)
+        waits = []
+        first = acquire_records(source, output, acquirer, sleep=waits.append)
+        self.assertEqual([60.0, 300.0, 900.0, 3600.0], waits)
+        self.assertEqual(5, len(attempts))
+        self.assertEqual([(60.0, 1, 1, 0), (300.0, 1, 1, 0), (900.0, 1, 1, 0), (3600.0, 1, 1, 0)],
+                         [(s["waitSeconds"], s["records"], s["items"], s["recovered"]) for s in first["sweeps"]])
         self.assertEqual({"cache-hit-public": 2, "retry": 1, "unavailable": 1, "supplied": 1}, first["provenance"])
+        self.assertIsNotNone(first["next"])
         lines = [json.loads(line) for line in output.read_text().splitlines()]
         jats = lines[0]
         self.assertEqual(("public", "cache-hit-public"), (jats["provenanceClass"], jats["acquisition"]["provenance"]))
@@ -368,10 +383,30 @@ class ReviewAcquisitionTests(CacheTestCase):
         self.assertEqual("retry", lines[2]["acquisition"]["state"])
         self.assertEqual("unavailable", lines[3]["provenanceClass"])
         self.assertNotIn("acquisition", lines[4])
-        second = acquire_records(output, self.root / "acquired" / "reviews.2.jsonl", acquirer)
-        self.assertEqual((1, 4), (second["acquired"], second["passedThrough"]))
+        second = acquire_records(output, self.root / "acquired" / "reviews.2.jsonl", acquirer, sleep=waits.append)
+        self.assertEqual((1, 4, []), (second["acquired"], second["passedThrough"], second["sweeps"]))
         self.assertEqual("live-entitled", json.loads((self.root / "acquired" / "reviews.2.jsonl").read_text()
                                                      .splitlines()[2])["acquisition"]["provenance"])
+
+    def test_acquisitions_left_in_state_retry_are_swept_and_the_output_is_written_once(self):
+        source = self.acquire_source()
+        acquirer, attempts = self.flaky_acquirer(failures=1)
+        output = self.root / "acquired" / "reviews.jsonl"
+        waits = []
+        with mock.patch("os.replace", wraps=os.replace) as replaced:
+            result = acquire_records(source, output, acquirer, sleep=waits.append)
+        self.assertEqual([60.0], waits, "the first sweep acquired it; no further sweep waits")
+        self.assertEqual([(60.0, 1, 1, 1)], [(s["waitSeconds"], s["records"], s["items"], s["recovered"])
+                                             for s in result["sweeps"]])
+        self.assertEqual({"cache-hit-public": 2, "live-entitled": 1, "unavailable": 1, "supplied": 1}, result["provenance"])
+        self.assertIsNone(result["next"])
+        self.assertEqual(1, sum(1 for call in replaced.call_args_list if Path(call.args[1]) == output))
+        self.assertEqual([output.name], [path.name for path in output.parent.iterdir() if path.is_file()])
+        lines = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual([row["doi"] for row in map(json.loads, source.read_text().splitlines())],
+                         [line["doi"] for line in lines])
+        self.assertEqual("live-entitled", lines[2]["acquisition"]["provenance"])
+        self.assertTrue((output.parent / lines[2]["document"]["path"]).is_file())
 
 
 class CitedWorkTests(CacheTestCase):

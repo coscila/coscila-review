@@ -1001,13 +1001,81 @@ def needs_acquisition(record: Mapping[str, Any], *, retry_unavailable: bool = Fa
     return retry_unavailable and acquisition.get("provenance") == "unavailable"
 
 
-def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, retry_unavailable: bool = False
-                    ) -> dict[str, Any]:
-    """Stream review records through the acquirer into ``<output>.partial``; resume it; rename when complete.
+def acquisition_retry(record: Mapping[str, Any]) -> int:
+    """1 for a record whose acquisition failed transiently (state retry), else 0."""
+    acquisition = record.get("acquisition")
+    return int(isinstance(acquisition, dict) and acquisition.get("state") == "retry")
+
+
+# Waits before each further sweep over what a step's main pass left with transport failures (acquisitions in state
+# retry, cited-work lookups that failed): one, five, fifteen and sixty minutes.
+SWEEP_WAITS = (60.0, 300.0, 900.0, 3600.0)
+
+
+def sweep_partial(partial: Path, output: Path, *, failures: Callable[[Mapping[str, Any]], int],
+                  redo: Callable[[dict[str, Any]], dict[str, Any]],
+                  sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
+    """Finish a step whose main pass wrote all its records to ``partial``: sweep the transport failures, then write
+    ``output`` once.
+
+    ``failures(record)`` counts a record's items that failed in transport. While any is left, the next of SWEEP_WAITS
+    is waited and every such record is done again with ``redo``, which retries only its failed items. ``output`` is
+    then the partial file with every redone record in its place, written in one sequential copy, fsynced and renamed
+    (a partial without redone records is renamed as it is). Returns the sweeps (wait, records and items swept,
+    items recovered), the records still failing and {line index: (record before, record after)} of the redone ones.
+    """
+    wait = sleep or time.sleep
+    pending: dict[int, dict[str, Any]] = {}
+    with partial.open("rb") as handle:
+        for index, raw in enumerate(handle):
+            record = json.loads(raw)
+            if failures(record):
+                pending[index] = record
+    redone: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+    sweeps = []
+    for seconds in SWEEP_WAITS:
+        if not pending:
+            break
+        wait(seconds)
+        swept, items = len(pending), sum(failures(record) for record in pending.values())
+        for index in list(pending):
+            after = redo(pending[index])
+            redone[index] = (redone[index][0] if index in redone else pending[index], after)
+            if failures(after):
+                pending[index] = after
+            else:
+                del pending[index]
+        sweeps.append({"waitSeconds": seconds, "records": swept, "items": items,
+                       "recovered": items - sum(failures(record) for record in pending.values())})
+    if not redone:
+        os.replace(partial, output)
+        return {"sweeps": sweeps, "failing": 0, "redone": redone}
+    temporary = Path(str(output) + ".incoming")
+    with partial.open("rb") as source, temporary.open("wb") as target:
+        for index, raw in enumerate(source):
+            target.write(json.dumps(redone[index][1], ensure_ascii=False).encode("utf-8") + b"\n"
+                         if index in redone else raw)
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, output)
+    partial.unlink(missing_ok=True)
+    return {"sweeps": sweeps, "failing": len(pending), "redone": redone}
+
+
+def _acquisition_label(record: Mapping[str, Any]) -> str:
+    acquisition = record.get("acquisition") or {}
+    return acquisition.get("provenance") or ("retry" if acquisition.get("state") == "retry" else "supplied")
+
+
+def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, retry_unavailable: bool = False,
+                    sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
+    """Stream review records through the acquirer into ``<output>.partial``; resume it; sweep; rename when complete.
 
     Documents are written content-addressed into ``documents/`` beside the output, so every manifest of the
-    study should live in that directory. Records with a supplied document pass through unchanged; records
-    whose acquisition failed transiently are acquired again when the command runs on its own output.
+    study should live in that directory. Records with a supplied document pass through unchanged. Records whose
+    acquisition failed transiently (state retry) are acquired again in sweeps after the main pass (``sweep_partial``),
+    and the output is written once; a record still failing after the last sweep keeps state retry and is acquired
+    again when the command runs on its own output.
     """
     from .census_runner import iter_records
     source, output = Path(source), Path(output)
@@ -1032,18 +1100,25 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
             else:
                 result = dict(record)
                 counts["passedThrough"] += 1
-            label = (result.get("acquisition") or {}).get("provenance") or (
-                "retry" if (result.get("acquisition") or {}).get("state") == "retry" else "supplied")
+            label = _acquisition_label(result)
             provenance[label] = provenance.get(label, 0) + 1
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
             counts["records"] += 1
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(partial, output)
-    return {**counts, "output": str(output), "documents": str(documents), "provenance": dict(sorted(provenance.items())),
+    swept = sweep_partial(partial, output, failures=acquisition_retry, sleep=sleep,
+                          redo=lambda record: acquired_record(record, acquirer.acquire(record), documents))
+    for index, (before, after) in swept["redone"].items():
+        if index >= len(done):
+            provenance[_acquisition_label(before)] -= 1
+        label = _acquisition_label(after)
+        provenance[label] = provenance.get(label, 0) + 1
+    provenance = {label: count for label, count in sorted(provenance.items()) if count}
+    return {**counts, "output": str(output), "documents": str(documents), "provenance": provenance,
+            "sweeps": swept["sweeps"],
             "next": "run study acquire again on the output for reviews whose acquisition failed transiently"
-            if provenance.get("retry") else None}
+            if swept["failing"] else None}
 
 
 def _resume_partial(partial: Path) -> list[tuple[Any, Any]]:

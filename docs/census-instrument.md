@@ -139,9 +139,12 @@ User-Agent. A Europe PMC abstract
 replaces whatever a work carried; where Europe PMC definitively has none, an
 abstract supplied from another provider is kept as a recorded fallback
 (`abstractSource` `fallback:<provider>`, outside the Europe-PMC-only ladder).
-A failed lookup changes nothing but the outcome; running the command again on
-its output looks up exactly those works, and `study prepare` skips a review
-with a failed lookup until then. Records stream one line at a time into
+A failed lookup changes nothing but the outcome. After the main pass the
+command looks up exactly the works whose lookup failed again, in sweeps after
+1, 5, 15 and 60 minutes while any is left (the result lists them under
+`sweeps`), and writes its output once; a work still failing after the last
+sweep keeps `europe-pmc-failed`, running the command again on its output looks
+it up, and `study prepare` skips a review with a failed lookup until then. Records stream one line at a time into
 `<output>.partial`, which an interrupted run resumes; the output appears when
 every record is written.
 
@@ -240,9 +243,12 @@ must declare the review's. Without a route a journal is read from the caches
 only. Documents are written content-addressed to `documents/` beside the output
 (keep the study's later manifests, such as the abstracts output, in the same
 directory so the document paths resolve), records stream through
-`<output>.partial` and resume, a throttled or failing
-route leaves the record in state `retry` for the next run on the output, and
-`--retry-unavailable` tries the unavailable ones again.
+`<output>.partial` and resume, a throttled or failing route leaves the record
+in state `retry`, and `--retry-unavailable` tries the unavailable ones again.
+After the main pass the records in state `retry` are acquired again in sweeps
+after 1, 5, 15 and 60 minutes while any is left (the result lists them under
+`sweeps`), and the output is written once; a record still failing after the
+last sweep keeps state `retry` for the next run on the output.
 
 Every review records its provenance class: `cache-hit-public`,
 `cache-hit-entitled`, `live-public`, `live-entitled` or `unavailable` (and
@@ -368,18 +374,13 @@ manifest comes only after the census is complete:
 
 ```bash
 ocsl-review study enumerate --spec protocol/enumeration.json --output study/enumeration.jsonl
+# acquisitions and lookups that fail in transport are swept again inside each step
 ocsl-review study acquire --input study/enumeration.jsonl --output study/reviews.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
-# one bounded retry pass on its own output: acquisitions that failed transiently are tried again
-ocsl-review study acquire --input study/reviews.jsonl --output study/reviews.retry.jsonl \
-  --store "$STORE" --provider-cache "$PROVIDER_CACHE" --route "$JOURNAL_A=public" --route "$JOURNAL_B=entitled" --live
-ocsl-review study works --input study/reviews.retry.jsonl --output study/reviews.works.jsonl
+ocsl-review study works --input study/reviews.jsonl --output study/reviews.works.jsonl
 ocsl-review study abstracts --input study/reviews.works.jsonl --output study/reviews.works.abstracts.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE"
-# one bounded retry pass of the lookups that failed in transport
-ocsl-review study abstracts --input study/reviews.works.abstracts.jsonl --output study/reviews.works.abstracts.retry.jsonl \
-  --store "$STORE" --provider-cache "$PROVIDER_CACHE"
-ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.retry.jsonl \
+ocsl-review study prepare --database work/census.sqlite3 --seed "$SEED" --input study/reviews.works.abstracts.jsonl \
   --store "$STORE" --provider-cache "$PROVIDER_CACHE" \
   --require-fresh-enumeration --enumeration study/enumeration.jsonl.receipt.json --settle-unprepared
 ocsl-review study gates --database work/census.sqlite3 --require-fresh-enumeration
