@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import http.cookiejar
 import ipaddress
 import math
 import os
@@ -160,6 +161,16 @@ class _BrokerHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
+class _SetCookieSource:
+    """The ``info()`` view http.cookiejar reads a response's Set-Cookie headers from."""
+
+    def __init__(self, headers: Any):
+        self.headers = headers
+
+    def info(self) -> Any:
+        return self.headers
+
+
 class _Response:
     def __init__(self, response: http.client.HTTPResponse, connection: Any, url: str, deadline: float):
         self.response = response
@@ -199,11 +210,18 @@ def open_public_https(
     timeout: float,
     allow_cross_origin: bool = False,
     authorize_url: Callable[[str], None] | None = None,
+    cookies: http.cookiejar.CookieJar | None = None,
 ) -> _Response:
     """Open GET only, directly or via the attempt's scoped public-web broker.
 
     Ambient HTTP proxies and cookies are never inherited. A configured broker
     is authoritative: failure does not fall back to direct network access.
+
+    ``cookies`` is an in-memory session jar the caller holds for a sign-in
+    flow: every hop, redirects included, sends the cookies the jar's policy
+    returns for that hop's address and stores the Set-Cookie headers its policy
+    accepts, so the policy alone decides which hosts take part. A cross-origin
+    document request never sends a Cookie header of its own.
     """
 
     url = request.full_url
@@ -233,6 +251,15 @@ def open_public_https(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProviderError("HTTPS redirects exceeded the configured timeout")
+        sent = dict(headers)
+        hop = None
+        if cookies is not None:
+            # A redirect is a request the user did not choose, made for the address the chain started at.
+            hop = urllib.request.Request(url, headers=dict(headers), origin_req_host=initial.hostname,
+                                         unverifiable=redirect > 0)
+            cookies.add_cookie_header(hop)
+            if hop.unredirected_hdrs.get("Cookie"):
+                sent["Cookie"] = hop.unredirected_hdrs["Cookie"]
         broker = os.environ.get("PUPPENCLAW_ORCHESTRATION_SOCKET")
         context = ssl.create_default_context()
         connection = (
@@ -242,11 +269,13 @@ def open_public_https(
                                                   timeout=remaining, context=context)
         )
         try:
-            connection.request("GET", urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, "")), headers=headers)
+            connection.request("GET", urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, "")), headers=sent)
             response = connection.getresponse()
         except Exception:
             connection.close()
             raise
+        if hop is not None:
+            cookies.extract_cookies(_SetCookieSource(response.headers), hop)
         if response.status not in {301, 302, 303, 307, 308}:
             return _Response(response, connection, url, deadline)
         location = response.headers.get("Location")

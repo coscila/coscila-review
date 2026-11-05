@@ -226,8 +226,15 @@ Otherwise, with `--live`, the review is acquired through its journal's route,
 document kinds the route reads in order (`:jats,html`, or one kind only, which
 then also limits the cached candidates): Europe PMC fullTextXML by PMCID, which
 is always public, and the publisher page through doi.org under the route's
-class (entitled: the institution's licence). The same identity and article
-checks apply. Linked table pages of an HTML review come from the store, the
+class (entitled: the institution's licence). On an entitled route the
+publisher page and its linked table pages share one session cookie jar per
+`study acquire` run, held in memory and never written, logged or recorded:
+nature.com serves a licensed page only to a client that returns the cookie its
+sign-in redirects set (a client without cookies ends on
+`?error=cookies_not_supported`), and the jar accepts and returns cookies for
+nature.com and its subdomains alone (RFC 6265 domain matching), so doi.org and
+every other host of a redirect chain never see one. Publisher pages are
+fetched one per second. The same identity and article checks apply. Linked table pages of an HTML review come from the store, the
 provider cache or the route, in that order; a table page that declares a DOI
 must declare the review's. Without a route a journal is read from the caches
 only. Documents are written content-addressed to `documents/` beside the output
