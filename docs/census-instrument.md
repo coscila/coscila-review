@@ -338,9 +338,13 @@ record that answers both. Within one invocation that cannot be told from a
 withdrawn record. With `--transport-retries 0`, or cooldowns far below 60 s, a
 PMCID without any record stays open instead. A 404, a 410 or another client
 error is Europe PMC's own definitive answer; throttling (408, 425, 429),
-timeouts and dropped connections get no record check. Each `study full-text`
-result counts the escalated entries that invocation closed without a window by
-reason, in `withoutFullText` (and per journal in `withoutFullTextByJournal`):
+timeouts and dropped connections get no record check. A PMCID an invocation
+found without a readable full text (a definitive miss, or a fullTextXML that
+cannot be read) is fetched once in it: every other entry citing that PMCID
+closes with the same reason, and the next invocation asks Europe PMC again.
+Each `study full-text` result counts the escalated entries that invocation
+closed without a window by reason, in `withoutFullText` (and per journal in
+`withoutFullTextByJournal`):
 `noPmcid`, `notOpenAccess`, `noRecord`, `notFound` (404, 410 or another client
 error), `entitledBlocked`, `persistentError` (a fetch that kept failing in
 transport, below) and `other` (an unreadable fullTextXML, no live retrieval, a
