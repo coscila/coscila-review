@@ -23,6 +23,7 @@ the fresh population afterwards and never imported.
 from __future__ import annotations
 
 import csv
+import email.utils
 import hashlib
 import http.client
 import http.cookiejar
@@ -601,6 +602,91 @@ def _record_identity(raw: Any, wanted: Mapping[str, str], scheme: str) -> tuple[
     if observed.get(scheme) != wanted.get(scheme):
         return False, None
     return check_identity(observed, wanted, require=(scheme,))
+
+
+# ----------------------------------------------------------------------------- request rates
+# Europe PMC asks its clients to stay under 10 requests a second (500 a minute). Every census request to www.ebi.ac.uk
+# that one command sends, from all of its threads (the full-text fetcher and its record checks, the abstract and
+# metadata lookups, the enumeration's search pages, an acquisition's PMC copies), waits its turn at one rate below that.
+EUROPE_PMC_REQUESTS_PER_SECOND = 8.0
+# Answers whose Retry-After header the census honours: too many requests, and the service unavailable.
+RETRY_AFTER_STATUSES = frozenset({429, 503})
+# The longest one Retry-After holds a host's requests; a longer wait (or a date a skewed clock puts far ahead) holds
+# them this long, and the host's next answer names the wait again.
+MAX_RETRY_AFTER_SECONDS = 900.0
+
+
+def retry_after_seconds(headers: Any) -> float | None:
+    """The wait an answer's Retry-After header names (delay seconds or an HTTP date), or None."""
+    get = getattr(headers, "get", None)
+    value = str((get("Retry-After") if callable(get) else None) or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return float(value)
+    try:
+        moment = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+
+
+class RateLimit:
+    """One host's request rate, shared by every thread that sends through it: at most ``per_second`` requests a
+    second, and none before the end of a wait the host named in a Retry-After answer.
+
+    ``wait()`` takes the next start time, ``1 / per_second`` after the one taken before it, and sleeps until it comes.
+    ``hold()`` (after a 429 or 503 answer with Retry-After) moves the next start time past the wait the answer names,
+    for requests already waiting their turn as well. ``clock`` gives monotonic seconds and ``sleep`` waits them.
+    """
+
+    def __init__(self, per_second: float, *, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep):
+        if not per_second > 0:
+            raise ValueError("a request rate is positive")
+        self.interval = 1.0 / per_second
+        self.clock, self.sleep = clock, sleep
+        self._lock = threading.Lock()
+        self._next = float("-inf")          # the next free start time
+        self._held = float("-inf")          # the end of the latest Retry-After wait
+        self._holds = 0
+
+    def wait(self) -> None:
+        """Wait for this request's turn."""
+        while True:
+            with self._lock:
+                now = self.clock()
+                start = max(now, self._next, self._held)
+                self._next = start + self.interval
+                holds = self._holds
+            if start > now:
+                self.sleep(start - now)
+            with self._lock:
+                # A Retry-After that arrived while this request waited, and that ends after its start, takes it back.
+                if self._holds == holds or self._held <= start:
+                    return
+
+    def hold(self, status: Any, headers: Any) -> float | None:
+        """Honour an answer's Retry-After: after a 429 or 503 that names a wait, no request starts before it ends (at
+        most MAX_RETRY_AFTER_SECONDS from now). Returns the wait, or None when the answer names none."""
+        if status not in RETRY_AFTER_STATUSES:
+            return None
+        seconds = retry_after_seconds(headers)
+        if seconds is None:
+            return None
+        seconds = min(seconds, MAX_RETRY_AFTER_SECONDS)
+        with self._lock:
+            self._held = max(self._held, self.clock() + seconds)
+            self._holds += 1
+        return seconds
+
+
+# One per process: every Europe PMC request of a command shares it.
+EUROPE_PMC_LIMIT = RateLimit(EUROPE_PMC_REQUESTS_PER_SECOND)
 
 
 # ----------------------------------------------------------------------------- live routes
@@ -1269,26 +1355,29 @@ def verify_abstract_claim(work: Mapping[str, Any], detail: Mapping[str, Any], te
 
 
 # ----------------------------------------------------------------------------- fresh enumeration
-def search_pages(*, spacing: float = 0.4, attempts: int = 4, opener: Callable[..., Any] | None = None,
-                 sleep: Callable[[float], None] = time.sleep) -> Callable[[Mapping[str, Any]], bytes]:
-    """GET Europe PMC search pages; the raw bytes, or ProviderError after the last attempt (an enumeration never guesses)."""
-    state = threading.local()
+def search_pages(*, attempts: int = 4, opener: Callable[..., Any] | None = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 limit: RateLimit | None = None) -> Callable[[Mapping[str, Any]], bytes]:
+    """GET Europe PMC search pages; the raw bytes, or ProviderError after the last attempt (an enumeration never guesses).
+
+    Every request waits its turn at ``limit`` (default EUROPE_PMC_LIMIT, the census's one Europe PMC rate), and a 429
+    or 503 answer's Retry-After holds it."""
+    rate = limit or EUROPE_PMC_LIMIT
 
     def get(params: Mapping[str, Any]) -> bytes:
         error = "no attempt"
         for attempt in range(max(1, attempts)):
-            wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
-            if wait > 0:
-                sleep(wait)
-            state.last = time.monotonic()
+            rate.wait()
             request = urllib.request.Request(SEARCH + "?" + urllib.parse.urlencode(dict(params)),
                                              headers={"Accept": "application/json", "User-Agent": USER_AGENT})
             try:
                 with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     if getattr(response, "status", 200) == 200:
                         return response.read()
+                    rate.hold(response.status, getattr(response, "headers", None))
                     error = f"HTTP {response.status}"
             except urllib.error.HTTPError as failure:
+                rate.hold(failure.code, failure.headers)
                 error = f"HTTP {failure.code}"
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as failure:
                 error = type(failure).__name__

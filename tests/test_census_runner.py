@@ -31,6 +31,12 @@ JOURNAL = "Synthetic Journal of Examples"
 MODEL = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 
 
+def unpaced():
+    """A Europe PMC rate whose waits sleep for nothing: the census's fetchers without real pauses in a test."""
+    from ocsl_review.census_inputs import EUROPE_PMC_REQUESTS_PER_SECOND, RateLimit
+    return RateLimit(EUROPE_PMC_REQUESTS_PER_SECOND, sleep=lambda seconds: None)
+
+
 class MockJudge:
     """Answers chat-completions requests from the labels and abstracts in the user message."""
 
@@ -859,15 +865,15 @@ class RetryableFetchTests(RunnerTestCase):
         sleeps = []
         throttled = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b""))
         missing = urllib.error.HTTPError("u", 404, "Not Found", {}, io.BytesIO(b""))
-        fetch = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled), sleep=sleeps.append)
+        fetch = europe_pmc_fetcher(limit=unpaced(), opener=opener_for(throttled), sleep=sleeps.append)
         with self.assertRaises(RetryableFetch):
             fetch("PMC1")
         self.assertEqual([2.0, 5.0], sleeps)
-        self.assertIsNone(europe_pmc_fetcher(spacing=0, opener=opener_for(missing), sleep=sleeps.append)("PMC1"))
+        self.assertIsNone(europe_pmc_fetcher(limit=unpaced(), opener=opener_for(missing), sleep=sleeps.append)("PMC1"))
         cut = Response(fail=http.client.IncompleteRead(b"<article>", 100))
         with self.assertRaises(RetryableFetch):
-            europe_pmc_fetcher(spacing=0, opener=opener_for(cut), sleep=sleeps.append)("PMC1")
-        recovered = europe_pmc_fetcher(spacing=0, opener=opener_for(throttled, Response()), sleep=sleeps.append)
+            europe_pmc_fetcher(limit=unpaced(), opener=opener_for(cut), sleep=sleeps.append)("PMC1")
+        recovered = europe_pmc_fetcher(limit=unpaced(), opener=opener_for(throttled, Response()), sleep=sleeps.append)
         self.assertEqual(b"<article/>", recovered("PMC1"))
         # Every request names the census inputs' User-Agent and asks for XML; no contact address is sent.
         sent = []
@@ -875,7 +881,7 @@ class RetryableFetchTests(RunnerTestCase):
         def recording(request, timeout=None):
             sent.append(request)
             return Response()
-        europe_pmc_fetcher(spacing=0, opener=recording, sleep=sleeps.append)("PMC7")
+        europe_pmc_fetcher(limit=unpaced(), opener=recording, sleep=sleeps.append)("PMC7")
         self.assertEqual("https://www.ebi.ac.uk/europepmc/webservices/rest/PMC7/fullTextXML", sent[0].full_url)
         self.assertEqual({"Accept": "application/xml", "User-agent": "ocsl-review census inputs"},
                          dict(sent[0].header_items()))
@@ -887,7 +893,7 @@ class RetryableFetchTests(RunnerTestCase):
         # its own record of the PMCID tells such a miss from an outage.
         europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001", "PMC999999999", "PMC7"}, records={"PMC7": "Y"})
         sleeps = []
-        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleeps.append)
+        fetch = europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=sleeps.append)
         self.assertIsNone(fetch("PMC2000001"))
         self.assertEqual(["fullTextXML PMC2000001", "search PMC2000001"], europe_pmc.log)
         self.assertEqual([], sleeps, "a miss is never retried")
@@ -922,12 +928,13 @@ class RetryableFetchTests(RunnerTestCase):
         # A search that fails concludes nothing: the entry stays open too.
         down = EuropePmcStandIn(server_errors={"PMC2000001"}, search_status=503)
         with self.assertRaisesRegex(RetryableFetch, r"PMC2000001: HTTP 500; its Europe PMC record could not be checked"):
-            europe_pmc_fetcher(spacing=0, opener=down, sleep=lambda seconds: None)("PMC2000001")
+            europe_pmc_fetcher(limit=unpaced(), opener=down, sleep=lambda seconds: None)("PMC2000001")
         self.assertEqual(4, len(down.log))
         # An outage that clears: the record says open access, the next attempt serves the full text.
         flaky = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
                                  errors_before_success=1)
-        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=flaky, sleep=lambda seconds: None)("PMC7"))
+        self.assertEqual(b"<article/>",
+                         europe_pmc_fetcher(limit=unpaced(), opener=flaky, sleep=lambda seconds: None)("PMC7"))
 
     def test_full_text_completes_when_cited_works_have_no_open_access_full_text(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
@@ -940,7 +947,7 @@ class RetryableFetchTests(RunnerTestCase):
                                       records={"PMC900005": "Y", "PMC900007": "N"})
         clock = FakeClock()
         run.sleep = clock.sleep
-        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=clock.sleep,
                                                                 clock=clock), cooldown=60)
         # The first pass leaves work 15 open: its search finds no record, and one search for it and a sentinel finds
         # the sentinel's record and none of 15, which starts its absence. The second pass, a 60 s cooldown later,
@@ -966,7 +973,7 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual(["fullTextXML PMC900015", "search PMC900015"], second_pass[:2])
         self.assertIn(second_pass[2].removeprefix("search PMC900015 OR "), sentinels)
         # The next invocation finds nothing open: it closes nothing.
-        again = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+        again = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=lambda s: None),
                                   cooldown=0)
         self.assertEqual(dict.fromkeys(result["withoutFullText"], 0), again["withoutFullText"])
 
@@ -977,7 +984,7 @@ class RetryableFetchTests(RunnerTestCase):
         run.run_abstract()
         europe_pmc = EuropePmcStandIn(server_errors={"PMC900005", "PMC900007", "PMC900015"},
                                       records={"PMC900005": "Y", "PMC900007": "Y", "PMC900015": "Y"})
-        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda s: None),
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=lambda s: None),
                                    transport_retries=0, cooldown=0)
         self.assertEqual(("paused", 3), (result["state"], result["fetchRetries"]))
         # The three entries with a PMCID stay open; only the two without one are settled (no-pmcid).
@@ -997,7 +1004,7 @@ class RetryableFetchTests(RunnerTestCase):
                                       server_errors={"PMC900007", "PMC900015"})
         clock = FakeClock()
         run.sleep = clock.sleep
-        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=clock.sleep,
                                                                 clock=clock))
         self.assertEqual(("paused", 4, 2, 8), (result["state"], result["passes"], result["openEntries"],
                                                result["fetchRetries"]))
@@ -1032,7 +1039,7 @@ class RetryableFetchTests(RunnerTestCase):
                     clock, empty, partial, sentinel="PMC900005", target="PMC900015",
                     full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
                     server_errors={"PMC900015"})
-                result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=opener, sleep=clock.sleep,
+                result = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=opener, sleep=clock.sleep,
                                                                         clock=clock))
                 self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 2, "notFound": 1,
                                                                                "noRecord": no_record},
@@ -1056,7 +1063,7 @@ class RetryableFetchTests(RunnerTestCase):
         europe_pmc = EuropePmcStandIn(server_errors={"PMC900005", "PMC900007", "PMC900015"})
         clock = FakeClock()
         run.sleep = clock.sleep
-        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=clock.sleep,
+        result = run.run_full_text(fetch_xml=europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=clock.sleep,
                                                                 clock=clock))
         self.assertEqual(("completed", 2, 3), (result["state"], result["passes"], result["fetchRetries"]))
         self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 2, "noRecord": 3},
@@ -1078,7 +1085,7 @@ class RetryableFetchTests(RunnerTestCase):
         def sleep(seconds):
             sleeps.append(seconds)
             clock.sleep(seconds)
-        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=sleep, clock=clock)
+        fetch = europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=sleep, clock=clock)
         self.assertEqual(b"<article/>", fetch("PMC5"))
         with self.assertRaisesRegex(RetryableFetch, r"PMC7: HTTP 500; Europe PMC's search found no record of it, not "
                                                     r"confirmed"):
@@ -1101,13 +1108,14 @@ class RetryableFetchTests(RunnerTestCase):
         # An outage that clears after such an answer serves the full text.
         cleared = EuropePmcStandIn(full_texts={"PMC7": b"<article/>"}, server_errors={"PMC7"}, records={"PMC7": "Y"},
                                    errors_before_success=1, unlisted_searches=1)
-        self.assertEqual(b"<article/>", europe_pmc_fetcher(spacing=0, opener=cleared, sleep=lambda s: None)("PMC7"))
+        self.assertEqual(b"<article/>",
+                         europe_pmc_fetcher(limit=unpaced(), opener=cleared, sleep=lambda s: None)("PMC7"))
 
     def test_a_record_check_without_an_open_access_flag_or_a_matching_record_concludes_nothing(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
         # The PMCID's record carries no isOpenAccess, or the hits list other PMCIDs only: nothing is concluded.
         europe_pmc = EuropePmcStandIn(server_errors={"PMC8", "PMC9"}, records={"PMC8": None}, foreign_records={"PMC9"})
-        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        fetch = europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=lambda seconds: None)
         for pmcid in ("PMC8", "PMC9"):
             with self.assertRaisesRegex(RetryableFetch, pmcid + r": HTTP 500; its Europe PMC record could not be "
                                                                 r"checked"):
@@ -1116,34 +1124,30 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual(["fullTextXML PMC8", "search PMC8", "fullTextXML PMC8", "fullTextXML PMC8"],
                          europe_pmc.log[:4], "one inconclusive check per fetch")
 
-    def test_the_record_check_is_paced_and_throttling_gets_none(self):
+    def test_the_record_check_waits_its_turn_at_the_shared_rate_and_throttling_gets_none(self):
         import io
-        import types
         import urllib.error
-        from unittest import mock
         from ocsl_review import study_cli
-        clock, requests = [100.0], []
-
-        def sleep(seconds):
-            clock[0] += seconds
+        from ocsl_review.census_inputs import RateLimit
+        clock, requests = FakeClock(100.0), []
         europe_pmc = EuropePmcStandIn(server_errors={"PMC2000001"})
 
         def opener(request, timeout=None):
-            requests.append((clock[0], request.full_url))
+            requests.append((clock(), request.full_url))
             if "PMC3" in request.full_url and request.full_url.endswith("/fullTextXML"):
                 raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(b""))
             return europe_pmc(request, timeout)
-        with mock.patch.object(study_cli, "time", types.SimpleNamespace(monotonic=lambda: clock[0])):
-            fetch = study_cli.europe_pmc_fetcher(spacing=0.4, opener=opener, sleep=sleep)
-            self.assertIsNone(fetch("PMC2000001"))
-            # The record check keeps the census's spacing after the fullTextXML request.
-            (full_text_at, full_text), (search_at, search) = requests
-            self.assertTrue(full_text.endswith("/PMC2000001/fullTextXML") and "/search?" in search)
-            self.assertGreaterEqual(search_at - full_text_at, 0.4)
-            # Throttling gets no record check: three fullTextXML requests, then the entry stays open.
-            requests.clear()
-            with self.assertRaisesRegex(RetryableFetch, r"^PMC3: HTTP 429$"):
-                fetch("PMC3")
+        fetch = study_cli.europe_pmc_fetcher(opener=opener, sleep=clock.sleep, clock=clock,
+                                             limit=RateLimit(8.0, clock=clock, sleep=clock.sleep))
+        self.assertIsNone(fetch("PMC2000001"))
+        # The record check waits its turn at the shared rate after the fullTextXML request.
+        (full_text_at, full_text), (search_at, search) = requests
+        self.assertTrue(full_text.endswith("/PMC2000001/fullTextXML") and "/search?" in search)
+        self.assertAlmostEqual(0.125, search_at - full_text_at)
+        # Throttling gets no record check: three fullTextXML requests, then the entry stays open.
+        requests.clear()
+        with self.assertRaisesRegex(RetryableFetch, r"^PMC3: HTTP 429$"):
+            fetch("PMC3")
         self.assertEqual(3, len(requests))
         self.assertFalse(any("/search?" in url for _, url in requests))
 
@@ -1154,7 +1158,7 @@ class RetryableFetchTests(RunnerTestCase):
         europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"  \n", "PMC6": b""}, records={"PMC3": "N", "PMC4": "Y",
                                       "PMC5": "N", "PMC6": "Y"}, full_text_status={"PMC3": 403, "PMC4": 401,
                                                                                    "PMC10": 410})
-        fetch = europe_pmc_fetcher(spacing=0, opener=europe_pmc, sleep=lambda seconds: None)
+        fetch = europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=lambda seconds: None)
         self.assertIsNone(fetch("PMC3"))
         self.assertEqual("notOpenAccess", fetch.miss_reason("PMC3"))
         with self.assertRaisesRegex(RetryableFetch, r"PMC4: HTTP 401; Europe PMC lists it as open access"):
@@ -1316,7 +1320,7 @@ class NoRecordDecisionTests(unittest.TestCase):
 
     def fetcher(self, europe_pmc, clock, opener=None):
         from ocsl_review.study_cli import europe_pmc_fetcher
-        return europe_pmc_fetcher(spacing=0, opener=opener or europe_pmc, sleep=clock.sleep, clock=clock)
+        return europe_pmc_fetcher(limit=unpaced(), opener=opener or europe_pmc, sleep=clock.sleep, clock=clock)
 
     def assertOpen(self, fetch, pmcid):
         with self.assertRaisesRegex(RetryableFetch, "^" + pmcid + ": HTTP "):
@@ -1898,7 +1902,7 @@ class PersistentFailureTests(RunnerTestCase):
         stand_in = EuropePmcStandIn(full_texts={pmcid: text for pmcid in pmcids if pmcid not in failing},
                                     server_errors=set(pmcids if outage else failing),
                                     records=dict.fromkeys(pmcids, "Y"))
-        return stand_in, europe_pmc_fetcher(spacing=0, opener=stand_in, sleep=lambda seconds: None)
+        return stand_in, europe_pmc_fetcher(limit=unpaced(), opener=stand_in, sleep=lambda seconds: None)
 
     def test_a_batch_no_call_answers_while_others_are_answered_closes_as_invalid_no_response(self):
         run = self.run_census(wall=self.clock)

@@ -244,15 +244,17 @@ def _caches(args):
                             provider_cache=getattr(args, "provider_cache", None))
 
 
-def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tuple[float, ...] = (2.0, 5.0, 10.0),
-                       opener: Any = None, sleep: Any = time.sleep, clock: Any = None):
-    """Fetch fullTextXML by PMCID; each fetching thread pauses ``spacing`` seconds between its requests.
+def europe_pmc_fetcher(*, attempts: int = 3, backoff: tuple[float, ...] = (2.0, 5.0, 10.0), opener: Any = None,
+                       sleep: Any = time.sleep, clock: Any = None, limit: Any = None):
+    """Fetch fullTextXML by PMCID; every request of every fetching thread waits its turn at ``limit`` (default
+    census_inputs.EUROPE_PMC_LIMIT, the census's one Europe PMC rate), and a 429 or 503 answer's Retry-After holds
+    them all.
 
     A 404, a 410 or another definitive client error means there is no open-access full text (None). Europe PMC serves
     fullTextXML for its open-access subset only and answers every other PMCID (free-to-read articles and author
     manuscripts included) with HTTP 500, not 404. So a server error (and a 401 or 403 from the service's edge, or a
     200 with an empty body) is checked once per fetch against Europe PMC's own record of the PMCID (``PMCID:<id>`` on
-    the search the census's abstracts step uses), at the census's spacing:
+    the search the census's abstracts step uses), at the same rate:
 
     - a record whose ``isOpenAccess`` is ``N`` (outside the open-access subset) is a definitive miss (None);
     - a record whose ``isOpenAccess`` is ``Y`` makes the error an outage, retried with backoff;
@@ -280,10 +282,11 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
     (the record check for JSON); it carries identifiers only (no contact address, no credentials, no cookies), as the
     census's other Europe PMC requests do.
     """
-    from .census_inputs import USER_AGENT
+    from .census_inputs import EUROPE_PMC_LIMIT, USER_AGENT
     from .census_runner import RetryableFetch
     state = threading.local()
     monotonic = clock or time.monotonic
+    rate = limit or EUROPE_PMC_LIMIT
     headers = {"Accept": "application/xml", "User-Agent": USER_AGENT}
     search_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     notes = {"open-access": "; Europe PMC lists it as open access",
@@ -294,12 +297,6 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
     absent_since: dict[str, float] = {}     # PMCID -> its first joint answer without it, since it was last seen
     sentinels: list[str] = []               # the last two PMCIDs seen in Europe PMC's index, the newest first
 
-    def pace() -> None:
-        wait = getattr(state, "last", 0.0) + spacing - monotonic()
-        if wait > 0:
-            sleep(wait)
-        state.last = monotonic()
-
     def seen(pmcid: str) -> None:
         """``pmcid`` is in Europe PMC's index: a sentinel for other PMCIDs, and any absence of it is over."""
         with lock:
@@ -307,17 +304,21 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
             sentinels[:] = [pmcid, *[other for other in sentinels if other != pmcid][:1]]
 
     def search(query: str, page_size: int) -> tuple[int, list[Any]] | None:
-        """One paced search of Europe PMC: its hitCount and the page's results, or None for a failed or unreadable
-        answer."""
-        pace()
+        """One search of Europe PMC at the shared rate: its hitCount and the page's results, or None for a failed or
+        unreadable answer."""
+        rate.wait()
         parameters = urllib.parse.urlencode({"query": query, "format": "json", "resultType": "lite",
                                              "pageSize": page_size})
         request = urllib.request.Request(EUROPE_PMC_SEARCH + "?" + parameters, headers=search_headers)
         try:
             with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                 if getattr(response, "status", 200) != 200:
+                    rate.hold(response.status, getattr(response, "headers", None))
                     return None
                 answer = json.loads(response.read())
+        except urllib.error.HTTPError as failure:
+            rate.hold(failure.code, failure.headers)
+            return None
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
             return None
         listing = answer.get("resultList") if isinstance(answer, dict) else None
@@ -386,15 +387,17 @@ def europe_pmc_fetcher(spacing: float = 0.4, *, attempts: int = 3, backoff: tupl
         tries = max(1, attempts)
         for attempt in range(tries):
             last = attempt + 1 >= tries
-            pace()
+            rate.wait()
             request = urllib.request.Request(EUROPE_PMC_FULL_TEXT % pmcid, headers=headers)
             status, body = None, b""
             try:
                 with (opener or urllib.request.urlopen)(request, timeout=90) as response:
                     body = response.read()
                     status = getattr(response, "status", 200)
+                    rate.hold(status, getattr(response, "headers", None))
             except urllib.error.HTTPError as failure:
                 status = failure.code
+                rate.hold(status, failure.headers)
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as failure:
                 error = type(failure).__name__
             if status == 200 and body.strip():

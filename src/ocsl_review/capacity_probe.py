@@ -46,7 +46,7 @@ the store's Europe PMC records, else the census's live search, as ``study
 abstracts`` looks works up, ``CensusRun.prepare_review``), every entry whose
 cited work has a PMCID is retrieved and windowed by the tier's own code
 (``CensusRun.prepare_full_text_group``: the store first, then Europe PMC through
-the census's fetcher, with its headers and spacing; fetched full texts are kept
+the census's fetcher, with its headers and rate; fetched full texts are kept
 in a cache directory for later runs), and the calls are the census's
 (``census_runner.full_text_call``: five entries of one review per call, the
 claim-targeted windows in the FULL TEXT field, reasoning low, ``max_tokens`` for
@@ -844,7 +844,7 @@ class FullTextCache:
     the PMCID (``noRecord``: it contradicts the record the work's PMCID came from), so a later run asks again.
     Fresh misses are also counted by the fetcher's reason (``absentNotOpenAccess``, ``absentNoRecord``,
     ``absentNotFound``). ``fetch`` is the census's own fetcher (``study_cli.europe_pmc_fetcher``: its headers,
-    spacing, retries and record checks). Without ``fetch`` (the dry run) nothing is fetched and only what the
+    rate, retries and record checks). Without ``fetch`` (the dry run) nothing is fetched and only what the
     directory holds is returned.
     """
 
@@ -1043,7 +1043,8 @@ class FullTextInputs:
             "fullTexts": {"cacheDirectory": str(cache.directory) if cache.directory else None, "live": live,
                           **dict(sorted(cache.counts.items())),
                           "fetcher": ("study_cli.europe_pmc_fetcher: the census's own Europe PMC fullTextXML fetcher "
-                                      "(its User-Agent, 0.4 s spacing per thread, 3 attempts; a server error is "
+                                      "(its User-Agent, the census's Europe PMC rate of 8 requests a second over "
+                                      "every thread, 3 attempts; a server error is "
                                       "checked against the PMCID's Europe PMC record: a PMCID outside the "
                                       "open-access subset is a definitive miss, one without any record only when the "
                                       "search finds none and two searches for it and another PMCID together, at least "
@@ -1136,6 +1137,7 @@ class FullTextInputs:
         """Without any network: the store's reviews for the prefixes, and the first ``PLAN_REVIEWS`` of them prepared
         in a temporary database, with the full texts the store or the cache directory already hold."""
         import tempfile
+        from .census_inputs import EUROPE_PMC_REQUESTS_PER_SECOND
         from .census_runner import CensusRun, full_text_call
         settings, started = self.settings, time.monotonic()
         caches = self._open()
@@ -1184,12 +1186,12 @@ class FullTextInputs:
                             "note": "prepared offline; only full texts the store or the cache directory hold were used"}
         record["estimate"] = {
             "reviewsForTarget": math.ceil(settings.full_text_entries / per_review) if per_review else None,
-            "fetchSecondsAtLeast": round(settings.full_text_entries * 0.4 / settings.fetch_workers),
+            "fetchSecondsAtLeast": round(settings.full_text_entries / EUROPE_PMC_REQUESTS_PER_SECOND),
             "note": ("one Europe PMC request per candidate the store and the cache directory do not hold, until the "
                      "target is retrieved (target / share of PMCIDs with an open-access full text), and a second one, "
-                     "the record check, for each PMCID outside the open-access subset; each fetch thread "
-                     "spaces its requests 0.4 s apart, so fetching takes at least target x 0.4 s / threads plus the "
-                     "downloads, and a rerun with the same cache directory fetches nothing it fetched before")}
+                     "the record check, for each PMCID outside the open-access subset; the fetch threads share the "
+                     "census's Europe PMC rate of 8 requests a second, so fetching takes at least target / 8 s plus "
+                     "the downloads, and a rerun with the same cache directory fetches nothing it fetched before")}
         return record
 
 
@@ -3314,8 +3316,8 @@ def allowed_concurrency(report: dict[str, Any], settings: ProbeSettings) -> dict
                 "exploratoryAbove": None,
                 "line": (f"Concurrency: {streams} streams for the full-text tier, a probe setting and no census one: a "
                          "census's full-text calls arrive at the pace of its Europe PMC retrieval (study full-text "
-                         "--fetch-workers, 0.4 s between a thread's requests), so the judge holds far fewer of them than "
-                         f"the abstract tier's {settings.allowed_streams} streams.")}
+                         "--fetch-workers, at most 8 Europe PMC requests a second), so the judge holds far fewer of "
+                         f"them than the abstract tier's {settings.allowed_streams} streams.")}
     allowed, items = settings.allowed_streams, instrument_items()
     above = [assess_cell(c, settings) for c in report.get("cells", []) if c.get("streams", 0) > allowed]
     eligible = [a for a in above if a["eligible"]]
