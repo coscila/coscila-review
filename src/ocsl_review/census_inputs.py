@@ -45,7 +45,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from xml.etree import ElementTree as ET
 
 from .errors import ProviderError, ReviewError, TransientError, ValidationError
-from .scholarly import EUROPE_PMC, normalize_doi, normalize_europe_pmc
+from .scholarly import EUROPE_PMC, display_text, normalize_doi, normalize_europe_pmc
 from .scores_db import PROVENANCE as ITEM_PROVENANCE
 
 # The five acquisition classes; ITEM_PROVENANCE adds "supplied": material an input record carried without an
@@ -792,22 +792,86 @@ def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[f
     return fetch
 
 
+# A review whose Europe PMC record has a DOI and no PMCID can still have a copy in PMC, which Europe PMC holds as a
+# record of its own: with the PMCID and without the DOI. One search by the review's title among PMC's records finds it;
+# the records on the search's first page whose title is the review's are its candidates.
+PMC_COPY_PAGE = 10
+
+
+def pmc_copy_query(title: Any) -> str | None:
+    """The search for a review's copy in PMC: its title as a phrase among PMC's records (None without a title)."""
+    phrase = " ".join(re.sub(r'["\\]', " ", display_text(title) or "").split())
+    return f'TITLE:"{phrase}" AND SRC:PMC' if phrase else None
+
+
+def title_key(value: Any) -> str:
+    """A title as two records are compared by it: markup, case, punctuation and spacing aside."""
+    return " ".join(re.sub(r"[\W_]+", " ", display_text(value) or "").casefold().split())
+
+
 @dataclass
 class LiveSources:
-    """Live acquisition paths: Europe PMC fullTextXML by PMCID and the publisher page through doi.org.
+    """Live acquisition paths: Europe PMC fullTextXML by PMCID (for a review without one, of its copy in PMC:
+    ``pmc_copy``) and the publisher page through doi.org.
 
     ``session`` (``session_cookies``) goes with every publisher fetch of an entitled route, a review's page and its
-    linked table pages alike, and with no other fetch; one acquisition holds one jar.
+    linked table pages alike, and with no other fetch; one acquisition holds one jar. ``search`` asks Europe PMC's
+    search (``search_pages``: raw pages, ProviderError after its last attempt).
     """
 
     europe_pmc: Callable[[str], bytes | None] | None = None
     publisher: Callable[..., Any] | None = None
     session: http.cookiejar.CookieJar | None = None
+    search: Callable[[Mapping[str, Any]], bytes] | None = None
 
     @classmethod
     def default(cls) -> "LiveSources":
         from .study_cli import europe_pmc_fetcher
-        return cls(europe_pmc=europe_pmc_fetcher(), publisher=page_fetcher(), session=session_cookies())
+        return cls(europe_pmc=europe_pmc_fetcher(), publisher=page_fetcher(), session=session_cookies(),
+                   search=search_pages())
+
+    def pmc_copy(self, doi: str, title: str):
+        """The review's copy in PMC: (its fullTextXML, its address, how it was linked), or why there is none.
+
+        One search by the review's title among PMC's records (``pmc_copy_query``); a record on its page whose title is
+        the review's (``title_key``) and that names no other DOI is a candidate, and its fullTextXML is fetched. The
+        first candidate whose JATS article-id names the review's DOI is the copy. A failed search or fetch raises
+        RetryableFetch, so the review is acquired again later.
+        """
+        from .census_runner import RetryableFetch
+        query = pmc_copy_query(title)
+        try:
+            page = self.search({"query": query, "resultType": "lite", "pageSize": PMC_COPY_PAGE, "format": "json"})
+        except ProviderError as error:
+            raise RetryableFetch(f"PMC copy search: {error}") from error
+        try:
+            results = json.loads(page)["resultList"]["result"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise RetryableFetch("PMC copy search: the answer is no Europe PMC result list") from error
+        wanted, candidates = title_key(title), []
+        for item in results if isinstance(results, list) else []:
+            pmcid = normal_pmcid(item.get("pmcid")) if isinstance(item, dict) else None
+            if (pmcid and pmcid not in candidates and title_key(item.get("title")) == wanted
+                    and normal_doi(item.get("doi")) in (None, doi)):
+                candidates.append(pmcid)
+        if not candidates:
+            return "no-pmc-copy"
+        refused = []
+        for pmcid in candidates:
+            body = self.europe_pmc(pmcid)
+            if not body:
+                refused.append(f"{pmcid} has no open-access full text")
+                continue
+            try:
+                declared = document_identifiers(body, "jats").get("doi")
+            except ValidationError:
+                refused.append(f"{pmcid}'s full text is unreadable")
+                continue
+            if declared != doi:
+                refused.append(f"{pmcid}'s JATS names {'DOI ' + declared if declared else 'no DOI'}")
+                continue
+            return body, FULL_TEXT % pmcid, {"by": "title+jats-doi", "pmcid": pmcid, "search": query}
+        return "pmc-copy-unconfirmed: " + "; ".join(refused)
 
     def page(self, url: str, route: Route):
         """A publisher page on the journal's route; entitled routes send the session's cookies."""
@@ -815,9 +879,11 @@ class LiveSources:
             return self.publisher(url, cookies=self.session)
         return self.publisher(url)
 
-    def attempts(self, route: Route, doi: str, identifiers: Mapping[str, str]) -> list[tuple[str, str, str, str, Callable]]:
-        """(kind, class, provider, url, fetch) for the kinds the route reads, in its order; a fetch returns (body, url)
-        or a reason string."""
+    def attempts(self, route: Route, doi: str, identifiers: Mapping[str, str],
+                 title: Any = None) -> list[tuple[str, str, str, str, Callable]]:
+        """(kind, class, provider, url, fetch) for the kinds the route reads, in its order; a fetch returns (body, url),
+        (body, url, link) for a review's copy in PMC, or a reason string. A review without a PMCID gets the search for
+        its copy in PMC by its ``title`` instead."""
         items = []
         if self.europe_pmc is not None and identifiers.get("pmcid"):
             url = FULL_TEXT % identifiers["pmcid"]
@@ -826,6 +892,9 @@ class LiveSources:
                 body = self.europe_pmc(pmcid)
                 return (body, url) if body else "not-available"
             items.append(("jats", "public", "europe-pmc", url, europe_pmc))
+        elif self.europe_pmc is not None and self.search is not None and pmc_copy_query(title):
+            url = SEARCH + "?" + urllib.parse.urlencode({"query": pmc_copy_query(title)})
+            items.append(("jats", "public", "europe-pmc", url, lambda: self.pmc_copy(doi, title)))
         if self.publisher is not None:
             url = "https://doi.org/" + urllib.parse.quote(doi, safe="/()")
             items.append(("html", route.klass, "publisher", url, lambda url=url: self.page(url, route)))
@@ -981,7 +1050,8 @@ class ReviewAcquirer:
                                       candidate.tables, route, expected, detail, rejected)
             transient = []
             if route is not None and self.live is not None:
-                for kind, klass, provider, url, fetch in self.live.attempts(route, doi, expected):
+                title = record.get("enumeratedTitle") or record.get("title")
+                for kind, klass, provider, url, fetch in self.live.attempts(route, doi, expected, title):
                     try:
                         got = fetch()
                     except RetryableFetch as error:
@@ -990,7 +1060,7 @@ class ReviewAcquirer:
                     if isinstance(got, str):
                         rejected.append({"provider": provider, "url": url, "reason": got})
                         continue
-                    body, final_url = got
+                    body, final_url, *linked = got
                     if pinned and sha256_bytes(body) != pinned:
                         rejected.append({"provider": provider, "url": url, "reason": "sha256-mismatch",
                                          "detail": "differs from the document digest the record pins"})
@@ -1003,7 +1073,8 @@ class ReviewAcquirer:
                     base = final_url if str(final_url).startswith("https://") else (
                         html_base_url(body) if kind == "html" else None)
                     detail = {"cache": None, "sourceSha256": sha256_bytes(body), "identity": outcome["identity"],
-                              "kind": kind, "provider": provider, "sourceUrl": final_url, "retrievedAt": utc_now()}
+                              "kind": kind, "provider": provider, "sourceUrl": final_url, "retrievedAt": utc_now(),
+                              **({"link": linked[0]} if linked else {})}
                     if state == "not-article":
                         rejected.append({"provider": provider, "url": url, "reason": "not-the-article", "detail": reason})
                         continue
@@ -1153,6 +1224,12 @@ def _acquisition_label(record: Mapping[str, Any]) -> str:
     return acquisition.get("provenance") or ("retry" if acquisition.get("state") == "retry" else "supplied")
 
 
+def _pmc_copy(record: Mapping[str, Any]) -> int:
+    """1 for a record whose document is the review's copy in PMC (``LiveSources.pmc_copy``), else 0."""
+    acquisition = record.get("acquisition")
+    return int(isinstance(acquisition, dict) and isinstance(acquisition.get("link"), dict))
+
+
 def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, retry_unavailable: bool = False,
                     sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
     """Stream review records through the acquirer into ``<output>.partial``; resume it; sweep; rename when complete.
@@ -1161,7 +1238,8 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
     study should live in that directory. Records with a supplied document pass through unchanged. Records whose
     acquisition failed transiently (state retry) are acquired again in sweeps after the main pass (``sweep_partial``),
     and the output is written once; a record still failing after the last sweep keeps state retry and is acquired
-    again when the command runs on its own output.
+    again when the command runs on its own output. ``pmcCopies`` counts the records it wrote whose document is the
+    review's copy in PMC, as ``provenance`` counts them by label.
     """
     from .census_runner import iter_records
     source, output = Path(source), Path(output)
@@ -1171,7 +1249,7 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
     documents = output.parent / "documents"
     partial = Path(str(output) + ".partial")
     done = _resume_partial(partial)
-    counts: dict[str, int] = {"records": 0, "resumed": len(done), "acquired": 0, "passedThrough": 0}
+    counts: dict[str, int] = {"records": 0, "resumed": len(done), "acquired": 0, "passedThrough": 0, "pmcCopies": 0}
     provenance: dict[str, int] = {}
     with partial.open("a", encoding="utf-8") as handle:
         for index, record in enumerate(iter_records(source)):
@@ -1188,6 +1266,7 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
                 counts["passedThrough"] += 1
             label = _acquisition_label(result)
             provenance[label] = provenance.get(label, 0) + 1
+            counts["pmcCopies"] += _pmc_copy(result)
             handle.write(json.dumps(result, ensure_ascii=False) + "\n")
             handle.flush()
             counts["records"] += 1
@@ -1198,8 +1277,10 @@ def acquire_records(source: Path, output: Path, acquirer: ReviewAcquirer, *, ret
     for index, (before, after) in swept["redone"].items():
         if index >= len(done):
             provenance[_acquisition_label(before)] -= 1
+            counts["pmcCopies"] -= _pmc_copy(before)
         label = _acquisition_label(after)
         provenance[label] = provenance.get(label, 0) + 1
+        counts["pmcCopies"] += _pmc_copy(after)
     provenance = {label: count for label, count in sorted(provenance.items()) if count}
     return {**counts, "output": str(output), "documents": str(documents), "provenance": provenance,
             "sweeps": swept["sweeps"],
