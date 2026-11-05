@@ -24,7 +24,7 @@ from .errors import ValidationError
 SCHEMA_VERSION = 1
 TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "call_transport", "history",
           "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "exclusions",
-          "manifest_comparisons", "data_dictionary")
+          "manifest_comparisons", "persistent_failures", "data_dictionary")
 # Execution state documented in the data dictionary but never exported, and emptied in a frozen database.
 EXECUTION_TABLES = ("pending_calls",)
 PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
@@ -139,6 +139,11 @@ CREATE TABLE IF NOT EXISTS manifest_comparisons(
   enumeration_sha256 TEXT NOT NULL, report_sha256 TEXT NOT NULL, run_complete INTEGER NOT NULL,
   compared_at TEXT NOT NULL, in_study INTEGER, excluded INTEGER, population_sha256 TEXT,
   PRIMARY KEY(label, journal, stratum));
+CREATE TABLE IF NOT EXISTS persistent_failures(
+  kind TEXT NOT NULL CHECK(kind IN ('full-text-fetch', 'abstract-batch')), journal TEXT NOT NULL, doi TEXT NOT NULL,
+  unit TEXT NOT NULL, labels_json TEXT NOT NULL, invocations INTEGER NOT NULL, others_succeeded INTEGER NOT NULL,
+  first_failed_at TEXT NOT NULL, last_failed_at TEXT NOT NULL, last_invocation TEXT NOT NULL, outcome TEXT,
+  closed_at TEXT, PRIMARY KEY(kind, journal, doi, unit));
 CREATE TABLE IF NOT EXISTS data_dictionary(
   table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
   PRIMARY KEY(table_name, column_name));
@@ -198,18 +203,24 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "abs_category": "abstract tier category: true, false, not_assessable, unsure (NULL for never cited)",
         "abs_support_verdict": "abstract tier support type", "abs_escalated": "1 when the judge escalated to full text",
         "abs_class": "sure_supported, unsure, sure_not_supported or not_cited", "abs_source": "abstract provider",
-        "abs_basis": "model, deterministic:not-cited, deterministic:unresolved-identity or invalid:no-parseable-output",
+        "abs_basis": "model, deterministic:not-cited, deterministic:unresolved-identity, invalid:no-parseable-output "
+                     "(answered calls without a parseable line, after repair) or invalid:no-response (no call answered "
+                     "the entry's batch while it kept failing; persistent_failures)",
         "abs_confidence": "rule-based confidence from category and escalation; never calibrated",
         "abs_reason": "judge rationale", "abs_quote": "verbatim quote returned for F",
         "abs_quote_present": "for F: 1 when a quote was returned", "abs_quote_in_evidence": "for F: 1 when the quote occurs in the abstract sent",
-        "abs_call_id": "call receipt of the accepted verdict", "abs_batch": "batch index within the review (0-based)",
+        "abs_call_id": "call receipt of the accepted verdict",
+        "abs_batch": "batch index within the review (0-based) of the calls that decided the entry; NULL when no call "
+                     "answered it (invalid:no-response)",
         "abs_position": "position within the call (1-based)", "abs_evidence_id": "abstract evidence unit",
         "abs_cut": "1 when the abstract sent was cut", "abs_sent_characters": "abstract characters sent",
         "ft_category": "full-text tier category", "ft_support_verdict": "full-text tier support type", "ft_class": "full-text class",
         "ft_source": "full-text source (europe-pmc-fulltextxml, entitled, cache)",
         "ft_provenance": "where the full text behind the window came from: cache-hit-public, live-public, live-entitled, "
                          "supplied (a source recorded before provenance), or unavailable when no window was sent",
-        "ft_retrieval": "retrieval outcome (cache, europe-pmc-fulltextxml, entitled, fetch-failed, no-pmcid)",
+        "ft_retrieval": "retrieval outcome (cache, europe-pmc-fulltextxml, entitled, fetch-failed, no-pmcid, "
+                        "entitled-blocked); a fetch that kept failing in transport closes as fetch-failed "
+                        "(persistent_failures)",
         "ft_reason": "full-text rationale", "ft_quote": "full-text quote", "ft_quote_present": "for F: quote returned",
         "ft_quote_in_evidence": "for F: quote occurs in the window sent", "ft_call_id": "call receipt of the full-text verdict",
         "ft_position": "position within the full-text call", "ft_evidence_id": "full-text evidence unit",
@@ -345,6 +356,23 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "excluded": "enumerated reviews of the cell excluded by the protocol at comparison time",
         "population_sha256": "sha256 of the study population at comparison time (reviews with their provenance and the "
                              "exclusions); the gates check that it is unchanged"},
+    "persistent_failures": {
+        "kind": "full-text-fetch (an escalated entry whose Europe PMC fetch failed in transport) or abstract-batch (an "
+                "abstract-tier batch whose open labels no call answered)",
+        "journal": "journal", "doi": "review DOI",
+        "unit": "the entry's label (full-text-fetch) or the batch index within the review (abstract-batch)",
+        "labels_json": "labels the failure kept open, in batch order (the labels closed, once closed)",
+        "invocations": "census invocations that counted the failure: a fetch only in an invocation in which another "
+                       "fetch succeeded; a batch in every invocation except one in which other calls went unanswered "
+                       "and none was answered (an outage)",
+        "others_succeeded": "1 when another fetch succeeded or another call was answered in a counted invocation",
+        "first_failed_at": "time of the first counted failure (UTC)",
+        "last_failed_at": "time of the latest counted failure (UTC)",
+        "last_invocation": "id of the latest invocation that counted the failure",
+        "outcome": "NULL while open; persistentError (the entry closed as fetch-failed) or invalid:no-response (the "
+                   "labels closed as unsure and invalid outputs): after 3 counted invocations, the first and the last "
+                   "at least 2 h apart, with another fetch or call succeeding",
+        "closed_at": "time the failure was closed (UTC)"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }
 
@@ -558,14 +586,18 @@ def redact_entitled(connection: sqlite3.Connection) -> dict[str, int]:
 
 def freeze_source_state(connection: sqlite3.Connection) -> str:
     """A digest of what a freeze copies from a working database: the append-only receipts and verdict history, the
-    provenance, evidence and population tables (row counts and their last row), the reviews by state and the run
-    metadata. A freeze leaves all of these as they were, so a frozen copy that records this digest is exactly the copy
-    a new freeze of the same database would write."""
+    provenance, evidence and population tables (row counts and their last row), the persistent failures (their rows),
+    the reviews by state and the run metadata. A freeze leaves all of these as they were, so a frozen copy that records
+    this digest is exactly the copy a new freeze of the same database would write."""
     parts: dict[str, Any] = {}
     for table in ("calls", "call_transport", "history", "input_provenance", "evidence", "enumeration", "exclusions",
                   "manifest_comparisons"):
         if has_table(connection, table):
             parts[table] = list(connection.execute(f"SELECT COUNT(*), MAX(rowid) FROM {table}").fetchone())
+    if has_table(connection, "persistent_failures"):
+        # Its rows change in place (counted invocations, closing): their content, not their count.
+        parts["persistent_failures"] = [list(row) for row in connection.execute(
+            "SELECT * FROM persistent_failures ORDER BY kind, journal, doi, unit")]
     parts["reviews"] = [list(row) for row in connection.execute(
         "SELECT abstract_state, full_text_state, COUNT(*) FROM reviews GROUP BY 1, 2 ORDER BY 1, 2")]
     parts["meta"] = [list(row) for row in connection.execute("SELECT key, value FROM meta ORDER BY key")]

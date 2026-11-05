@@ -40,6 +40,7 @@ class MockJudge:
         self.never = set()
         self.never_full_text = set()
         self.fail_next = 0
+        self.fail_matching: set[str] = set()   # requests whose user message holds one of these get HTTP 500
         self.model = MODEL
         self.delays: dict[str, float] = {}      # a review title -> seconds every call of that review waits
         self.lock = threading.Lock()
@@ -93,6 +94,8 @@ def start_server(judge: MockJudge):
                 failing = judge.fail_next > 0
                 if failing:
                     judge.fail_next -= 1
+                content = json.loads(body)["messages"][1]["content"]
+                failing = failing or any(text in content for text in judge.fail_matching)
             if failing:
                 self.send_response(500)
                 self.end_headers()
@@ -818,7 +821,7 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual(3, self.rows("SELECT COUNT(*) AS n FROM citations WHERE ft_retrieval='fetch-failed'")[0]["n"])
         # A fetcher that names no reason for its misses: the entries count as other failed retrievals.
         self.assertEqual({"noPmcid": 2, "notOpenAccess": 0, "noRecord": 0, "notFound": 0, "entitledBlocked": 0,
-                          "other": 3}, missed["withoutFullText"])
+                          "persistentError": 0, "other": 3}, missed["withoutFullText"])
         self.assertEqual(0, run.run_full_text(fetch_xml=full_text_fetcher([]))["retrieved"])
         again = run.run_full_text(fetch_xml=full_text_fetcher([]), retry_failed=True)
         self.assertEqual(("completed", 3), (again["state"], again["retrieved"]))
@@ -945,7 +948,7 @@ class RetryableFetchTests(RunnerTestCase):
         self.assertEqual(("completed", 1, 1, 2), (result["state"], result["retrieved"], result["fetchRetries"],
                                                  result["passes"]))
         self.assertEqual({"noPmcid": 2, "notOpenAccess": 1, "noRecord": 1, "notFound": 0, "entitledBlocked": 0,
-                          "other": 0}, result["withoutFullText"])
+                          "persistentError": 0, "other": 0}, result["withoutFullText"])
         self.assertEqual({"PMC900007", "PMC900015"}, {pmcid for pmcid, in self.rows_of(
             "SELECT w.pmcid FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
             "WHERE c.ft_retrieval='fetch-failed' AND c.ft_provenance='unavailable'")})
@@ -1858,6 +1861,195 @@ class FreezeExportTests(RunnerTestCase):
             self.assertIn("citations.parquet", names)
         except ImportError:
             self.assertTrue(manifest["parquet"].startswith("unavailable"))
+
+
+STUCK = "Synthetic review whose batch no call answers"
+
+
+class WallClock:
+    """Seconds since the epoch that only the test moves, between invocations."""
+
+    def __init__(self, now: float = 1_800_000_000.0):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, hours: float) -> None:
+        self.now += hours * 3600
+
+
+class PersistentFailureTests(RunnerTestCase):
+    """An item that keeps failing in transport while other items succeed closes with a recorded outcome after three
+    invocations at least 2 h apart; an outage counts for no item it finds open with others."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock = WallClock()
+
+    def counting(self, kind):
+        return self.rows("SELECT doi, unit, invocations, others_succeeded, outcome FROM persistent_failures "
+                         "WHERE kind=? ORDER BY doi, unit", kind)
+
+    def full_texts(self, failing=("PMC900007",), outage=False):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        text = (FIXTURES / "full_texts" / "ft2.xml").read_bytes()
+        pmcids = ("PMC900005", "PMC900007", "PMC900015")
+        stand_in = EuropePmcStandIn(full_texts={pmcid: text for pmcid in pmcids if pmcid not in failing},
+                                    server_errors=set(pmcids if outage else failing),
+                                    records=dict.fromkeys(pmcids, "Y"))
+        return stand_in, europe_pmc_fetcher(spacing=0, opener=stand_in, sleep=lambda seconds: None)
+
+    def test_a_batch_no_call_answers_while_others_are_answered_closes_as_invalid_no_response(self):
+        run = self.run_census(wall=self.clock)
+        stuck = {**record(doi="10.5555/stuck.review"), "title": STUCK}
+        self.prepare(run, record(), stuck)
+        self.judge.fail_matching = {STUCK}
+        first = run.run_abstract(cooldown=0)
+        self.assertEqual(("paused", 15, 0, 0), (first["state"], first["accepted"], first["invalid"],
+                                                first["closedNoResponse"]))
+        self.assertEqual([("10.5555/stuck.review", "0", 1, 1, None)], [tuple(r.values()) for r in self.counting(
+            "abstract-batch")], "counted once over the invocation's passes, with another batch answered")
+        # Only the failing batch is left: such an invocation counts without evidence either way.
+        self.clock.advance(1)
+        second = run.run_abstract(cooldown=0)
+        self.assertEqual(("paused", 0), (second["state"], second["closedNoResponse"]))
+        self.assertEqual(2, self.counting("abstract-batch")[0]["invocations"])
+        self.clock.advance(1)
+        third = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 0, 15, 15), (third["state"], third["accepted"], third["invalid"],
+                                                    third["closedNoResponse"]))
+        rows = self.rows("SELECT abs_basis, abs_class, model_judged, abs_batch FROM citations WHERE doi=? AND "
+                         "cited_inbody=1 AND identity IN ('resolved','resolved_unverified')", "10.5555/stuck.review")
+        self.assertEqual({("invalid:no-response", "unsure", 0, None)}, {tuple(r.values()) for r in rows})
+        self.assertEqual(15, len(rows))
+        history = self.rows("SELECT outcome, call_id FROM history WHERE doi=? AND outcome!='deterministic'",
+                            "10.5555/stuck.review")
+        self.assertEqual([("invalid", None)] * 15, [tuple(r.values()) for r in history])
+        self.assertEqual("completed", self.rows("SELECT abstract_state FROM reviews WHERE doi=?",
+                                                "10.5555/stuck.review")[0]["abstract_state"])
+        self.assertEqual([("10.5555/stuck.review", "0", 3, 1, "invalid:no-response")],
+                         [tuple(r.values()) for r in self.counting("abstract-batch")])
+        status = run.status()
+        self.assertEqual((15, 0), (status["invalidOutputs"], status["openEntries"]))
+        self.assertEqual({"batches": 1, "entries": 15, "byJournal": {JOURNAL: 15}},
+                         status["persistentFailures"]["abstractClosed"])
+        notes = gates(status)["notes"]
+        self.assertTrue(any("invalid:no-response" in note and "15 entries of 1 abstract-tier batches" in note
+                            for note in notes), notes)
+        # The sensitivity samples re-run answered batches only.
+        self.assertEqual({"10.5555/synthetic.review.1"}, {doi for _, doi, _ in run.replicate_sample(30)})
+        self.assertEqual({"10.5555/synthetic.review.1"}, {doi for _, doi, _ in run.no_truncation_sample(30)})
+        frozen = scores_db.freeze(self.database, self.root / "frozen.sqlite3", allow_incomplete=True)
+        with closing(scores_db.open_frozen(Path(frozen["path"]))) as connection:
+            self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM persistent_failures").fetchone()[0])
+
+    def test_a_batch_closes_only_once_its_counted_invocations_span_two_hours(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run, record(), {**record(doi="10.5555/stuck.review"), "title": STUCK})
+        self.judge.fail_matching = {STUCK}
+        for hours in (0, 0.5, 0.5):
+            self.clock.advance(hours)
+            self.assertEqual("paused", run.run_abstract(cooldown=0)["state"])
+        self.assertEqual((3, None), (self.counting("abstract-batch")[0]["invocations"],
+                                     self.counting("abstract-batch")[0]["outcome"]))
+        self.clock.advance(0.99)
+        self.assertEqual("paused", run.run_abstract(cooldown=0)["state"], "1.99 h after the first counted failure")
+        self.clock.advance(0.01)
+        self.assertEqual(("completed", 15), (lambda r: (r["state"], r["closedNoResponse"]))(run.run_abstract(cooldown=0)))
+
+    def test_a_judge_outage_closes_no_batch(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run, record(), record(doi="10.5555/second"))
+        self.judge.fail_next = 10 ** 6
+        for _ in range(4):
+            self.assertEqual("paused", run.run_abstract(cooldown=0)["state"])
+            self.clock.advance(1)
+        self.assertEqual([], self.counting("abstract-batch"), "invocations in which no batch was answered count for none")
+        self.assertEqual(0, run.status()["invalidOutputs"])
+        self.judge.fail_next = 0
+        self.assertEqual(("completed", 30, 0), (lambda r: (r["state"], r["accepted"], r["invalid"]))(
+            run.run_abstract(cooldown=0)))
+
+    def test_an_outage_with_several_open_batches_counts_for_none_of_them(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run, record(), {**record(doi="10.5555/stuck.a"), "title": STUCK + " A"},
+                     {**record(doi="10.5555/stuck.b"), "title": STUCK + " B"})
+        # The two batches fail while the first review is answered: one counted invocation each, with evidence.
+        self.judge.fail_matching = {STUCK}
+        run.run_abstract(cooldown=0)
+        self.assertEqual([1, 1], [row["invocations"] for row in self.counting("abstract-batch")])
+        # Then the judge is down for everyone for three hours: those invocations count for neither batch.
+        self.judge.fail_matching, self.judge.fail_next = set(), 10 ** 6
+        for _ in range(3):
+            self.clock.advance(1)
+            self.assertEqual("paused", run.run_abstract(cooldown=0)["state"])
+        self.assertEqual([(1, None), (1, None)], [(row["invocations"], row["outcome"])
+                                                  for row in self.counting("abstract-batch")])
+        self.judge.fail_next = 0
+        self.clock.advance(1)
+        after = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 30, 0), (after["state"], after["accepted"], after["invalid"]))
+        self.assertEqual([], self.counting("abstract-batch"), "answered batches start their count again")
+
+    def test_a_full_text_that_keeps_failing_while_others_succeed_closes_as_persistent_error(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run)
+        run.run_abstract()
+        stand_in, fetch = self.full_texts()
+        first = run.run_full_text(fetch_xml=fetch, cooldown=0)
+        self.assertEqual(("paused", 2, 1), (first["state"], first["retrieved"], first["openEntries"]))
+        self.assertEqual([("10.5555/synthetic.review.1", "7", 1, 1, None)],
+                         [tuple(r.values()) for r in self.counting("full-text-fetch")])
+        # Only the failing entry is left: a fetch of a full text the census already read shows Europe PMC serving.
+        self.clock.advance(1)
+        stand_in, fetch = self.full_texts()
+        second = run.run_full_text(fetch_xml=fetch, cooldown=0)
+        self.assertEqual("paused", second["state"])
+        self.assertEqual(2, self.counting("full-text-fetch")[0]["invocations"])
+        probes = [line for line in stand_in.log if line in ("fullTextXML PMC900005", "fullTextXML PMC900015")]
+        self.assertEqual(1, len(probes), stand_in.log)
+        self.clock.advance(1)
+        third = run.run_full_text(fetch_xml=self.full_texts()[1], cooldown=0)
+        self.assertEqual("completed", third["state"])
+        self.assertEqual(dict.fromkeys(third["withoutFullText"], 0) | {"persistentError": 1}, third["withoutFullText"])
+        self.assertEqual({JOURNAL: dict.fromkeys(third["withoutFullText"], 0) | {"persistentError": 1}},
+                         third["withoutFullTextByJournal"])
+        entry = self.rows("SELECT ft_retrieval, ft_provenance, ft_class, ft_category, ft_call_id FROM citations "
+                          "WHERE label='7'")[0]
+        self.assertEqual(("fetch-failed", "unavailable", None, None, None), tuple(entry.values()))
+        self.assertEqual([], self.rows("SELECT * FROM history WHERE tier='full-text' AND label='7'"),
+                         "never a support verdict")
+        self.assertEqual("completed", self.rows("SELECT full_text_state FROM reviews")[0]["full_text_state"])
+        status = run.status()
+        self.assertEqual({"entries": 1, "byJournal": {JOURNAL: 1}}, status["persistentFailures"]["fullTextClosed"])
+        self.assertTrue(any("persistentError" in note for note in gates(status)["notes"]))
+        # Reopening recorded fetch failures counts the entry's failures again.
+        stand_in, fetch = self.full_texts(failing=())
+        reopened = run.run_full_text(fetch_xml=fetch, retry_failed=True, cooldown=0)
+        self.assertEqual(("completed", 1), (reopened["state"], reopened["judged"]))
+        self.assertEqual([], self.counting("full-text-fetch"))
+
+    def test_a_europe_pmc_outage_closes_no_full_text_entry(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run)
+        run.run_abstract()
+        for _ in range(4):
+            result = run.run_full_text(fetch_xml=self.full_texts(outage=True)[1], cooldown=0)
+            self.assertEqual(("paused", 3), (result["state"], result["openEntries"]))
+            self.clock.advance(1)
+        self.assertEqual([], self.counting("full-text-fetch"), "without a full text served, nothing counts")
+        # An outage after other fetches succeeded: the outage's invocations count for no entry either.
+        run.run_full_text(fetch_xml=self.full_texts()[1], cooldown=0)
+        self.assertEqual([1], [row["invocations"] for row in self.counting("full-text-fetch")])
+        for _ in range(3):
+            self.clock.advance(1)
+            stand_in, fetch = self.full_texts(outage=True)
+            self.assertEqual("paused", run.run_full_text(fetch_xml=fetch, cooldown=0)["state"])
+            self.assertTrue({"fullTextXML PMC900005", "fullTextXML PMC900015"} & set(stand_in.log),
+                            "the probe found Europe PMC down")
+        self.assertEqual([(1, None)], [(row["invocations"], row["outcome"]) for row in self.counting("full-text-fetch")])
+        self.assertEqual(1, run.status()["openFullTextEntries"])
 
 
 if __name__ == "__main__":

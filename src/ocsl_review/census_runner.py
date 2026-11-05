@@ -28,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,13 +126,28 @@ class RetryableFetch(ReviewError):
 # and another PMCID together, at least 60 s apart (study_cli.NO_RECORD_SECONDS), each found the other's record only.
 FULL_TEXT_MISS_REASONS = ("notFound", "notOpenAccess", "noRecord")
 # Escalated entries one full-text invocation closed without a window, by reason (``withoutFullText`` of its result):
-# the cited work has no PMCID; the fetcher's reasons above; entitled text for a judge that is not on premises; any
-# other failed retrieval (an unreadable fullTextXML, no live retrieval, a fetcher that names no reason).
-WITHOUT_FULL_TEXT = ("noPmcid", *FULL_TEXT_MISS_REASONS, "entitledBlocked", "other")
+# the cited work has no PMCID; the fetcher's reasons above; entitled text for a judge that is not on premises; a fetch
+# that kept failing in transport while other fetches succeeded (PERSISTENT_INVOCATIONS); any other failed retrieval
+# (an unreadable fullTextXML, no live retrieval, a fetcher that names no reason).
+WITHOUT_FULL_TEXT = ("noPmcid", *FULL_TEXT_MISS_REASONS, "entitledBlocked", "persistentError", "other")
+# An item that keeps failing in transport while other items succeed closes with a recorded outcome instead of keeping
+# its step open: an escalated entry whose Europe PMC fetch failed (persistentError, never a support verdict) or an
+# abstract-tier batch no call answered (invalid:no-response), once this many invocations counted its failure, the first
+# and the last at least PERSISTENT_SECONDS apart (persistent_failures in the scores database).
+PERSISTENT_INVOCATIONS = 3
+PERSISTENT_SECONDS = 2 * 3600.0
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stamp(seconds: float) -> str:
+    return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _seconds(stamp: str) -> float:
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
 
 
 def canonical(value: Any) -> str:
@@ -545,7 +561,7 @@ class CensusRun:
     def __init__(self, database: Path, *, seed: int, transport: Any = None, request_model: str | None = None,
                  concurrency: int = 60, run_id: str | None = None, sleep: Callable[[float], None] = time.sleep,
                  revision: str | None = None, breaker: int | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValidationError("the census protocol seed must be an integer")
         if not 1 <= concurrency <= 1024:
@@ -556,13 +572,18 @@ class CensusRun:
         self.transport, self.concurrency, self.sleep = transport, concurrency, sleep
         # The batches' start and end times of the abstract tier (steady_throughput), on one monotonic clock.
         self.clock = clock
+        # Seconds since the epoch: when items that keep failing failed, across invocations (persistent_failures).
+        self.wall = wall
         # Consecutive batches or calls without any response before a pass stops dispatching (an outage).
         self.breaker = breaker or max(4, concurrency)
         self.revision = revision or code_revision()
         self.lock = threading.Lock()
         self.input_caches: Any = None
-        # Escalated entries closed without a full text by the current full-text invocation, by WITHOUT_FULL_TEXT reason.
+        # Escalated entries closed without a full text by the current full-text invocation, by WITHOUT_FULL_TEXT reason,
+        # overall and by journal; and the live fetches that returned a full text in it.
         self._without_full_text: dict[str, int] = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
+        self._without_by_journal: dict[str, dict[str, int]] = {}
+        self._live_fetches = 0
         self._fidelity: list[str] = []
         self._digests: dict[tuple[str, str], str] = {}
         self._writer = writer_lock(Path(database))
@@ -1239,13 +1260,14 @@ class CensusRun:
                                         (json.dumps(dict(detail), sort_keys=True, ensure_ascii=False),))
 
     def _schedule(self, work: Iterable[tuple[str, str, str, list[tuple[int, list[dict[str, Any]], Any, str]]]], *,
-                  cut: Any, variant: str,
-                  timings: list[tuple[float, float, int]] | None = None) -> tuple[dict[str, int], str | None, bool]:
+                  cut: Any, variant: str, timings: list[tuple[float, float, int]] | None = None,
+                  outcomes: list[tuple[str, str, dict[str, Any]]] | None = None) -> tuple[dict[str, int], str | None, bool]:
         """Run review batches with at most two batches per stream in flight; write each review when complete.
 
         Returns the totals, the served model of a drift (or None) and whether the breaker stopped the pass
         after ``self.breaker`` consecutive batches that got no response at all. ``timings`` receives every batch's
-        start, end and the entries it decided (accepted, or invalid after its repair call), for steady_throughput.
+        start, end and the entries it decided (accepted, or invalid after its repair call), for steady_throughput;
+        ``outcomes`` receives (journal, doi, outcome) of every batch that ran.
         """
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "open": 0, "transportFailures": 0}
         pending: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1268,6 +1290,8 @@ class CensusRun:
                 for future in done:
                     key = inflight.pop(future)
                     outcome = future.result()
+                    if outcomes is not None:
+                        outcomes.append((key[0], key[1], outcome))
                     if timings is not None:
                         # An incomplete or drifted batch decided only what its answered calls accepted.
                         decided = (len(outcome["got"]) if outcome["incomplete"] or outcome["drift"] is not None
@@ -1370,6 +1394,9 @@ class CensusRun:
         A pass stops early when the breaker trips (consecutive batches without any response). Reviews
         left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
         some are still open, the run pauses with ``paused:transport`` and the next invocation resumes it.
+        A batch no call answers closes as invalid:no-response once PERSISTENT_INVOCATIONS invocations, the first and
+        the last at least PERSISTENT_SECONDS apart, counted its failure while other calls were answered
+        (``_persistent_batches``); its entries count in ``invalid`` and in ``closedNoResponse``.
         The result's ``throughput`` is the invocation's steady-state rate (``steady_throughput``).
         """
         if self.transport is None:
@@ -1395,17 +1422,24 @@ class CensusRun:
                 with self.lock:
                     batches = self._open_batches(journal, doi)
                 yield journal, doi, title or "", batches
-        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0}
+        totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0, "closedNoResponse": 0}
         drift, retries = None, 0
         passes: list[list[tuple[float, float, int]]] = []
+        invocation, answered, attempted = uuid.uuid4().hex, set(), set()
         while True:
             totals["passes"] += 1
             passes.append([])
-            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary", timings=passes[-1])
+            outcomes: list[tuple[str, str, dict[str, Any]]] = []
+            outcome, drift, _ = self._schedule(work(reviews), cut=True, variant="primary", timings=passes[-1],
+                                               outcomes=outcomes)
             for name in ("accepted", "invalid", "transportFailures"):
                 totals[name] += outcome[name]
             if drift is not None:
                 break
+            if not self._stop_reason():
+                closed = self._persistent_batches(outcomes, invocation, answered, attempted)
+                totals["invalid"] += closed
+                totals["closedNoResponse"] += closed
             with self.lock:
                 open_reviews = {tuple(r) for r in self.connection.execute(
                     "SELECT journal, doi FROM reviews WHERE abstract_state='pending'")}
@@ -1431,6 +1465,174 @@ class CensusRun:
                                          "reason": f"transport: {len(reviews)} reviews still open after {totals['passes']} "
                                                    "passes; run the command again to resume"})
         return self._with_transport(self._paused(totals, drift))
+
+    # ------------------------------------------------------------------ items that keep failing
+    def _persisting(self, kind: str, failed: Mapping[tuple[str, str, str], Sequence[str]], invocation: str,
+                    counted: Callable[[tuple[str, str, str]], bool | None]) -> list[dict[str, str]]:
+        """Count this invocation for every item that failed in transport in it, once, and return the items now due.
+
+        ``failed`` maps (journal, doi, unit) to the labels the item keeps open. ``counted(key)`` tells how the
+        invocation counts for the item: True when another item succeeded in it, False when it shows nothing either
+        way, None when it does not count. An item is due once PERSISTENT_INVOCATIONS invocations counted it, the first
+        and the last at least PERSISTENT_SECONDS apart, and another item succeeded in one of them.
+        """
+        now = self.wall()
+        due = []
+        with self.lock, self.connection:
+            for (journal, doi, unit), labels in failed.items():
+                verdict = counted((journal, doi, unit))
+                if verdict is None:
+                    continue
+                row = self.connection.execute(
+                    "SELECT invocations, others_succeeded, first_failed_at, last_invocation, outcome FROM "
+                    "persistent_failures WHERE kind=? AND journal=? AND doi=? AND unit=?",
+                    (kind, journal, doi, unit)).fetchone()
+                if row is None or row["outcome"] is not None:
+                    invocations, others, first = 1, bool(verdict), now
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO persistent_failures VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)",
+                        (kind, journal, doi, unit, canonical(list(labels)), 1, int(others), _stamp(now), _stamp(now),
+                         invocation))
+                else:
+                    invocations = row["invocations"] + int(row["last_invocation"] != invocation)
+                    others, first = bool(row["others_succeeded"]) or bool(verdict), _seconds(row["first_failed_at"])
+                    self.connection.execute(
+                        "UPDATE persistent_failures SET labels_json=?, invocations=?, others_succeeded=?, "
+                        "last_failed_at=?, last_invocation=? WHERE kind=? AND journal=? AND doi=? AND unit=?",
+                        (canonical(list(labels)), invocations, int(others), _stamp(now), invocation, kind, journal,
+                         doi, unit))
+                if invocations >= PERSISTENT_INVOCATIONS and others and now - first >= PERSISTENT_SECONDS:
+                    due.append({"journal": journal, "doi": doi, "unit": unit})
+        return due
+
+    def _forget(self, kind: str, keys: Iterable[tuple[str, str, str]]) -> None:
+        """Items that no longer fail in transport (they succeeded, or failed definitively) start their count again."""
+        with self.lock:
+            counting = {tuple(row) for row in self.connection.execute(
+                "SELECT journal, doi, unit FROM persistent_failures WHERE kind=? AND outcome IS NULL", (kind,))}
+        gone = [key for key in set(keys) if key in counting]
+        if gone:
+            with self.lock, self.connection:
+                self.connection.executemany(
+                    "DELETE FROM persistent_failures WHERE kind=? AND journal=? AND doi=? AND unit=? AND outcome IS NULL",
+                    [(kind, *key) for key in gone])
+
+    def _probe_full_text(self, fetch_xml) -> bool:
+        """Whether Europe PMC serves full texts now: one fetch of a PMCID whose full text this census already read."""
+        if fetch_xml is None:
+            return False
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT w.pmcid FROM evidence e JOIN works w ON w.work_key=e.work_key WHERE e.unit='full-text' AND "
+                "e.route='source' AND e.provider='europe-pmc-fulltextxml' AND w.pmcid IS NOT NULL "
+                "ORDER BY e.retrieved_at DESC, e.evidence_id LIMIT 1").fetchone()
+        if row is None:
+            return False
+        pmcid = row[0] if str(row[0]).upper().startswith("PMC") else "PMC%s" % row[0]
+        try:
+            body = fetch_xml(pmcid)
+        except RetryableFetch:
+            return False
+        if body:
+            with self.lock:
+                self._live_fetches += 1
+        return bool(body)
+
+    def _persistent_fetches(self, fetches: Sequence[tuple[str, str, str, bool]], fetch_xml, invocation: str) -> None:
+        """Count one pass's fetches that failed in transport and close those that keep failing (persistentError).
+
+        An invocation counts for such an entry only when another fetch returned a full text in it; when none has yet,
+        one fetch of a full text the census already read (``_probe_full_text``) tells a failure of these works from an
+        outage, which counts for none of them.
+        """
+        failed = {(journal, doi, label): [label] for journal, doi, label, transient in fetches if transient}
+        self._forget("full-text-fetch", [(journal, doi, label) for journal, doi, label, transient in fetches
+                                         if not transient])
+        if not failed:
+            return
+        with self.lock:
+            succeeded = self._live_fetches > 0
+        succeeded = succeeded or self._probe_full_text(fetch_xml)
+        due = self._persisting("full-text-fetch", failed, invocation, lambda key: True if succeeded else None)
+        with self.lock, self.connection:
+            for item in due:
+                closed = self.connection.execute(
+                    "UPDATE citations SET ft_retrieval='fetch-failed', ft_provenance='unavailable' WHERE journal=? AND "
+                    "doi=? AND label=? AND ft_retrieval IS NULL", (item["journal"], item["doi"], item["unit"])).rowcount
+                self.connection.execute(
+                    "UPDATE persistent_failures SET outcome='persistentError', closed_at=? WHERE kind='full-text-fetch' "
+                    "AND journal=? AND doi=? AND unit=?", (_stamp(self.wall()), item["journal"], item["doi"], item["unit"]))
+                if closed:
+                    self._count_without_full_text(item["journal"], "persistentError")
+
+    def _persistent_batches(self, outcomes: Sequence[tuple[str, str, dict[str, Any]]], invocation: str,
+                            answered: set, attempted: set) -> int:
+        """Count one pass's abstract batches that no call answered and close those that keep failing
+        (invalid:no-response); returns the entries closed.
+
+        ``answered`` and ``attempted`` collect the batches of the invocation, across its passes. The invocation counts
+        for such a batch when another batch was answered in it (evidence that the judge answers), and also when no other
+        batch was sent (it shows nothing either way); it does not count when other batches were sent and none was
+        answered (an outage).
+        """
+        failed: dict[tuple[str, str, str], list[str]] = {}
+        settled = []
+        for journal, doi, outcome in outcomes:
+            key = (journal, doi, str(outcome["batch"]))
+            attempted.add(key)
+            if outcome["responded"]:
+                answered.add(key)
+            if outcome["incomplete"] and not outcome["stopped"] and outcome["drift"] is None:
+                failed[key] = [item["label"] for item in outcome["items"]
+                               if item["label"] in outcome["todo"] and item["label"] not in outcome["got"]]
+            elif not outcome["incomplete"]:
+                settled.append(key)
+        self._forget("abstract-batch", settled)
+        if not failed:
+            return 0
+
+        def counted(key: tuple[str, str, str]) -> bool | None:
+            if len(answered) - (key in answered) > 0:
+                return True
+            return None if len(attempted) - (key in attempted) > 0 else False
+        due = self._persisting("abstract-batch", failed, invocation, counted)
+        now, closed = utc_now(), 0
+        with self.lock, self.connection:
+            for item in due:
+                journal, doi, index = item["journal"], item["doi"], int(item["unit"])
+                batch = next((entry for entry in self._open_batches(journal, doi) if entry[0] == index), None)
+                labels = []
+                if batch is not None:
+                    for position, entry in enumerate(batch[1], 1):
+                        if entry["label"] not in batch[2]:
+                            continue
+                        self.connection.execute(
+                            "UPDATE citations SET model_judged=0, abs_class='unsure', abs_basis='invalid:no-response', "
+                            "abs_batch=NULL, abs_position=NULL WHERE journal=? AND doi=? AND label=? AND abs_basis IS NULL",
+                            (journal, doi, entry["label"]))
+                        self.connection.execute(
+                            "INSERT INTO history(journal, doi, label, tier, variant, call_id, position, outcome, created_at)"
+                            " VALUES(?,?,?,?,?,?,?,?,?)", (journal, doi, entry["label"], "abstract", "primary", None,
+                                                           position, "invalid", now))
+                        labels.append(entry["label"])
+                    remaining = self.connection.execute(
+                        "SELECT COUNT(*) FROM citations WHERE journal=? AND doi=? AND cited_inbody=1 AND identity IN "
+                        "('resolved','resolved_unverified') AND abs_basis IS NULL", (journal, doi)).fetchone()[0]
+                    if not remaining:
+                        self.connection.execute("UPDATE reviews SET abstract_state='completed' WHERE journal=? AND doi=?",
+                                                (journal, doi))
+                    scores_db.aggregate_reviews(self.connection, journal, doi)
+                self.connection.execute(
+                    "UPDATE persistent_failures SET outcome='invalid:no-response', closed_at=?, labels_json=? WHERE "
+                    "kind='abstract-batch' AND journal=? AND doi=? AND unit=?",
+                    (_stamp(self.wall()), canonical(labels), journal, doi, item["unit"]))
+                closed += len(labels)
+        return closed
+
+    def _count_without_full_text(self, journal: str, reason: str) -> None:
+        """One escalated entry closed without a window, overall and in its journal (the lock is held)."""
+        self._without_full_text[reason] += 1
+        self._without_by_journal.setdefault(journal, dict.fromkeys(WITHOUT_FULL_TEXT, 0))[reason] += 1
 
     # ------------------------------------------------------------------ full-text tier
     def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
@@ -1475,6 +1677,8 @@ class CensusRun:
                 reason_of = getattr(fetch_xml, "miss_reason", None)
                 miss = reason_of(pmcid) if callable(reason_of) else None
             if fetched:
+                with self.lock:
+                    self._live_fetches += 1
                 try:
                     text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
                     label, detail = "live-public", {"provider": source, "sourceUrl": FULL_TEXT % pmcid,
@@ -1508,13 +1712,19 @@ class CensusRun:
         return text, source, source, provenance, label, None
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
-                       allow_entitled: bool, cache=None) -> tuple[str, str, str, list[dict[str, Any]], int]:
-        """Retrieve every entry of one review's group, record definitive failures, build the windows."""
+                       allow_entitled: bool, cache=None, fetches: list[tuple[str, str, str, bool]] | None = None
+                       ) -> tuple[str, str, str, list[dict[str, Any]], int]:
+        """Retrieve every entry of one review's group, record definitive failures, build the windows.
+
+        ``fetches`` receives (journal, doi, label, transient) for every entry: whether its fetch failed in transport.
+        """
         journal, title = group[0]["journal"], group[0]["title"] or ""
         retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
             text, outcome, source, provenance, label, miss = self._retrieve(work, fetch_xml, entitled, cache)
+            if fetches is not None:
+                fetches.append((journal, doi, row["label"], outcome == "retry"))
             if outcome == "retry":
                 retry += 1
                 continue
@@ -1526,8 +1736,7 @@ class CensusRun:
                     self.connection.execute(
                         "UPDATE citations SET ft_retrieval=?, ft_provenance='unavailable' WHERE journal=? AND doi=? AND label=?",
                         (outcome, journal, doi, row["label"]))
-                    reason = miss if miss in self._without_full_text else "other"
-                    self._without_full_text[reason] += 1
+                    self._count_without_full_text(journal, miss if miss in self._without_full_text else "other")
                 continue
             with self.lock:
                 passages = [{"sentence": r["sentence"], "section": r["section"]}
@@ -1600,12 +1809,14 @@ class CensusRun:
                   "AND c.identity IN ('resolved','resolved_unverified')")
 
     def _full_text_pass(self, fetch_xml, entitled, fetch_workers: int, totals: dict[str, int],
-                        touched: set[tuple[str, str]], cache=None) -> tuple[str | None, bool]:
+                        touched: set[tuple[str, str]], cache=None,
+                        fetches: list[tuple[str, str, str, bool]] | None = None) -> tuple[str | None, bool]:
         """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped).
 
         Broker calls an earlier pass or invocation submitted without recording them (``pending_calls``) are sent first,
         unchanged (the same call id and request meet the broker job that holds them); their entries stay out of this
-        pass's chunks, so no entry is judged by a second call while the first may still finish.
+        pass's chunks, so no entry is judged by a second call while the first may still finish. ``fetches`` receives
+        every entry's retrieval (``_prepare_group``).
         """
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
@@ -1647,7 +1858,7 @@ class CensusRun:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as fetch_pool, \
                 concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as call_pool:
             retrievals = [fetch_pool.submit(self._prepare_group, doi, group, works, fetch_xml, entitled, allow_entitled,
-                                            cache) for doi, group in groups]
+                                            cache, fetches) for doi, group in groups]
             calls: set[concurrent.futures.Future] = set()
 
             def collect(block: bool) -> None:
@@ -1698,8 +1909,12 @@ class CensusRun:
         """Escalated entries: seeded order by review, retrieval, windows, five per call, reasoning low, no repair.
 
         Entries whose fetch failed transiently or whose call got no response stay open and are retried in
-        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``. The result's
-        ``withoutFullText`` counts the entries this invocation closed without a window, by WITHOUT_FULL_TEXT reason;
+        further passes; ``retry_failed`` also reopens entries an earlier run recorded as ``fetch-failed``. An entry
+        whose fetch keeps failing in transport closes as fetch-failed with reason persistentError once
+        PERSISTENT_INVOCATIONS invocations, the first and the last at least PERSISTENT_SECONDS apart, counted it: each an
+        invocation in which another fetch returned a full text (``_persistent_fetches``). The result's
+        ``withoutFullText`` counts the entries this invocation closed without a window, by WITHOUT_FULL_TEXT reason,
+        and ``withoutFullTextByJournal`` the same per journal;
         ``noRecord`` should stay 0, because every PMCID of the census came from a Europe PMC record.
         ``cache`` (census_inputs.InputCaches) is asked before Europe PMC for each work's fullTextXML, and only with
         ``fetch_xml``: a cached full text stands in for a download the run makes for every escalated work, so the
@@ -1715,6 +1930,11 @@ class CensusRun:
                 self.connection.execute(
                     "UPDATE citations SET ft_retrieval=NULL WHERE ft_retrieval='fetch-failed' AND model_judged=1 AND "
                     "abs_escalated=1 AND cited_inbody=1 AND identity IN ('resolved','resolved_unverified')")
+                # A reopened entry that had closed after failing in transport counts its failures again.
+                self.connection.execute(
+                    "DELETE FROM persistent_failures WHERE kind='full-text-fetch' AND outcome IS NOT NULL AND EXISTS ("
+                    "SELECT 1 FROM citations c WHERE c.journal=persistent_failures.journal AND "
+                    "c.doi=persistent_failures.doi AND c.label=persistent_failures.unit AND c.ft_retrieval IS NULL)")
                 self.connection.execute(
                     "UPDATE reviews SET full_text_state='pending' WHERE EXISTS (SELECT 1 FROM citations c WHERE "
                     f"c.journal=reviews.journal AND c.doi=reviews.doi AND {self._ESCALATED} AND c.ft_retrieval IS NULL)")
@@ -1725,11 +1945,17 @@ class CensusRun:
                   "fetchRetries": 0, "passes": 0, "replayed": 0}
         with self.lock:
             self._without_full_text = dict.fromkeys(WITHOUT_FULL_TEXT, 0)
+            self._without_by_journal = {}
+            self._live_fetches = 0
         drift, retries, still_open = None, 0, 0
         touched: set[tuple[str, str]] = set()
+        invocation = uuid.uuid4().hex
         while True:
             totals["passes"] += 1
-            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched, cache)
+            fetches: list[tuple[str, str, str, bool]] = []
+            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched, cache, fetches)
+            if drift is None and not self._stop_reason():
+                self._persistent_fetches(fetches, fetch_xml, invocation)
             with self.lock:
                 still_open = self.connection.execute(
                     f"SELECT COUNT(*) FROM citations c WHERE {self._ESCALATED} AND c.ft_retrieval IS NULL").fetchone()[0]
@@ -1739,6 +1965,8 @@ class CensusRun:
             self.sleep(cooldown * 2 ** (retries - 1))
         with self.lock:
             totals["withoutFullText"] = dict(self._without_full_text)
+            totals["withoutFullTextByJournal"] = {journal: dict(counts)
+                                                  for journal, counts in sorted(self._without_by_journal.items())}
         with self.lock, self.connection:
             for journal, doi in sorted(touched):
                 scores_db.aggregate_reviews(self.connection, journal, doi)
@@ -1973,7 +2201,31 @@ def census_status(connection: Any, *, code_instrument_digest: str | None = None)
     result.update(consistency_status(c))
     result.update(transport_status(c, meta))
     result.update(input_status(c, meta))
+    result.update(persistence_status(c))
     return result
+
+
+def persistence_status(c: Any) -> dict[str, Any]:
+    """Items closed after they kept failing in transport while others succeeded (persistent_failures): escalated
+    entries closed without a full text (persistentError) and abstract-tier batches closed as invalid:no-response, by
+    journal, and the items still counting towards a closure. None for a database without the table."""
+    if not scores_db.has_table(c, "persistent_failures"):
+        return {"persistentFailures": None}
+    closed: dict[str, dict[str, int]] = {"full-text-fetch": {}, "abstract-batch": {}}
+    counting = {"full-text-fetch": 0, "abstract-batch": 0}
+    batches = 0
+    for kind, journal, outcome, labels in c.execute(
+            "SELECT kind, journal, outcome, labels_json FROM persistent_failures ORDER BY journal"):
+        if outcome is None:
+            counting[kind] += 1
+            continue
+        closed[kind][journal] = closed[kind].get(journal, 0) + len(json.loads(labels or "[]"))
+        batches += kind == "abstract-batch"
+    full_text, abstract = closed["full-text-fetch"], closed["abstract-batch"]
+    return {"persistentFailures": {
+        "fullTextClosed": {"entries": sum(full_text.values()), "byJournal": full_text},
+        "abstractClosed": {"batches": batches, "entries": sum(abstract.values()), "byJournal": abstract},
+        "counting": {"fullTextEntries": counting["full-text-fetch"], "abstractBatches": counting["abstract-batch"]}}}
 
 
 # Items per call, in the buckets the gates report: a single item, small remainder batches, larger remainder batches and

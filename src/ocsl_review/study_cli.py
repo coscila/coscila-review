@@ -489,6 +489,20 @@ def gates(status: dict[str, Any], *, require_fresh_enumeration: bool = False) ->
     if small:
         notes.append("invalid outputs after repair above 1 % in batches of " + ", ".join(
             f"{name} items ({value['invalid']}/{value['decided']})" for name, value in small.items()))
+    from .census_runner import PERSISTENT_INVOCATIONS, PERSISTENT_SECONDS
+    persistent = status.get("persistentFailures") or {}
+    span = f"{PERSISTENT_INVOCATIONS} invocations, the first and the last at least {PERSISTENT_SECONDS / 3600:g} h apart,"
+    by_journal = lambda cell: ", ".join(f"{journal} {count}" for journal, count in (cell.get("byJournal") or {}).items())
+    closed = persistent.get("fullTextClosed") or {}
+    if closed.get("entries"):
+        notes.append(f"{closed['entries']} escalated entries were closed without a full text (fetch-failed, reason "
+                     f"persistentError): their Europe PMC fetch failed in transport in {span} while other fetches "
+                     f"succeeded; this is never a support verdict; by journal {by_journal(closed)}")
+    closed = persistent.get("abstractClosed") or {}
+    if closed.get("entries"):
+        notes.append(f"{closed['entries']} entries of {closed['batches']} abstract-tier batches were closed as "
+                     f"invalid:no-response: no call answered them in {span} while other calls were answered; they "
+                     f"count as unsure and as invalid outputs; by journal {by_journal(closed)}")
     if status.get("fullTextWithoutParseableVerdict"):
         notes.append(f"{status['fullTextWithoutParseableVerdict']} full-text entries got no parseable verdict (no repair "
                      "pass at that tier); they stay unsure and are counted apart from entries without a full text")
