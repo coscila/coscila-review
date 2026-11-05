@@ -1070,6 +1070,44 @@ class FreshEnumerationTests(CacheTestCase):
                          (inputs["inputStoreMerkleRoot"], inputs["enumerationSha256"]))
         self.assertEqual({"ok": True, "facts": export["count"]}, corpus_facts.verify_export(self.root / "facts" / "facts.json"))
 
+    def test_a_review_without_a_pmcid_is_prepared_from_its_pmc_copy_and_its_enumeration_still_verifies(self):
+        spec = {"pageSize": 10, "groups": [{"journal": JOURNAL, "query": 'ISSN:"0000-0001"', "stratum": "Review"}]}
+        review = {"id": "42920861", "source": "MED", "pmid": "42920861", "doi": COPY_REVIEW, "title": COPY_TITLE,
+                  "firstPublicationDate": "2021-03-01", "pubYear": "2021", "pubTypeList": {"pubType": ["review"]}}
+        copy = pmc_record(COPY_PMCID)                 # Europe PMC lists the review's copy in PMC without a DOI
+        manifest = self.root / "study" / "enumeration.jsonl"
+        result = enumerate_reviews(spec, manifest, lambda params: search_page([review, copy], 2, "c2"),
+                                   code_revision="test")
+        group = json.loads(Path(result["receipt"]).read_text())["groups"][0]
+        self.assertEqual((1, 1, [COPY_PMCID]), (result["records"], group["withoutDoi"], group["withoutDoiIds"]))
+        caches = self.caches()
+        copies = PmcCopies([copy], {COPY_PMCID: copy_jats(COPY_PMCID, COPY_REVIEW, "42920861")})
+        live = LiveSources(europe_pmc=copies.fetch, publisher=refuse_live, search=copies.search)
+        acquired = manifest.parent / "acquired.jsonl"
+        self.assertEqual(1, acquire_records(manifest, acquired, ReviewAcquirer(
+            caches, routes=parse_routes([f"{JOURNAL}=public"]), live=live))["pmcCopies"])
+        derived = manifest.parent / "works.jsonl"
+        fill_works(acquired, derived)
+        looked_up = manifest.parent / "abstracts.jsonl"
+        fill_abstracts(derived, looked_up, lookups, cache=caches)
+        # Every prepare derives the population again from the kept pages, which the acquisition left unchanged.
+        enumeration = load_enumeration(Path(result["receipt"]))
+        run = self.run_census()
+        self.assertEqual({"prepared": 1}, prepare(run, looked_up, caches=caches, enumeration=enumeration)["states"])
+        run.close()
+        with closing(scores_db.open_readonly(self.database)) as connection:
+            checks = gates(census_status(connection), require_fresh_enumeration=True)["checks"]
+        for name in ("freshEnumerationPinned", "reviewsComeFromTheEnumeration", "everyReviewHasAcquisitionProvenance",
+                     "reviewsAcquiredThroughLiveRoutes", "everyWorkDerivedFromItsReview",
+                     "everyEnumeratedReviewInStudyOrExcluded"):
+            self.assertTrue(checks[name], name)
+        row = self.rows("SELECT doi, provenance, provider, source_url, detail_json FROM input_provenance "
+                        "WHERE kind='review'")[0]
+        self.assertEqual((COPY_REVIEW, "live-public", "europe-pmc", FULL_TEXT % COPY_PMCID),
+                         (row["doi"], row["provenance"], row["provider"], row["source_url"]))
+        self.assertEqual({"by": "title+jats-doi", "pmcid": COPY_PMCID, "search": f'TITLE:"{COPY_TITLE}" AND SRC:PMC'},
+                         json.loads(row["detail_json"])["link"])
+
     def test_a_trimmed_or_empty_population_never_counts_as_complete(self):
         manifest, enumeration, caches, rows = self.fresh_inputs()
         stored = manifest.parent / "stored.txt"
@@ -1555,6 +1593,150 @@ class LiveFetchTests(unittest.TestCase):
         self.assertEqual((b"<article/>", FULL_TEXT % "PMC1"), both[1][4]())
         only = live.attempts(census_inputs.Route("public", ("jats",)), "10.5555/x", {})
         self.assertEqual([], only, "no PMCID and the route reads JATS only")
+
+
+COPY_REVIEW = "10.5555/pmc.copy.review"                 # a review whose Europe PMC record has a DOI and no PMCID
+COPY_PMCID = "PMC13691543"                              # its copy in PMC: a record with the PMCID and without the DOI
+COPY_TITLE = "Synthetic review of zeta-kinase signalling in breast tumours"
+COPY_QUERY = f'TITLE:"{COPY_TITLE}" AND SRC:PMC'
+
+
+def copy_jats(pmcid: str, doi: str | None, pmid: str | None = None) -> bytes:
+    """The synthetic JATS review as Europe PMC serves a PMC copy: its PMCID and the given DOI (and PMID) in
+    article-meta."""
+    ids = f'<article-id pub-id-type="pmcid">{pmcid}</article-id>' + "".join(
+        f'<article-id pub-id-type="{kind}">{value}</article-id>' for kind, value in (("doi", doi), ("pmid", pmid))
+        if value)
+    return (FIXTURES / "review.xml").read_bytes().replace(
+        b'<article-id pub-id-type="doi">10.5555/synthetic.review.1</article-id>', ids.encode())
+
+
+def pmc_record(pmcid: str, title: str = COPY_TITLE, doi: str | None = None) -> dict:
+    """A lite record of Europe PMC's search for a record in PMC."""
+    return {"id": pmcid, "source": "PMC", "pmcid": pmcid, "title": title, "pubYear": "2021",
+            **({"doi": doi} if doi else {})}
+
+
+class PmcCopies:
+    """Europe PMC for reviews without a PMCID: the title search answers ``records`` (lite), fullTextXML serves
+    ``full_texts`` by PMCID (None for a PMCID without an open-access full text)."""
+
+    def __init__(self, records=(), full_texts=None, failure=None):
+        self.records, self.full_texts, self.failure = list(records), dict(full_texts or {}), failure
+        self.searches, self.fetched = [], []
+
+    def search(self, params):
+        self.searches.append(dict(params))
+        if self.failure is not None:
+            if isinstance(self.failure, Exception):
+                raise self.failure
+            return self.failure
+        return json.dumps({"hitCount": len(self.records), "resultList": {"result": self.records}}).encode()
+
+    def fetch(self, pmcid):
+        self.fetched.append(pmcid)
+        return self.full_texts.get(pmcid)
+
+
+class PmcCopyTests(RunnerTestCase):
+    """A review whose Europe PMC record has a DOI and no PMCID, acquired from its copy in PMC: one search by its title
+    among PMC's records, and a candidate is its document only when the candidate's JATS article-id names its DOI."""
+
+    def acquire(self, copies, publisher=refuse_live, record=None):
+        live = LiveSources(europe_pmc=copies.fetch, publisher=publisher, search=copies.search)
+        acquirer = ReviewAcquirer(None, routes=parse_routes([f"{JOURNAL}=public"]), live=live)
+        return acquirer.acquire(record or {"journal": JOURNAL, "doi": COPY_REVIEW, "enumeratedTitle": COPY_TITLE,
+                                           "pmid": "42920861"})
+
+    def test_a_true_copy_is_acquired_live_public_and_read_as_any_jats(self):
+        copies = PmcCopies(
+            [pmc_record("PMC2", "Corrigendum: " + COPY_TITLE),        # another title: never fetched
+             pmc_record("PMC3", doi="10.5555/another.review"),        # names another DOI: never fetched
+             pmc_record(COPY_PMCID, COPY_TITLE.upper() + ".")],       # the copy: the same title, no DOI
+            {COPY_PMCID: copy_jats(COPY_PMCID, COPY_REVIEW, "42920861")})
+        result = self.acquire(copies)
+        self.assertEqual(("acquired", "live-public", "jats"), (result.state, result.provenance, result.kind))
+        self.assertEqual([{"query": COPY_QUERY, "resultType": "lite", "pageSize": 10, "format": "json"}],
+                         copies.searches)
+        self.assertEqual([COPY_PMCID], copies.fetched)
+        self.assertEqual(("europe-pmc", FULL_TEXT % COPY_PMCID, "doi+pmid"),
+                         (result.detail["provider"], result.detail["sourceUrl"], result.detail["identity"]))
+        self.assertEqual({"by": "title+jats-doi", "pmcid": COPY_PMCID, "search": COPY_QUERY}, result.detail["link"])
+        # The reader does not change: the copy is prepared as any Europe PMC JATS document of the review.
+        record = acquired_record({"journal": JOURNAL, "doi": COPY_REVIEW, "pmid": "42920861", "works": {}}, result,
+                                 self.root / "documents")
+        self.assertEqual(("public", "live-public"), (record["provenanceClass"], record["acquisition"]["provenance"]))
+        self.assertNotIn("pmcid", record, "the record keeps its own identifiers")
+        document = (self.root / record["document"]["path"]).read_bytes()
+        self.assertEqual(copy_jats(COPY_PMCID, COPY_REVIEW, "42920861"), document)
+        prepared = self.run_census().prepare_review(record, document)
+        self.assertEqual("prepared", prepared["state"])
+        self.assertGreater(prepared["entries"], 0)
+
+    def test_a_copy_is_refused_unless_its_jats_names_the_reviews_doi(self):
+        copies = PmcCopies([pmc_record("PMC7"), pmc_record("PMC8"), pmc_record("PMC9")],
+                           {"PMC7": copy_jats("PMC7", "10.5555/another.review"),
+                            # Only the PMID agrees: a PMC copy is the review's only by its DOI.
+                            "PMC8": copy_jats("PMC8", None, "42920861")})
+        result = self.acquire(copies, publisher=lambda url: "http-404")
+        self.assertEqual(("unavailable", ["PMC7", "PMC8", "PMC9"]), (result.state, copies.fetched))
+        self.assertEqual([("europe-pmc", SEARCH + "?" + urllib.parse.urlencode({"query": COPY_QUERY}),
+                           "pmc-copy-unconfirmed: PMC7's JATS names DOI 10.5555/another.review; PMC8's JATS names no "
+                           "DOI; PMC9 has no open-access full text"),
+                          ("publisher", "https://doi.org/" + COPY_REVIEW, "http-404")],
+                         [(item["provider"], item["url"], item["reason"]) for item in result.detail["reasons"]])
+
+    def test_without_a_copy_the_publisher_page_is_tried_next(self):
+        copies = PmcCopies([pmc_record("PMC2", "Corrigendum: " + COPY_TITLE)])
+        result = self.acquire(copies, publisher=lambda url: (html_review(COPY_REVIEW), PUBLISHER + "copy"))
+        self.assertEqual(("acquired", "live-public", "html", "publisher"),
+                         (result.state, result.provenance, result.kind, result.detail["provider"]))
+        self.assertEqual([], copies.fetched)
+        self.assertNotIn("link", result.detail)
+        self.assertEqual(["no-pmc-copy"], [item["reason"] for item in result.detail["rejected"]])
+
+    def test_a_failed_search_leaves_the_review_for_a_later_pass(self):
+        from ocsl_review.errors import ProviderError
+        for failure in (ProviderError("Europe PMC search failed: HTTP 503"), b"<html>maintenance</html>"):
+            with self.subTest(failure=str(failure)[:30]):
+                copies = PmcCopies(failure=failure)
+                result = self.acquire(copies, publisher=lambda url: "http-404")
+                self.assertEqual("retry", result.state)
+                self.assertEqual([("publisher", "http-404"), ("europe-pmc", "transient")],
+                                 [(item["provider"], item["reason"]) for item in result.detail["reasons"]])
+                self.assertIn("PMC copy search", result.detail["reasons"][1]["detail"])
+
+    def test_a_review_with_a_pmcid_or_without_a_title_gets_no_search(self):
+        copies = PmcCopies([pmc_record(COPY_PMCID)], {"PMC5": copy_jats("PMC5", COPY_REVIEW)})
+        with_pmcid = self.acquire(copies, record={"journal": JOURNAL, "doi": COPY_REVIEW, "pmcid": "PMC5",
+                                                  "enumeratedTitle": COPY_TITLE})
+        self.assertEqual(("acquired", FULL_TEXT % "PMC5"), (with_pmcid.state, with_pmcid.detail["sourceUrl"]))
+        self.assertNotIn("link", with_pmcid.detail)
+        untitled = self.acquire(copies, publisher=lambda url: "http-404",
+                                record={"journal": JOURNAL, "doi": COPY_REVIEW})
+        self.assertEqual("unavailable", untitled.state)
+        self.assertEqual(([], ["PMC5"]), (copies.searches, copies.fetched))
+        # A route that reads HTML only never searches for a JATS copy.
+        live = LiveSources(europe_pmc=copies.fetch, publisher=lambda url: "http-404", search=copies.search)
+        self.assertEqual([("html", "public", "publisher")],
+                         [item[:3] for item in live.attempts(parse_routes([f"{JOURNAL}=public:html"])[JOURNAL],
+                                                             COPY_REVIEW, {}, COPY_TITLE)])
+        self.assertIsNotNone(LiveSources.default().search, "study acquire searches for copies")
+
+    def test_acquire_records_counts_the_reviews_read_from_their_copy(self):
+        copies = PmcCopies([pmc_record(COPY_PMCID)], {COPY_PMCID: copy_jats(COPY_PMCID, COPY_REVIEW)})
+        live = LiveSources(europe_pmc=copies.fetch, search=copies.search,
+                           publisher=lambda url: (html_review("10.5555/page.review"), PUBLISHER + "page"))
+        source = self.root / "reviews.jsonl"
+        source.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"journal": JOURNAL, "doi": COPY_REVIEW, "enumeratedTitle": COPY_TITLE},
+            {"journal": JOURNAL, "doi": "10.5555/page.review", "enumeratedTitle": "A review read from its page"})))
+        output = self.root / "acquired" / "reviews.jsonl"
+        result = acquire_records(source, output, ReviewAcquirer(None, routes=parse_routes([f"{JOURNAL}=public"]),
+                                                                live=live))
+        self.assertEqual(({"live-public": 2}, 1), (result["provenance"], result["pmcCopies"]))
+        rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual([COPY_PMCID, None], [(row["acquisition"].get("link") or {}).get("pmcid") for row in rows])
 
 
 class EuropePmcRateTests(unittest.TestCase):
