@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import http.client
+import http.cookiejar
 import io
 import json
 import os
@@ -62,8 +63,12 @@ TABLE_TARGET = re.compile(r"tables/(\d+)")
 MAX_TABLE_PAGES = 100
 ENUMERATION_FORMAT = "ocsl-census-enumeration-v1"
 COMPARISON_FORMAT = "ocsl-census-manifest-comparison-v1"
-# Requests carry identifiers only: no contact address, no credentials, no cookies.
+# Requests carry identifiers only: no contact address, no credentials, and no cookies except the in-memory session
+# of licensed nature.com pages (session_cookies).
 USER_AGENT = "ocsl-review census inputs"
+# nature.com serves a licensed page only to a client that keeps the session cookie its sign-in redirects set (through
+# idp.nature.com); a client without cookies ends on ?error=cookies_not_supported and gets the page outside the licence.
+SESSION_COOKIE_DOMAIN = "nature.com"
 # Extraction refusals that mean the bytes are not the article's full text (a landing, paywall or abstract page).
 NOT_ARTICLE = ("no explicit bibliography targets", "needs an explicit article container", "needs an article body")
 
@@ -632,21 +637,37 @@ def parse_routes(values: Iterable[str] | None) -> dict[str, Route]:
     return routes
 
 
+def session_cookies() -> http.cookiejar.CookieJar:
+    """The cookie jar of one acquisition's licensed nature.com pages, held in memory only.
+
+    Its policy accepts and returns cookies for nature.com and its subdomains alone, by RFC 6265 domain matching (a
+    cookie without a Domain attribute goes back only to the host that set it), so doi.org and every other host of a
+    redirect chain never see one. Nothing writes, logs or records the jar or its cookies.
+    """
+    policy = http.cookiejar.DefaultCookiePolicy(
+        allowed_domains=[SESSION_COOKIE_DOMAIN, "." + SESSION_COOKIE_DOMAIN],
+        strict_ns_domain=http.cookiejar.DefaultCookiePolicy.DomainStrictNonDomain)
+    return http.cookiejar.CookieJar(policy)
+
+
 def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[float] = (2.0, 5.0, 10.0),
                  timeout: float = 90.0, opener: Callable[..., Any] | None = None, sleep: Callable[[float], None] = time.sleep):
     """GET a page over public HTTPS: ``(body, final URL)``, a reason string for a definitive miss, or RetryableFetch.
 
     The default opener (``fulltext.open_public_https``) reaches public hosts only, follows a bounded number of
-    redirects and never sends cookies, proxies' credentials or contact addresses. 404, 410 and other client
-    errors are definitive (``http-403`` for a page the licence does not open); throttling, server errors,
-    timeouts and dropped connections are retried with backoff and then raise ``RetryableFetch``.
+    redirects and never sends proxies' credentials or contact addresses. ``fetch(url, cookies=jar)`` takes an
+    in-memory session jar (``session_cookies``) through every hop of the chain; without one no cookie is sent. 404,
+    410 and other client errors are definitive (``http-403`` for a page the licence does not open); throttling, server
+    errors, timeouts and dropped connections are retried with backoff and then raise ``RetryableFetch``. Pages are
+    fetched ``spacing`` seconds apart in each thread.
     """
     from .census_runner import RetryableFetch
     from .fulltext import MAX_DOCUMENT_BYTES, open_public_https
     state = threading.local()
 
-    def fetch(url: str):
+    def fetch(url: str, cookies: http.cookiejar.CookieJar | None = None):
         error = "no attempt"
+        session = {} if cookies is None else {"cookies": cookies}
         for attempt in range(max(1, attempts)):
             wait = getattr(state, "last", 0.0) + spacing - time.monotonic()
             if wait > 0:
@@ -654,7 +675,8 @@ def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[f
             state.last = time.monotonic()
             request = urllib.request.Request(url, headers={"Accept": "text/html", "User-Agent": USER_AGENT})
             try:
-                with (opener or open_public_https)(request, timeout=timeout, allow_cross_origin=True) as response:
+                with (opener or open_public_https)(request, timeout=timeout, allow_cross_origin=True,
+                                                   **session) as response:
                     status = int(getattr(response, "status", 200))
                     if status == 200:
                         body = response.read(MAX_DOCUMENT_BYTES + 1)
@@ -686,15 +708,26 @@ def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[f
 
 @dataclass
 class LiveSources:
-    """Live acquisition paths: Europe PMC fullTextXML by PMCID and the publisher page through doi.org."""
+    """Live acquisition paths: Europe PMC fullTextXML by PMCID and the publisher page through doi.org.
+
+    ``session`` (``session_cookies``) goes with every publisher fetch of an entitled route, a review's page and its
+    linked table pages alike, and with no other fetch; one acquisition holds one jar.
+    """
 
     europe_pmc: Callable[[str], bytes | None] | None = None
-    publisher: Callable[[str], Any] | None = None
+    publisher: Callable[..., Any] | None = None
+    session: http.cookiejar.CookieJar | None = None
 
     @classmethod
     def default(cls) -> "LiveSources":
         from .study_cli import europe_pmc_fetcher
-        return cls(europe_pmc=europe_pmc_fetcher(), publisher=page_fetcher())
+        return cls(europe_pmc=europe_pmc_fetcher(), publisher=page_fetcher(), session=session_cookies())
+
+    def page(self, url: str, route: Route):
+        """A publisher page on the journal's route; entitled routes send the session's cookies."""
+        if route.klass == "entitled" and self.session is not None:
+            return self.publisher(url, cookies=self.session)
+        return self.publisher(url)
 
     def attempts(self, route: Route, doi: str, identifiers: Mapping[str, str]) -> list[tuple[str, str, str, str, Callable]]:
         """(kind, class, provider, url, fetch) for the kinds the route reads, in its order; a fetch returns (body, url)
@@ -709,7 +742,7 @@ class LiveSources:
             items.append(("jats", "public", "europe-pmc", url, europe_pmc))
         if self.publisher is not None:
             url = "https://doi.org/" + urllib.parse.quote(doi, safe="/()")
-            items.append(("html", route.klass, "publisher", url, lambda url=url: self.publisher(url)))
+            items.append(("html", route.klass, "publisher", url, lambda url=url: self.page(url, route)))
         return sorted((item for item in items if route.rank(item[0]) is not None), key=lambda item: route.rank(item[0]))
 
 
@@ -802,7 +835,7 @@ class ReviewAcquirer:
             if route is None or self.live is None or self.live.publisher is None:
                 notes.append({"number": number, "url": url, "source": "missing", "reason": "not cached; no live route"})
                 continue
-            got = self.live.publisher(url)          # RetryableFetch propagates: the review is acquired again later
+            got = self.live.page(url, route)        # RetryableFetch propagates: the review is acquired again later
             if isinstance(got, str):
                 notes.append({"number": number, "url": url, "source": "missing", "reason": got})
                 continue

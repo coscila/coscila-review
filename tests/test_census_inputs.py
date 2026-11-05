@@ -4,6 +4,7 @@ per item in the scores database and the facts, and fresh enumeration compared wi
 from __future__ import annotations
 
 import csv
+import http.client
 import io
 import json
 import os
@@ -1212,6 +1213,189 @@ class FakeResponse:
 
     def __exit__(self, *args):
         return False
+
+
+LICENSED = "Licensed Synthetic Journal"
+LICENSED_REVIEW = "10.5555/licensed.review"
+ARTICLE = "https://www.nature.com/articles/synthetic-review-1"
+SESSION_VALUE = "session-value-kept-in-memory"
+
+
+class FakeHTTPResponse:
+    """What http.client returns for one hop: status, headers (Set-Cookie may repeat) and a bounded body."""
+
+    def __init__(self, status, headers, body=b""):
+        self.status = status
+        self.headers = http.client.HTTPMessage()
+        for name, value in headers:
+            self.headers[name] = value
+        self.body = io.BytesIO(body)
+
+    def read1(self, size):
+        return self.body.read(size)
+
+    def close(self):
+        pass
+
+
+class FakeConnection:
+    def __init__(self, site, host):
+        self.site, self.host, self.sock = site, host, None
+
+    def request(self, method, target, headers=None):
+        self.target, self.headers = target, dict(headers or {})
+        self.site.requests.append((self.host, target, dict(self.headers)))
+
+    def getresponse(self):
+        return FakeHTTPResponse(*self.site.serve(self.host, self.target, self.headers))
+
+    def close(self):
+        pass
+
+
+class LicensedSite:
+    """nature.com's sign-in flow behind fake HTTPS connections, with lookalike hosts beside it.
+
+    A licensed page redirects to idp.nature.com, which sets the session cookie for .nature.com and sends the client
+    back; the page is served under the licence only when the cookie comes back with it. A client that does not return
+    it ends on ``?error=cookies_not_supported`` with the page outside the licence (a paywall page).
+    """
+
+    def __init__(self):
+        self.requests = []
+
+    def connection(self, host, port=443, timeout=None, context=None):
+        return FakeConnection(self, host)
+
+    def sent_cookies(self, host):
+        return [headers.get("Cookie") for seen, _, headers in self.requests if seen == host]
+
+    def serve(self, host, target, headers):
+        path, _, query = target.partition("?")
+        signed_in = "idp_session=" + SESSION_VALUE in headers.get("Cookie", "")
+        sign_in = ("Location", "https://idp.nature.com/authorize?response_type=cookie&client_id=synthetic&redirect_uri="
+                   + urllib.parse.quote("https://www.nature.com" + path, safe=""))
+        if host == "doi.org":
+            return 302, [("Location", ARTICLE)]
+        if host == "www.nature.com" and path == "/articles/synthetic-review-1":
+            if signed_in:
+                # A host-only cookie: RFC 6265 returns it to www.nature.com alone.
+                return 200, [("Set-Cookie", "page_view=1; Path=/; Secure")], html_review(LICENSED_REVIEW)
+            if "error=cookies_not_supported" in query:
+                return 200, [], PAYWALL % LICENSED_REVIEW.encode()
+            return 303, [sign_in]
+        if host == "www.nature.com" and path == "/articles/synthetic-review-1/tables/1":
+            return (200, [], TABLE_PAGE) if signed_in else (303, [sign_in])
+        if host == "idp.nature.com" and path == "/authorize":
+            back = dict(urllib.parse.parse_qsl(query))["redirect_uri"]
+            return 302, [("Location", "/transit?code=transit-1&redirect_uri=" + urllib.parse.quote(back, safe="")),
+                         ("Set-Cookie", f"idp_session={SESSION_VALUE}; Domain=.nature.com; Path=/; Secure; HttpOnly"),
+                         # A sibling subdomain and another site: neither may be set from idp.nature.com.
+                         ("Set-Cookie", "sibling=1; Domain=www2.nature.com; Path=/; Secure"),
+                         ("Set-Cookie", "foreign=1; Domain=example.org; Path=/; Secure")]
+        if host == "idp.nature.com" and path == "/transit":
+            back = dict(urllib.parse.parse_qsl(query))["redirect_uri"]
+            if "idp_session=" + SESSION_VALUE in headers.get("Cookie", ""):
+                return 302, [("Location", back)]
+            return 302, [("Location", back + "?error=cookies_not_supported&code=transit-1")]
+        if host in ("evilnature.com", "nature.com.example"):
+            # Lookalike hosts claim nature.com for their cookies.
+            return 200, [("Set-Cookie", "lookalike=1; Domain=nature.com; Path=/; Secure"),
+                         ("Set-Cookie", "suffix=1; Domain=.nature.com; Path=/; Secure")], b"<html/>"
+        return 404, []
+
+
+class LicensedPageTests(unittest.TestCase):
+    """Entitled nature.com pages through the licence: one in-memory session per acquisition, nature.com hosts only."""
+
+    def setUp(self):
+        self.site = LicensedSite()
+        patcher = mock.patch("ocsl_review.fulltext._PublicHTTPSConnection", side_effect=self.site.connection)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("PUPPENCLAW_ORCHESTRATION_SOCKET", None)
+        self.waits = []
+
+    def live(self, session=True):
+        return LiveSources(publisher=census_inputs.page_fetcher(spacing=1.0, sleep=self.waits.append),
+                           session=census_inputs.session_cookies() if session else None)
+
+    def acquire(self, live, route="entitled"):
+        acquirer = ReviewAcquirer(None, routes=parse_routes([f"{LICENSED}={route}:html"]), live=live)
+        return acquirer.acquire({"journal": LICENSED, "doi": LICENSED_REVIEW})
+
+    def test_an_entitled_page_and_its_table_pages_keep_the_session_cookie_through_the_sign_in_redirects(self):
+        live = self.live()
+        result = self.acquire(live)
+        self.assertEqual(("acquired", "live-entitled", "html"), (result.state, result.provenance, result.kind))
+        self.assertEqual(html_review(LICENSED_REVIEW), result.body)
+        self.assertEqual(ARTICLE, result.detail["sourceUrl"])
+        self.assertEqual([(1, TABLE_PAGE)], result.tables)
+        self.assertEqual(("live", ARTICLE + "/tables/1"), (result.detail["tables"][0]["source"],
+                                                          result.detail["tables"][0]["url"]))
+        hosts = [(host, target.partition("?")[0]) for host, target, _ in self.site.requests]
+        self.assertEqual([("doi.org", "/" + LICENSED_REVIEW), ("www.nature.com", "/articles/synthetic-review-1"),
+                          ("idp.nature.com", "/authorize"), ("idp.nature.com", "/transit"),
+                          ("www.nature.com", "/articles/synthetic-review-1"),
+                          ("www.nature.com", "/articles/synthetic-review-1/tables/1")], hosts,
+                         "one sign-in; the table page reuses the session")
+        self.assertEqual([None], self.site.sent_cookies("doi.org"))
+        article, transit, table = (self.site.requests[4][2], self.site.requests[3][2], self.site.requests[5][2])
+        self.assertEqual(f"idp_session={SESSION_VALUE}", transit["Cookie"])
+        self.assertEqual(f"idp_session={SESSION_VALUE}", article["Cookie"])
+        self.assertIn(f"idp_session={SESSION_VALUE}", table["Cookie"])
+        self.assertIn("page_view=1", table["Cookie"])
+        self.assertEqual(["idp_session", "page_view"], sorted(cookie.name for cookie in live.session))
+        # The page and its table page were fetched one second apart; the redirects of one fetch are one fetch.
+        self.assertEqual(1, len(self.waits))
+        self.assertTrue(0.5 < self.waits[0] <= 1.0, self.waits)
+        # The session is never written: not into the record, the acquisition detail or the documents.
+        with tempfile.TemporaryDirectory() as root:
+            written = acquired_record({"journal": LICENSED, "doi": LICENSED_REVIEW}, result, Path(root) / "documents")
+            stored = b"".join(path.read_bytes() for path in Path(root).rglob("*") if path.is_file())
+        for text in (json.dumps(written), json.dumps(result.detail), stored.decode("utf-8", "replace")):
+            self.assertNotIn(SESSION_VALUE, text)
+            self.assertNotIn("idp_session", text)
+
+    def test_without_the_session_the_sign_in_ends_on_cookies_not_supported(self):
+        for live, route in ((self.live(session=False), "entitled"), (self.live(), "public")):
+            with self.subTest(route=route, session=live.session is not None):
+                self.site.requests.clear()
+                result = self.acquire(live, route)
+                self.assertEqual("unavailable", result.state)
+                self.assertEqual(["not-the-article"], [item["reason"] for item in result.detail["reasons"]])
+                self.assertIn("error=cookies_not_supported", self.site.requests[-1][1])
+                self.assertEqual({None}, {headers.get("Cookie") for _, _, headers in self.site.requests})
+                if live.session is not None:
+                    self.assertEqual([], list(live.session), "a public route never fills the session")
+
+    def test_cookies_stay_on_nature_com_hosts_by_domain_matching(self):
+        jar = census_inputs.session_cookies()
+        fetch = census_inputs.page_fetcher(spacing=0, sleep=lambda seconds: None)
+        body, final = fetch("https://doi.org/" + LICENSED_REVIEW, cookies=jar)
+        self.assertEqual((html_review(LICENSED_REVIEW), ARTICLE), (body, final))
+        # Neither the sibling subdomain's nor another site's cookie was taken from idp.nature.com.
+        self.assertEqual({"idp_session": ".nature.com", "page_view": "www.nature.com"},
+                         {cookie.name: cookie.domain for cookie in jar})
+        self.site.requests.clear()
+        for url in ("https://evilnature.com/page", "https://nature.com.example/page", "https://doi.org/10.5555/other"):
+            fetch(url, cookies=jar)
+        outside = {host: headers.get("Cookie") for host, _, headers in self.site.requests if host != "www.nature.com"}
+        self.assertEqual({"evilnature.com": None, "nature.com.example": None, "doi.org": None}, outside)
+        self.assertIn(f"idp_session={SESSION_VALUE}", self.site.sent_cookies("www.nature.com")[0],
+                      "the doi.org redirect to www.nature.com carries the session on its nature.com hop only")
+        self.assertEqual({"idp_session", "page_view"}, {cookie.name for cookie in jar},
+                         "lookalike hosts set no cookie for nature.com")
+        # The host-only cookie goes back to www.nature.com only; the domain cookie to every nature.com host.
+        self.site.requests.clear()
+        fetch("https://idp.nature.com/authorize?redirect_uri=" + urllib.parse.quote(ARTICLE, safe=""), cookies=jar)
+        cookies = self.site.sent_cookies("idp.nature.com")
+        self.assertIn(f"idp_session={SESSION_VALUE}", cookies[0])
+        self.assertNotIn("page_view", cookies[0])
+        self.assertIn("page_view=1", self.site.sent_cookies("www.nature.com")[0])
 
 
 class LiveFetchTests(unittest.TestCase):
