@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from xml.etree import ElementTree as ET
 
-from .errors import ProviderError, ReviewError, ValidationError
+from .errors import ProviderError, ReviewError, TransientError, ValidationError
 from .scholarly import EUROPE_PMC, normalize_doi, normalize_europe_pmc
 from .scores_db import PROVENANCE as ITEM_PROVENANCE
 
@@ -1314,6 +1314,16 @@ def _stratum(group: Mapping[str, Any], publication_types: Sequence[str]) -> str 
     return group.get("stratum")
 
 
+class PagingGlitch(ValidationError):
+    """Europe PMC's cursor paging answered inconsistently: a page that is no result list, a hit count that changed
+    between pages, more rows than the hit count, or a cursor that ended early. Paging the group again from its first
+    page can succeed; a kept page that reads this way fails its verification."""
+
+
+# A group whose paging glitched or whose search failed starts over from its first page after each of these waits.
+RESTART_WAITS = (30.0, 60.0, 120.0)
+
+
 def enumerated_records(spec: Mapping[str, Any], index: int, page: bytes) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Review records of one raw search page (journal and stratum from the group): (records, page summary)."""
     group = spec["groups"][index]
@@ -1322,9 +1332,9 @@ def enumerated_records(spec: Mapping[str, Any], index: int, page: bytes) -> tupl
         rows = payload["resultList"]["result"]
         total = payload["hitCount"]
     except (ValueError, KeyError, TypeError) as error:
-        raise ValidationError("enumeration page is not a Europe PMC result list") from error
+        raise PagingGlitch("enumeration page is not a Europe PMC result list") from error
     if not isinstance(rows, list) or not isinstance(total, int) or total < 0:
-        raise ValidationError("enumeration provider omitted a valid hit count or result list")
+        raise PagingGlitch("enumeration provider omitted a valid hit count or result list")
     records, without = [], []
     for raw in rows:
         if not isinstance(raw, dict):
@@ -1346,16 +1356,49 @@ def enumerated_records(spec: Mapping[str, Any], index: int, page: bytes) -> tupl
                      "nextCursorMark": payload.get("nextCursorMark")}
 
 
+def _page_group(spec: Mapping[str, Any], index: int, query: str, get: Callable[[Mapping[str, Any]], bytes],
+                pages_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One complete cursor paging of a group: its records in page order and its summary (hit count, rows, kept pages,
+    records without a DOI). Raises PagingGlitch for inconsistent pages and ProviderError for a failed search."""
+    cursor, total, rows_seen, pages, without, records = "*", None, 0, [], [], []
+    while True:
+        params = {"query": query, "cursorMark": cursor, "pageSize": spec.get("pageSize", 1000),
+                  "resultType": spec.get("resultType", "core"), "format": "json"}
+        body = get(params)
+        page_records, summary = enumerated_records(spec, index, body)
+        if total is not None and summary["hitCount"] != total:
+            raise PagingGlitch("enumeration population changed during paging")
+        total = summary["hitCount"]
+        name = _write_content(pages_dir, body, ".json")
+        pages.append({"sha256": name[:-5], "rows": summary["rows"], "cursorMark": cursor})
+        records += page_records
+        without += summary["withoutDoi"]
+        rows_seen += summary["rows"]
+        following = summary["nextCursorMark"]
+        if rows_seen >= total:
+            if rows_seen != total:
+                raise PagingGlitch("enumeration returned more records than its declared population")
+            return records, {"hitCount": total, "rows": rows_seen, "pages": pages, "withoutDoi": without}
+        if not summary["rows"] or not following or following == cursor:
+            raise PagingGlitch("enumeration stopped before its declared population was exhausted")
+        cursor = following
+
+
 def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable[[Mapping[str, Any]], bytes],
-                      *, code_revision: str | None = None) -> dict[str, Any]:
+                      *, code_revision: str | None = None,
+                      sleep: Callable[[float], None] | None = None) -> dict[str, Any]:
     """Live enumeration through Europe PMC search pages (cursorMark): manifest, kept pages and a receipt.
 
     Every page is written content-addressed into ``<output>.pages/``; the population must be exhausted
-    (the declared hit count reached and stable across pages). A DOI enumerated twice is kept once; records
-    without a DOI are counted and listed by provider id. The receipt is written last.
+    (the declared hit count reached and stable across pages). A group whose search failed or whose paging glitched
+    (PagingGlitch) is paged again from its first page after each of RESTART_WAITS, and the receipt records every
+    restart with its reason; when the last restart fails too, the command ends with a TransientError, so it can run
+    again later. A DOI enumerated twice is kept once; records without a DOI are counted and listed by provider id.
+    The receipt is written last.
     """
     spec = _spec(spec_value)
     output = Path(output)
+    wait = sleep or time.sleep
     receipt_path = Path(str(output) + ".receipt.json")
     if receipt_path.exists():
         # The receipt is written last: the enumeration finished. The same spec again (a step submitted again after its
@@ -1375,37 +1418,35 @@ def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable
     groups = []
     for index, group in enumerate(spec["groups"]):
         query = effective_query(spec, group)
-        cursor, total, rows_seen, pages, duplicates, without = "*", None, 0, [], 0, []
+        journal = str(group["journal"]).strip()
+        restarts: list[dict[str, Any]] = []
         while True:
-            params = {"query": query, "cursorMark": cursor, "pageSize": spec.get("pageSize", 1000),
-                      "resultType": spec.get("resultType", "core"), "format": "json"}
-            body = get(params)
-            records, summary = enumerated_records(spec, index, body)
-            if total is not None and summary["hitCount"] != total:
-                raise ValidationError("enumeration population changed during paging; enumerate again")
-            total = summary["hitCount"]
-            name = _write_content(pages_dir, body, ".json")
-            pages.append({"sha256": name[:-5], "rows": summary["rows"], "cursorMark": cursor})
-            for record in records:
-                key = (record["journal"], record["doi"])
-                if key in seen:
-                    duplicates += 1
-                    continue
-                seen[key] = len(manifest)
-                manifest.append(record)
-            without += summary["withoutDoi"]
-            rows_seen += summary["rows"]
-            following = summary["nextCursorMark"]
-            if rows_seen >= total:
-                if rows_seen != total:
-                    raise ValidationError("enumeration returned more records than its declared population")
+            try:
+                records, paged = _page_group(spec, index, query, get, pages_dir)
                 break
-            if not summary["rows"] or not following or following == cursor:
-                raise ValidationError("enumeration stopped before its declared population was exhausted")
-            cursor = following
-        groups.append({"index": index, "journal": str(group["journal"]).strip(), "stratum": group.get("stratum"),
-                       "strata": group.get("strata"), "query": query, "hitCount": total, "rows": rows_seen,
-                       "duplicates": duplicates, "withoutDoi": len(without), "withoutDoiIds": without, "pages": pages})
+            except (PagingGlitch, ProviderError) as error:
+                if len(restarts) == len(RESTART_WAITS):
+                    raise TransientError(
+                        f"Europe PMC paging of {journal!r} (enumeration group {index}) failed again after "
+                        f"{len(restarts)} restarts, the last {RESTART_WAITS[-1]:g} s after the failure before it: "
+                        f"{str(error)[:300]}; run the enumeration again") from error
+                seconds = RESTART_WAITS[len(restarts)]
+                failed_at = utc_now()
+                wait(seconds)
+                restarts.append({"reason": str(error)[:300], "failedAt": failed_at, "waitSeconds": seconds,
+                                 "restartedAt": utc_now()})
+        duplicates = 0
+        for record in records:
+            key = (record["journal"], record["doi"])
+            if key in seen:
+                duplicates += 1
+                continue
+            seen[key] = len(manifest)
+            manifest.append(record)
+        groups.append({"index": index, "journal": journal, "stratum": group.get("stratum"),
+                       "strata": group.get("strata"), "query": query, "hitCount": paged["hitCount"],
+                       "rows": paged["rows"], "duplicates": duplicates, "withoutDoi": len(paged["withoutDoi"]),
+                       "withoutDoiIds": paged["withoutDoi"], "pages": paged["pages"], "restarts": restarts})
     temporary = Path(str(output) + ".incoming")
     with temporary.open("w", encoding="utf-8") as handle:
         for record in manifest:
@@ -1423,7 +1464,8 @@ def enumerate_reviews(spec_value: Mapping[str, Any], output: Path, get: Callable
     partial.write_text(json.dumps(receipt, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(partial, receipt_path)
     return {"output": str(output), "receipt": str(receipt_path), "records": len(manifest),
-            "groups": [{k: g[k] for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")} for g in groups]}
+            "groups": [{**{k: g[k] for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")},
+                        "restarts": len(g["restarts"])} for g in groups]}
 
 
 def _enumerated_already(spec: Mapping[str, Any], output: Path, receipt_path: Path) -> dict[str, Any] | None:
@@ -1444,8 +1486,8 @@ def _enumerated_already(spec: Mapping[str, Any], output: Path, receipt_path: Pat
     if manifest.get("sha256") != sha256_bytes(output.read_bytes()):
         return None
     return {"output": str(output), "receipt": str(receipt_path), "records": manifest.get("records"),
-            "groups": [{k: g.get(k) for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")}
-                       for g in receipt.get("groups") or []],
+            "groups": [{**{k: g.get(k) for k in ("journal", "stratum", "hitCount", "duplicates", "withoutDoi")},
+                        "restarts": len(g.get("restarts") or [])} for g in receipt.get("groups") or []],
             "alreadyEnumerated": True}
 
 

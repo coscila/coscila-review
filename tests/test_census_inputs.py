@@ -760,20 +760,90 @@ class FreshEnumerationTests(CacheTestCase):
         with self.assertRaisesRegex(ValidationError, "differs from its digest"):
             load_enumeration(receipt)
 
-    def test_incomplete_or_changing_populations_are_refused(self):
+    def test_a_paging_glitch_restarts_the_group_from_its_first_page_and_the_receipt_records_it(self):
+        from ocsl_review.errors import ProviderError
+        get, requests = self.provider()
+        glitches = {('ISSN:"0000-0001"', "c2"): [search_page([], 4, "c3")],   # the hit count changed between pages
+                    ('ISSN:"0000-0002"', "*"): [ProviderError("Europe PMC search failed: HTTP 503"),
+                                                b"<html>maintenance</html>"]}
+
+        def glitching(params):
+            pending = glitches.get((params["query"].split(") AND ")[0].lstrip("("), params["cursorMark"]))
+            if pending:
+                outcome = pending.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+            return get(params)
+        waits = []
+        manifest = self.root / "study" / "enumeration.jsonl"
+        result = enumerate_reviews(self.SPEC, manifest, glitching, code_revision="test", sleep=waits.append)
+        self.assertEqual([30.0, 30.0, 60.0], waits, "each group's restarts wait 30 s, then 60 s")
+        self.assertEqual([1, 2], [group["restarts"] for group in result["groups"]])
+        clean = self.root / "clean" / "enumeration.jsonl"
+        expected = enumerate_reviews(self.SPEC, clean, self.provider()[0], code_revision="test")
+        self.assertEqual(expected["records"], result["records"])
+        self.assertEqual(clean.read_bytes(), manifest.read_bytes(), "a restarted group keeps no record of its glitch")
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        first, second = (group["restarts"] for group in receipt["groups"])
+        self.assertEqual([("enumeration population changed during paging", 30.0)],
+                         [(item["reason"], item["waitSeconds"]) for item in first])
+        self.assertEqual([("Europe PMC search failed: HTTP 503", 30.0),
+                          ("enumeration page is not a Europe PMC result list", 60.0)],
+                         [(item["reason"], item["waitSeconds"]) for item in second])
+        self.assertTrue(all(item["failedAt"] <= item["restartedAt"] for item in first + second))
+        self.assertEqual(["*", "c2"], [page["cursorMark"] for page in receipt["groups"][0]["pages"]],
+                         "the receipt keeps the pages of the paging that completed")
+        self.assertEqual(3, len(load_enumeration(Path(result["receipt"])).reviews))
+        again = enumerate_reviews(self.SPEC, manifest, get, code_revision="test")
+        self.assertEqual((True, [1, 2]), (again["alreadyEnumerated"], [g["restarts"] for g in again["groups"]]))
+
+    def test_glitches_that_outlast_three_restarts_end_transient_and_write_no_receipt(self):
+        from ocsl_review.errors import ProviderError, TransientError
+
         def short(params):
             return search_page([enumerated(JATS_REVIEW, "review")], 5, params["cursorMark"])
-        with self.assertRaisesRegex(ValidationError, "exhausted"):
-            enumerate_reviews(self.SPEC, self.root / "a.jsonl", short)
         calls = []
 
         def changing(params):
             calls.append(1)
             return search_page([enumerated(JATS_REVIEW, "review")], 2 + len(calls), "next%d" % len(calls))
-        with self.assertRaisesRegex(ValidationError, "changed during paging"):
-            enumerate_reviews(self.SPEC, self.root / "b.jsonl", changing)
+
+        def down(params):
+            raise ProviderError("Europe PMC search failed: URLError")
+        for name, get, reason in (("short", short, "exhausted"), ("changing", changing, "changed during paging"),
+                                  ("down", down, "search failed")):
+            with self.subTest(name=name):
+                waits = []
+                output = self.root / name / "enumeration.jsonl"
+                with self.assertRaisesRegex(TransientError, f"after 3 restarts.*{reason}"):
+                    enumerate_reviews(self.SPEC, output, get, sleep=waits.append)
+                self.assertEqual([30.0, 60.0, 120.0], waits)
+                self.assertFalse(Path(str(output) + ".receipt.json").exists())
+                self.assertFalse(output.exists())
+        # A spec the enumeration cannot run is refused at once.
+        waits = []
         with self.assertRaises(ValidationError):
-            enumerate_reviews({"groups": []}, self.root / "c.jsonl", short)
+            enumerate_reviews({"groups": []}, self.root / "c.jsonl", short, sleep=waits.append)
+        self.assertEqual([], waits)
+
+    def test_an_enumeration_that_stays_unavailable_exits_with_error_kind_transient(self):
+        from ocsl_review.errors import EXIT_TRANSIENT, ProviderError
+
+        def down(params):
+            raise ProviderError("Europe PMC search failed: HTTP 503")
+        spec = self.root / "spec.json"
+        spec.write_text(json.dumps(self.SPEC))
+        result_file = self.root / "enumerate.result.json"
+        with mock.patch.object(census_inputs, "search_pages", return_value=down), \
+                mock.patch.object(census_inputs, "RESTART_WAITS", (0.0, 0.0, 0.0)), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code = main(["--result-file", str(result_file), "study", "enumerate", "--spec", str(spec),
+                         "--output", str(self.root / "study" / "enumeration.jsonl")])
+        record = json.loads(result_file.read_text())
+        self.assertEqual((EXIT_TRANSIENT, EXIT_TRANSIENT), (code, record["exitCode"]))
+        self.assertEqual("transient", record["error"]["kind"])
+        self.assertIn("3 restarts", record["error"]["message"])
 
     def test_enumeration_queries_select_a_population_never_single_reviews(self):
         for query in ('DOI:"10.5555/a" OR DOI:"10.5555/b"', '"10.5555/a" OR "10.5555/b"', "EXT_ID:1 AND SRC:MED",

@@ -6,6 +6,8 @@ EXIT_USAGE = 2
 EXIT_TRUST = 3
 EXIT_POLICY = 4
 EXIT_VALIDATION = 5
+# A failure that may clear by itself: running the same command again later can succeed (sysexits EX_TEMPFAIL).
+EXIT_TRANSIENT = 75
 
 
 class ReviewError(RuntimeError):
@@ -26,3 +28,7 @@ class ValidationError(ReviewError):
 
 class ProviderError(ReviewError):
     """A bounded scholarly-provider operation failed."""
+
+
+class TransientError(ReviewError):
+    """A provider or transport failure outlasted the command's own retries; the same command can run again later."""
