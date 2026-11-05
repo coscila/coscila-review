@@ -264,6 +264,25 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(census.manifest["validator"]["sha256"], description["modules"]["validator"])
         self.assertNotEqual(census.digest, instruments.load("citation-support@2").digest)
 
+    def test_census_registry_and_broker_digests_are_pinned(self):
+        """citation-census@1 measures the census: its registry digest (manifest, prompt, note, label schema and the
+        citation_census module) and the broker bundles a run installs, the abstract and full-text tier for each
+        journal of the oncology census, stay fixed while the execution code around them changes."""
+        self.assertEqual("4d1d9c0caa0447c7cd2759bf3bc9cf53115cc4877a4759e4c8097b834687c2f7",
+                         instruments.load("citation-census@1").digest)
+        pinned = {("Nature Reviews Clinical Oncology", "abstract"):
+                  "07f0f504b04756fb02a1d6f849f66dd3b7cf56b976c6221b934e59749010a4fb",
+                  ("Nature Reviews Clinical Oncology", "full-text"):
+                  "5df46d219ff2cb9eb6a28dc5bc19d8e07364bf81f21a4556ec1392063945f320",
+                  ("Frontiers in Oncology", "abstract"):
+                  "bfa88ef186890fa6ad5795e2e4d540b85e6ed0da9e37a38aa609d317ff682756",
+                  ("Frontiers in Oncology", "full-text"):
+                  "f475b8b2a5128abc3f08e4ec8385edd573465ad785ad8b395dda61ebbb2f3ccf"}
+        for (journal, tier), digest in pinned.items():
+            with self.subTest(journal=journal, tier=tier):
+                exported = instruments.broker_bundle("citation-census@1", tier=tier, parameters={"journal": journal})
+                self.assertEqual(digest, exported["digest"])
+
     def test_bundle_fields(self):
         census = instruments.load("citation-census@1")
         abstract, full = census.tier("abstract"), census.tier("full-text")
