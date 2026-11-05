@@ -7,6 +7,8 @@ import unittest
 
 from ocsl_review.census_abstracts import DOIS_PER_QUERY, fetch_abstracts, fill_record, http_get
 
+from test_census_runner import unpaced
+
 
 class FakeSearch:
     def __init__(self, failing=False):
@@ -101,7 +103,7 @@ class AbstractTests(unittest.TestCase):
             if len(sent) == 1:
                 raise urllib.error.URLError("dropped")
             return Response(json.dumps({"resultList": {"result": []}}).encode())
-        get = http_get(spacing=0, opener=opener, sleep=sleeps.append)
+        get = http_get(opener=opener, sleep=sleeps.append, limit=unpaced())
         self.assertEqual({"resultList": {"result": []}}, get({"query": 'DOI:"10.5555/n.1"', "format": "json"}))
         self.assertEqual(2, len(sent))
         self.assertEqual([3], sleeps, "one retry after the dropped connection")

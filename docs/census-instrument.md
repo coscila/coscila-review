@@ -294,15 +294,15 @@ escalated work (`liveRetrieval` in the source's provenance record). Only Europe
 PMC documents are candidates. Each escalated entry records `ft_provenance`: the
 class of the source behind its window, or `unavailable` when no window was
 sent. Live fullTextXML requests name the census inputs' User-Agent and ask for
-XML; like every other census request they carry identifiers only. Each fetch
-thread (`--fetch-workers`, 4 by default) spaces its requests 0.4 s apart and
-retries throttling and server errors with backoff. Europe PMC serves
-fullTextXML for its open-access subset only and answers every other PMCID
+XML; like every other census request they carry identifiers only. The fetch
+threads (`--fetch-workers`, 4 by default) share the census's one Europe PMC
+rate (below) and retry throttling and server errors with backoff. Europe PMC
+serves fullTextXML for its open-access subset only and answers every other PMCID
 (free-to-read articles and author manuscripts included) with HTTP 500, not 404.
 A server error (and a 401 or 403 from the service's edge, or a 200 without a
 body) is therefore checked against Europe PMC's record of the PMCID
 (`PMCID:<id>` on the search `study abstracts` uses, JSON, the same User-Agent,
-at the same spacing): a record whose `isOpenAccess` is `N` is a definitive miss;
+at the same rate): a record whose `isOpenAccess` is `N` is a definitive miss;
 a record whose `isOpenAccess` is `Y` (a genuine server error), a matching record
 without that field, hits that list other PMCIDs only, or a search without a
 usable answer keep the error transient. Each fetch checks the record once. No
@@ -350,6 +350,18 @@ a non-zero count means that two searches at least 60 s apart each held another
 PMCID's record but not theirs (a withdrawn record, or a copy of the index that
 lacked them that long), and `--retry-failed` reopens those entries (with every
 other `fetch-failed` entry).
+
+**The Europe PMC rate.** Every request a census command sends to Europe PMC
+(www.ebi.ac.uk), from all of its threads, waits its turn at one rate: at most 8
+requests a second, below the 10 a second Europe PMC allows a client. That
+covers the full-text fetches and their record checks, the
+abstract and metadata lookups of `study abstracts`, the search pages of `study
+enumerate` and the Europe PMC requests of `study acquire`. A 429 or 503 answer
+that names a wait in its Retry-After header (seconds or a date) holds every
+request of the command until the wait has passed, requests already waiting
+their turn included; one answer holds them for at most 15 minutes, and the next
+answer names the wait again. The request that got the answer is then retried as
+its step retries it.
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,
 `inputProviderCache` in the run metadata; a later change is refused) and

@@ -365,7 +365,8 @@ prepares it, into a scratch census database in the output directory
 2. its cited works derived from its own bibliography (`study works`), with
    title, venue, year and PMCID from the Europe PMC record `study abstracts`
    selects: the store's record first, else the census's live Europe PMC search
-   (40 DOIs per query, the census inputs' User-Agent, 0.4 s between requests);
+   (40 DOIs per query, the census inputs' User-Agent, the census's Europe PMC
+   rate of 8 requests a second);
    the dry run stays in the store;
 3. prepared by `CensusRun.prepare_review`, so its loci are the census's own.
 
@@ -376,8 +377,8 @@ never reads. Each review's candidates are shuffled with the seed, grouped by
 review as the tier groups them, and retrieved and windowed by the tier itself
 (`CensusRun.prepare_full_text_group`): the store's Europe PMC fullTextXML first,
 then Europe PMC live through the census's own fetcher (`study_cli.europe_pmc_fetcher`:
-the census inputs' User-Agent, 0.4 s between a thread's requests, retries with
-backoff), with `--fetch-workers` threads, review by review until
+the census inputs' User-Agent, at most 8 requests a second over all threads,
+retries with backoff), with `--fetch-workers` threads, review by review until
 `--full-text-entries` entries are retrieved. Europe PMC answers fullTextXML with
 HTTP 500 for every PMCID outside its open-access subset; the fetcher checks a
 server error against the PMCID's Europe PMC record, so such a PMCID costs two
@@ -410,9 +411,9 @@ call once, in order, and ends when the last call has been handed out or at
 `--drain-seconds`. The steady-state window and the abort rules are the abstract
 tier's; when the calls run out the window ends at the earliest start of the
 calls still in flight. Twenty streams is the default because a census's
-full-text calls arrive at the pace of its Europe PMC retrieval (four fetch
-threads, each spacing its requests 0.4 s apart, and a review's calls only once
-all of its entries are retrieved), not at the abstract tier's sixty streams.
+full-text calls arrive at the pace of its Europe PMC retrieval (at most 8
+requests a second, and a review's calls only once all of its entries are
+retrieved), not at the abstract tier's sixty streams.
 
 **Measurements.** Per cell, in `cells[].fullText`, over answered calls:
 

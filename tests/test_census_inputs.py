@@ -37,7 +37,7 @@ from ocsl_review.store_client import (ByteCacheError, EvidenceStore, GuardedRead
 from ocsl_review.store_projection import KEPT_TABLES, build_projection
 from ocsl_review.study_cli import fill_abstracts, gates, prepare
 
-from test_census_runner import FIXTURES, JOURNAL, RunnerTestCase, record
+from test_census_runner import FIXTURES, JOURNAL, RunnerTestCase, record, unpaced
 
 SECOND = "Second Synthetic Journal"
 JATS_REVIEW = "10.5555/synthetic.review.1"          # retained capture in the store (JATS)
@@ -1539,10 +1539,11 @@ class LiveFetchTests(unittest.TestCase):
             seen.append(request)
             raise urllib.error.URLError("down")
         with self.assertRaisesRegex(ProviderError, "search failed"):
-            census_inputs.search_pages(spacing=0, attempts=2, opener=failing, sleep=lambda s: None)({"query": "q"})
+            census_inputs.search_pages(attempts=2, opener=failing, sleep=lambda s: None,
+                                       limit=unpaced())({"query": "q"})
         self.assertEqual(2, len(seen))
         self.assertEqual({"Accept", "User-agent"}, set(dict(seen[0].header_items())))
-        ok = census_inputs.search_pages(spacing=0, opener=lambda request, timeout: FakeResponse(200, b"{}"),
+        ok = census_inputs.search_pages(limit=unpaced(), opener=lambda request, timeout: FakeResponse(200, b"{}"),
                                         sleep=lambda s: None)
         self.assertEqual(b"{}", ok({"query": "q", "cursorMark": "*"}))
 
@@ -1554,6 +1555,118 @@ class LiveFetchTests(unittest.TestCase):
         self.assertEqual((b"<article/>", FULL_TEXT % "PMC1"), both[1][4]())
         only = live.attempts(census_inputs.Route("public", ("jats",)), "10.5555/x", {})
         self.assertEqual([], only, "no PMCID and the route reads JATS only")
+
+
+class EuropePmcRateTests(unittest.TestCase):
+    """One Europe PMC rate per command: every request of every thread takes its turn at 8 a second, and a 429 or 503
+    answer's Retry-After holds them all."""
+
+    def test_threads_take_turns_at_eight_requests_a_second(self):
+        import threading
+        starts, lock = [], threading.Lock()
+
+        def sleep(seconds):                       # the clock stands still: a request starts when its sleep ends
+            with lock:
+                starts.append(seconds)
+        rate = census_inputs.RateLimit(census_inputs.EUROPE_PMC_REQUESTS_PER_SECOND, clock=lambda: 0.0, sleep=sleep)
+        threads = [threading.Thread(target=lambda: [rate.wait() for _ in range(10)]) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        # Forty requests from four threads: the first at once, every other one 1/8 s after the one before it.
+        self.assertEqual([number * 0.125 for number in range(1, 40)], sorted(starts))
+
+    def test_a_retry_after_holds_every_request_also_those_waiting_their_turn(self):
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                # While this request waits its turn, another thread's request gets a 429 that names 30 s.
+                self.assertEqual(30.0, rate.hold(429, {"Retry-After": "30"}))
+        rate = census_inputs.RateLimit(8.0, clock=lambda: 0.0, sleep=sleep)
+        rate.wait()
+        rate.wait()
+        rate.wait()
+        self.assertEqual([0.125, 30.0, 30.125], sleeps,
+                         "the waiting request starts when the wait ends, the next one a turn later")
+
+    def test_retry_after_names_seconds_or_a_date_and_holds_at_most_fifteen_minutes(self):
+        import email.utils
+        from datetime import datetime, timedelta, timezone
+        rate = census_inputs.RateLimit(8.0, clock=lambda: 0.0, sleep=lambda seconds: None)
+        self.assertIsNone(rate.hold(500, {"Retry-After": "30"}), "only 429 and 503 answers hold the requests")
+        self.assertIsNone(rate.hold(429, {}))
+        self.assertIsNone(rate.hold(429, None))
+        self.assertIsNone(rate.hold(503, {"Retry-After": "soon"}))
+        self.assertEqual(900.0, rate.hold(503, {"Retry-After": "86400"}))
+        when = email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(seconds=120), usegmt=True)
+        self.assertAlmostEqual(120.0, census_inputs.retry_after_seconds({"Retry-After": when}), delta=2.0)
+        message = http.client.HTTPMessage()
+        message["retry-after"] = "7"
+        self.assertEqual(7.0, census_inputs.retry_after_seconds(message), "header names are case-insensitive")
+        gone = email.utils.format_datetime(datetime.now(timezone.utc) - timedelta(seconds=60), usegmt=True)
+        self.assertEqual(0.0, census_inputs.retry_after_seconds({"Retry-After": gone}))
+
+    def test_a_retry_after_from_one_lookup_holds_the_next_request_of_another(self):
+        import urllib.error
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        from test_census_runner import EuropePmcStandIn, FakeClock
+        clock, requests = FakeClock(100.0), []
+        rate = census_inputs.RateLimit(8.0, clock=clock, sleep=clock.sleep)
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC5": b"<article/>"})
+
+        def busy(request, timeout=None):
+            requests.append((clock(), "search"))
+            raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {"Retry-After": "60"},
+                                         io.BytesIO(b""))
+
+        def serving(request, timeout=None):
+            requests.append((clock(), "fullTextXML"))
+            return europe_pmc(request, timeout)
+        # The abstracts step's lookup gets a 503 that names 60 s at its last attempt and gives up; the full-text
+        # fetcher of the same command then waits for the end of that wait before its first request.
+        self.assertIsNone(census_abstracts.http_get(attempts=1, opener=busy, sleep=clock.sleep, limit=rate)(
+            {"query": 'DOI:"10.5555/x"'}))
+        fetch = europe_pmc_fetcher(opener=serving, sleep=clock.sleep, clock=clock, limit=rate)
+        self.assertEqual(b"<article/>", fetch("PMC5"))
+        self.assertEqual([(100.0, "search"), (160.0, "fullTextXML")], requests)
+        # An enumeration page answered 429 with a wait of 5 s is asked again after that wait, not after its 3 s.
+        requests.clear()
+        pages = iter([urllib.error.HTTPError(SEARCH, 429, "Too Many Requests", {"Retry-After": "5"}, io.BytesIO(b"")),
+                      FakeResponse(200, b"{}")])
+
+        def enumeration(request, timeout=None):
+            requests.append((clock(), "page"))
+            answer = next(pages)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        self.assertEqual(b"{}", census_inputs.search_pages(opener=enumeration, sleep=clock.sleep, limit=rate)(
+            {"query": "q", "cursorMark": "*"}))
+        (first, _), (second, _) = requests
+        self.assertEqual(5.0, second - first)
+
+    def test_the_census_fetchers_share_one_europe_pmc_rate_by_default(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        turns = []
+
+        class Recording:
+            def wait(self):
+                turns.append("wait")
+
+            def hold(self, status, headers):
+                return None
+
+        def answer(request, timeout=None):
+            turns.append(urllib.parse.urlsplit(request.full_url).path.rsplit("/", 1)[-1])
+            return FakeResponse(200, b'{"resultList": {"result": []}}' if "search" in request.full_url else b"<a/>")
+        with mock.patch.object(census_inputs, "EUROPE_PMC_LIMIT", Recording()):
+            census_inputs.search_pages(opener=answer)({"query": "q"})
+            census_abstracts.http_get(opener=answer)({"query": "q"})
+            europe_pmc_fetcher(opener=answer)("PMC1")
+        self.assertEqual(["wait", "search", "wait", "search", "wait", "fullTextXML"], turns)
 
 
 class CommandLineInputTests(CacheTestCase):
