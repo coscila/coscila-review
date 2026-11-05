@@ -977,6 +977,36 @@ class RetryableFetchTests(RunnerTestCase):
                                   cooldown=0)
         self.assertEqual(dict.fromkeys(result["withoutFullText"], 0), again["withoutFullText"])
 
+    def test_a_pmcid_without_a_full_text_is_fetched_once_per_invocation(self):
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        run = self.run_census()
+        # Two reviews cite the same works: 5 is open access, 7 is outside the subset (HTTP 500, record N), 15 has none
+        # (HTTP 404).
+        self.prepare(run, record(), record(doi="10.5555/synthetic.review.2"))
+        run.run_abstract()
+        europe_pmc = EuropePmcStandIn(full_texts={"PMC900005": (FIXTURES / "full_texts" / "ft2.xml").read_bytes()},
+                                      server_errors={"PMC900007"}, records={"PMC900005": "Y", "PMC900007": "N"})
+
+        def fetcher():
+            return europe_pmc_fetcher(limit=unpaced(), opener=europe_pmc, sleep=lambda seconds: None)
+        result = run.run_full_text(fetch_xml=fetcher(), fetch_workers=1, cooldown=0)
+        self.assertEqual(("completed", 2), (result["state"], result["retrieved"]))
+        # Every entry closes with its reason, and Europe PMC is asked once per PMCID: the second review's entries take
+        # the miss the first review's fetch found (and work 5's full text from the evidence it stored).
+        self.assertEqual(dict.fromkeys(result["withoutFullText"], 0) | {"noPmcid": 4, "notOpenAccess": 2,
+                                                                       "notFound": 2}, result["withoutFullText"])
+        self.assertEqual(["fullTextXML PMC900005", "fullTextXML PMC900007", "fullTextXML PMC900015",
+                          "search PMC900007"], sorted(europe_pmc.log))
+        self.assertEqual([("fetch-failed", "PMC900007", 2), ("fetch-failed", "PMC900015", 2)], self.rows_of(
+            "SELECT c.ft_retrieval, w.pmcid, COUNT(*) FROM citations c JOIN works w ON w.work_key=c.cited_work_key "
+            "WHERE c.ft_retrieval='fetch-failed' GROUP BY 1, 2 ORDER BY 2"))
+        # The memo lasts one invocation: reopened, each PMCID is fetched once again.
+        europe_pmc.log.clear()
+        again = run.run_full_text(fetch_xml=fetcher(), fetch_workers=1, cooldown=0, retry_failed=True)
+        self.assertEqual(dict.fromkeys(again["withoutFullText"], 0) | {"notOpenAccess": 2, "notFound": 2},
+                         again["withoutFullText"])
+        self.assertEqual(["fullTextXML PMC900007", "fullTextXML PMC900015", "search PMC900007"], sorted(europe_pmc.log))
+
     def test_a_europe_pmc_outage_keeps_full_text_entries_open(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
         run = self.run_census()

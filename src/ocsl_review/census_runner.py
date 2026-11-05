@@ -1635,15 +1635,19 @@ class CensusRun:
         self._without_by_journal.setdefault(journal, dict.fromkeys(WITHOUT_FULL_TEXT, 0))[reason] += 1
 
     # ------------------------------------------------------------------ full-text tier
-    def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled,
-                  cache=None) -> tuple[str | None, str, str | None, str, str, str | None]:
+    def _retrieve(self, work: Mapping[str, Any], fetch_xml, entitled, cache=None,
+                  misses: dict[str, str | None] | None = None
+                  ) -> tuple[str | None, str, str | None, str, str, str | None]:
         """Full text of a cited work: (text, outcome, source, provenance class, provenance label, the WITHOUT_FULL_TEXT
         reason when there is none), cached per identity version.
 
         A study's byte caches (``cache``) are asked first; their Europe PMC fullTextXML is accepted only with its
         digest verified and its PMCID or DOI confirmed. Where the source came from is recorded once per source
         (``input_provenance``, kind full-text) and returned as the label (cache-hit-public, live-public,
-        live-entitled; supplied for a source recorded before provenance existed).
+        live-entitled; supplied for a source recorded before provenance existed). ``misses`` (one full-text
+        invocation's, shared by its fetch threads) holds the PMCIDs ``fetch_xml`` found without a readable full text,
+        with the fetcher's reason: such a PMCID is not fetched again, and every later entry citing it gets the same
+        reason (two threads that fetch it at the same moment both get Europe PMC's answer).
         """
         with self.lock:
             cached = self.connection.execute(
@@ -1668,23 +1672,32 @@ class CensusRun:
                     rejected.append({**hit["provenance"], "reason": "unreadable"})
                     text = None
         if text is None and pmcid and fetch_xml is not None:
-            try:
-                fetched = fetch_xml(pmcid)
-            except RetryableFetch:
-                # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
-                return None, "retry", None, provenance, "unavailable", None
-            if not fetched:
-                reason_of = getattr(fetch_xml, "miss_reason", None)
-                miss = reason_of(pmcid) if callable(reason_of) else None
-            if fetched:
-                with self.lock:
-                    self._live_fetches += 1
+            with self.lock:
+                known = misses is not None and pmcid.upper() in misses
+                miss = misses.get(pmcid.upper()) if known else None
+            if not known:
                 try:
-                    text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
-                    label, detail = "live-public", {"provider": source, "sourceUrl": FULL_TEXT % pmcid,
-                                                    "retrievedAt": utc_now()}
-                except ValidationError:
-                    text = None
+                    fetched = fetch_xml(pmcid)
+                except RetryableFetch:
+                    # Throttled, a server error or a dropped connection: keep the entry open, never a failed retrieval.
+                    return None, "retry", None, provenance, "unavailable", None
+                if not fetched:
+                    reason_of = getattr(fetch_xml, "miss_reason", None)
+                    miss = reason_of(pmcid) if callable(reason_of) else None
+                if fetched:
+                    with self.lock:
+                        self._live_fetches += 1
+                    try:
+                        text, raw, source = C.jats_to_text(fetched), fetched, "europe-pmc-fulltextxml"
+                        label, detail = "live-public", {"provider": source, "sourceUrl": FULL_TEXT % pmcid,
+                                                        "retrievedAt": utc_now()}
+                    except ValidationError:
+                        text = None
+                if text is None and misses is not None:
+                    # A definitive miss (or a full text that cannot be read) is the same for every entry that cites the
+                    # PMCID: the invocation fetches it once and closes the others with the same reason.
+                    with self.lock:
+                        misses[pmcid.upper()] = miss
         if text is None and entitled is not None:
             supplied = entitled(dict(work))
             if supplied:
@@ -1712,17 +1725,18 @@ class CensusRun:
         return text, source, source, provenance, label, None
 
     def _prepare_group(self, doi: str, group: list[Any], works: Mapping[str, Mapping[str, Any]], fetch_xml, entitled,
-                       allow_entitled: bool, cache=None, fetches: list[tuple[str, str, str, bool]] | None = None
-                       ) -> tuple[str, str, str, list[dict[str, Any]], int]:
+                       allow_entitled: bool, cache=None, fetches: list[tuple[str, str, str, bool]] | None = None,
+                       misses: dict[str, str | None] | None = None) -> tuple[str, str, str, list[dict[str, Any]], int]:
         """Retrieve every entry of one review's group, record definitive failures, build the windows.
 
         ``fetches`` receives (journal, doi, label, transient) for every entry: whether its fetch failed in transport.
+        ``misses`` is the invocation's record of PMCIDs without a readable full text (``_retrieve``).
         """
         journal, title = group[0]["journal"], group[0]["title"] or ""
         retrieved, retry = [], 0
         for row in group:
             work = works[row["cited_work_key"]]
-            text, outcome, source, provenance, label, miss = self._retrieve(work, fetch_xml, entitled, cache)
+            text, outcome, source, provenance, label, miss = self._retrieve(work, fetch_xml, entitled, cache, misses)
             if fetches is not None:
                 fetches.append((journal, doi, row["label"], outcome == "retry"))
             if outcome == "retry":
@@ -1810,13 +1824,14 @@ class CensusRun:
 
     def _full_text_pass(self, fetch_xml, entitled, fetch_workers: int, totals: dict[str, int],
                         touched: set[tuple[str, str]], cache=None,
-                        fetches: list[tuple[str, str, str, bool]] | None = None) -> tuple[str | None, bool]:
+                        fetches: list[tuple[str, str, str, bool]] | None = None,
+                        misses: dict[str, str | None] | None = None) -> tuple[str | None, bool]:
         """One pass over the escalated entries still open (ft_retrieval NULL); returns (drift, breaker tripped).
 
         Broker calls an earlier pass or invocation submitted without recording them (``pending_calls``) are sent first,
         unchanged (the same call id and request meet the broker job that holds them); their entries stay out of this
         pass's chunks, so no entry is judged by a second call while the first may still finish. ``fetches`` receives
-        every entry's retrieval (``_prepare_group``).
+        every entry's retrieval and ``misses`` holds the invocation's PMCIDs without a full text (``_prepare_group``).
         """
         with self.lock:
             rows = [dict(r) for r in self.connection.execute(
@@ -1858,7 +1873,7 @@ class CensusRun:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as fetch_pool, \
                 concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as call_pool:
             retrievals = [fetch_pool.submit(self._prepare_group, doi, group, works, fetch_xml, entitled, allow_entitled,
-                                            cache, fetches) for doi, group in groups]
+                                            cache, fetches, misses) for doi, group in groups]
             calls: set[concurrent.futures.Future] = set()
 
             def collect(block: bool) -> None:
@@ -1949,11 +1964,13 @@ class CensusRun:
             self._live_fetches = 0
         drift, retries, still_open = None, 0, 0
         touched: set[tuple[str, str]] = set()
+        # PMCIDs this invocation found without a readable full text: each is fetched once in it (``_retrieve``).
+        misses: dict[str, str | None] = {}
         invocation = uuid.uuid4().hex
         while True:
             totals["passes"] += 1
             fetches: list[tuple[str, str, str, bool]] = []
-            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched, cache, fetches)
+            drift, _ = self._full_text_pass(fetch_xml, entitled, fetch_workers, totals, touched, cache, fetches, misses)
             if drift is None and not self._stop_reason():
                 self._persistent_fetches(fetches, fetch_xml, invocation)
             with self.lock:
