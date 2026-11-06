@@ -956,7 +956,8 @@ row of that call and position. Entries whose history row names no call are
 outside replay. The results go to `replay_calls`, `replay_entries` and
 `replay_meta`, in the census database or with `--output` in a separate file;
 the command prints a JSON summary with `reportSha256` and exits 0 when every
-entry in scope replays, 3 otherwise, 2 on invalid input. See
+entry in scope replays, 3 when any did not, 2 on invalid input and 75 when the
+broker socket stops answering (nothing is recorded then). See
 [citation-census.md](citation-census.md#replay-a-registered-instrument-census)
 for the sources, the checks and the outcomes.
 
