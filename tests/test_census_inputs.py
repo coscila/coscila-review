@@ -1938,6 +1938,29 @@ class ParallelAcquisitionTests(CacheTestCase):
         self.assertEqual(("live-public", "Live abstract.", self.STAMP),
                          (work["abstractProvenance"]["provenance"], work["abstract"], work["abstractRetrievedAt"]))
 
+    def test_an_answer_without_any_record_reaches_only_the_works_it_answered(self):
+        # Three reviews cite one work; the first review's lookup is answered from an empty index (a result list
+        # without any hit). The later reviews ask for the work again and take its record.
+        rows = [record(doi=f"10.5555/review.{n}") for n in range(1, 4)]
+        for row in rows:
+            row["works"]["shared"] = {"doi": "10.5555/shared.work", "title": "Shared work"}
+        source = self.root / "input" / "reviews.jsonl"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        asked = []
+
+        def get(params):
+            asked.append(params["query"])
+            return {"hitCount": 0, "resultList": {"result": []}} if len(asked) == 1 else lookups(params)
+        output = self.root / "abstracts.jsonl"
+        fill_abstracts(source, output, get, overwrite=True, workers=1)
+        filled = [json.loads(line)["works"]["shared"] for line in output.read_text().splitlines()]
+        self.assertEqual(["europe-pmc-no-hit", "europe-pmc-core", "europe-pmc-core"],
+                         [work["europePmcOutcome"] for work in filled])
+        self.assertEqual([None, "Live abstract.", "Live abstract."], [work.get("abstract") for work in filled])
+        self.assertEqual(2, sum('DOI:"10.5555/shared.work"' in query for query in asked),
+                         "asked once more, then answered from its record for the third review")
+
     def test_the_pages_of_one_sign_in_session_are_fetched_one_after_another(self):
         import threading
         import time
