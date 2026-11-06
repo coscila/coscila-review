@@ -1622,6 +1622,40 @@ class BrokerStopTests(BrokerTestCase):
         self.assertTrue(any("2 run principals" in note for note in gates(status)["notes"]))
 
 
+class BrokerPersistentFailureTests(BrokerTestCase):
+    def test_the_last_open_batch_counts_only_when_the_judge_answers_a_call_sent_again_through_the_socket(self):
+        self.broker.install_census()
+        stuck, down, execute = "Synthetic review whose batch no call answers", [False], self.broker.execute_item
+
+        def upstream(job, item):
+            # The judge fails every call of the stuck review's batch, and every call while it is down.
+            if down[0] or stuck in json.dumps(item["input"].get("messages")):
+                self.broker.settle(job, job["results"][item["id"]], state="failed", errorCode="PROVIDER_UNREACHABLE",
+                                   error="Provider request failed with HTTP 502.", attempts=3, httpStatus=502)
+                return
+            execute(job, item)
+        self.broker.execute_item = upstream
+        wall = [1_800_000_000.0]
+        run = self.run_census(wall=lambda: wall[0])
+        self.prepare(run, record(), {**record(doi="10.5555/stuck.review"), "title": stuck})
+
+        def invocation(hours):
+            wall[0] += hours * 3600
+            result = run.run_abstract(cooldown=0)
+            counted = self.rows("SELECT invocations, outcome FROM persistent_failures WHERE kind='abstract-batch'")
+            # The broker's jobs in the order they were submitted.
+            return result["closedNoResponse"], [(row["invocations"], row["outcome"]) for row in counted], [
+                job["state"] for job in list(self.broker.jobs.values()) if job["items"][0]["id"].startswith("probe-")]
+        self.assertEqual((0, [(1, None)], []), invocation(0), "another batch was answered: no probe")
+        self.assertEqual((0, [(2, None)], ["completed"]), invocation(1), "the judge answers the call sent again")
+        down[0] = True
+        self.assertEqual((0, [(2, None)], ["completed", "failed"]), invocation(1),
+                         "2 h after the first failure, an outage counts for nothing")
+        down[0] = False
+        self.assertEqual((15, [(3, "invalid:no-response")], ["completed", "failed", "completed"]), invocation(1))
+        self.assertEqual([], self.rows("SELECT call_id FROM calls WHERE call_id LIKE 'probe-%'"), "probes are not recorded")
+
+
 class BrokerCursorTests(unittest.TestCase):
     """The feed cursor and a job that settles between its own summary reading and the cursor's start."""
 

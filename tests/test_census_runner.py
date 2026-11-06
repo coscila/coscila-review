@@ -1922,8 +1922,14 @@ class PersistentFailureTests(RunnerTestCase):
         self.clock = WallClock()
 
     def counting(self, kind):
-        return self.rows("SELECT doi, unit, invocations, others_succeeded, outcome FROM persistent_failures "
-                         "WHERE kind=? ORDER BY doi, unit", kind)
+        return self.rows("SELECT doi, unit, invocations, outcome FROM persistent_failures WHERE kind=? "
+                         "ORDER BY doi, unit", kind)
+
+    def probes(self, since):
+        """The judge requests after the first ``since`` that carry no batch of the stuck review: calls the judge
+        answered before, sent again."""
+        return [request for request in self.judge.requests[since:]
+                if STUCK not in request["payload"]["messages"][1]["content"]]
 
     def full_texts(self, failing=("PMC900007",), outage=False):
         from ocsl_review.study_cli import europe_pmc_fetcher
@@ -1942,13 +1948,21 @@ class PersistentFailureTests(RunnerTestCase):
         first = run.run_abstract(cooldown=0)
         self.assertEqual(("paused", 15, 0, 0), (first["state"], first["accepted"], first["invalid"],
                                                 first["closedNoResponse"]))
-        self.assertEqual([("10.5555/stuck.review", "0", 1, 1, None)], [tuple(r.values()) for r in self.counting(
+        self.assertEqual([("10.5555/stuck.review", "0", 1, None)], [tuple(r.values()) for r in self.counting(
             "abstract-batch")], "counted once over the invocation's passes, with another batch answered")
-        # Only the failing batch is left: such an invocation counts without evidence either way.
+        # Only the failing batch is left: the judge answers the first call it answered last, built again and sent
+        # again, so the invocation counts. That call's answer is recorded nowhere.
         self.clock.advance(1)
+        sent = len(self.judge.requests)
+        answered = self.rows("SELECT body_sha256 FROM calls WHERE doi=? AND kind='first' AND error IS NULL",
+                             "10.5555/synthetic.review.1")
         second = run.run_abstract(cooldown=0)
         self.assertEqual(("paused", 0), (second["state"], second["closedNoResponse"]))
         self.assertEqual(2, self.counting("abstract-batch")[0]["invocations"])
+        self.assertEqual([answered[-1]["body_sha256"]], [request["sha256"] for request in self.probes(sent)],
+                         "one probe in the invocation's four passes: the recorded request, byte for byte")
+        self.assertEqual(answered, self.rows("SELECT body_sha256 FROM calls WHERE doi=? AND kind='first' AND error "
+                                             "IS NULL", "10.5555/synthetic.review.1"))
         self.clock.advance(1)
         third = run.run_abstract(cooldown=0)
         self.assertEqual(("completed", 0, 15, 15), (third["state"], third["accepted"], third["invalid"],
@@ -1962,7 +1976,7 @@ class PersistentFailureTests(RunnerTestCase):
         self.assertEqual([("invalid", None)] * 15, [tuple(r.values()) for r in history])
         self.assertEqual("completed", self.rows("SELECT abstract_state FROM reviews WHERE doi=?",
                                                 "10.5555/stuck.review")[0]["abstract_state"])
-        self.assertEqual([("10.5555/stuck.review", "0", 3, 1, "invalid:no-response")],
+        self.assertEqual([("10.5555/stuck.review", "0", 3, "invalid:no-response")],
                          [tuple(r.values()) for r in self.counting("abstract-batch")])
         status = run.status()
         self.assertEqual((15, 0), (status["invalidOutputs"], status["openEntries"]))
@@ -2026,6 +2040,33 @@ class PersistentFailureTests(RunnerTestCase):
         self.assertEqual(("completed", 30, 0), (after["state"], after["accepted"], after["invalid"]))
         self.assertEqual([], self.counting("abstract-batch"), "answered batches start their count again")
 
+    def test_an_outage_counts_for_no_batch_left_open_alone(self):
+        run = self.run_census(wall=self.clock)
+        self.prepare(run, record(), {**record(doi="10.5555/stuck.review"), "title": STUCK})
+        # The batch fails once while the other review is answered: one counted invocation, with evidence.
+        self.judge.fail_matching = {STUCK}
+        run.run_abstract(cooldown=0)
+        self.assertEqual([(1, None)], [(row["invocations"], row["outcome"]) for row in self.counting("abstract-batch")])
+        recorded = self.rows("SELECT COUNT(*) AS n FROM calls WHERE doi=?", "10.5555/synthetic.review.1")
+        # Then the judge is down for three hours, and that batch is the only one left to send: the call the judge
+        # answered last, sent again in each invocation, goes unanswered too, so none of them counts.
+        self.judge.fail_next = 10 ** 6
+        for _ in range(3):
+            self.clock.advance(1)
+            sent = len(self.judge.requests)
+            self.assertEqual(("paused", 0), (lambda r: (r["state"], r["closedNoResponse"]))(run.run_abstract(cooldown=0)))
+            self.assertTrue(self.probes(sent), "the judge was asked again for a call it answered before")
+        self.assertEqual([(1, None)], [(row["invocations"], row["outcome"]) for row in self.counting("abstract-batch")])
+        self.assertEqual(recorded, self.rows("SELECT COUNT(*) AS n FROM calls WHERE doi=?", "10.5555/synthetic.review.1"),
+                         "the probes are recorded nowhere")
+        # The judge is back and answers the batch: nothing was lost to the outage.
+        self.judge.fail_next, self.judge.fail_matching = 0, set()
+        self.clock.advance(1)
+        after = run.run_abstract(cooldown=0)
+        self.assertEqual(("completed", 15, 0, 0), (after["state"], after["accepted"], after["invalid"],
+                                                   after["closedNoResponse"]))
+        self.assertEqual([], self.counting("abstract-batch"))
+
     def test_a_full_text_that_keeps_failing_while_others_succeed_closes_as_persistent_error(self):
         run = self.run_census(wall=self.clock)
         self.prepare(run)
@@ -2033,7 +2074,7 @@ class PersistentFailureTests(RunnerTestCase):
         stand_in, fetch = self.full_texts()
         first = run.run_full_text(fetch_xml=fetch, cooldown=0)
         self.assertEqual(("paused", 2, 1), (first["state"], first["retrieved"], first["openEntries"]))
-        self.assertEqual([("10.5555/synthetic.review.1", "7", 1, 1, None)],
+        self.assertEqual([("10.5555/synthetic.review.1", "7", 1, None)],
                          [tuple(r.values()) for r in self.counting("full-text-fetch")])
         # Only the failing entry is left: a fetch of a full text the census already read shows Europe PMC serving.
         self.clock.advance(1)

@@ -1395,7 +1395,7 @@ class CensusRun:
         left open are retried in up to ``transport_retries`` further passes after a growing cooldown; if
         some are still open, the run pauses with ``paused:transport`` and the next invocation resumes it.
         A batch no call answers closes as invalid:no-response once PERSISTENT_INVOCATIONS invocations, the first and
-        the last at least PERSISTENT_SECONDS apart, counted its failure while other calls were answered
+        the last at least PERSISTENT_SECONDS apart, counted its failure while the judge answered other calls
         (``_persistent_batches``); its entries count in ``invalid`` and in ``closedNoResponse``.
         The result's ``throughput`` is the invocation's steady-state rate (``steady_throughput``).
         """
@@ -1425,7 +1425,7 @@ class CensusRun:
         totals = {"reviews": 0, "accepted": 0, "invalid": 0, "transportFailures": 0, "passes": 0, "closedNoResponse": 0}
         drift, retries = None, 0
         passes: list[list[tuple[float, float, int]]] = []
-        invocation, answered, attempted = uuid.uuid4().hex, set(), set()
+        invocation, answered, attempted, probed = uuid.uuid4().hex, set(), set(), {}
         while True:
             totals["passes"] += 1
             passes.append([])
@@ -1437,7 +1437,7 @@ class CensusRun:
             if drift is not None:
                 break
             if not self._stop_reason():
-                closed = self._persistent_batches(outcomes, invocation, answered, attempted)
+                closed = self._persistent_batches(outcomes, invocation, answered, attempted, probed)
                 totals["invalid"] += closed
                 totals["closedNoResponse"] += closed
             with self.lock:
@@ -1468,40 +1468,34 @@ class CensusRun:
 
     # ------------------------------------------------------------------ items that keep failing
     def _persisting(self, kind: str, failed: Mapping[tuple[str, str, str], Sequence[str]], invocation: str,
-                    counted: Callable[[tuple[str, str, str]], bool | None]) -> list[dict[str, str]]:
+                    counts: Callable[[tuple[str, str, str]], bool]) -> list[dict[str, str]]:
         """Count this invocation for every item that failed in transport in it, once, and return the items now due.
 
-        ``failed`` maps (journal, doi, unit) to the labels the item keeps open. ``counted(key)`` tells how the
-        invocation counts for the item: True when another item succeeded in it, False when it shows nothing either
-        way, None when it does not count. An item is due once PERSISTENT_INVOCATIONS invocations counted it, the first
-        and the last at least PERSISTENT_SECONDS apart, and another item succeeded in one of them.
+        ``failed`` maps (journal, doi, unit) to the labels the item keeps open. ``counts(key)`` tells whether the
+        invocation counts for the item: only one in which the service answered other requests does. An item is due
+        once PERSISTENT_INVOCATIONS invocations counted it, the first and the last at least PERSISTENT_SECONDS apart.
         """
+        counted = [(key, labels) for key, labels in failed.items() if counts(key)]
         now = self.wall()
         due = []
         with self.lock, self.connection:
-            for (journal, doi, unit), labels in failed.items():
-                verdict = counted((journal, doi, unit))
-                if verdict is None:
-                    continue
+            for (journal, doi, unit), labels in counted:
                 row = self.connection.execute(
-                    "SELECT invocations, others_succeeded, first_failed_at, last_invocation, outcome FROM "
-                    "persistent_failures WHERE kind=? AND journal=? AND doi=? AND unit=?",
-                    (kind, journal, doi, unit)).fetchone()
+                    "SELECT invocations, first_failed_at, last_invocation, outcome FROM persistent_failures WHERE "
+                    "kind=? AND journal=? AND doi=? AND unit=?", (kind, journal, doi, unit)).fetchone()
                 if row is None or row["outcome"] is not None:
-                    invocations, others, first = 1, bool(verdict), now
+                    invocations, first = 1, now
                     self.connection.execute(
-                        "INSERT OR REPLACE INTO persistent_failures VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL)",
-                        (kind, journal, doi, unit, canonical(list(labels)), 1, int(others), _stamp(now), _stamp(now),
-                         invocation))
+                        "INSERT OR REPLACE INTO persistent_failures VALUES(?,?,?,?,?,?,?,?,?,NULL,NULL)",
+                        (kind, journal, doi, unit, canonical(list(labels)), 1, _stamp(now), _stamp(now), invocation))
                 else:
                     invocations = row["invocations"] + int(row["last_invocation"] != invocation)
-                    others, first = bool(row["others_succeeded"]) or bool(verdict), _seconds(row["first_failed_at"])
+                    first = _seconds(row["first_failed_at"])
                     self.connection.execute(
-                        "UPDATE persistent_failures SET labels_json=?, invocations=?, others_succeeded=?, "
-                        "last_failed_at=?, last_invocation=? WHERE kind=? AND journal=? AND doi=? AND unit=?",
-                        (canonical(list(labels)), invocations, int(others), _stamp(now), invocation, kind, journal,
-                         doi, unit))
-                if invocations >= PERSISTENT_INVOCATIONS and others and now - first >= PERSISTENT_SECONDS:
+                        "UPDATE persistent_failures SET labels_json=?, invocations=?, last_failed_at=?, "
+                        "last_invocation=? WHERE kind=? AND journal=? AND doi=? AND unit=?",
+                        (canonical(list(labels)), invocations, _stamp(now), invocation, kind, journal, doi, unit))
+                if invocations >= PERSISTENT_INVOCATIONS and now - first >= PERSISTENT_SECONDS:
                     due.append({"journal": journal, "doi": doi, "unit": unit})
         return due
 
@@ -1553,7 +1547,7 @@ class CensusRun:
         with self.lock:
             succeeded = self._live_fetches > 0
         succeeded = succeeded or self._probe_full_text(fetch_xml)
-        due = self._persisting("full-text-fetch", failed, invocation, lambda key: True if succeeded else None)
+        due = self._persisting("full-text-fetch", failed, invocation, lambda key: succeeded)
         with self.lock, self.connection:
             for item in due:
                 closed = self.connection.execute(
@@ -1565,15 +1559,37 @@ class CensusRun:
                 if closed:
                     self._count_without_full_text(item["journal"], "persistentError")
 
+    def _probe_judge(self, journal: str, invocation: str) -> bool:
+        """Whether the judge answers now: the journal's latest answered first call of an abstract-tier batch, built
+        again from its review's items and sent again. Its answer only tells whether a completion came back; nothing of
+        it is recorded or parsed. Entitled review text goes only to a judge on premises, as for every call."""
+        on_premises = bool(getattr(self.transport, "on_premises", False))
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT c.doi, c.batch, r.title FROM calls c JOIN reviews r ON r.journal=c.journal AND r.doi=c.doi "
+                "WHERE c.run_id=? AND c.journal=? AND c.tier='abstract' AND c.variant='primary' AND c.kind='first' "
+                "AND c.error IS NULL AND c.n_parsed>0 AND (? OR r.provenance_class IS NOT 'entitled') "
+                "ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1", (self.run_id, journal, int(on_premises))).fetchone()
+            batches = C.paper_batches(self._items(journal, row["doi"])) if row is not None else []
+        if row is None or not 0 <= row["batch"] < len(batches):
+            return False
+        batch = batches[row["batch"]]
+        payload = abstract_call(batch, row["title"] or "", journal, kind="first", model=self.request_model, cut=True)
+        call_id = "probe-" + sha256_text(canonical([self.run_id, invocation, journal, row["doi"], row["batch"]]))[:24]
+        result = self._call(payload, tier="abstract", journal=journal, doi=row["doi"], variant="primary",
+                            batch=row["batch"], kind="first", items=len(batch), call_id=call_id)
+        return result.text is not None
+
     def _persistent_batches(self, outcomes: Sequence[tuple[str, str, dict[str, Any]]], invocation: str,
-                            answered: set, attempted: set) -> int:
+                            answered: set, attempted: set, probed: dict[str, bool]) -> int:
         """Count one pass's abstract batches that no call answered and close those that keep failing
         (invalid:no-response); returns the entries closed.
 
         ``answered`` and ``attempted`` collect the batches of the invocation, across its passes. The invocation counts
-        for such a batch when another batch was answered in it (evidence that the judge answers), and also when no other
-        batch was sent (it shows nothing either way); it does not count when other batches were sent and none was
-        answered (an outage).
+        for such a batch when another batch was answered in it (evidence that the judge answers). When no other batch
+        was sent, it counts only when the judge answers a call it answered before, sent again (``_probe_judge``, once
+        per invocation, kept in ``probed``). It does not count when other batches were sent and none was answered (an
+        outage), nor when the judge leaves that call unanswered too.
         """
         failed: dict[tuple[str, str, str], list[str]] = {}
         settled = []
@@ -1591,11 +1607,15 @@ class CensusRun:
         if not failed:
             return 0
 
-        def counted(key: tuple[str, str, str]) -> bool | None:
+        def counts(key: tuple[str, str, str]) -> bool:
             if len(answered) - (key in answered) > 0:
                 return True
-            return None if len(attempted) - (key in attempted) > 0 else False
-        due = self._persisting("abstract-batch", failed, invocation, counted)
+            if len(attempted) - (key in attempted) > 0:
+                return False
+            if "answered" not in probed:
+                probed["answered"] = self._probe_judge(key[0], invocation)
+            return probed["answered"]
+        due = self._persisting("abstract-batch", failed, invocation, counts)
         now, closed = utc_now(), 0
         with self.lock, self.connection:
             for item in due:
