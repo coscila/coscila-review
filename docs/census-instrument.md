@@ -937,9 +937,11 @@ enumerated reviews in the study and excluded at comparison time). The pinned
 store root, provider cache digest and enumeration digest are recorded with the
 input hashes. The export passes `ocsl-writing facts verify` unchanged;
 `ocsl-writing facts lint` then requires every numeral in a manuscript template
-to come from a fact token. A database that holds a replay (below) also exports
-`census.<journal>.replay.*` and `census.replay.*`: entries replayed, mismatched,
-unavailable, digest failures and outside replay, and the share replayed.
+to come from a fact token. A database that holds a replay (below) of its whole
+verdict history also exports `census.<journal>.replay.*` and `census.replay.*`:
+entries replayed, mismatched, unavailable, digest failures and outside replay,
+and the share replayed; a replay made before more verdicts were recorded exports
+none (the export's result says why).
 
 ## Replay
 
@@ -947,17 +949,27 @@ unavailable, digest failures and outside replay, and the share replayed.
 [--output <db>]` re-derives every verdict a model call produced from the
 response the broker stores for the settled call, without a model call: the
 first and repair calls of an abstract-tier batch, full-text calls and the
-sensitivity variants. It checks each stored item against the receipts first
-(completed with the required served model, its request digest equal to the
-receipt's broker digest and to the canonical digest of the request the
-instrument built, its output digest equal to the digest of its output), parses
-it with the instrument's label parser and compares each entry with the history
-row of that call and position. Entries whose history row names no call are
-outside replay. The results go to `replay_calls`, `replay_entries` and
-`replay_meta`, in the census database or with `--output` in a separate file;
-the command prints a JSON summary with `reportSha256` and exits 0 when every
-entry in scope replays, 3 when any did not, 2 on invalid input and 75 when the
-broker socket stops answering (nothing is recorded then). See
+sensitivity variants. The stored response is a completed item's output, or the
+judge server's refusal of the request (HTTP 400, 413 or 422), which the
+instrument counts as an answer without labels. It checks each stored item
+against the receipts first (its request digest equal to the receipt's broker
+digest and to the canonical digest of the request the instrument built; a
+completed item served by the required model with its output digest equal to the
+digest of its output; a refused item without output and with the refusal its
+receipt recorded), parses it with the instrument's label parser and compares
+each entry with the history row of that call and position. An entry recorded as
+invalid replays when an answered repair call carried it and none of the answered
+calls of its batch that carried it yields a parseable line for it. Entries no
+answered call decided (decided without a model call, or closed as
+`invalid:no-response`) are outside replay. The results go to `replay_calls`,
+`replay_entries` and `replay_meta`, in the census database (writable and not
+frozen) or with `--output` in a separate file; the command prints a JSON summary
+with `reportSha256` and exits 0 when every entry in scope replays, 3 when any did
+not, 2 on invalid input (also a census database it cannot write in place, or a
+socket that cannot serve the run's results, such as a revoked principal's) and
+75 on an outage: a broker socket that stops answering or keeps refusing a result
+page, or a census database that changes while it is replayed into `--output`
+(nothing is recorded then). See
 [citation-census.md](citation-census.md#replay-a-registered-instrument-census)
 for the sources, the checks and the outcomes.
 
