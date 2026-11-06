@@ -1867,6 +1867,48 @@ class EuropePmcRateTests(unittest.TestCase):
         (first, _), (second, _) = requests
         self.assertEqual(5.0, second - first)
 
+    def test_a_retry_after_on_a_full_text_fetch_or_its_record_check_holds_the_next_request_of_another(self):
+        import urllib.error
+        from ocsl_review.study_cli import europe_pmc_fetcher
+        from test_census_runner import FakeClock
+
+        class Answer(FakeResponse):
+            def __init__(self, status, headers):
+                super().__init__(status)
+                self.headers = headers
+        # urllib raises an HTTPError for such an answer; an opener may also return it as a response.
+        for raised in (True, False):
+            with self.subTest(raised=raised):
+                clock, requests = FakeClock(100.0), []
+                rate = census_inputs.RateLimit(8.0, clock=clock, sleep=clock.sleep)
+
+                def europe_pmc(request, timeout=None):
+                    kind = "fullTextXML" if request.full_url.endswith("/fullTextXML") else "search"
+                    requests.append((clock(), kind))
+                    # PMC5's fullTextXML is throttled with a wait of 30 s; PMC6's answers 500, and its record check
+                    # finds the search unavailable for 60 s.
+                    status, wait = ((429, "30") if "PMC5" in request.full_url else (500, None)) \
+                        if kind == "fullTextXML" else (503, "60")
+                    headers = {"Retry-After": wait} if wait else {}
+                    if raised:
+                        raise urllib.error.HTTPError(request.full_url, status, "Refused", headers, io.BytesIO(b""))
+                    return Answer(status, headers)
+
+                def page(request, timeout=None):
+                    requests.append((clock(), "page"))
+                    return FakeResponse(200, b"{}")
+                fetch = europe_pmc_fetcher(attempts=1, opener=europe_pmc, sleep=clock.sleep, clock=clock, limit=rate)
+                pages = census_inputs.search_pages(opener=page, sleep=clock.sleep, limit=rate)
+                with self.assertRaises(RetryableFetch):
+                    fetch("PMC5")
+                pages({"query": "q", "cursorMark": "*"})
+                with self.assertRaises(RetryableFetch):
+                    fetch("PMC6")
+                pages({"query": "q", "cursorMark": "*"})
+                # The enumeration's next page waits out each wait, then a full-text request takes its turn 1/8 s on.
+                self.assertEqual([(100.0, "fullTextXML"), (130.0, "page"), (130.125, "fullTextXML"), (130.25, "search"),
+                                  (190.25, "page")], requests)
+
     def test_the_census_fetchers_share_one_europe_pmc_rate_by_default(self):
         from ocsl_review.study_cli import europe_pmc_fetcher
         turns = []
