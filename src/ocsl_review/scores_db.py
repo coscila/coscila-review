@@ -397,39 +397,47 @@ DICTIONARY: dict[str, dict[str, str]] = {
                    "at least 2 h apart",
         "closed_at": "time the failure was closed (UTC)"},
     "replay_calls": {
-        "call_id": "call receipt (calls.call_id) of a call the verdict history names",
+        "call_id": "call receipt (calls.call_id) of a call that decided a recorded verdict: one the verdict history names, "
+                   "or an answered call of the batch of an entry recorded as invalid",
         "job_id": "broker job that settled the call (call_transport.broker_job_id); NULL for a direct call",
         "item_id": "broker item replay read (call_transport.broker_item_id, the call id)",
         "outcome": "replayed (every entry of the call replayed), mismatched (the stored response passed every check and "
                    "at least one entry differs), unavailable (no stored response: a direct call, a call without a "
-                   "receipt or a broker job, an item the broker does not hold or that did not complete) or "
-                   "digest-failure (the stored response failed a check against the receipts)",
+                   "receipt or a broker job, an item the broker does not hold, one that did not settle or failed in "
+                   "transport) or digest-failure (the stored response failed a check against the receipts)",
         "output_sha256": "sha256 of the stored output as the daemon digests it (a string as its UTF-8 bytes, any other "
-                         "value as JSON.stringify writes it); NULL when no completed item was read",
+                         "value as JSON.stringify writes it, no output as the empty text); NULL when no response was "
+                         "read",
         "request_sha256": "requestSha256 the stored item reports",
-        "n_entries": "entries of the call: its history rows and the verdicts its answer yields that the history lacks",
+        "n_entries": "entries of the call: its history rows, the verdicts its answer yields that the history lacks, and "
+                     "the entries recorded as invalid whose outcome its response decided",
         "n_replayed": "entries of the call whose re-derived verdict equals the recorded one",
         "n_mismatched": "entries of the call whose re-derived verdict differs from the recorded one",
-        "detail_json": "the checks (request digests, output digest, served model, instrument digest), the item's state "
-                       "and failure code, why the call did not replay, and counts of parsed labels and parser problems; "
-                       "never output text",
+        "detail_json": "the checks (request digests, output digest, served model or recorded refusal, instrument "
+                       "digest), the item's state, failure code and HTTP status, why the call did not replay, and counts "
+                       "of parsed labels and parser problems; never output text",
         "created_at": "replay time (UTC)"},
     "replay_entries": {
-        "call_id": "call that decided the entry; NULL outside replay",
-        "position": "position in the call (1-based), as the history row records it",
+        "call_id": "call that decided the entry (for an entry recorded as invalid, the deciding call whose response "
+                   "decided the outcome: one without a usable response, one whose answer yields a line for it, or the "
+                   "repair call that closed it); NULL outside replay",
+        "position": "position in that call (1-based); the history row's own position outside replay",
         "label": "bibliography label",
-        "outcome": "replayed, mismatched, unavailable or digest-failure (the call's outcome), or outside-replay (the "
-                   "history row names no call: decided without a model call, such as an unresolved identity, an "
-                   "entry never cited or an invalid output after repair)",
+        "outcome": "replayed, mismatched, unavailable or digest-failure (as the call's response gave them), or "
+                   "outside-replay (no answered call decided the entry: decided without a model call, such as an "
+                   "unresolved identity or an entry never cited, or closed after no call of its batch was answered)",
         "recorded_json": "the recorded verdict as compared: outcome, label, category, support verdict, escalate and the "
                          "quote as sha256:<hex> (NULL when redacted); NULL for a verdict the history lacks",
-        "replayed_json": "the verdict re-derived from the stored response, with the same fields, whether the quote was "
-                         "compared and the fields that differ; NULL when the call's response could not be used",
+        "replayed_json": "the verdict re-derived from the stored responses, with the same fields, whether the quote was "
+                         "compared and the fields that differ (for an entry recorded as invalid also its deciding calls); "
+                         "NULL when the response could not be used",
         "journal": "journal", "doi": "review DOI", "tier": "abstract or full-text",
         "variant": "primary or a predeclared sensitivity",
         "history_id": "history row compared (NULL for a verdict the history lacks)"},
     "replay_meta": {"key": "replay record: format, census run, instrument digest and required model, response source, "
-                           "summary, report digest, replay time and code revision",
+                           "summary, report digest, the verdict history rows replayed and the last history id, the "
+                           "sha256 of the census database read (a replay into a file of its own), replay time and code "
+                           "revision",
                     "value": "value"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }

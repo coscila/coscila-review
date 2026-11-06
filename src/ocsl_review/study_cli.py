@@ -199,7 +199,8 @@ def add_commands(families, register):
                                      "OCSL_BROKER_SOCKET); each call's item is read from GET /jobs/<jobId>/results")
             source.add_argument("--responses",
                                 help="JSON lines of the calls' stored item results {jobId, itemId, state, output, "
-                                     "outputDigest, requestSha256, servedModel}, as the lab exports them from the daemon")
+                                     "outputDigest, requestSha256, servedModel}, with errorCode, httpStatus and attempts "
+                                     "for an item that did not complete, as the lab exports them from the daemon")
             command.add_argument("--output",
                                  help="new SQLite file for the replay tables; the census database is then only read "
                                       "(default: new tables in the census database)")

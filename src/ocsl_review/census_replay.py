@@ -1,34 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 """``ocsl-review study replay``: the census's model verdicts re-derived from the stored responses, without model calls.
 
-Every verdict a model call produced is a row of the scores database's append-only ``history`` that names its call and
-its position in the call. Replay reads the item of each such call from the broker that settled it: over the run
-principal's socket (``GET /jobs/<jobId>/results``, as the census's broker transport reads it) or from the JSON lines
-the lab exports from the daemon's item results (``--responses``). Before it parses anything it checks the item against
-the receipts:
+Every verdict a model call produced is a row of the scores database's append-only ``history``: one that names its call
+and its position in the call, or an abstract-tier entry recorded as invalid because it still had no parseable line after
+the answered first and repair calls of its batch. Replay reads the item of each such call from the broker that settled
+it: over the run principal's socket (``GET /jobs/<jobId>/results``, as the census's broker transport reads it) or from
+the JSON lines the lab exports from the daemon's item results (``--responses``). The response the daemon stores for a
+settled call is the item's output when the item completed, or the judge server's refusal of the request (HTTP 400, 413
+or 422, ``census_runner.judge_refusal``), which the census counts as an answer without labels. Before it parses
+anything replay checks the item against the receipts:
 
-- the item completed with the instrument's required served model;
 - the request digest the item reports (``requestSha256``) equals the broker's request digest in the call's receipt
   (``call_transport.broker_request_sha256``) and the canonical digest of the request the instrument built
   (``call_transport.request_sha256``);
-- the item's ``outputDigest`` equals the digest of its output computed as the daemon computes it
-  (``output_digest``: a string as its UTF-8 bytes, any other value as ``JSON.stringify`` writes it).
+- a completed item: its ``outputDigest`` equals the digest of its output computed as the daemon computes it
+  (``output_digest``: a string as its UTF-8 bytes, any other value as ``JSON.stringify`` writes it), and the
+  instrument's required model served it;
+- a refused item: it stores no output (the receipt's output digest is the digest of no output), and the call's
+  receipt records the same refusal (error code and HTTP status).
 
 A response that passes is parsed exactly as the census parsed it (``census_runner.broker_output_text`` and
 ``census_runner.parse_answer`` at the call's tier: the first and repair calls of an abstract-tier batch, full-text
-calls), and each re-derived entry is compared with the history row of that call and position on outcome, label,
-category, support verdict and escalation, and on the quote unless the recorded quote was redacted (an entitled review
-in a frozen copy). A verdict the answer yields that the history lacks is a mismatch too. Entries whose history row
-names no call were decided without a model call (never cited, no identified work, no parseable line after the repair
-pass) and are outside replay. A call without a stored response (a direct call, a history call id without a receipt, a
-receipt without a broker job, an item the broker does not hold or that did not complete) makes its entries
-unavailable; a response that fails a check makes them digest failures. A socket that stops answering is an outage,
-never a call without a stored response: the replay then ends as a transient failure and records nothing.
+calls); an empty completion or a refusal yields no verdict. Each re-derived entry is compared with the history row of
+that call and position on outcome, label, category, support verdict and escalation, and on the quote unless the
+recorded quote was redacted (an entitled review in a frozen copy). A verdict the answer yields that the history lacks is
+a mismatch too. An entry recorded as invalid replays when none of the answered calls of its batch that carried it
+yields a parseable line for it and an answered repair call carried it (for a sensitivity variant, whose batch runs again
+whole until a run settles, the calls of its last run). Entries no answered call decided are outside replay: those
+decided without a model call (never cited, no identified work) and a primary batch's entries closed after none of its
+calls was answered (``invalid:no-response``).
+
+A call without a stored response (a direct call, a history call id without a receipt, a receipt without a broker job, an
+item the broker does not hold, one that did not settle or failed in transport) makes its entries unavailable; a
+response that fails a check makes them digest failures. Over the socket, only WORKER_NOT_FOUND means the broker holds
+no such job. A socket that cannot serve the run's results (a revoked principal, a socket without the principal's
+routes) is invalid input, and one that stops answering or keeps refusing a page is an outage: the replay then ends as
+a transient failure and records nothing, so an outage never reads as calls without a stored response.
 
 The results go to ``replay_calls``, ``replay_entries`` and ``replay_meta`` (``scores_db.REPLAY_DDL``): in the census
 database itself, or with ``--output`` in a new SQLite file while the census database is only read. They hold no output
-text: verdicts are compared field by field and quotes are kept as digests. ``reportSha256`` is the sha256 over the rows
-of both result tables in a fixed order (``report_sha256``), so it can be recomputed from them.
+text: verdicts are compared field by field and quotes are kept as digests. ``replay_meta`` records the extent of the
+history replayed (rows and last id), so a facts export can tell whether the replay still covers the frozen history, and
+with ``--output`` the sha256 of the census database read. ``reportSha256`` is the sha256 over the rows of both result
+tables in a fixed order (``report_sha256``), so it can be recomputed from them.
 """
 from __future__ import annotations
 
@@ -49,7 +63,8 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from . import citation_census as C
 from . import scores_db
 from .census_broker import SOCKET_ENV, BrokerClient, BrokerRefused, BrokerUnavailable, _js_number, _js_string, check_socket
-from .census_runner import PARSER_STAGES, broker_output_text, canonical, code_revision, parse_answer, utc_now, writer_lock
+from .census_runner import (PARSER_STAGES, broker_output_text, call_answered, call_id_for, canonical, code_revision,
+                            judge_refusal, parse_answer, refusal_error, utc_now, writer_lock)
 from .errors import ReviewError, TransientError, ValidationError
 from .util import CommandOutcome
 
@@ -61,6 +76,11 @@ CALL_CHUNK = 500            # calls replayed together: their history rows read a
 FETCH_WORKERS = 8
 FETCH_ATTEMPTS = 3
 MAX_RESULT_PAGES = 10_000
+# The daemon's job ids (UUIDs) as its worker routes accept them; a receipt naming another id names no broker job.
+JOB_ID = re.compile(r"[a-f0-9-]+")
+# Refusals of a socket that cannot serve this run's results at all: a revoked or expired principal, or a socket without
+# the principal's worker routes. Asking again cannot help; the replay needs another socket or exported results.
+SOCKET_REFUSALS = frozenset({"PRINCIPAL_REVOKED", "PRINCIPAL_EXPIRED", "UNKNOWN_PRINCIPAL_ROUTE", "UNKNOWN_WORKER_ROUTE"})
 CALL_COLUMNS = ("call_id", "job_id", "item_id", "outcome", "output_sha256", "request_sha256", "n_entries", "n_replayed",
                 "n_mismatched", "detail_json")
 ENTRY_COLUMNS = ("call_id", "position", "label", "outcome", "recorded_json", "replayed_json", "journal", "doi", "tier",
@@ -69,6 +89,8 @@ HISTORY_COLUMNS = ("history_id", "journal", "doi", "label", "tier", "variant", "
                    "category", "support_verdict", "escalate", "quote")
 # The compared fields of a verdict besides the quote (in the history's column names).
 COMPARED = ("outcome", "category", "support_verdict", "escalate")
+# The abstract-tier basis of a primary entry left without a parseable line after its batch's answered calls.
+NO_PARSEABLE_OUTPUT = "invalid:no-parseable-output"
 
 
 class ReplayInputError(ReviewError):
@@ -186,6 +208,8 @@ class SocketItems:
             return dict(zip(unique, pool.map(lambda key: self._item(*key), unique)))
 
     def _item(self, job_id: str, item_id: str) -> Fetched:
+        if not JOB_ID.fullmatch(job_id):
+            return Fetched(None, "the receipt names no job id the broker issues")
         found, after = None, 0
         for _ in range(MAX_RESULT_PAGES):
             page = self._page(job_id, after)
@@ -201,29 +225,35 @@ class SocketItems:
         return Fetched(found, None if found is not None else "the broker job holds no item of the call")
 
     def _page(self, job_id: str, after: int) -> dict[str, Any] | Fetched:
-        """One result page, or why the broker holds none. A socket that stops answering ends the replay as a transient
-        failure (the same command can run again), so an outage never reads as calls without a stored response."""
+        """One result page, or why the broker holds none. Only WORKER_NOT_FOUND means that the broker holds no such job
+        for this principal. A refusal that means the socket cannot serve this run's results is invalid input; a socket
+        that stops answering, or keeps refusing the page for any other reason, ends the replay as a transient failure
+        (the same command can run again), so an outage never reads as calls without a stored response."""
         route = f"/jobs/{urllib.parse.quote(job_id, safe='')}/results?after={after}&limit=100"
         failure = "no answer"
         for attempt in range(self.attempts):
             try:
                 return self.client.request("GET", route)
             except BrokerRefused as error:
-                if error.code == "WORKER_NOT_FOUND" or error.status == 404:
+                if error.code == "WORKER_NOT_FOUND":
                     return Fetched(None, _short(f"the broker holds no job {job_id} for this principal ({error.code})"))
-                return Fetched(None, _short(f"the broker refused the job's result page ({error.code})"))
+                if error.code in SOCKET_REFUSALS:
+                    raise ReplayInputError(f"the broker socket does not serve this run's results ({error.code}, HTTP "
+                                           f"{error.status}): give the run principal's socket, or the item results the "
+                                           "lab exported (--responses)") from error
+                failure = f"the broker refused the job's result page: {error.code} (HTTP {error.status})"
             except BrokerUnavailable as error:
                 failure = str(error)
-                if attempt + 1 < self.attempts:
-                    self.sleep(2.0 * (attempt + 1))
-        raise TransientError(f"the broker socket stopped answering ({failure[:200]}); run the replay again")
+            if attempt + 1 < self.attempts:
+                self.sleep(2.0 * (attempt + 1))
+        raise TransientError(f"the broker socket did not serve a result page ({failure[:200]}); run the replay again")
 
 
 class ResponseItems:
     """Item results the lab exported as JSON lines ``{jobId, itemId, state, output, outputDigest, requestSha256,
-    servedModel}``. The file is indexed once (a later line for the same job and item replaces an earlier one, as in the
-    daemon's changed-state result feed) and each item is read again when its call is replayed, so the outputs are
-    never all held in memory."""
+    servedModel}``, with ``errorCode``, ``httpStatus`` and ``attempts`` for an item that did not complete. The file is
+    indexed once (a later line for the same job and item replaces an earlier one, as in the daemon's changed-state
+    result feed) and each item is read again when its call is replayed, so the outputs are never all held in memory."""
 
     kind = "responses"
 
@@ -270,11 +300,16 @@ class ResponseItems:
 # ----------------------------------------------------------------------------- one call
 @dataclass
 class CallReplay:
-    """What replay recorded for one call: its replay_calls row and its replay_entries rows."""
+    """What replay recorded for one call: its replay_calls row and its replay_entries rows, how its stored response
+    checked out (``status``: verified, unavailable or digest-failure), the labels it carried and the verdicts its answer
+    yields by label."""
 
     call_row: tuple
     entry_rows: list[tuple] = field(default_factory=list)
     outcome: str = "replayed"
+    status: str = "verified"
+    labels: list[str] = field(default_factory=list)
+    yielded: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 def _quote_view(quote: Any) -> str | None:
@@ -294,11 +329,14 @@ def _verdict_view(entry: Mapping[str, Any] | None, label: Any = None) -> dict[st
 
 def verify_item(call: Mapping[str, Any], fetched: Fetched | None, *, required_model: str,
                 instrument_digest: str) -> tuple[str, dict[str, Any], str | None]:
-    """("verified" | "unavailable" | "digest-failure", detail, the text the census parsed) for one broker call.
+    """("verified" | "unavailable" | "digest-failure", detail, the answer's text) for one broker call.
 
-    A call is replayed only from an item that completed and passes every check against the receipts: the request
-    digests (the item's, the broker receipt's and the census's own), the output digest and the served model. The
-    call's instrument digest must be the census's as well."""
+    A call replays from the response the broker stores for it: an item that completed, or one the judge server refused
+    (``judge_refusal``: HTTP 400, 413 or 422 after a provider call, an answer without labels for the census). The item
+    must pass every check against the receipts: the request digests (the item's, the broker receipt's and the census's
+    own); for a completed item the output digest and the served model; for a refused one that it stores no output and
+    that the call's receipt records the same refusal. The call's instrument digest must be the census's as well. Any
+    other item (one that did not settle, failed in transport, paused or was cancelled) holds no response."""
     detail: dict[str, Any] = {}
     item = fetched.item if fetched is not None else None
     if item is None:
@@ -308,7 +346,8 @@ def verify_item(call: Mapping[str, Any], fetched: Fetched | None, *, required_mo
     detail.update({"state": state,
                    "errorCode": _short(item.get("errorCode"), 80) if isinstance(item.get("errorCode"), str) else None,
                    "servedModel": _short(item.get("servedModel")) if isinstance(item.get("servedModel"), str) else None})
-    if state != "completed":
+    refused = judge_refusal(item) if state == "failed" else None
+    if state != "completed" and refused is None:
         detail["reasons"] = [f"the broker item is {state if isinstance(state, str) else 'without a state'}"
                              + (f" ({detail['errorCode']})" if detail["errorCode"] else "") + ": no stored response"]
         return "unavailable", detail, None
@@ -318,41 +357,49 @@ def verify_item(call: Mapping[str, Any], fetched: Fetched | None, *, required_mo
     except ValidationError:
         computed = None
     reported = item.get("requestSha256")
-    checks = {
-        "requestDigest": isinstance(reported, str) and reported == call.get("broker_request_sha256")
-        and reported == call.get("request_sha256"),
-        "outputDigest": computed is not None and isinstance(item.get("outputDigest"), str)
-        and item.get("outputDigest") == computed,
-        "servedModel": item.get("servedModel") == required_model,
-        "instrumentDigest": call.get("instrument_digest") == instrument_digest,
-        "tier": call.get("tier") in PARSER_STAGES,
-    }
+    checks = {"requestDigest": isinstance(reported, str) and reported == call.get("broker_request_sha256")
+              and reported == call.get("request_sha256")}
+    if refused is None:
+        checks["outputDigest"] = (computed is not None and isinstance(item.get("outputDigest"), str)
+                                  and item.get("outputDigest") == computed)
+        checks["servedModel"] = item.get("servedModel") == required_model
+    else:
+        # A refusal stores no output: the broker receipt's output digest is the digest of no output.
+        detail.update({"httpStatus": refused, "attempts": item.get("attempts")})
+        checks["outputDigest"] = output is ABSENT and item.get("outputDigest", computed) == computed
+        checks["refusal"] = (call.get("error") == refusal_error(refused)
+                             and call.get("broker_error_code") == item.get("errorCode")
+                             and call.get("broker_http_status") == refused)
+    checks["instrumentDigest"] = call.get("instrument_digest") == instrument_digest
+    checks["tier"] = call.get("tier") in PARSER_STAGES
     detail.update({"checks": checks, "outputSha256": computed,
                    "requestSha256": reported if isinstance(reported, str) else None})
     reasons = {"requestDigest": "the item's request digest differs from the broker receipt's or the census's",
-               "outputDigest": "the output differs from the item's output digest" if isinstance(
-                   item.get("outputDigest"), str) else "the item carries no output digest",
+               "outputDigest": ("the refused item stores an output" if refused is not None else
+                                "the output differs from the item's output digest" if isinstance(
+                                    item.get("outputDigest"), str) else "the item carries no output digest"),
                "servedModel": f"the item was served by {detail['servedModel'] or 'no named model'}, not {required_model}",
+               "refusal": "the call's receipt records no refusal with this error code and HTTP status",
                "instrumentDigest": "the call ran another instrument digest than the census",
                "tier": f"the call's tier {call.get('tier')!r} has no parser stage"}
     failed = [reasons[name] for name, passed in checks.items() if not passed]
     if failed:
         detail["reasons"] = failed
         return "digest-failure", detail, None
-    return "verified", detail, broker_output_text(None if output is ABSENT else output)
+    return "verified", detail, ("" if refused is not None else broker_output_text(None if output is ABSENT else output))
 
 
 def rederive(call: Mapping[str, Any], text: str) -> tuple[dict[int, dict[str, Any]], dict[str, int]]:
     """The entries the census derives from a call's answer, by position in the call, and parse counts.
 
     As the census records them: an abstract-tier call (first or repair, any variant) records an accepted verdict for
-    each label with a parseable line and nothing for the others (they go to the repair call or become invalid without a
-    call); a full-text call records an accepted verdict or ``missing`` at every position. A call the census recorded
-    with an error (an empty completion) or an answer without text yields no verdict."""
+    each label with a parseable line and nothing for the others (they go to the repair call or become invalid); a
+    full-text call records an accepted verdict or ``missing`` at every position. An answer without text (an empty
+    completion, or a request the judge server refused) yields no verdict."""
     labels = json.loads(call["labels_json"])
     records: dict[str, Any] = {}
     problems = 0
-    if call.get("error") is None and text.strip():
+    if text.strip():
         records, found, _ = parse_answer(text, labels, tier=call["tier"])
         problems = len(found)
     entries: dict[int, dict[str, Any]] = {}
@@ -391,18 +438,22 @@ def compare(row: Mapping[str, Any], derived: Mapping[str, Any] | None, call: Map
 
 def replay_call(call_id: str, call: Mapping[str, Any] | None, rows: Sequence[Mapping[str, Any]],
                 fetched: Mapping[tuple[str, str], Fetched], *, required_model: str, instrument_digest: str,
-                now: str) -> CallReplay:
-    """Replay one call the verdict history names: verify its stored response, re-derive its entries and compare them
-    with the call's history rows."""
+                now: str, invalid: frozenset[str] | set[str] = frozenset()) -> CallReplay:
+    """Replay one call: verify its stored response, re-derive its entries and compare them with the call's history
+    rows (none for a call that decided only entries recorded as invalid). ``invalid`` names the entries recorded as
+    invalid that the call decided: a verdict its answer yields for one of them is compared with that entry's history
+    row (``_invalid_entry``), not counted as a verdict the history lacks."""
     def entry(row: Mapping[str, Any], outcome: str, replayed: Mapping[str, Any] | None = None) -> tuple:
         return (call_id, row["position"], row["label"], outcome, canonical(_verdict_view(row)),
                 None if replayed is None else canonical(replayed), row["journal"], row["doi"], row["tier"],
                 row["variant"], row["history_id"])
 
     job_id = item_id = None
+    labels: list[str] = []
     if call is None:
         status, detail, text = "unavailable", {"reasons": ["the history names a call without a receipt"]}, None
     else:
+        labels = json.loads(call["labels_json"])
         job_id, item_id = call.get("broker_job_id"), call.get("broker_item_id")
         if (call.get("transport") or "direct") != "broker":
             status, detail, text = "unavailable", {"reasons": ["a direct call: no stored response"]}, None
@@ -415,13 +466,14 @@ def replay_call(call_id: str, call: Mapping[str, Any] | None, rows: Sequence[Map
                        "censusError": _short(call.get("error"))})
     output_sha, request_sha = detail.pop("outputSha256", None), detail.pop("requestSha256", None)
     entries: list[tuple] = []
+    yielded: dict[str, dict[str, Any]] = {}
     replayed = mismatched = 0
     if status != "verified":
         entries = [entry(row, status) for row in rows]
         outcome = status
     else:
-        labels = json.loads(call["labels_json"])
         derived, counts = rederive(call, text or "")
+        yielded = {found["label"]: found for found in derived.values() if found["outcome"] == "accepted"}
         detail.update(counts)
         recorded_positions = set()
         for row in rows:
@@ -435,7 +487,8 @@ def replay_call(call_id: str, call: Mapping[str, Any] | None, rows: Sequence[Map
             mismatched += bool(differs)
             replayed += not differs
         # A verdict the answer yields at a position the history has no row for: the record lacks it.
-        unrecorded = [position for position in sorted(derived) if position not in recorded_positions]
+        unrecorded = [position for position in sorted(derived)
+                      if position not in recorded_positions and derived[position]["label"] not in invalid]
         for position in unrecorded:
             found = derived[position]
             entries.append((call_id, position, found["label"], "mismatched", None,
@@ -446,7 +499,133 @@ def replay_call(call_id: str, call: Mapping[str, Any] | None, rows: Sequence[Map
         outcome = "mismatched" if mismatched else "replayed"
     call_row = (call_id, job_id, item_id, outcome, output_sha, request_sha, len(entries), replayed, mismatched,
                 canonical(detail), now)
-    return CallReplay(call_row, entries, outcome)
+    return CallReplay(call_row, entries, outcome, status, labels, yielded)
+
+
+# ----------------------------------------------------------------------------- entries recorded as invalid
+@dataclass
+class Decided:
+    """The answered calls that decided an entry recorded as invalid, first calls before repair calls, each in the
+    census's order, and the last answered repair call that carried it (None when none did)."""
+
+    calls: list[str]
+    closing: str | None
+
+
+@dataclass
+class Checked:
+    """What a deciding call's stored response gave for the entries recorded as invalid that it decided: its status,
+    their positions in the call and the verdicts it yields for them (as replay records them, quotes as digests)."""
+
+    status: str
+    positions: dict[str, int]
+    yielded: dict[str, dict[str, Any]]
+
+
+def decided_by_calls(row: Mapping[str, Any], basis: str | None) -> bool:
+    """Whether answered calls decided a history row that names no call: an abstract-tier entry recorded as invalid after
+    its batch's answered calls left it without a parseable line. A primary entry the census closed because no call of
+    its batch was answered (``invalid:no-response``) and every outcome decided without a model call are outside
+    replay."""
+    if row["tier"] != "abstract" or row["outcome"] != "invalid":
+        return False
+    return row["variant"] != "primary" or basis == NO_PARSEABLE_OUTPUT
+
+
+def _order_calls(calls: Sequence[dict[str, Any]], journal: str, doi: str, variant: str) -> None:
+    """Each call's place among the recorded calls of its batch and kind: the census numbers them in the order it
+    recorded them, and the call id names that number (``call_id_for``). A call whose id names none sorts after them, by
+    time and id."""
+    groups: dict[tuple[Any, Any, Any], list[dict[str, Any]]] = {}
+    for call in calls:
+        groups.setdefault((call["run_id"], call["batch"], call["kind"]), []).append(call)
+    for (run_id, batch, kind), members in groups.items():
+        places = {call_id_for(run_id, journal, doi, "abstract", variant, batch, kind, nonce): nonce
+                  for nonce in range(len(members))}
+        for call in members:
+            place = places.get(call["call_id"])
+            call["order"] = (0, place, "", "") if place is not None else (1, 0, call["created_at"] or "", call["call_id"])
+
+
+def _decided(row: Mapping[str, Any], calls: Sequence[dict[str, Any]]) -> Decided:
+    """The answered calls of an invalid entry's batch that carried it. A primary batch writes each answered call's
+    verdicts with its receipt, so every answered call that carried the entry decided it. A sensitivity batch that did
+    not settle runs again whole and only its last run is recorded: its last first call and its last repair call."""
+    label = row["label"]
+    carrying = [call for call in calls if label in call["labels"]]
+    if row["variant"] != "primary":
+        batches = {call["batch"] for call in carrying}
+        last: dict[tuple[Any, str], dict[str, Any]] = {}
+        for call in calls:
+            key = (call["batch"], call["kind"])
+            if call["batch"] in batches and (key not in last or call["order"] > last[key]["order"]):
+                last[key] = call
+        carrying = [call for call in last.values() if label in call["labels"]]
+    answered = sorted((call for call in carrying if call_answered(call["error"])),
+                      key=lambda call: (call["kind"] != "first", call["batch"], call["order"]))
+    repairs = [call for call in answered if call["kind"] == "repair"]
+    return Decided([call["call_id"] for call in answered], repairs[-1]["call_id"] if repairs else None)
+
+
+def _deciding(reader: sqlite3.Connection, invalid: Sequence[Mapping[str, Any]]) -> dict[int, Decided]:
+    """The deciding calls of every entry recorded as invalid, by history row (the calls of each review and variant read
+    once)."""
+    groups: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in invalid:
+        groups.setdefault((row["journal"], row["doi"], row["variant"]), []).append(row)
+    columns = ("call_id", "run_id", "batch", "kind", "labels_json", "error", "created_at")
+    decided: dict[int, Decided] = {}
+    for (journal, doi, variant), rows in groups.items():
+        calls = [dict(zip(columns, values)) for values in reader.execute(
+            f"SELECT {', '.join(columns)} FROM calls WHERE journal=? AND doi=? AND tier='abstract' AND variant=? "
+            "AND kind IN ('first', 'repair')", (journal, doi, variant))]
+        for call in calls:
+            try:
+                labels = json.loads(call["labels_json"])
+            except ValueError:
+                labels = []
+            call["labels"] = set(labels) if isinstance(labels, list) else set()
+        _order_calls(calls, journal, doi, variant)
+        for row in rows:
+            decided[row["history_id"]] = _decided(row, calls)
+    return decided
+
+
+def _checked(result: CallReplay, labels: set[str]) -> Checked:
+    """Only what the invalid entries ``labels`` need: a deciding call's other verdicts were compared already."""
+    return Checked(result.status,
+                   {label: position for position, label in enumerate(result.labels, 1) if label in labels},
+                   {label: {**_verdict_view(entry), "_compared": {name: entry.get(name) for name in COMPARED}}
+                    for label, entry in result.yielded.items() if label in labels})
+
+
+def _invalid_entry(row: Mapping[str, Any], decided: Decided, checked: Mapping[str, Checked]) -> tuple[str, str | None,
+                                                                                                         dict[str, Any] | None]:
+    """(outcome, the call it is counted with, the re-derived verdict) of an entry recorded as invalid: a deciding call
+    without a usable stored response decides the outcome (digest failure before unavailable); a deciding call whose
+    answer yields a parseable line for the entry is a mismatch; so is an entry no answered repair call carried (the
+    census would have left it open); otherwise it is invalid again, counted with the repair call that closed it."""
+    calls = [(call_id, checked[call_id]) for call_id in decided.calls]
+    for status in ("digest-failure", "unavailable"):
+        failed = next((call_id for call_id, result in calls if result.status == status), None)
+        if failed is not None:
+            return status, failed, None
+    quoted = row["quote"] is not None
+    for call_id, result in calls:
+        found = result.yielded.get(row["label"])
+        if found is not None:
+            view = {name: value for name, value in found.items() if name != "_compared"}
+            differs = [name for name in COMPARED if row[name] != found["_compared"][name]]
+            if quoted and _quote_view(row["quote"]) != view["quote"]:
+                differs.append("quote")
+            return "mismatched", call_id, {**view, "quoteCompared": quoted, "differs": differs, "calls": decided.calls}
+    derived = {"outcome": "invalid", "category": None, "support_verdict": None, "escalate": None}
+    view = {**_verdict_view(derived, row["label"]), "quoteCompared": quoted, "calls": decided.calls}
+    if decided.closing is None:
+        return "mismatched", (decided.calls[-1] if decided.calls else None), {
+            **view, "outcome": None, "differs": ["outcome"], "reason": "no answered repair call carried the entry"}
+    differs = [name for name in COMPARED if row[name] != derived[name]] + (["quote"] if quoted else [])
+    return ("mismatched" if differs else "replayed"), decided.closing, {**view, "differs": differs}
 
 
 # ----------------------------------------------------------------------------- the replay
@@ -464,7 +643,8 @@ def _calls(connection: sqlite3.Connection, call_ids: Sequence[str]) -> dict[str,
     """Receipts of the given calls with their transport row (a call recorded without one is a direct call)."""
     columns = ("call_id", "journal", "doi", "tier", "variant", "batch", "kind", "labels_json", "instrument_digest",
                "served_model", "error")
-    transport = ("transport", "request_sha256", "broker_job_id", "broker_item_id", "broker_request_sha256")
+    transport = ("transport", "request_sha256", "broker_job_id", "broker_item_id", "broker_request_sha256",
+                 "broker_error_code", "broker_http_status")
     joined = scores_db.has_table(connection, "call_transport")
     select = ", ".join([f"k.{name}" for name in columns] + [f"t.{name}" if joined else f"NULL AS {name}"
                                                             for name in transport])
@@ -496,6 +676,15 @@ class _Writer:
     def entries(self, rows: Sequence[tuple]) -> None:
         self.connection.executemany(f"INSERT INTO replay_entries({', '.join(ENTRY_COLUMNS)}) "
                                     f"VALUES({', '.join('?' * len(ENTRY_COLUMNS))})", rows)
+
+    def count(self, added: Mapping[str, Sequence[int]]) -> None:
+        """Entries counted with calls already written: (entries, replayed, mismatched) added per call; a replayed call
+        with a mismatched entry becomes mismatched."""
+        self.connection.executemany(
+            "UPDATE replay_calls SET n_entries=n_entries+?, n_replayed=n_replayed+?, n_mismatched=n_mismatched+?, "
+            "outcome=CASE WHEN outcome='replayed' AND ?>0 THEN 'mismatched' ELSE outcome END WHERE call_id=?",
+            [(entries, replayed, mismatched, mismatched, call_id)
+             for call_id, (entries, replayed, mismatched) in sorted(added.items())])
 
     def finish(self, record: Mapping[str, Any]) -> None:
         self.connection.executemany("INSERT INTO replay_meta VALUES(?,?)", [
@@ -534,27 +723,42 @@ def _context(meta: Mapping[str, str]) -> dict[str, Any]:
 
 
 def _replay(reader: sqlite3.Connection, writer: _Writer, items: Any, context: Mapping[str, Any]) -> dict[str, Any]:
-    entries = dict.fromkeys(ENTRY_OUTCOMES, 0)
-    calls = dict.fromkeys(CALL_OUTCOMES, 0)
-    # Entries decided without a model call.
-    outside = reader.execute(f"SELECT {', '.join(HISTORY_COLUMNS)} FROM history WHERE call_id IS NULL ORDER BY history_id")
+    history_rows, last_id = reader.execute("SELECT COUNT(*), COALESCE(MAX(history_id), 0) FROM history").fetchone()
+    # History rows that name no call: outside replay, unless answered calls decided them (an invalid output).
+    invalid: list[dict[str, Any]] = []
+    unnamed = reader.execute(f"SELECT {', '.join('h.' + name for name in HISTORY_COLUMNS)}, c.abs_basis FROM history h "
+                             "LEFT JOIN citations c ON c.journal=h.journal AND c.doi=h.doi AND c.label=h.label "
+                             "WHERE h.call_id IS NULL ORDER BY h.history_id")
     while True:
-        batch = outside.fetchmany(5000)
+        batch = unnamed.fetchmany(5000)
         if not batch:
             break
-        writer.entries([(None, row[7], row[3], "outside-replay", canonical(_verdict_view(dict(zip(HISTORY_COLUMNS, row)))),
-                         None, row[1], row[2], row[4], row[5], row[0]) for row in batch])
-        entries["outside-replay"] += len(batch)
-    # The history rows of each call (ids only: the rows are read per chunk of calls).
+        outside = []
+        for values in batch:
+            row = dict(zip(HISTORY_COLUMNS, values))
+            if decided_by_calls(row, values[len(HISTORY_COLUMNS)]):
+                invalid.append(row)
+            else:
+                outside.append((None, row["position"], row["label"], "outside-replay", canonical(_verdict_view(row)),
+                                None, row["journal"], row["doi"], row["tier"], row["variant"], row["history_id"]))
+        writer.entries(outside)
+    decided = _deciding(reader, invalid)
+    deciding: dict[str, set[str]] = {}
+    for row in invalid:
+        for call_id in decided[row["history_id"]].calls:
+            deciding.setdefault(call_id, set()).add(row["label"])
+    # The history rows of each call (ids only: the rows are read per chunk of calls), and the calls that decided
+    # invalid entries.
     by_call: dict[str, list[int]] = {}
     for call_id, history_id in reader.execute("SELECT call_id, history_id FROM history WHERE call_id IS NOT NULL"):
         by_call.setdefault(call_id, []).append(history_id)
-    call_ids = sorted(by_call)
+    call_ids = sorted(set(by_call) | set(deciding))
+    checked: dict[str, Checked] = {}
     for start in range(0, len(call_ids), CALL_CHUNK):
         chunk = call_ids[start:start + CALL_CHUNK]
         receipts = _calls(reader, chunk)
         rows: dict[str, list[dict[str, Any]]] = {}
-        for row in _history_rows(reader, [history_id for call_id in chunk for history_id in by_call[call_id]]):
+        for row in _history_rows(reader, [history_id for call_id in chunk for history_id in by_call.get(call_id, [])]):
             rows.setdefault(row["call_id"], []).append(row)
         keys = [(call["broker_job_id"], call["broker_item_id"]) for call in receipts.values()
                 if call.get("transport") == "broker" and call.get("broker_job_id") and call.get("broker_item_id")]
@@ -565,18 +769,37 @@ def _replay(reader: sqlite3.Connection, writer: _Writer, items: Any, context: Ma
                                                                       row["history_id"]))
             result = replay_call(call_id, receipts.get(call_id), ordered, fetched,
                                  required_model=context["requiredModel"], instrument_digest=context["instrumentDigest"],
-                                 now=writer.now)
+                                 now=writer.now, invalid=deciding.get(call_id, frozenset()))
             call_rows.append(result.call_row)
             entry_rows.extend(result.entry_rows)
-            calls[result.outcome] += 1
-            for row in result.entry_rows:
-                entries[row[3]] += 1
+            if call_id in deciding:
+                checked[call_id] = _checked(result, deciding[call_id])
         writer.calls(call_rows)
         writer.entries(entry_rows)
+    # Entries recorded as invalid: each counted with the call whose response decided its outcome.
+    rows_out, added = [], {}
+    for row in invalid:
+        outcome, call_id, view = _invalid_entry(row, decided[row["history_id"]], checked)
+        position = checked[call_id].positions.get(row["label"], row["position"]) if call_id is not None else row["position"]
+        rows_out.append((call_id, position, row["label"], outcome, canonical(_verdict_view(row)),
+                         None if view is None else canonical(view), row["journal"], row["doi"], row["tier"],
+                         row["variant"], row["history_id"]))
+        if call_id is not None:
+            counts = added.setdefault(call_id, [0, 0, 0])
+            counts[0] += 1
+            counts[1] += outcome == "replayed"
+            counts[2] += outcome == "mismatched"
+    writer.entries(rows_out)
+    writer.count(added)
+    entries = dict.fromkeys(ENTRY_OUTCOMES, 0)
+    entries.update(dict(writer.connection.execute("SELECT outcome, COUNT(*) FROM replay_entries GROUP BY outcome")))
+    calls = dict.fromkeys(CALL_OUTCOMES, 0)
+    calls.update(dict(writer.connection.execute("SELECT outcome, COUNT(*) FROM replay_calls GROUP BY outcome")))
     return {"replayed": entries["replayed"], "mismatched": entries["mismatched"],
             "outsideReplay": entries["outside-replay"], "unavailable": entries["unavailable"],
-            "digestFailures": entries["digest-failure"], "calls": len(call_ids), "entries": sum(entries.values()),
-            "callOutcomes": {name.replace("digest-failure", "digestFailure"): count for name, count in calls.items()}}
+            "digestFailures": entries["digest-failure"], "calls": sum(calls.values()), "entries": sum(entries.values()),
+            "callOutcomes": {name.replace("digest-failure", "digestFailure"): count for name, count in calls.items()},
+            "_extent": {"historyRows": history_rows, "maxHistoryId": last_id}}
 
 
 @contextmanager
@@ -585,6 +808,9 @@ def _census_lock(census: Path) -> Iterator[None]:
         descriptor = writer_lock(census)
     except ValidationError as error:
         raise ReplayInputError(str(error)) from error
+    except OSError as error:
+        raise ReplayInputError(f"the census database's writer lock cannot be taken ({type(error).__name__}): replay it "
+                               "into a separate file with --output") from error
     try:
         yield
     finally:
@@ -592,25 +818,61 @@ def _census_lock(census: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _record(context: Mapping[str, Any], summary: Mapping[str, Any], source: str, report: str, now: str,
-            revision: str | None) -> dict[str, Any]:
-    return {"format": FORMAT, "censusRunId": context.get("runId") or "", "instrumentDigest": context["instrumentDigest"],
-            "requiredModel": context["requiredModel"], "studyBundleSha256": context.get("studyBundleSha256") or "",
-            "source": source, "summary": summary, "reportSha256": report, "replayedAt": now,
-            "codeRevision": revision or code_revision()}
+def _record(context: Mapping[str, Any], summary: Mapping[str, Any], extent: Mapping[str, Any], source: str, report: str,
+            now: str, revision: str | None, census_sha256: str | None = None) -> dict[str, Any]:
+    record = {"format": FORMAT, "censusRunId": context.get("runId") or "", "instrumentDigest": context["instrumentDigest"],
+              "requiredModel": context["requiredModel"], "studyBundleSha256": context.get("studyBundleSha256") or "",
+              "source": source, "summary": summary, "reportSha256": report, "replayedAt": now,
+              "codeRevision": revision or code_revision(), "historyRows": extent["historyRows"],
+              "maxHistoryId": extent["maxHistoryId"]}
+    if census_sha256 is not None:
+        record["censusSha256"] = census_sha256
+    return record
+
+
+def _writable(census: Path) -> bool:
+    """Whether an in-place replay can write the census database: the file, and its directory for the rollback journal
+    and the writer lock."""
+    return os.access(census, os.W_OK) and os.access(census.parent, os.W_OK | os.X_OK)
+
+
+def _file_state(path: Path) -> tuple:
+    """What changes when a database file is written: inode, size and times of the file and of a write-ahead log."""
+    state = []
+    for candidate in (path, Path(str(path) + "-wal")):
+        try:
+            info = candidate.stat()
+        except FileNotFoundError:
+            state.append(None)
+            continue
+        state.append((info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+    return tuple(state)
 
 
 def replay(census: Path, items: Any, *, output: Path | None = None, revision: str | None = None) -> dict[str, Any]:
     """Replay the census database's verdicts against ``items`` (``SocketItems`` or ``ResponseItems``) and return the
-    summary. Without ``output`` the results go to new tables of the census database, under its writer lock and in one
-    transaction (a replay that stops leaves the earlier results, if any, as they were); with ``output`` the census
-    database is opened read-only and the results go to a new SQLite file, written beside it and renamed into place once
-    complete."""
+    summary. Without ``output`` the results go to new tables of the census database, which must be writable and not
+    frozen (checked before its writer lock is taken), under its writer lock and in one transaction (a replay that stops
+    leaves the earlier results, if any, as they were); with ``output`` the census database is opened read-only and the
+    results go to a new SQLite file, written beside it and renamed into place once complete, with the sha256 of the
+    census database it read (a census database that changes meanwhile ends the replay as a transient failure)."""
     census = Path(census)
     if not census.is_file():
         raise ReplayInputError(f"census database is missing: {census}")
     now = utc_now()
     if output is None:
+        try:
+            probe = scores_db.open_readonly(census)
+        except (ValidationError, sqlite3.DatabaseError) as error:
+            raise ReplayInputError(f"not a census scores database: {error}") from error
+        with closing(probe):
+            meta = scores_db.meta(probe)
+        if meta.get("frozen") == "1":
+            raise ReplayInputError("a frozen scores database is closed: replay it into a separate file with --output")
+        _context(meta)
+        if not _writable(census):
+            raise ReplayInputError("the census database cannot be written here (a read-only file or directory): replay "
+                                   "it into a separate file with --output")
         with _census_lock(census):
             try:
                 connection = scores_db.connect(census)
@@ -626,8 +888,9 @@ def replay(census: Path, items: Any, *, output: Path | None = None, revision: st
                 writer.begin()
                 try:
                     summary = _replay(connection, writer, items, context)
+                    extent = summary.pop("_extent")
                     summary["reportSha256"] = report_sha256(connection)
-                    writer.finish(_record(context, summary, items.kind, summary["reportSha256"], now, revision))
+                    writer.finish(_record(context, summary, extent, items.kind, summary["reportSha256"], now, revision))
                     connection.commit()
                 except BaseException:
                     connection.rollback()
@@ -636,10 +899,12 @@ def replay(census: Path, items: Any, *, output: Path | None = None, revision: st
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise ReplayInputError("the replay output already exists; write it to a new path")
+    before = _file_state(census)
     try:
+        census_sha256 = scores_db.file_sha256(census)
         reader = scores_db.open_readonly(census)
-    except ValidationError as error:
-        raise ReplayInputError(str(error)) from error
+    except (ValidationError, sqlite3.DatabaseError, OSError) as error:
+        raise ReplayInputError(f"not a readable census scores database: {error}") from error
     with closing(reader):
         context = _context(scores_db.meta(reader))
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -652,8 +917,13 @@ def replay(census: Path, items: Any, *, output: Path | None = None, revision: st
                 writer = _Writer(connection, now)
                 writer.begin()
                 summary = _replay(reader, writer, items, context)
+                extent = summary.pop("_extent")
                 summary["reportSha256"] = report_sha256(connection)
-                writer.finish(_record(context, summary, items.kind, summary["reportSha256"], now, revision))
+                writer.finish(_record(context, summary, extent, items.kind, summary["reportSha256"], now, revision,
+                                      census_sha256))
+                if _file_state(census) != before:
+                    raise TransientError("the census database changed while it was replayed: replay a frozen copy, or "
+                                         "run again once no census process writes it")
                 connection.commit()
             os.chmod(temporary, 0o444)
             os.replace(temporary, output)
@@ -675,8 +945,10 @@ def _items(args: Any) -> Any:
 
 def command(args: Any) -> CommandOutcome:
     """``study replay``: exit 0 when every entry in scope replays, 3 when any entry is mismatched, unavailable or a
-    digest failure, 2 when the input is invalid (``ReplayInputError``); a broker socket that stops answering ends it as
-    a transient failure (``TransientError``, exit 75) without results."""
+    digest failure, 2 when the input is invalid (``ReplayInputError``: also a census database an in-place replay cannot
+    write, or a broker socket that cannot serve the run's results); a broker socket that stops answering or keeps
+    refusing a result page, or a census database that changes while it is replayed into ``--output``, ends it as a
+    transient failure (``TransientError``, exit 75) without results."""
     try:
         summary = replay(Path(args.census), _items(args), output=Path(args.output) if getattr(args, "output", None) else None)
     except ValidationError as error:
