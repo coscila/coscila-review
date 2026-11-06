@@ -367,10 +367,24 @@ def _token_count(value: Any) -> int | None:
 BROKER_REFUSALS = frozenset({"INSTRUMENT_MESSAGE_MISMATCH", "PRINCIPAL_REQUIRED", "INVALID_REQUEST"})
 # Receipt errors of calls stopped as fidelity failures; status and facts count them apart from transport failures.
 FIDELITY_ERRORS = ("request_mismatch", "broker refused the instrument call:%")
+# The label parser's stage for the calls of each tier: first and repair calls of an abstract-tier batch, full-text calls.
+PARSER_STAGES = {"abstract": "abstract", "full-text": "fulltext"}
 
 
 def _http_status(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
+
+
+def broker_output_text(output: Any) -> str:
+    """The text the census reads from a completed broker item's output: a string as it is, any other value as its
+    JSON, and nothing for an item without output."""
+    return output if isinstance(output, str) else ("" if output is None else json.dumps(output, ensure_ascii=False))
+
+
+def parse_answer(text: str, labels: Sequence[str], *, tier: str) -> tuple[dict[str, Any], list[str], list[str]]:
+    """(records by label, problems, missing labels) of an answered call: the instrument's label parser at the stage of
+    the call's tier, for every call the census parses, repair calls included (``study replay`` parses the same way)."""
+    return C.parse_labels(text, labels, stage=PARSER_STAGES[tier])
 
 
 def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, required_model: str, call_id: str,
@@ -437,8 +451,7 @@ def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, requir
         if item.get("requestSha256") != expected:
             receipt["error"] = "request_mismatch"
             return CallResult(receipt, None, served, responded=False, stop="fidelity")
-        output = item.get("output")
-        text = output if isinstance(output, str) else ("" if output is None else json.dumps(output, ensure_ascii=False))
+        text = broker_output_text(item.get("output"))
         if not text.strip():
             # The judge answered with an empty completion (the broker asked again as a direct call would): an answer
             # without labels.
@@ -1155,7 +1168,7 @@ class CensusRun:
                 responded = responded or result.responded
                 continue
             responded, answered = True, True
-            records, problems, missing = C.parse_labels(result.text, labels, stage="abstract")
+            records, problems, missing = parse_answer(result.text, labels, tier="abstract")
             positions = {label: i + 1 for i, label in enumerate(labels)}
             accepted = {label: (record, positions[label]) for label, record in records.items()
                         if label in open_labels and label not in got}
@@ -1833,7 +1846,7 @@ class CensusRun:
             if answered:
                 return {**outcome, "missing": len(items)}
             return {**outcome, "failed": True, "recordedFailure": result.record}
-        records, problems, missing = C.parse_labels(result.text, labels, stage="fulltext")
+        records, problems, missing = parse_answer(result.text, labels, tier="full-text")
         self._receipt(result, journal=journal, doi=doi, tier="full-text", variant="primary", batch=index,
                       kind="full-text", labels=labels, parsed=len(records), missing=len(missing), problems=len(problems),
                       accepted=lambda cid, now: self._full_text_rows(journal, doi, items, records, cid, now))
