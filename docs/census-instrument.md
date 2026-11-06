@@ -863,7 +863,8 @@ q-values), `sanitizer_findings`, `input_provenance` (where each review document,
 abstract evidence unit and full-text source came from), `enumeration` (a pinned
 fresh enumeration), `exclusions` (enumerated reviews the protocol excluded, with
 their reasons), `manifest_comparisons` (counts of a stored manifest compared
-afterwards, with the population in the study and its digest) and
+afterwards, with the population in the study and its digest), after a replay
+`replay_calls`, `replay_entries` and `replay_meta` (see Replay), and
 `data_dictionary`; `reviews.provenance` and `citations.ft_provenance` carry the
 provenance class of the review document and of the full text behind each
 window, and `works.derivation` and `works.metadata_provenance` how a work record
@@ -936,7 +937,28 @@ enumerated reviews in the study and excluded at comparison time). The pinned
 store root, provider cache digest and enumeration digest are recorded with the
 input hashes. The export passes `ocsl-writing facts verify` unchanged;
 `ocsl-writing facts lint` then requires every numeral in a manuscript template
-to come from a fact token.
+to come from a fact token. A database that holds a replay (below) also exports
+`census.<journal>.replay.*` and `census.replay.*`: entries replayed, mismatched,
+unavailable, digest failures and outside replay, and the share replayed.
+
+## Replay
+
+`study replay --census <db> [--broker-socket <path> | --responses <jsonl>]
+[--output <db>]` re-derives every verdict a model call produced from the
+response the broker stores for the settled call, without a model call: the
+first and repair calls of an abstract-tier batch, full-text calls and the
+sensitivity variants. It checks each stored item against the receipts first
+(completed with the required served model, its request digest equal to the
+receipt's broker digest and to the canonical digest of the request the
+instrument built, its output digest equal to the digest of its output), parses
+it with the instrument's label parser and compares each entry with the history
+row of that call and position. Entries whose history row names no call are
+outside replay. The results go to `replay_calls`, `replay_entries` and
+`replay_meta`, in the census database or with `--output` in a separate file;
+the command prints a JSON summary with `reportSha256` and exits 0 when every
+entry in scope replays, 3 otherwise, 2 on invalid input. See
+[citation-census.md](citation-census.md#replay-a-registered-instrument-census)
+for the sources, the checks and the outcomes.
 
 ## Fidelity tests
 
