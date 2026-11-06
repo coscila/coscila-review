@@ -29,9 +29,12 @@ study bundle pinned by `study prepare --study-bundle`. Read
 unchanged and its decisions are recorded per entry. `study replay` re-derives
 the recorded verdicts from the responses the broker stores (over the run
 principal's socket, or from item results the lab exported), each checked against
-the receipts' request and output digests, without a model call; it runs before
-`study freeze`, so the facts report the share of verdicts replayed. Its sources,
-checks, outcomes and exit codes are in
+the receipts' request and output digests, without a model call: also the
+entries of calls the judge refused and the invalid outputs after the repair
+pass. It runs in place before `study freeze`, so the facts report the share of
+verdicts replayed (a replay made before more verdicts were recorded exports no
+replay facts); a sealed or frozen database is replayed with `--output`. Its
+sources, checks, outcomes and exit codes are in
 `$OCSL_REVIEW_HOME/docs/citation-census.md` (Replay a registered-instrument
 census).
 

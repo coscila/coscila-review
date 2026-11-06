@@ -69,11 +69,15 @@ revoked principal or a restarting daemon. Details:
 `$OCSL_REVIEW_HOME/docs/census-instrument.md`.
 
 `study replay --census <db>` reads the same socket afterwards and submits
-nothing: for each call the verdict history names it reads the call's item
-(`GET /jobs/<jobId>/results`), checks it against the receipts (request digests,
-output digest, served model) and re-derives the recorded verdicts without a
-model call. `--responses` takes the item results the lab exported instead.
-Sources, outcomes and exit codes: `$OCSL_REVIEW_HOME/docs/citation-census.md`.
+nothing: for each call that decided a recorded verdict it reads the call's item
+(`GET /jobs/<jobId>/results`), checks it against the receipts (request digests;
+output digest and served model of a completed item, the recorded refusal of a
+refused one) and re-derives the recorded verdicts without a model call.
+Only `WORKER_NOT_FOUND` makes a call's entries unavailable; a revoked
+principal's socket is invalid input (exit 2), and a socket that stops answering
+or keeps refusing a page is an outage (exit 75, nothing recorded).
+`--responses` takes the item results the lab exported instead. Sources,
+outcomes and exit codes: `$OCSL_REVIEW_HOME/docs/citation-census.md`.
 
 ## Durable execution
 
