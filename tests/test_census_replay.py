@@ -760,6 +760,16 @@ class DecidedWithoutVerdictTests(unittest.TestCase):
         query = "SELECT call_id, position, label, outcome, recorded_json, replayed_json FROM replay_entries ORDER BY 1, 2, 3"
         self.assertEqual(rows(exported, query), rows(output, query))
 
+    def test_calls_replayed_in_small_chunks_give_the_same_record(self):
+        # An invalid entry's deciding calls fall into different chunks of calls: the same report either way.
+        from ocsl_review import census_replay
+        responses = self.census.responses(self.root / "responses.jsonl")
+        whole = replay(self.database, ResponseItems(responses), output=self.root / "whole.sqlite3")
+        self.addCleanup(setattr, census_replay, "CALL_CHUNK", census_replay.CALL_CHUNK)
+        census_replay.CALL_CHUNK = 2
+        chunked = replay(self.database, ResponseItems(responses), output=self.root / "chunked.sqlite3")
+        self.assertEqual((whole["reportSha256"], whole["entries"]), (chunked["reportSha256"], chunked["entries"]))
+
     def test_an_export_without_the_refusal_fields_leaves_a_refused_call_unavailable(self):
         responses = self.census.responses(self.root / "responses.jsonl",
                                           omit={self.ids["refused"]: ("httpStatus", "attempts")})
