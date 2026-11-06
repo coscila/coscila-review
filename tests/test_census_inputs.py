@@ -1807,15 +1807,19 @@ class EuropePmcRateTests(unittest.TestCase):
         self.assertEqual([0.125, 30.0, 30.125], sleeps,
                          "the waiting request starts when the wait ends, the next one a turn later")
 
-    def test_retry_after_names_seconds_or_a_date_and_holds_at_most_fifteen_minutes(self):
+    def test_retry_after_names_seconds_or_a_date_and_holds_the_requests_as_long_as_it_names(self):
         import email.utils
         from datetime import datetime, timedelta, timezone
-        rate = census_inputs.RateLimit(8.0, clock=lambda: 0.0, sleep=lambda seconds: None)
+        sleeps = []
+        rate = census_inputs.RateLimit(8.0, clock=lambda: 0.0, sleep=sleeps.append)
         self.assertIsNone(rate.hold(500, {"Retry-After": "30"}), "only 429 and 503 answers hold the requests")
         self.assertIsNone(rate.hold(429, {}))
         self.assertIsNone(rate.hold(429, None))
         self.assertIsNone(rate.hold(503, {"Retry-After": "soon"}))
-        self.assertEqual(900.0, rate.hold(503, {"Retry-After": "86400"}))
+        # A maintenance window of an hour holds every request for the hour.
+        self.assertEqual(3600.0, rate.hold(503, {"Retry-After": "3600"}))
+        rate.wait()
+        self.assertEqual([3600.0], sleeps)
         when = email.utils.format_datetime(datetime.now(timezone.utc) + timedelta(seconds=120), usegmt=True)
         self.assertAlmostEqual(120.0, census_inputs.retry_after_seconds({"Retry-After": when}), delta=2.0)
         message = http.client.HTTPMessage()

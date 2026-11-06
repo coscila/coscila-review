@@ -382,9 +382,8 @@ covers the full-text fetches and their record checks, the
 abstract and metadata lookups of `study abstracts`, the search pages of `study
 enumerate` and the Europe PMC requests of `study acquire`. A 429 or 503 answer
 that names a wait in its Retry-After header (seconds or a date) holds every
-request of the command until the wait has passed, requests already waiting
-their turn included; one answer holds them for at most 15 minutes, and the next
-answer names the wait again. The request that got the answer is then retried as
+request of the command, requests already waiting their turn included, until
+that wait has passed. The request that got the answer is then retried as
 its step retries it.
 
 **Preparation.** `study prepare` with the same caches pins them (`inputStore`,

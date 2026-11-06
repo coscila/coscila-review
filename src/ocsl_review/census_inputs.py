@@ -611,9 +611,6 @@ def _record_identity(raw: Any, wanted: Mapping[str, str], scheme: str) -> tuple[
 EUROPE_PMC_REQUESTS_PER_SECOND = 8.0
 # Answers whose Retry-After header the census honours: too many requests, and the service unavailable.
 RETRY_AFTER_STATUSES = frozenset({429, 503})
-# The longest one Retry-After holds a host's requests; a longer wait (or a date a skewed clock puts far ahead) holds
-# them this long, and the host's next answer names the wait again.
-MAX_RETRY_AFTER_SECONDS = 900.0
 
 
 def retry_after_seconds(headers: Any) -> float | None:
@@ -671,14 +668,13 @@ class RateLimit:
                     return
 
     def hold(self, status: Any, headers: Any) -> float | None:
-        """Honour an answer's Retry-After: after a 429 or 503 that names a wait, no request starts before it ends (at
-        most MAX_RETRY_AFTER_SECONDS from now). Returns the wait, or None when the answer names none."""
+        """Honour an answer's Retry-After: after a 429 or 503 that names a wait, no request starts before it ends.
+        Returns the wait, or None when the answer names none."""
         if status not in RETRY_AFTER_STATUSES:
             return None
         seconds = retry_after_seconds(headers)
         if seconds is None:
             return None
-        seconds = min(seconds, MAX_RETRY_AFTER_SECONDS)
         with self._lock:
             self._held = max(self._held, self.clock() + seconds)
             self._holds += 1
