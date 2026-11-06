@@ -68,6 +68,13 @@ changed) and never judges an entry twice. A socket that is gone may mean a
 revoked principal or a restarting daemon. Details:
 `$OCSL_REVIEW_HOME/docs/census-instrument.md`.
 
+`study replay --census <db>` reads the same socket afterwards and submits
+nothing: for each call the verdict history names it reads the call's item
+(`GET /jobs/<jobId>/results`), checks it against the receipts (request digests,
+output digest, served model) and re-derives the recorded verdicts without a
+model call. `--responses` takes the item results the lab exported instead.
+Sources, outcomes and exit codes: `$OCSL_REVIEW_HOME/docs/citation-census.md`.
+
 ## Durable execution
 
 Run `corpus status`, then `corpus resume` to recover existing work. Use
