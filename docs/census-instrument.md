@@ -233,17 +233,22 @@ is always public, and the publisher page through doi.org under the route's
 class (entitled: the institution's licence). A review whose record has a DOI
 and no PMCID may still have a copy in PMC that Europe PMC holds as a record of
 its own, with the PMCID and without the DOI. In place of the PMCID's
-fullTextXML it gets one search for that copy (`TITLE:"<the record's title>" AND
-SRC:PMC`, the record's `enumeratedTitle` or else its `title`, lite records, one
-page of 10): a record on that page whose title is the review's (markup, case,
-punctuation and spacing aside) and that names no other DOI is fetched, and it
-is the review's document only when its JATS article-id names the review's DOI;
-the identity and article checks then apply as to any document. Such a review is
-`live-public` from provider `europe-pmc`, its acquisition records `link` (`by`
-`title+jats-doi`, the copy's PMCID and the search) and the acquire result
-counts it in `pmcCopies`. A failed search or fetch leaves the review in state
-`retry`; when the page holds no such copy, or only copies whose JATS names
-another DOI, the publisher page is tried next (the reasons go to `rejected`).
+fullTextXML it gets one search for that copy (`(TITLE:"<the record's title>"
+AND SRC:PMC) OR DOI:"<the review's DOI>"`, the record's `enumeratedTitle` or
+else its `title`, lite records, one page of 10): a record on that page whose
+title is the review's (markup, case, punctuation and spacing aside) and that
+names no other DOI is fetched, and it is the review's document only when its
+JATS article-id names the review's DOI; the identity and article checks then
+apply as to any document. Such a review is `live-public` from provider
+`europe-pmc`, its acquisition records `link` (`by` `title+jats-doi`, the copy's
+PMCID and the search) and the acquire result counts it in `pmcCopies`. The DOI
+in the search finds the review's own record, the one it was enumerated from, so
+an answer without a copy shows that there is none only when it holds that
+record: an empty or rebuilding index answers without the copy and without the
+record alike. Such an answer, a failed search and a failed fetch leave the
+review in state `retry`; when the page holds the review's own record and no
+such copy, or only copies whose JATS names another DOI, the publisher page is
+tried next (the reasons go to `rejected`).
 The enumeration and its kept pages are unchanged: Europe PMC lists the copy
 there as a record without a DOI. On an entitled route the publisher page and
 its linked table pages share one session cookie jar per

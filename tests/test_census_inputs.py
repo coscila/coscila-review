@@ -8,6 +8,7 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -1105,7 +1106,7 @@ class FreshEnumerationTests(CacheTestCase):
                         "WHERE kind='review'")[0]
         self.assertEqual((COPY_REVIEW, "live-public", "europe-pmc", FULL_TEXT % COPY_PMCID),
                          (row["doi"], row["provenance"], row["provider"], row["source_url"]))
-        self.assertEqual({"by": "title+jats-doi", "pmcid": COPY_PMCID, "search": f'TITLE:"{COPY_TITLE}" AND SRC:PMC'},
+        self.assertEqual({"by": "title+jats-doi", "pmcid": COPY_PMCID, "search": COPY_QUERY},
                          json.loads(row["detail_json"])["link"])
 
     def test_a_trimmed_or_empty_population_never_counts_as_complete(self):
@@ -1598,7 +1599,7 @@ class LiveFetchTests(unittest.TestCase):
 COPY_REVIEW = "10.5555/pmc.copy.review"                 # a review whose Europe PMC record has a DOI and no PMCID
 COPY_PMCID = "PMC13691543"                              # its copy in PMC: a record with the PMCID and without the DOI
 COPY_TITLE = "Synthetic review of zeta-kinase signalling in breast tumours"
-COPY_QUERY = f'TITLE:"{COPY_TITLE}" AND SRC:PMC'
+COPY_QUERY = f'(TITLE:"{COPY_TITLE}" AND SRC:PMC) OR DOI:"{COPY_REVIEW}"'
 
 
 def copy_jats(pmcid: str, doi: str | None, pmid: str | None = None) -> bytes:
@@ -1618,12 +1619,14 @@ def pmc_record(pmcid: str, title: str = COPY_TITLE, doi: str | None = None) -> d
 
 
 class PmcCopies:
-    """Europe PMC for reviews without a PMCID: the title search answers ``records`` (lite), fullTextXML serves
-    ``full_texts`` by PMCID (None for a PMCID without an open-access full text)."""
+    """Europe PMC for reviews without a PMCID: the copy search answers ``records`` (lite) for the title and the
+    review's own record (a MEDLINE record with the DOI) for the DOI it names, fullTextXML serves ``full_texts`` by
+    PMCID (None for a PMCID without an open-access full text). The first ``empty`` searches get the answer of an empty
+    index: a result list without any hit."""
 
-    def __init__(self, records=(), full_texts=None, failure=None):
+    def __init__(self, records=(), full_texts=None, failure=None, empty=0):
         self.records, self.full_texts, self.failure = list(records), dict(full_texts or {}), failure
-        self.searches, self.fetched = [], []
+        self.empty, self.searches, self.fetched = empty, [], []
 
     def search(self, params):
         self.searches.append(dict(params))
@@ -1631,7 +1634,12 @@ class PmcCopies:
             if isinstance(self.failure, Exception):
                 raise self.failure
             return self.failure
-        return json.dumps({"hitCount": len(self.records), "resultList": {"result": self.records}}).encode()
+        if len(self.searches) <= self.empty:
+            return json.dumps({"hitCount": 0, "resultList": {"result": []}}).encode()
+        own = [{"id": "42920861", "source": "MED", "pmid": "42920861", "doi": doi, "title": "Its record " + doi}
+               for doi in re.findall(r'DOI:"([^"]+)"', params["query"])]
+        results = self.records + own
+        return json.dumps({"hitCount": len(results), "resultList": {"result": results}}).encode()
 
     def fetch(self, pmcid):
         self.fetched.append(pmcid)
@@ -1705,6 +1713,31 @@ class PmcCopyTests(RunnerTestCase):
                 self.assertEqual([("publisher", "http-404"), ("europe-pmc", "transient")],
                                  [(item["provider"], item["reason"]) for item in result.detail["reasons"]])
                 self.assertIn("PMC copy search", result.detail["reasons"][1]["detail"])
+
+    def test_an_answer_without_the_reviews_own_record_shows_no_absence_of_a_copy(self):
+        landing = lambda url: (PAYWALL % COPY_REVIEW.encode(), PUBLISHER + "landing")
+        # An empty index, and a partial one that lacks the review's own record, answer without a copy: that is no
+        # answer, so the review stays for a later pass instead of closing as unavailable.
+        partial = json.dumps({"hitCount": 1, "resultList": {"result": [pmc_record("PMC2", "Corrigendum: " + COPY_TITLE)]}})
+        for index, copies in (("empty", PmcCopies(empty=1)), ("partial", PmcCopies(failure=partial.encode()))):
+            with self.subTest(index=index):
+                result = self.acquire(copies, publisher=landing)
+                self.assertEqual("retry", result.state)
+                self.assertEqual([("publisher", "not-the-article"), ("europe-pmc", "transient")],
+                                 [(item["provider"], item["reason"]) for item in result.detail["reasons"]])
+                self.assertIn("neither a copy nor the review's own record", result.detail["reasons"][1]["detail"])
+        # The first sweep, once the index answers again, reads the review from its copy.
+        copies = PmcCopies([pmc_record(COPY_PMCID)], {COPY_PMCID: copy_jats(COPY_PMCID, COPY_REVIEW)}, empty=1)
+        live = LiveSources(europe_pmc=copies.fetch, publisher=landing, search=copies.search)
+        source = self.root / "reviews.jsonl"
+        source.write_text(json.dumps({"journal": JOURNAL, "doi": COPY_REVIEW, "enumeratedTitle": COPY_TITLE}) + "\n")
+        waits = []
+        result = acquire_records(source, self.root / "acquired" / "reviews.jsonl", ReviewAcquirer(
+            None, routes=parse_routes([f"{JOURNAL}=public"]), live=live), sleep=waits.append)
+        self.assertEqual(({"live-public": 1}, 1, [60.0], None),
+                         (result["provenance"], result["pmcCopies"], waits, result["next"]))
+        self.assertEqual(([COPY_QUERY, COPY_QUERY], [COPY_PMCID]),
+                         ([search["query"] for search in copies.searches], copies.fetched))
 
     def test_a_review_with_a_pmcid_or_without_a_title_gets_no_search(self):
         copies = PmcCopies([pmc_record(COPY_PMCID)], {"PMC5": copy_jats("PMC5", COPY_REVIEW)})

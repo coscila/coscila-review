@@ -794,14 +794,18 @@ def page_fetcher(*, spacing: float = 1.0, attempts: int = 3, backoff: Sequence[f
 
 # A review whose Europe PMC record has a DOI and no PMCID can still have a copy in PMC, which Europe PMC holds as a
 # record of its own: with the PMCID and without the DOI. One search by the review's title among PMC's records finds it;
-# the records on the search's first page whose title is the review's are its candidates.
+# the records on the search's first page whose title is the review's are its candidates. The same search also asks for
+# the review's DOI, which finds the review's own record (the record it was enumerated from) in an index that answers:
+# an empty or rebuilding index answers without the copy and without that record alike.
 PMC_COPY_PAGE = 10
 
 
-def pmc_copy_query(title: Any) -> str | None:
-    """The search for a review's copy in PMC: its title as a phrase among PMC's records (None without a title)."""
+def pmc_copy_query(title: Any, doi: str) -> str | None:
+    """The search for a review's copy in PMC: its title as a phrase among PMC's records, or its DOI (None without a
+    title)."""
     phrase = " ".join(re.sub(r'["\\]', " ", display_text(title) or "").split())
-    return f'TITLE:"{phrase}" AND SRC:PMC' if phrase else None
+    named = re.sub(r'["\\]', "", doi)
+    return f'(TITLE:"{phrase}" AND SRC:PMC) OR DOI:"{named}"' if phrase else None
 
 
 def title_key(value: Any) -> str:
@@ -833,13 +837,15 @@ class LiveSources:
     def pmc_copy(self, doi: str, title: str):
         """The review's copy in PMC: (its fullTextXML, its address, how it was linked), or why there is none.
 
-        One search by the review's title among PMC's records (``pmc_copy_query``); a record on its page whose title is
-        the review's (``title_key``) and that names no other DOI is a candidate, and its fullTextXML is fetched. The
-        first candidate whose JATS article-id names the review's DOI is the copy. A failed search or fetch raises
-        RetryableFetch, so the review is acquired again later.
+        One search by the review's title among PMC's records and by its DOI (``pmc_copy_query``); a record on its page
+        whose title is the review's (``title_key``) and that names no other DOI is a candidate, and its fullTextXML is
+        fetched. The first candidate whose JATS article-id names the review's DOI is the copy. An answer without a
+        candidate shows that there is no copy only when it holds the review's own record (a record that names its
+        DOI), so the index that answered holds the review; an answer without either, a failed search and a failed fetch
+        raise RetryableFetch, so the review is acquired again later.
         """
         from .census_runner import RetryableFetch
-        query = pmc_copy_query(title)
+        query = pmc_copy_query(title, doi)
         try:
             page = self.search({"query": query, "resultType": "lite", "pageSize": PMC_COPY_PAGE, "format": "json"})
         except ProviderError as error:
@@ -848,13 +854,17 @@ class LiveSources:
             results = json.loads(page)["resultList"]["result"]
         except (ValueError, KeyError, TypeError) as error:
             raise RetryableFetch("PMC copy search: the answer is no Europe PMC result list") from error
-        wanted, candidates = title_key(title), []
+        wanted, candidates, indexed = title_key(title), [], False
         for item in results if isinstance(results, list) else []:
-            pmcid = normal_pmcid(item.get("pmcid")) if isinstance(item, dict) else None
-            if (pmcid and pmcid not in candidates and title_key(item.get("title")) == wanted
-                    and normal_doi(item.get("doi")) in (None, doi)):
+            if not isinstance(item, dict):
+                continue
+            named, pmcid = normal_doi(item.get("doi")), normal_pmcid(item.get("pmcid"))
+            indexed = indexed or named == doi
+            if pmcid and pmcid not in candidates and title_key(item.get("title")) == wanted and named in (None, doi):
                 candidates.append(pmcid)
         if not candidates:
+            if not indexed:
+                raise RetryableFetch("PMC copy search: the answer holds neither a copy nor the review's own record")
             return "no-pmc-copy"
         refused = []
         for pmcid in candidates:
@@ -892,8 +902,8 @@ class LiveSources:
                 body = self.europe_pmc(pmcid)
                 return (body, url) if body else "not-available"
             items.append(("jats", "public", "europe-pmc", url, europe_pmc))
-        elif self.europe_pmc is not None and self.search is not None and pmc_copy_query(title):
-            url = SEARCH + "?" + urllib.parse.urlencode({"query": pmc_copy_query(title)})
+        elif self.europe_pmc is not None and self.search is not None and pmc_copy_query(title, doi):
+            url = SEARCH + "?" + urllib.parse.urlencode({"query": pmc_copy_query(title, doi)})
             items.append(("jats", "public", "europe-pmc", url, lambda: self.pmc_copy(doi, title)))
         if self.publisher is not None:
             url = "https://doi.org/" + urllib.parse.quote(doi, safe="/()")
