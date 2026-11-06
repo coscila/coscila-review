@@ -24,7 +24,10 @@ from .errors import ValidationError
 SCHEMA_VERSION = 1
 TABLES = ("meta", "reviews", "citations", "loci", "works", "identity", "evidence", "calls", "call_transport", "history",
           "review_scores", "work_scores", "sanitizer_findings", "input_provenance", "enumeration", "exclusions",
-          "manifest_comparisons", "persistent_failures", "data_dictionary")
+          "manifest_comparisons", "persistent_failures", "replay_calls", "replay_entries", "replay_meta",
+          "data_dictionary")
+# Tables of ``study replay`` (census_replay): created by a replay, in the scores database or in a file of their own.
+REPLAY_TABLES = ("replay_calls", "replay_entries", "replay_meta")
 # Execution state documented in the data dictionary but never exported, and emptied in a frozen database.
 EXECUTION_TABLES = ("pending_calls",)
 PROVENANCE = ("cache-hit-public", "cache-hit-entitled", "live-public", "live-entitled", "unavailable", "supplied")
@@ -163,6 +166,26 @@ CREATE TRIGGER IF NOT EXISTS calls_no_update BEFORE UPDATE ON calls
   BEGIN SELECT RAISE(ABORT, 'call receipts are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS call_transport_no_update BEFORE UPDATE ON call_transport
   BEGIN SELECT RAISE(ABORT, 'call receipts are immutable'); END;
+"""
+
+# ``study replay`` creates these when it runs (never with the scores tables), so their presence means a replay ran. A
+# replay written to a file of its own documents its tables there in a data dictionary of the same shape.
+REPLAY_DDL = """
+CREATE TABLE IF NOT EXISTS data_dictionary(
+  table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
+  PRIMARY KEY(table_name, column_name));
+CREATE TABLE IF NOT EXISTS replay_calls(
+  call_id TEXT PRIMARY KEY, job_id TEXT, item_id TEXT,
+  outcome TEXT NOT NULL CHECK(outcome IN ('replayed', 'mismatched', 'unavailable', 'digest-failure')),
+  output_sha256 TEXT, request_sha256 TEXT, n_entries INTEGER NOT NULL, n_replayed INTEGER NOT NULL,
+  n_mismatched INTEGER NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replay_entries(
+  call_id TEXT, position INTEGER, label TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK(outcome IN ('replayed', 'mismatched', 'unavailable', 'digest-failure', 'outside-replay')),
+  recorded_json TEXT, replayed_json TEXT, journal TEXT NOT NULL, doi TEXT NOT NULL, tier TEXT NOT NULL,
+  variant TEXT NOT NULL, history_id INTEGER UNIQUE);
+CREATE INDEX IF NOT EXISTS ix_replay_entries_journal ON replay_entries(journal, outcome);
+CREATE TABLE IF NOT EXISTS replay_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 DICTIONARY: dict[str, dict[str, str]] = {
@@ -373,6 +396,41 @@ DICTIONARY: dict[str, dict[str, str]] = {
                    "labels closed as unsure and invalid outputs): after 3 counted invocations, the first and the last "
                    "at least 2 h apart",
         "closed_at": "time the failure was closed (UTC)"},
+    "replay_calls": {
+        "call_id": "call receipt (calls.call_id) of a call the verdict history names",
+        "job_id": "broker job that settled the call (call_transport.broker_job_id); NULL for a direct call",
+        "item_id": "broker item replay read (call_transport.broker_item_id, the call id)",
+        "outcome": "replayed (every entry of the call replayed), mismatched (the stored response passed every check and "
+                   "at least one entry differs), unavailable (no stored response: a direct call, a call without a "
+                   "receipt or a broker job, an item the broker does not hold or that did not complete) or "
+                   "digest-failure (the stored response failed a check against the receipts)",
+        "output_sha256": "sha256 of the stored output as the daemon digests it (a string as its UTF-8 bytes, any other "
+                         "value as JSON.stringify writes it); NULL when no completed item was read",
+        "request_sha256": "requestSha256 the stored item reports",
+        "n_entries": "entries of the call: its history rows and the verdicts its answer yields that the history lacks",
+        "n_replayed": "entries of the call whose re-derived verdict equals the recorded one",
+        "n_mismatched": "entries of the call whose re-derived verdict differs from the recorded one",
+        "detail_json": "the checks (request digests, output digest, served model, instrument digest), the item's state "
+                       "and failure code, why the call did not replay, and counts of parsed labels and parser problems; "
+                       "never output text",
+        "created_at": "replay time (UTC)"},
+    "replay_entries": {
+        "call_id": "call that decided the entry; NULL outside replay",
+        "position": "position in the call (1-based), as the history row records it",
+        "label": "bibliography label",
+        "outcome": "replayed, mismatched, unavailable or digest-failure (the call's outcome), or outside-replay (the "
+                   "history row names no call: decided without a model call, such as an unresolved identity, an "
+                   "entry never cited or an invalid output after repair)",
+        "recorded_json": "the recorded verdict as compared: outcome, label, category, support verdict, escalate and the "
+                         "quote as sha256:<hex> (NULL when redacted); NULL for a verdict the history lacks",
+        "replayed_json": "the verdict re-derived from the stored response, with the same fields, whether the quote was "
+                         "compared and the fields that differ; NULL when the call's response could not be used",
+        "journal": "journal", "doi": "review DOI", "tier": "abstract or full-text",
+        "variant": "primary or a predeclared sensitivity",
+        "history_id": "history row compared (NULL for a verdict the history lacks)"},
+    "replay_meta": {"key": "replay record: format, census run, instrument digest and required model, response source, "
+                           "summary, report digest, replay time and code revision",
+                    "value": "value"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }
 
@@ -420,9 +478,9 @@ def has_table(connection: sqlite3.Connection, table: str) -> bool:
     return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
 
-def write_dictionary(connection: sqlite3.Connection) -> None:
+def write_dictionary(connection: sqlite3.Connection, tables: Iterable[str] = TABLES + EXECUTION_TABLES) -> None:
     rows = []
-    for table in TABLES + EXECUTION_TABLES:
+    for table in tables:
         declared = {r[1]: r[2] for r in connection.execute(f"PRAGMA table_info({table})")}
         meanings = DICTIONARY.get(table, {})
         missing = set(declared) - set(meanings)
@@ -587,7 +645,8 @@ def redact_entitled(connection: sqlite3.Connection) -> dict[str, int]:
 def freeze_source_state(connection: sqlite3.Connection) -> str:
     """A digest of what a freeze copies from a working database: the append-only receipts and verdict history, the
     provenance, evidence and population tables (row counts and their last row), the persistent failures (their rows),
-    the reviews by state and the run metadata. A freeze leaves all of these as they were, so a frozen copy that records
+    the record of a replay (``replay_meta``), the reviews by state and the run metadata. A freeze leaves all of these as
+    they were, so a frozen copy that records
     this digest is exactly the copy a new freeze of the same database would write."""
     parts: dict[str, Any] = {}
     for table in ("calls", "call_transport", "history", "input_provenance", "evidence", "enumeration", "exclusions",
@@ -598,6 +657,9 @@ def freeze_source_state(connection: sqlite3.Connection) -> str:
         # Its rows change in place (counted invocations, closing): their content, not their count.
         parts["persistent_failures"] = [list(row) for row in connection.execute(
             "SELECT * FROM persistent_failures ORDER BY kind, journal, doi, unit")]
+    if has_table(connection, "replay_meta"):
+        # A replay's record (its report digest and time): a replay after a freeze leaves that frozen copy stale.
+        parts["replay"] = [list(row) for row in connection.execute("SELECT key, value FROM replay_meta ORDER BY key")]
     parts["reviews"] = [list(row) for row in connection.execute(
         "SELECT abstract_state, full_text_state, COUNT(*) FROM reviews GROUP BY 1, 2 ORDER BY 1, 2")]
     parts["meta"] = [list(row) for row in connection.execute("SELECT key, value FROM meta ORDER BY key")]
