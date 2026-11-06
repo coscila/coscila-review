@@ -855,7 +855,8 @@ class FactsTests(unittest.TestCase):
             self.assertEqual(3, code)
             frozen = root / "scores.sqlite3"
             scores_db.freeze(work, frozen)
-            corpus_facts.export_facts(frozen, root / "facts", ["J1", "J2"], b=50, seed=3, code_revision="rev-test")
+            result = corpus_facts.export_facts(frozen, root / "facts", ["J1", "J2"], b=50, seed=3, code_revision="rev-test")
+            self.assertTrue(result["replay"]["exported"])
             facts = json.loads((root / "facts" / "facts.json").read_text())["facts"]
             # build_scores records its no-truncation rows and deterministic outcomes without calls.
             outside = {journal: len(rows(work, "SELECT 1 FROM history WHERE journal=? AND call_id IS NULL", journal))
@@ -869,6 +870,7 @@ class FactsTests(unittest.TestCase):
                         "census.replay.entries": summary["entries"], "census.replay.replayed": summary["replayed"],
                         "census.replay.share_replayed": 2 / 4}
             self.assertEqual(expected, {key: facts[key]["value"] for key in expected})
+            self.assertIn("replay_meta", facts["census.replay.share_replayed"]["sql"], "the derivation checks coverage")
             self.assertTrue(corpus_facts.verify_export(root / "facts" / "facts.json")["ok"])
             bundle = json.loads((root / "facts" / "facts.json").read_text())
             bundle["facts"]["census.j1.replay.replayed"]["value"] = 3
@@ -877,14 +879,53 @@ class FactsTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 corpus_facts.verify_export(mutated)
 
+    def test_replay_facts_need_a_replay_that_covers_the_frozen_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = root / "work.sqlite3"
+            build_scores(work)
+            with closing(scores_db.connect(work)) as connection:
+                census = SyntheticCensus(work, journal="J1", doi="r1", connection=connection)
+                census.call("j1-a", ["1", "2"], "\n".join([line("1"), line("2")]))
+                census.commit()
+                code, _, _ = cli("study", "replay", "--census", str(work), "--responses",
+                                 str(census.responses(root / "responses.jsonl")))
+                self.assertEqual(0, code)
+                replayed = connection.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+                # A verdict recorded after the replay: the replay no longer covers the history.
+                census.call("j1-b", ["3"], line("3"))
+                census.commit()
+                responses = census.responses(root / "responses.jsonl")
+            stale = root / "stale.sqlite3"
+            scores_db.freeze(work, stale)
+            result = corpus_facts.export_facts(stale, root / "stale-facts", ["J1"], b=20, seed=1, code_revision="r")
+            facts = json.loads((root / "stale-facts" / "facts.json").read_text())["facts"]
+            self.assertFalse([key for key in facts if ".replay." in key])
+            self.assertEqual((False, replayed, replayed + 1), tuple(result["replay"][key] for key in (
+                "exported", "replayedHistoryRows", "historyRows")))
+            self.assertIn("replay the census again", result["replay"]["reason"])
+            # Replayed again before freezing: the facts are exported and verified.
+            code, _, _ = cli("study", "replay", "--census", str(work), "--responses", str(responses))
+            self.assertEqual(0, code)
+            frozen = root / "scores.sqlite3"
+            scores_db.freeze(work, frozen)
+            result = corpus_facts.export_facts(frozen, root / "facts", ["J1"], b=20, seed=1, code_revision="r")
+            self.assertTrue(result["replay"]["exported"])
+            facts = json.loads((root / "facts" / "facts.json").read_text())["facts"]
+            self.assertEqual((3, 1.0), (facts["census.j1.replay.replayed"]["value"],
+                                        facts["census.replay.share_replayed"]["value"]))
+            self.assertTrue(corpus_facts.verify_export(root / "facts" / "facts.json")["ok"])
+
     def test_no_replay_facts_without_a_replay(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             build_scores(root / "work.sqlite3")
             scores_db.freeze(root / "work.sqlite3", root / "scores.sqlite3")
-            corpus_facts.export_facts(root / "scores.sqlite3", root / "facts", ["J1"], b=20, seed=1, code_revision="r")
+            result = corpus_facts.export_facts(root / "scores.sqlite3", root / "facts", ["J1"], b=20, seed=1,
+                                               code_revision="r")
             facts = json.loads((root / "facts" / "facts.json").read_text())["facts"]
             self.assertFalse([key for key in facts if ".replay." in key])
+            self.assertNotIn("replay", result)
 
 
 class RunnerReplayTests(BrokerTestCase):
