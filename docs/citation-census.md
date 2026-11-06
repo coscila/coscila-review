@@ -167,6 +167,76 @@ statistics require an explicitly specified analysis. Judgments of other runs
 are not human labels. Parser tests, schema checks and fixture success do not
 establish live-provider scientific accuracy.
 
+## Replay a registered-instrument census
+
+A `citation-census@1` study (`ocsl-review study`, see
+[census-instrument.md](census-instrument.md)) records every verdict a model call
+produced in the scores database's append-only `history`, with the call and the
+position in the call. `study replay` re-derives those verdicts from the
+responses the broker stores for the settled calls, without a model call:
+
+```bash
+"$OCSL_REVIEW_HOME/bin/ocsl-review" study replay --census work/census.sqlite3 \
+  --broker-socket "$OCSL_BROKER_SOCKET"
+"$OCSL_REVIEW_HOME/bin/ocsl-review" study replay --census results/scores.sqlite3 \
+  --responses results/items.jsonl --output results/replay.sqlite3
+```
+
+For each call the history names, replay reads the call's item (the job and item
+of its `call_transport` row) over the run principal's socket
+(`GET /jobs/<jobId>/results?after&limit`, as the judging steps read results;
+`--broker-socket`, by default `OCSL_BROKER_SOCKET`), or from the JSON lines
+`{"jobId","itemId","state","output","outputDigest","requestSha256","servedModel"}`
+the lab exports from the daemon's job results (`--responses`; a later line for
+the same job and item replaces an earlier one). The daemon keeps the items of
+settled jobs, also once it has archived them. An item is parsed only when it
+completed with the instrument's required served model, its `requestSha256`
+equals both the broker's request digest in the call's receipt
+(`broker_request_sha256`) and the canonical digest of the request the instrument
+built (`request_sha256`), and its `outputDigest` equals the digest of its output
+computed as the daemon computes it (a string as its UTF-8 bytes, any other value
+as `JSON.stringify` writes it). The census database must be pinned to the
+installed instrument's digest, so that the parser is the census's.
+
+A response that passes is parsed exactly as the census parsed it: the
+instrument's label parser at the call's tier, for first and repair calls of an
+abstract-tier batch, full-text calls and the sensitivity variants. Each
+re-derived entry is compared with the history row of that call and position on
+outcome, label, category, support verdict and escalation, and on the quote
+unless the recorded quote was redacted. Every history row gets one outcome:
+
+| Outcome | Meaning |
+| --- | --- |
+| `replayed` | the re-derived verdict equals the recorded one |
+| `mismatched` | it differs, or the answer yields a verdict the history lacks (counted as an entry as well) |
+| `unavailable` | the call has no stored response: a direct call, a history call id without a receipt, a receipt without a broker job, an item the broker does not hold or one that did not complete (a request the judge refused has no response) |
+| `digest-failure` | the stored response failed a check: request digests, output digest, served model or instrument digest |
+| `outside-replay` | the row names no call: decided without a model call (an entry never cited, without an identified work, or without a parseable line after the repair pass) |
+
+The results go to `replay_calls` (one row per call: job, item, outcome, the
+output and request digests and the checks), `replay_entries` (one row per entry:
+the recorded and the re-derived verdict as compared) and `replay_meta`: new
+tables of the census database, which must then be writable (the working
+database, under its writer lock and in one transaction; a later replay replaces
+them), or with `--output` a new SQLite file, written beside its final name and
+renamed into place read-only, while the census database (a frozen copy, for
+example) is only read. Neither table holds output text: verdict fields are
+compared one by one, and quotes are kept as `sha256:` digests.
+
+The command prints one JSON summary: the entries `replayed`, `mismatched`,
+`outsideReplay`, `unavailable` and `digestFailures`, the `calls` replayed, all
+`entries`, and `reportSha256`, the sha256 over both result tables' rows in a
+fixed order (recomputable from them). It exits 0 when every entry in scope
+replays, 3 when any entry is mismatched, unavailable or a digest failure, and 2
+on invalid input. A socket that stops answering is an outage, not a call without
+a stored response: the command then ends as a transient failure (exit 75) and
+records nothing, so it can run again. When the scores database holds a replay
+(an in-place replay before `study freeze`), `study facts` exports
+`census.<journal>.replay.{entries,replayed,mismatched,unavailable,digest_failures,outside_replay,share_replayed}`
+and the same over all journals (`census.replay.*`) as SQL facts, which
+`study verify-facts` executes again. `share_replayed` divides the replayed
+entries by the entries a model call decided (all but those outside replay).
+
 Synthetic integration coverage is in `tests/test_census.py`, with original
 Apache-2.0 JATS fixture `tests/fixtures/citation_census_canary.xml`. No historical
 project scripts, research results or publisher manuscript text were copied.
