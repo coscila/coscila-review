@@ -375,6 +375,34 @@ def _http_status(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
 
 
+def judge_refusal(item: Mapping[str, Any]) -> int | None:
+    """The HTTP status of a broker item the judge server refused (INVALID_REQUEST after at least one provider call,
+    HTTP 400, 413 or 422): the census counts it as an answer without labels. None for any other item."""
+    status = _http_status(item.get("httpStatus"))
+    if (str(item.get("errorCode") or "INTERNAL") == "INVALID_REQUEST" and _token_count(item.get("attempts"))
+            and status in REFUSED_STATUS):
+        return status
+    return None
+
+
+def refusal_error(status: int) -> str:
+    """The receipt error of a broker call the judge server refused (``judge_refusal``)."""
+    return f"refused: broker INVALID_REQUEST (HTTP {status})"
+
+
+# Receipt errors of a direct call the judge server refused (``execute``: the status of the refusal).
+DIRECT_REFUSALS = frozenset(f"HTTP {status}" for status in REFUSED_STATUS)
+
+
+def call_answered(error: str | None) -> bool:
+    """Whether a call receipt records an answer of the judge: text (no error), an empty completion, or the judge
+    server's refusal of the request itself (``refusal_error`` through the broker, ``DIRECT_REFUSALS`` for a direct
+    call). Any other error (a transport failure, model drift, a fidelity stop) records no answer."""
+    if error is None:
+        return True
+    return error.startswith(("empty content;", "refused: ")) or error in DIRECT_REFUSALS
+
+
 def broker_output_text(output: Any) -> str:
     """The text the census reads from a completed broker item's output: a string as it is, any other value as its
     JSON, and nothing for an item without output."""
@@ -459,9 +487,10 @@ def execute_broker(transport: Any, payload: dict[str, Any], *, tier: str, requir
             return CallResult(receipt, None, served)
         return CallResult(receipt, text, served)
     code = str(item.get("errorCode") or "INTERNAL")
-    if code == "INVALID_REQUEST" and receipt["attempts"] and status in REFUSED_STATUS:
+    refused = judge_refusal(item)
+    if refused is not None:
         # The judge server refused this very request (HTTP 400, 413 or 422): an answer without labels.
-        receipt["error"] = f"refused: broker INVALID_REQUEST (HTTP {status})"
+        receipt["error"] = refusal_error(refused)
         return CallResult(receipt, None, None, responded=True)
     if code in BROKER_REFUSALS and not receipt["attempts"]:
         # The broker refused the item before any provider call: it would not send the request the instrument built.
@@ -558,6 +587,14 @@ def steady_throughput(passes: Sequence[Sequence[tuple[float, float, int]]], stre
         return {"basis": "busy", "entries": busy_entries, "seconds": round(busy_seconds, 3),
                 "entriesPerSecond": round(busy_entries / busy_seconds, 3), "batches": batches, "streams": streams}
     return None
+
+
+def call_id_for(run_id: str, journal: str, doi: str, tier: str, variant: str, batch: int, kind: str, nonce: int,
+                labels: Sequence[str] | None = None) -> str:
+    """The receipt id of the call of a batch and kind that follows ``nonce`` recorded calls of that batch and kind: the
+    census numbers them in the order it recorded them (``CensusRun._call_id``), so the ids give that order back."""
+    base = canonical([run_id, journal, doi, tier, variant, batch, kind] + ([list(labels)] if labels else []))
+    return "call-" + sha256_text(base + ":" + str(nonce))[:24]
 
 
 def repair_items(batch: Sequence[dict[str, Any]], open_labels: Iterable[str],
@@ -963,12 +1000,11 @@ class CensusRun:
         names its labels: chunks are numbered per pass, and a call still pending from an earlier pass keeps its id
         beside a new chunk of the same number.
         """
-        base = canonical([self.run_id, journal, doi, tier, variant, batch, kind] + ([list(labels)] if labels else []))
         with self.lock:
             nonce = self.connection.execute(
                 "SELECT COUNT(*) FROM calls WHERE run_id=? AND journal=? AND doi=? AND tier=? AND variant=? AND batch=? AND kind=?",
                 (self.run_id, journal, doi, tier, variant, batch, kind)).fetchone()[0]
-        return "call-" + sha256_text(base + ":" + str(nonce))[:24]
+        return call_id_for(self.run_id, journal, doi, tier, variant, batch, kind, nonce, labels)
 
     def _broker(self) -> bool:
         return getattr(self.transport, "kind", None) == "broker"
