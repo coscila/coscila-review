@@ -141,9 +141,9 @@ CREATE TABLE IF NOT EXISTS manifest_comparisons(
   PRIMARY KEY(label, journal, stratum));
 CREATE TABLE IF NOT EXISTS persistent_failures(
   kind TEXT NOT NULL CHECK(kind IN ('full-text-fetch', 'abstract-batch')), journal TEXT NOT NULL, doi TEXT NOT NULL,
-  unit TEXT NOT NULL, labels_json TEXT NOT NULL, invocations INTEGER NOT NULL, others_succeeded INTEGER NOT NULL,
-  first_failed_at TEXT NOT NULL, last_failed_at TEXT NOT NULL, last_invocation TEXT NOT NULL, outcome TEXT,
-  closed_at TEXT, PRIMARY KEY(kind, journal, doi, unit));
+  unit TEXT NOT NULL, labels_json TEXT NOT NULL, invocations INTEGER NOT NULL, first_failed_at TEXT NOT NULL,
+  last_failed_at TEXT NOT NULL, last_invocation TEXT NOT NULL, outcome TEXT, closed_at TEXT,
+  PRIMARY KEY(kind, journal, doi, unit));
 CREATE TABLE IF NOT EXISTS data_dictionary(
   table_name TEXT NOT NULL, column_name TEXT NOT NULL, type TEXT NOT NULL, meaning TEXT NOT NULL,
   PRIMARY KEY(table_name, column_name));
@@ -362,16 +362,16 @@ DICTIONARY: dict[str, dict[str, str]] = {
         "journal": "journal", "doi": "review DOI",
         "unit": "the entry's label (full-text-fetch) or the batch index within the review (abstract-batch)",
         "labels_json": "labels the failure kept open, in batch order (the labels closed, once closed)",
-        "invocations": "census invocations that counted the failure: a fetch only in an invocation in which another "
-                       "fetch succeeded; a batch in every invocation except one in which other calls went unanswered "
-                       "and none was answered (an outage)",
-        "others_succeeded": "1 when another fetch succeeded or another call was answered in a counted invocation",
+        "invocations": "census invocations that counted the failure, each one in which the service answered others: "
+                       "for a fetch, another fetch returned a full text (with none, a full text the census already read, "
+                       "fetched again); for a batch, another batch was answered (with no other batch sent, a call the "
+                       "judge answered before, sent again)",
         "first_failed_at": "time of the first counted failure (UTC)",
         "last_failed_at": "time of the latest counted failure (UTC)",
         "last_invocation": "id of the latest invocation that counted the failure",
         "outcome": "NULL while open; persistentError (the entry closed as fetch-failed) or invalid:no-response (the "
                    "labels closed as unsure and invalid outputs): after 3 counted invocations, the first and the last "
-                   "at least 2 h apart, with another fetch or call succeeding",
+                   "at least 2 h apart",
         "closed_at": "time the failure was closed (UTC)"},
     "data_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
 }

@@ -624,12 +624,16 @@ fetch failed counts in an invocation in which another fetch returned a full
 text; when none has yet, one fetch of a full text the census already read tells
 a failure of that work from an outage. It closes as `fetch-failed` with reason
 `persistentError`, never a support verdict. An abstract-tier batch no call
-answered counts in every invocation except one in which other batches went
-unanswered and none was answered (an outage), and closes only when another
-batch was answered in one of its counted invocations: its open entries become
-`invalid:no-response`, unsure and invalid outputs, outside the sensitivity
-samples (no call answered them). An item that fails only during an outage
-therefore never closes. The database keeps every such item in
+answered counts in an invocation in which another batch was answered. When no
+other batch was sent (it is the last one open), the first call of the
+journal's batch the judge answered last is built again from its review's items
+and sent once more (its answer is neither recorded nor parsed): the batch's
+failure counts only when that call is answered, which tells a failure of that
+batch from an outage. An invocation in which other batches were sent and none
+was answered counts for none of them. Such a batch closes with its open
+entries as `invalid:no-response`, unsure and invalid outputs, outside the
+sensitivity samples (no call answered them). An invocation during an outage
+therefore counts for no item. The database keeps every such item in
 `persistent_failures` (invocations counted, first and last failure, outcome),
 `status` reports the closed ones by journal (`persistentFailures`) and `gates`
 notes them. `replicate`
