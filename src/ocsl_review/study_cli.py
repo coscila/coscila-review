@@ -7,8 +7,9 @@ review's own bibliography, look up cited-work abstracts and metadata from the
 study's byte caches or live routes, record protocol exclusions, prepare reviews
 from a manifest (pinning the study bundle), run the abstract and full-text
 tiers directly or through the run principal's broker socket, the predeclared
-no-truncation sensitivity, gates, freezing, exports, estimands and facts, and
-compare a stored manifest with the fresh enumeration afterwards.
+no-truncation sensitivity, gates, freezing, exports, estimands and facts,
+compare a stored manifest with the fresh enumeration afterwards, and replay the
+recorded verdicts from the responses the broker stores, without model calls.
 ``instruments export`` prints the broker bundle of a verbatim instrument.
 """
 from __future__ import annotations
@@ -63,7 +64,7 @@ def add_commands(families, register):
     actions = study.add_subparsers(dest="study_command", required=True)
     for name in ("enumerate", "acquire", "works", "abstracts", "exclude", "prepare", "judge", "full-text",
                  "no-truncation", "replicate", "status", "gates", "freeze", "export", "estimands", "facts", "verify-facts",
-                 "cross-validate", "compare-manifest"):
+                 "cross-validate", "compare-manifest", "replay"):
         command = actions.add_parser(name)
         if name in ("exclude", "prepare", "judge", "full-text", "no-truncation", "replicate", "status", "gates", "freeze",
                     "compare-manifest"):
@@ -188,6 +189,20 @@ def add_commands(families, register):
             command.add_argument("--jats", required=True, help="JATS document of a review")
             command.add_argument("--html", required=True, help="publisher HTML of the same review")
             command.add_argument("--minimum-share", type=float, default=0.95)
+        if name == "replay":
+            command.add_argument("--census", required=True,
+                                 help="census scores database whose recorded verdicts are replayed (a frozen copy needs "
+                                      "--output)")
+            source = command.add_mutually_exclusive_group()
+            source.add_argument("--broker-socket",
+                                help="the run principal's broker socket the census's calls ran through (default: "
+                                     "OCSL_BROKER_SOCKET); each call's item is read from GET /jobs/<jobId>/results")
+            source.add_argument("--responses",
+                                help="JSON lines of the calls' stored item results {jobId, itemId, state, output, "
+                                     "outputDigest, requestSha256, servedModel}, as the lab exports them from the daemon")
+            command.add_argument("--output",
+                                 help="new SQLite file for the replay tables; the census database is then only read "
+                                      "(default: new tables in the census database)")
         trust = "read-only" if name in ("status", "gates", "estimands", "verify-facts", "cross-validate") else "workspace"
         register(command, "study_cli", "command", trust, state_required=False)
 
@@ -922,6 +937,9 @@ def command(args) -> Any:
     if action == "verify-facts":
         from .corpus_facts import verify_export
         return verify_export(Path(args.facts))
+    if action == "replay":
+        from .census_replay import command as replay_command
+        return replay_command(args)
     if action == "cross-validate":
         from .census_extraction import cross_validate, cross_validation_gate, extract_review, uncovered_gate
         jats = extract_review(Path(args.jats).read_bytes())
