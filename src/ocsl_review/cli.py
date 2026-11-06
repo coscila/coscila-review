@@ -25,7 +25,7 @@ from .errors import (
     TrustBoundaryError,
     ValidationError,
 )
-from .util import CommandResult
+from .util import CommandOutcome, CommandResult
 
 OPERATOR = "operator"
 READ_ONLY = "read-only"
@@ -571,6 +571,10 @@ def _run(raw: list[str], outcome: dict[str, Any], *, keep_exit: bool) -> int:
             if result.stderr:
                 sys.stderr.write(result.stderr)
             return result.returncode
+        if isinstance(result, CommandOutcome):
+            outcome["result"] = result.result
+            _emit(result.result, as_json=bool(getattr(args, "json", False)))
+            return result.exit_code
         if result is not None:
             outcome["result"] = result
             _emit(result, as_json=bool(getattr(args, "json", False)))

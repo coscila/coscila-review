@@ -91,6 +91,15 @@ class CommandResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class CommandOutcome:
+    """A command's JSON result with the exit code it ends with (for example a replay that found mismatches): the
+    result is printed and recorded in the result file as for any command, and the process exits with ``exit_code``."""
+
+    exit_code: int
+    result: Any
+
+
 def run_command(
     argv: Sequence[str | os.PathLike[str]],
     *,
