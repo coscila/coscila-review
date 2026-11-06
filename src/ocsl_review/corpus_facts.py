@@ -362,6 +362,43 @@ def _comparison_totals(connection: sqlite3.Connection) -> dict[str, tuple[str, s
     return facts
 
 
+# Entry outcomes of ``study replay`` (replay_entries.outcome) and the fact name of each.
+REPLAY_OUTCOMES = (("replayed", "replayed", "entries whose verdict re-derived from the stored response equals the recorded one"),
+                   ("mismatched", "mismatched", "entries whose re-derived verdict differs from the recorded one, or "
+                                                "verdicts a replayed answer yields that the history lacks"),
+                   ("unavailable", "unavailable", "entries of calls without a stored response (a direct call, an item "
+                                                  "the broker no longer holds or that did not complete)"),
+                   ("digest_failures", "digest-failure", "entries of calls whose stored response failed a check against "
+                                                         "the receipts (request digests, output digest, served model)"),
+                   ("outside_replay", "outside-replay", "entries decided without a model call (no call in the history)"))
+
+
+def _replay_cells(where: str, scope: str) -> dict[str, tuple[str, str]]:
+    e = f"FROM replay_entries WHERE {where}"
+    facts = {"entries": (f"SELECT COUNT(*) {e}", f"verdict history rows replay compared, {scope}, and verdicts a "
+                                                 "replayed answer yields that the history lacks")}
+    for name, outcome, meaning in REPLAY_OUTCOMES:
+        facts[name] = (f"SELECT COUNT(*) {e} AND outcome={_quote(outcome)}", f"{meaning}, {scope}")
+    facts["share_replayed"] = (f"SELECT 1.0*SUM(outcome='replayed')/NULLIF(SUM(outcome!='outside-replay'),0) {e}",
+                               f"share of the entries a model call decided whose verdict replayed without a model "
+                               f"call, {scope}")
+    return facts
+
+
+def _replay_facts(connection: sqlite3.Connection, journal: str) -> dict[str, tuple[str, str]]:
+    """A replay's outcome per journal (``study replay``), when the database holds one."""
+    if not scores_db.has_table(connection, "replay_entries"):
+        return {}
+    return {f"replay.{name}": value for name, value in _replay_cells(f"journal={_quote(journal)}", "this journal").items()}
+
+
+def _replay_totals(connection: sqlite3.Connection) -> dict[str, tuple[str, str]]:
+    """A replay's outcome over every journal of the study, when the database holds one."""
+    if not scores_db.has_table(connection, "replay_entries"):
+        return {}
+    return {f"census.replay.{name}": value for name, value in _replay_cells("1=1", "all journals").items()}
+
+
 def _store(estimates: list[tuple], key: str, value: Any, estimand: str, journal: str | None, detail: Mapping[str, Any]) -> None:
     if value is None or isinstance(value, bool) or (isinstance(value, float) and not math.isfinite(value)):
         return
@@ -450,9 +487,10 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
         estimates, report = compute_estimates(frozen, journals, b=b, seed=seed, ratio_pair=ratio_pair,
                                               trend_years=trend_years, panels=panels)
         coverage = {journal: {**_coverage_facts(frozen, journal), **_provenance_facts(frozen, journal),
-                              **_enumeration_facts(frozen, journal), **_full_text_route_facts(frozen, journal)}
+                              **_enumeration_facts(frozen, journal), **_full_text_route_facts(frozen, journal),
+                              **_replay_facts(frozen, journal)}
                     for journal in journals}
-        totals = _comparison_totals(frozen)
+        totals = {**_comparison_totals(frozen), **_replay_totals(frozen)}
         frozen.execute("VACUUM INTO ?", (str(database),))
     scores_sha = scores_db.file_sha256(scores_path)
     revision = code_revision or _revision()
