@@ -150,11 +150,11 @@ interrupted run resumes; the output appears once every record is written and
 the sweeps are done. Four records are looked up at a time and written in the
 input's order, so the output, and the partial file a stopped run leaves, hold
 exactly what one record at a time writes; every lookup keeps the census's
-Europe PMC rate. A DOI that a lookup of the invocation answered (with a record
-or without one) is answered from that lookup for every later work citing it,
-with its retrieval time; a failed lookup, an answer without a result list and
-a page that lists fewer records than its hit count leave the DOIs they did not
-list to be asked again, and PMID lookups are always asked.
+Europe PMC rate. A DOI whose record a lookup of the invocation found is
+answered from that record for every later work citing it, with its retrieval
+time; a DOI no answer listed a record for (an empty or rebuilding index answers
+without any) and a failed lookup are asked again by the next work citing them,
+and PMID lookups are always asked.
 
 Document paths are relative to the manifest. A review without a document, or
 whose document cannot be read (missing file, digest mismatch, an inconsistent

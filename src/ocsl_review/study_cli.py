@@ -580,9 +580,9 @@ def fill_abstracts(source: Path, output: Path, get: Any, *, overwrite: bool = Fa
 
     ``workers`` records (census_inputs.ACQUISITION_WORKERS by default) are looked up at the same time and written in
     the input's order (census_inputs.in_order), so the output, and the partial file an interrupted run leaves, hold
-    exactly what one record at a time would have written; every lookup keeps the census's Europe PMC rate. A DOI one
-    lookup of the invocation answered (a record, or none) is answered from that lookup for every later work citing it
-    (census_abstracts.DoiRecords); a failed lookup is asked again.
+    exactly what one record at a time would have written; every lookup keeps the census's Europe PMC rate. A DOI whose
+    record one lookup of the invocation found is answered from that record for every later work citing it
+    (census_abstracts.DoiRecords); a DOI no lookup found a record for, and a failed lookup, is asked again.
 
     ``cache`` (census_inputs.InputCaches) is asked before the live lookup for every work. Works whose lookup failed in
     transport are looked up again, and only they, in sweeps after the main pass (census_inputs.sweep_partial: waiting
