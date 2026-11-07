@@ -26,7 +26,17 @@ broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`) once the operator has
 installed the bundles that `ocsl-review instruments export` prints, with the
 study bundle pinned by `study prepare --study-bundle`. Read
 `$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the instrument runs
-unchanged and its decisions are recorded per entry.
+unchanged and its decisions are recorded per entry. `study replay` re-derives
+the recorded verdicts from the responses the broker stores (over the run
+principal's socket, or from item results the lab exported), each checked against
+the receipts' request and output digests, without a model call: also the
+entries of calls the judge refused and the invalid outputs after the repair
+pass. It runs in place before `study freeze`, so the facts report the share of
+verdicts replayed (a replay made before more verdicts were recorded exports no
+replay facts); a sealed or frozen database is replayed with `--output`. Its
+sources, checks, outcomes and exit codes are in
+`$OCSL_REVIEW_HOME/docs/citation-census.md` (Replay a registered-instrument
+census).
 
 For a multi-paper corpus and a database that can support future questions, start
 with `ocsl-review-reference-analysis`. This census skill also supplies the
