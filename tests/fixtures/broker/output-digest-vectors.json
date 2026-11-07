@@ -1,0 +1,89 @@
+{
+  "format": "output-digest-vectors-v1",
+  "description": "Item outputs and the text and sha256 a broker receipt's outputDigest covers: a string as its UTF-8 bytes (a lone surrogate as U+FFFD), any other value as JSON.stringify writes it. outputJson is the output as JSON text, parsed by the reader's own JSON parser; a vector without it has no output.",
+  "vectors": [
+    {
+      "name": "no output",
+      "text": "",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "name": "null output",
+      "outputJson": "null",
+      "text": "null",
+      "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+      "bytes": 4
+    },
+    {
+      "name": "empty string",
+      "outputJson": "\"\"",
+      "text": "",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "name": "census answer lines",
+      "outputJson": "\"{\\\"l\\\":\\\"1\\\",\\\"c\\\":\\\"T\\\",\\\"v\\\":\\\"direct\\\",\\\"q\\\":\\\"\\\",\\\"e\\\":0,\\\"r\\\":\\\"The abstract states the finding.\\\"}\\n{\\\"l\\\":\\\"2\\\",\\\"c\\\":\\\"F\\\",\\\"v\\\":\\\"contra\\\",\\\"q\\\":\\\"no effect on zeta-kinase é\\\",\\\"e\\\":0,\\\"r\\\":\\\"Contradicted.\\\"}\\n\\ntrailing prose the parser ignores\"",
+      "text": "{\"l\":\"1\",\"c\":\"T\",\"v\":\"direct\",\"q\":\"\",\"e\":0,\"r\":\"The abstract states the finding.\"}\n{\"l\":\"2\",\"c\":\"F\",\"v\":\"contra\",\"q\":\"no effect on zeta-kinase é\",\"e\":0,\"r\":\"Contradicted.\"}\n\ntrailing prose the parser ignores",
+      "sha256": "0a8bb83e82e859cb0b2623a78a237a51d5065ca577132d15defec3919f8e1a7a",
+      "bytes": 208
+    },
+    {
+      "name": "text beyond ASCII",
+      "outputJson": "\"\\u0394 é 漢字 \\ud83d\\ude00 \\u2028 end\"",
+      "text": "Δ é 漢字 😀   end",
+      "sha256": "0a60b5128458406f623954f7623071899506df69a200fe6a5ae2a9177f5583bc",
+      "bytes": 25
+    },
+    {
+      "name": "lone surrogates in text",
+      "outputJson": "\"a\\ud800b\\udc00c\\ud83d\"",
+      "text": "a\ud800b\udc00c\ud83d",
+      "sha256": "b2385e821b1575f38dd7e3ca2f320afeebad29d61c19a84380d698cda306eb2c",
+      "bytes": 12
+    },
+    {
+      "name": "numbers",
+      "outputJson": "[0, -0, -0.0, 1.0, 1e21, 1.5e-7, 0.1, 123456789012345678901, 100, -3.25, 1e300, 5e-324, 0.000001, 1e-7, 2.5e+22, 9007199254740993, -1.5e-10, 1e400]",
+      "text": "[0,0,0,1,1e+21,1.5e-7,0.1,123456789012345680000,100,-3.25,1e+300,5e-324,0.000001,1e-7,2.5e+22,9007199254740992,-1.5e-10,null]",
+      "sha256": "51083c57e8d38796c881c2cbe98e8b0067c2db162fc4a4d5e951ddfc3e64fe16",
+      "bytes": 125
+    },
+    {
+      "name": "literals",
+      "outputJson": "[true, false, null, \"\"]",
+      "text": "[true,false,null,\"\"]",
+      "sha256": "c08ea2a8c49c9760a68728347d24c85357c90da7f475bc42b7468d82757a8be6",
+      "bytes": 20
+    },
+    {
+      "name": "object key order",
+      "outputJson": "{\"b\": 1, \"2\": [1, 2.5, \"x\"], \"a\": {\"z\": null, \"10\": true, \"01\": false}, \"1\": \"é\", \"4294967295\": 5, \"4294967294\": 6, \"-1\": 7, \"1.5\": 8, \"\": 9}",
+      "text": "{\"1\":\"é\",\"2\":[1,2.5,\"x\"],\"4294967294\":6,\"b\":1,\"a\":{\"10\":true,\"z\":null,\"01\":false},\"4294967295\":5,\"-1\":7,\"1.5\":8,\"\":9}",
+      "sha256": "87f779f78fbdd1f1ec335d17866eb18040c22085b3c4fc0cbbbbf8c373868faf",
+      "bytes": 118
+    },
+    {
+      "name": "escapes in strings",
+      "outputJson": "{\"s\": \"line\\nnext\\t\\\"q\\\" \\\\ \\u0001 \\u001f \\u007f / \\b\\f\\r\", \"\\ud800\": \"\\udfff\", \"\\ud83d\\ude00\": \"é\"}",
+      "text": "{\"s\":\"line\\nnext\\t\\\"q\\\" \\\\ \\u0001 \\u001f  / \\b\\f\\r\",\"\\ud800\":\"\\udfff\",\"😀\":\"é\"}",
+      "sha256": "ebb71064fff542db76a29d84cec18831d0f774e900453493a33d310eee16ec9d",
+      "bytes": 83
+    },
+    {
+      "name": "nested values",
+      "outputJson": "[{\"l\": \"1\", \"c\": \"T\"}, [[], {}], {\"x\": {\"y\": [1, {\"z\": 0.5}]}}]",
+      "text": "[{\"l\":\"1\",\"c\":\"T\"},[[],{}],{\"x\":{\"y\":[1,{\"z\":0.5}]}}]",
+      "sha256": "49c8c70775c894c7d85cb3d7aef213de3c91299b59d452d7944c566328fbe089",
+      "bytes": 53
+    },
+    {
+      "name": "duplicate keys",
+      "outputJson": "{\"a\": 1, \"b\": 2, \"a\": 3}",
+      "text": "{\"a\":3,\"b\":2}",
+      "sha256": "493df656a590967c84d643bdd55ee956fb53262c51b154115083c9bcc4c992e3",
+      "bytes": 13
+    }
+  ]
+}

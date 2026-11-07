@@ -362,6 +362,73 @@ def _comparison_totals(connection: sqlite3.Connection) -> dict[str, tuple[str, s
     return facts
 
 
+# Entry outcomes of ``study replay`` (replay_entries.outcome) and the fact name of each.
+REPLAY_OUTCOMES = (("replayed", "replayed", "entries whose verdict re-derived from the stored responses equals the "
+                                            "recorded one"),
+                   ("mismatched", "mismatched", "entries whose re-derived verdict differs from the recorded one, or "
+                                                "verdicts a replayed answer yields that the history lacks"),
+                   ("unavailable", "unavailable", "entries of calls without a stored response (a direct call, an item "
+                                                  "the broker no longer holds, one that did not settle or failed in "
+                                                  "transport)"),
+                   ("digest_failures", "digest-failure", "entries of calls whose stored response failed a check against "
+                                                         "the receipts (request digests, output digest, served model, "
+                                                         "recorded refusal)"),
+                   ("outside_replay", "outside-replay", "entries no answered call decided (decided without a model call, "
+                                                        "or closed after no call of their batch was answered)"))
+# A replay covers the frozen history when the verdict history rows it compared are the history's, by count and last id
+# (``replay_meta``): a verdict recorded after the replay leaves it stale, and its facts are not exported. Every replay
+# fact's derivation checks this again.
+REPLAY_COVERS = ("CAST((SELECT value FROM replay_meta WHERE key='historyRows') AS INTEGER)=(SELECT COUNT(*) FROM history) "
+                 "AND CAST((SELECT value FROM replay_meta WHERE key='maxHistoryId') AS INTEGER)="
+                 "(SELECT COALESCE(MAX(history_id), 0) FROM history)")
+
+
+def _replay_cells(where: str, scope: str) -> dict[str, tuple[str, str]]:
+    e = f"FROM replay_entries WHERE {where}"
+
+    def covered(select: str) -> str:
+        return f"SELECT CASE WHEN {REPLAY_COVERS} THEN ({select}) END"
+    facts = {"entries": (covered(f"SELECT COUNT(*) {e}"), f"verdict history rows replay compared, {scope}, and verdicts "
+                                                          "a replayed answer yields that the history lacks")}
+    for name, outcome, meaning in REPLAY_OUTCOMES:
+        facts[name] = (covered(f"SELECT COUNT(*) {e} AND outcome={_quote(outcome)}"), f"{meaning}, {scope}")
+    facts["share_replayed"] = (covered(f"SELECT 1.0*SUM(outcome='replayed')/NULLIF(SUM(outcome!='outside-replay'),0) {e}"),
+                               f"share of the entries answered calls decided whose verdict replayed without a model "
+                               f"call, {scope}")
+    return facts
+
+
+def replay_coverage(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    """Whether the replay a scores database holds (``study replay``) covers its verdict history: the history rows and
+    last history id the replay compared and the history's own. None when the database holds no replay."""
+    if not scores_db.has_table(connection, "replay_entries") or not scores_db.has_table(connection, "replay_meta"):
+        return None
+    record = dict(connection.execute("SELECT key, value FROM replay_meta WHERE key IN ('historyRows', 'maxHistoryId')"))
+    rows, last = connection.execute("SELECT COUNT(*), COALESCE(MAX(history_id), 0) FROM history").fetchone()
+    covered = bool(connection.execute(f"SELECT {REPLAY_COVERS}").fetchone()[0])
+    def recorded(key: str) -> int | None:
+        try:
+            return int(record[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+    coverage = {"exported": covered, "historyRows": rows, "maxHistoryId": last,
+                "replayedHistoryRows": recorded("historyRows"), "replayedMaxHistoryId": recorded("maxHistoryId")}
+    if not covered:
+        coverage["reason"] = ("the replay compared another verdict history than the frozen one: replay the census again "
+                              "before freezing to export its facts")
+    return coverage
+
+
+def _replay_facts(journal: str) -> dict[str, tuple[str, str]]:
+    """A replay's outcome per journal (``study replay``)."""
+    return {f"replay.{name}": value for name, value in _replay_cells(f"journal={_quote(journal)}", "this journal").items()}
+
+
+def _replay_totals() -> dict[str, tuple[str, str]]:
+    """A replay's outcome over every journal of the study."""
+    return {f"census.replay.{name}": value for name, value in _replay_cells("1=1", "all journals").items()}
+
+
 def _store(estimates: list[tuple], key: str, value: Any, estimand: str, journal: str | None, detail: Mapping[str, Any]) -> None:
     if value is None or isinstance(value, bool) or (isinstance(value, float) and not math.isfinite(value)):
         return
@@ -449,10 +516,14 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
             raise ValidationError("unknown journals: " + ", ".join(sorted(missing)))
         estimates, report = compute_estimates(frozen, journals, b=b, seed=seed, ratio_pair=ratio_pair,
                                               trend_years=trend_years, panels=panels)
+        # A replay's facts only while it covers the frozen history (``replay_coverage``).
+        replay = replay_coverage(frozen)
+        replayed = bool(replay and replay["exported"])
         coverage = {journal: {**_coverage_facts(frozen, journal), **_provenance_facts(frozen, journal),
-                              **_enumeration_facts(frozen, journal), **_full_text_route_facts(frozen, journal)}
+                              **_enumeration_facts(frozen, journal), **_full_text_route_facts(frozen, journal),
+                              **(_replay_facts(journal) if replayed else {})}
                     for journal in journals}
-        totals = _comparison_totals(frozen)
+        totals = {**_comparison_totals(frozen), **(_replay_totals() if replayed else {})}
         frozen.execute("VACUUM INTO ?", (str(database),))
     scores_sha = scores_db.file_sha256(scores_path)
     revision = code_revision or _revision()
@@ -512,8 +583,11 @@ def export_facts(scores_path: Path, output: Path, journals: Sequence[str], *, b:
     partial = output / ".facts.json.incoming"
     partial.write_text(json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     os.replace(partial, bundle_path)
-    return {"facts": str(bundle_path), "database": str(database), "databaseSha256": database_sha,
-            "count": len(facts), "report": report}
+    result = {"facts": str(bundle_path), "database": str(database), "databaseSha256": database_sha,
+              "count": len(facts), "report": report}
+    if replay is not None:
+        result["replay"] = replay
+    return result
 
 
 def _exported_already(bundle_path: Path, database: Path, scores_path: Path, journals: Sequence[str], *, b: int,
