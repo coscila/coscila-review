@@ -905,8 +905,12 @@ headline is F / (T + F) at the abstract tier, escalated F included.
   corresponding-author country (descriptive), each with both intervals. Labels
   that give the same key (lower case, every run of characters other than a-z
   and 0-9 as one hyphen) are one cell, so two spellings of a country pool
-  their reviews; the cell carries the spelling of most reviews and its facts
-  list the pooled spellings (`derivation.labels`).
+  their reviews; the cell carries the spelling of most reviews (reviews with a
+  classifiable entry; of equally frequent spellings the first in label order)
+  and its facts list the pooled spellings (`derivation.labels`). A missing
+  label, an empty one and `None` have the key `unknown`. A label without any
+  of a-z and 0-9 has no key: it stays a cell of its own, and `study facts`
+  refuses the export naming it.
 - Ratio of two journals' headline shares with a bootstrap interval; the year
   trend is the OLS slope of the yearly share with a bootstrap stratified by year.
 - Predeclared sensitivity ladder (escalated F without full text, F without a

@@ -387,8 +387,10 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
             _store(estimates, f"census.{s}.headline_{name}_hi", hi, f"headline {name} upper bound", journal, detail)
         for by, table in result["panels"].items():
             for cell, value in table["cells"].items():
-                # The key the panel pools labels by, so no two cells of a panel share one; slug refuses an empty key.
-                prefix = f"census.{s}.{by}.{E.cell_key(cell) or slug(cell)}"
+                cell_name = E.cell_key(cell)        # the key the panel pools labels by: no two of its cells share one
+                if not cell_name:
+                    raise ValidationError(f"cannot derive a fact key from the {by} cell {cell!r} of {journal}")
+                prefix = f"census.{s}.{by}.{cell_name}"
                 cell_detail = {**detail, "panel": by, "cell": cell}
                 if "labels" in value:
                     cell_detail["labels"] = value["labels"]

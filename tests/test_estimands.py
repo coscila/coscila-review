@@ -304,15 +304,30 @@ class DatabaseEstimandTests(unittest.TestCase):
 class PooledCellTests(unittest.TestCase):
     """Labels with the same cell key are one panel cell. J1's reviews r1, r2 and r3 hold 2 F of 5, 3 of 5 and 1 of 2."""
 
-    def cells(self, countries):
+    # J2's reviews s1 (0 F of 4) and s2 (1 F of 4) as reviews of J1.
+    ONE_JOURNAL = ("UPDATE reviews SET journal='J1' WHERE journal='J2'", "UPDATE citations SET journal='J1' WHERE journal='J2'")
+
+    def cells(self, countries, *statements):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "scores.sqlite3"
             build_scores(path)
             with closing(sqlite3.connect(path)) as c:
+                for statement in statements:
+                    c.execute(statement)
                 c.executemany("UPDATE reviews SET country=? WHERE journal='J1' AND doi=?",
                               [(country, doi) for doi, country in countries.items()])
                 c.commit()
                 return E.panel(c, "J1", "country", b=200, seed=5)["cells"]
+
+    def test_a_cell_of_one_spelling_is_computed_under_its_label(self):
+        with tempfile.TemporaryDirectory() as temp:
+            build_scores(Path(temp) / "scores.sqlite3")
+            with closing(sqlite3.connect(Path(temp) / "scores.sqlite3")) as c:
+                strata = E.panel(c, "J1", "stratum", b=200, seed=5)
+                units = E.denominator_units(c, "J1", "doi IN ('r1','r2')")
+        # The bootstrap is seeded with the label as it is spelled, not with its key.
+        self.assertEqual(E.summarise(units, strata["icc"], b=200, seed=5, scope=("panel", "J1", "stratum", "Review")),
+                         strata["cells"]["Review"])
 
     def test_cell_key(self):
         self.assertEqual("united-kingdom", E.cell_key("United Kingdom"))
@@ -329,11 +344,25 @@ class PooledCellTests(unittest.TestCase):
         # Counts, intervals and bootstrap are those of the same reviews under one spelling.
         self.assertEqual(self.cells({"r1": "United Kingdom", "r2": "United Kingdom", "r3": "Italy"}), pooled)
 
+    def test_a_pooled_cell_holds_its_reviews_in_the_order_of_one_spelling(self):
+        # The spellings in label order hold r1 and r3, then r2: the bootstrap draws from r1, r2, r3 all the same.
+        pooled = self.cells({"r1": "B x", "r2": "b-x", "r3": "B x"})
+        self.assertEqual(["B x", "b-x"], pooled["B x"].pop("labels"))
+        self.assertEqual(self.cells({"r1": "B x", "r2": "B x", "r3": "B x"}), pooled)
+
     def test_a_pooled_cell_carries_the_spelling_of_most_reviews(self):
         cells = self.cells({"r1": "Hong Kong SAR, China", "r2": "Hong Kong, SAR China", "r3": "Hong Kong, SAR China"})
         self.assertEqual(["Hong Kong, SAR China"], list(cells))
         self.assertEqual(["Hong Kong SAR, China", "Hong Kong, SAR China"], cells["Hong Kong, SAR China"]["labels"])
         self.assertEqual((6, 12, 3), tuple(cells["Hong Kong, SAR China"][name] for name in ("k", "n", "reviews")))
+        # Reviews decide, not entries: one review with five entries against two reviews with two each.
+        cells = self.cells({"r1": "Big One", "r2": "Italy", "r3": "big-one", "s1": "big-one", "s2": "Italy"}, *self.ONE_JOURNAL,
+                           "UPDATE citations SET cited_inbody=0 WHERE journal='J1' AND doi='s1' AND label IN ('1','2')")
+        self.assertEqual((["Big One", "big-one"], 9, 3), tuple(cells["big-one"][name] for name in ("labels", "n", "reviews")))
+
+    def test_cells_stand_in_the_order_of_their_labels(self):
+        cells = self.cells({"r1": "A x", "r2": "a-x", "r3": "a-x", "s1": "B", "s2": "B"}, *self.ONE_JOURNAL)
+        self.assertEqual(["B", "a-x"], list(cells))
 
     def test_a_missing_label_pools_with_unknown(self):
         cells = self.cells({"r1": None, "r2": "Unknown", "r3": "Italy"})
