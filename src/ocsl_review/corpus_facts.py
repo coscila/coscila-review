@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import time
+from collections import Counter
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -453,9 +454,13 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
             _store(estimates, f"census.{s}.headline_{name}_hi", hi, f"headline {name} upper bound", journal, detail)
         for by, table in result["panels"].items():
             for cell, value in table["cells"].items():
-                cell_key = slug(cell) if cell not in ("None", "") else "unknown"
-                prefix = f"census.{s}.{by}.{cell_key}"
+                cell_name = E.cell_key(cell)        # the key the panel pools labels by: no two of its cells share one
+                if not cell_name:
+                    raise ValidationError(f"cannot derive a fact key from the {by} cell {cell!r} of {journal}")
+                prefix = f"census.{s}.{by}.{cell_name}"
                 cell_detail = {**detail, "panel": by, "cell": cell}
+                if "labels" in value:
+                    cell_detail["labels"] = value["labels"]
                 _store(estimates, prefix + ".share", value["share"], "cell F/(T+F)", journal, cell_detail)
                 _store(estimates, prefix + ".n", value["n"], "cell T + F", journal, cell_detail)
                 _store(estimates, prefix + ".reviews", value["reviews"], "cell reviews", journal, cell_detail)
@@ -482,6 +487,9 @@ def compute_estimates(connection: sqlite3.Connection, journals: Sequence[str], *
         detail = {"estimand": "ratio of headline shares", "b": b, "seed": seed}
         for name in ("estimate", "lo", "hi"):
             _store(estimates, f"{key}.{name}", r.get(name), "ratio of headline shares", None, detail)
+    shared = sorted(key for key, count in Counter(row[0] for row in estimates).items() if count > 1)
+    if shared:
+        raise ValidationError("several estimates share a fact key: " + ", ".join(shared[:5]))
     return estimates, report
 
 

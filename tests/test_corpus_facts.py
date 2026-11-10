@@ -150,5 +150,50 @@ class FactsExportTests(unittest.TestCase):
             corpus_facts.slug("  ")
 
 
+class FactKeyTests(unittest.TestCase):
+    """Every estimate has a key of its own, whatever the labels in the scores."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+
+    def export(self, statement: str, journals=("J1", "J2")) -> dict:
+        """The facts of the small census after ``statement`` changed its reviews."""
+        build_scores(self.root / "work.sqlite3")
+        with closing(sqlite3.connect(self.root / "work.sqlite3")) as c:
+            c.execute(statement)
+            c.commit()
+        scores_db.freeze(self.root / "work.sqlite3", self.root / "scores.sqlite3")
+        corpus_facts.export_facts(self.root / "scores.sqlite3", self.root / "facts", list(journals), b=100, seed=11,
+                                  code_revision="rev-test")
+        return json.loads((self.root / "facts" / "facts.json").read_text())["facts"]
+
+    def test_two_spellings_of_a_country_give_one_cell_of_facts(self):
+        facts = self.export("UPDATE reviews SET country=CASE doi WHEN 'r2' THEN 'United Kingdom' "
+                            "ELSE 'United Kingdom' END WHERE journal='J1'")
+        self.assertEqual((12, 3), tuple(facts[f"census.j1.country.united-kingdom.{name}"]["value"]
+                                        for name in ("n", "reviews")))
+        derivation = facts["census.j1.country.united-kingdom.share"]["derivation"]
+        self.assertEqual(("United Kingdom", ["United Kingdom", "United Kingdom"]),
+                         (derivation["cell"], derivation["labels"]))
+        self.assertNotIn("labels", facts["census.j2.country.italy.share"]["derivation"])
+        self.assertTrue(corpus_facts.verify_export(self.root / "facts" / "facts.json")["ok"])
+
+    def test_a_missing_country_is_the_cell_unknown(self):
+        facts = self.export("UPDATE reviews SET country=NULL WHERE journal='J1' AND doi='r1'")
+        self.assertEqual((5, 7), (facts["census.j1.country.unknown.n"]["value"], facts["census.j1.country.italy.n"]["value"]))
+
+    def test_a_label_without_a_key_is_refused_by_name(self):
+        with self.assertRaisesRegex(ValidationError, "country cell '中国' of J1"):
+            self.export("UPDATE reviews SET country='中国' WHERE journal='J1' AND doi='r1'")
+
+    def test_estimates_that_share_a_key_are_refused_by_name(self):
+        # r3 is a Mini Review: the ladder's steps for the two strata get the same key.
+        with self.assertRaisesRegex(ValidationError, r"share a fact key: census\.j1\.ladder\.stratum-mini-review\.n"):
+            self.export("UPDATE reviews SET stratum='Mini-Review' WHERE journal='J1' AND doi='r2'", journals=("J1",))
+        self.assertFalse((self.root / "facts" / "facts.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import sqlite3
 from collections import defaultdict
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -304,8 +305,21 @@ PANELS = {"year": "r.year", "stratum": "r.stratum", "topic": "r.topic", "country
           "route": "r.route", "provenance": "r.provenance_class", "acquisition": "r.provenance"}
 
 
+def cell_key(label: Any) -> str:
+    """The name a panel cell is filed under: ``unknown`` for a missing label, else the label in lower case with every
+    run of characters other than a-z and 0-9 as one hyphen. Empty for a label that has none of these characters."""
+    text = "" if label is None else str(label)
+    if text in ("", "None"):
+        return "unknown"
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def panel(connection: sqlite3.Connection, journal: str, by: str, *, b: int = DEFAULT_B, seed: int | str = 0) -> dict[str, Any]:
-    """Per cell of ``by``: counts, share, Wilson x DEFF (journal ICC, cell mean cluster) and bootstrap CI."""
+    """Per cell of ``by``: counts, share, Wilson x DEFF (journal ICC, cell mean cluster) and bootstrap CI.
+
+    Labels with the same ``cell_key`` are one cell, so two spellings of a country pool their reviews. The cell carries
+    the spelling of most reviews and lists every pooled spelling as ``labels``.
+    """
     if by not in PANELS:
         raise ValueError(f"unknown panel: {by}")
     icc = icc_anova((k, n) for _, k, n in denominator_units(connection, journal))
@@ -317,9 +331,23 @@ def panel(connection: sqlite3.Connection, journal: str, by: str, *, b: int = DEF
     cells = defaultdict(list)
     for row in rows:
         cells[row["cell"]].append((row["doi"], int(row["k"]), int(row["n"])))
+
+    def order(label: Any) -> tuple[bool, str]:
+        return (label is None, str(label))
+
+    spellings = defaultdict(list)
+    for label in sorted(cells, key=order):
+        spellings[cell_key(label) or (label,)].append(label)        # a label without a key stays a cell of its own
+    pooled = []
+    for labels in spellings.values():
+        name = max(labels, key=lambda label: len(cells[label]))     # of equally frequent spellings the first in order
+        units = cells[name] if len(labels) == 1 else sorted(unit for label in labels for unit in cells[label])
+        pooled.append((name, labels, units))
     result = {}
-    for cell in sorted(cells, key=lambda value: (value is None, str(value))):
-        result[str(cell)] = summarise(cells[cell], icc, b=b, seed=seed, scope=("panel", journal, by, cell))
+    for name, labels, units in sorted(pooled, key=lambda cell: order(cell[0])):
+        result[str(name)] = summarise(units, icc, b=b, seed=seed, scope=("panel", journal, by, name))
+        if len(labels) > 1:
+            result[str(name)]["labels"] = [str(label) for label in labels]
     return {"journal": journal, "by": by, "icc": icc, "cells": result}
 
 
