@@ -301,5 +301,50 @@ class DatabaseEstimandTests(unittest.TestCase):
         self.assertEqual({"year", "stratum", "topic", "country"}, set(report["journals"]["J1"]["panels"]))
 
 
+class PooledCellTests(unittest.TestCase):
+    """Labels with the same cell key are one panel cell. J1's reviews r1, r2 and r3 hold 2 F of 5, 3 of 5 and 1 of 2."""
+
+    def cells(self, countries):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "scores.sqlite3"
+            build_scores(path)
+            with closing(sqlite3.connect(path)) as c:
+                c.executemany("UPDATE reviews SET country=? WHERE journal='J1' AND doi=?",
+                              [(country, doi) for doi, country in countries.items()])
+                c.commit()
+                return E.panel(c, "J1", "country", b=200, seed=5)["cells"]
+
+    def test_cell_key(self):
+        self.assertEqual("united-kingdom", E.cell_key("United Kingdom"))
+        self.assertEqual(E.cell_key("Hong Kong SAR, China"), E.cell_key("Hong Kong, SAR China"))
+        self.assertEqual("2021", E.cell_key(2021))
+        self.assertEqual(["unknown"] * 3, [E.cell_key(label) for label in (None, "", "None")])
+        self.assertEqual("", E.cell_key("中国"))
+
+    def test_two_spellings_of_a_country_are_one_cell(self):
+        pooled = self.cells({"r1": "United Kingdom", "r2": "United Kingdom", "r3": "Italy"})
+        self.assertEqual(["Italy", "United Kingdom"], list(pooled))
+        self.assertEqual((5, 10, 2), tuple(pooled["United Kingdom"][name] for name in ("k", "n", "reviews")))
+        self.assertEqual(["United Kingdom", "United Kingdom"], pooled["United Kingdom"].pop("labels"))
+        # Counts, intervals and bootstrap are those of the same reviews under one spelling.
+        self.assertEqual(self.cells({"r1": "United Kingdom", "r2": "United Kingdom", "r3": "Italy"}), pooled)
+
+    def test_a_pooled_cell_carries_the_spelling_of_most_reviews(self):
+        cells = self.cells({"r1": "Hong Kong SAR, China", "r2": "Hong Kong, SAR China", "r3": "Hong Kong, SAR China"})
+        self.assertEqual(["Hong Kong, SAR China"], list(cells))
+        self.assertEqual(["Hong Kong SAR, China", "Hong Kong, SAR China"], cells["Hong Kong, SAR China"]["labels"])
+        self.assertEqual((6, 12, 3), tuple(cells["Hong Kong, SAR China"][name] for name in ("k", "n", "reviews")))
+
+    def test_a_missing_label_pools_with_unknown(self):
+        cells = self.cells({"r1": None, "r2": "Unknown", "r3": "Italy"})
+        self.assertEqual(["Italy", "Unknown"], list(cells))
+        self.assertEqual((["Unknown", "None"], 10), (cells["Unknown"]["labels"], cells["Unknown"]["n"]))
+
+    def test_labels_without_a_key_stay_cells_of_their_own(self):
+        cells = self.cells({"r1": "中国", "r2": "日本", "r3": "Italy"})
+        self.assertEqual({"Italy": 2, "中国": 5, "日本": 5}, {label: cell["n"] for label, cell in cells.items()})
+        self.assertFalse(any("labels" in cell for cell in cells.values()))
+
+
 if __name__ == "__main__":
     unittest.main()

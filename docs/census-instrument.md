@@ -902,7 +902,11 @@ headline is F / (T + F) at the abstract tier, escalated F included.
   (full-text class, else the non-escalated abstract class, else unsure) with
   availability strata.
 - Panels by year, stratum, topic (versioned title keyword map) and
-  corresponding-author country (descriptive), each with both intervals.
+  corresponding-author country (descriptive), each with both intervals. Labels
+  that give the same key (lower case, every run of characters other than a-z
+  and 0-9 as one hyphen) are one cell, so two spellings of a country pool
+  their reviews; the cell carries the spelling of most reviews and its facts
+  list the pooled spellings (`derivation.labels`).
 - Ratio of two journals' headline shares with a bootstrap interval; the year
   trend is the OLS slope of the yearly share with a bootstrap stratified by year.
 - Predeclared sensitivity ladder (escalated F without full text, F without a

@@ -150,5 +150,41 @@ class FactsExportTests(unittest.TestCase):
             corpus_facts.slug("  ")
 
 
+class FactKeyTests(unittest.TestCase):
+    """Every estimate has a key of its own, whatever the labels in the scores."""
+
+    def frozen(self, root: Path, statement: str) -> Path:
+        build_scores(root / "work.sqlite3")
+        with closing(sqlite3.connect(root / "work.sqlite3")) as c:
+            c.execute(statement)
+            c.commit()
+        scores_db.freeze(root / "work.sqlite3", root / "scores.sqlite3")
+        return root / "scores.sqlite3"
+
+    def test_two_spellings_of_a_country_give_one_cell_of_facts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            frozen = self.frozen(root, "UPDATE reviews SET country=CASE doi WHEN 'r2' THEN 'United Kingdom' "
+                                       "ELSE 'United Kingdom' END WHERE journal='J1'")
+            corpus_facts.export_facts(frozen, root / "facts", ["J1", "J2"], b=100, seed=11, code_revision="rev-test")
+            facts = json.loads((root / "facts" / "facts.json").read_text())["facts"]
+            self.assertEqual((12, 3), tuple(facts[f"census.j1.country.united-kingdom.{name}"]["value"]
+                                            for name in ("n", "reviews")))
+            derivation = facts["census.j1.country.united-kingdom.share"]["derivation"]
+            self.assertEqual(("United Kingdom", ["United Kingdom", "United Kingdom"]),
+                             (derivation["cell"], derivation["labels"]))
+            self.assertNotIn("labels", facts["census.j2.country.italy.share"]["derivation"])
+            self.assertTrue(corpus_facts.verify_export(root / "facts" / "facts.json")["ok"])
+
+    def test_estimates_that_share_a_key_are_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # r3 is a Mini Review: the ladder's steps for the two strata get the same key.
+            frozen = self.frozen(root, "UPDATE reviews SET stratum='Mini-Review' WHERE journal='J1' AND doi='r2'")
+            with self.assertRaisesRegex(ValidationError, r"share a fact key: census\.j1\.ladder\.stratum-mini-review\.n"):
+                corpus_facts.export_facts(frozen, root / "facts", ["J1"], b=10, seed=1, code_revision="rev-test")
+            self.assertFalse((root / "facts" / "facts.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
