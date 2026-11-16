@@ -2,7 +2,7 @@
 schema_version = 1
 id = "ocsl-review-followup-audit"
 title = "Compromised-evidence dependency audit"
-summary = "Branch a frozen citation census and audit which review claims rest on cited works with a dated retraction, expression of concern or correction, or on works cited systematically without support, and how those claims propagate."
+summary = "Branch a frozen citation census, give every cited work a dated retraction, correction or concern status, and build the follow-up audit's strata, statistics, facts and exports in any chat; its model judgments need a run principal's broker socket."
 primary_environment = "review-literature"
 secondary_environments = ["review-statistics"]
 mcps = ["ocsl_review_catalog", "ocsl_scholar"]

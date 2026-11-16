@@ -3,14 +3,13 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 These are the evidence commands of `ocsl-review followup`, the audit of claims and citations in a corpus of review
-articles described in `docs/followup-audit.md`: status observations, support and function judging, dependency,
-cited-by traversal, facts and exports. Every command works on one follow-up branch database (`--database`), returns
-one JSON result and, with the global `--result-file`, writes it as `ocsl-review-result-v1` for a Study Run step. A
-failure is a non-zero exit with its error class (`validation`, `policy`, `usage`, `runtime`). Judging commands refuse a
-branch whose strata are not frozen (`followup strata --freeze`); so do `dependency` and `citedby`, which read the
-strata. A command that can stop before its work is done (a halted broker, items left open, a throttling provider)
-says so in a top-level `state` of `paused` with a `reason` (the census step contract); a finished one reports
-`state` `completed`.
+articles described in `docs/followup-audit.md`: status observations, support and function judging, dependency, cited-by
+traversal, facts and exports. Every command works on one follow-up branch database (`--database`), returns one JSON
+result and, with the global `--result-file`, writes it as `ocsl-review-result-v1`. A failure is a non-zero exit with its
+error class (`validation`, `policy`, `usage`, `runtime`). Judging commands refuse a branch whose strata are not frozen
+(`followup strata --freeze`); so do `dependency` and `citedby`, which read the strata. A command that can stop before
+its work is done (a halted broker, items left open, a throttling provider) says so in a top-level `state` of `paused`
+with a `reason` (the census step contract); a finished one reports `state` `completed`.
 
 Sizes, shares and rates are never inputs: they come from the run's own data. Every adverse record reads "check
 suggested"; the instruments have no validation set, so their outputs are model measurements with evidence and
@@ -54,14 +53,13 @@ identifiers, at each live source; one thread per source keeps each host's interv
 | `europe-pmc` | search `DOI:"..."` (else `EXT_ID:<pmid> AND SRC:MED`), `resultType=core` | `isRetracted` `Y` retracted (no notice, no date), `N` none | retraction |
 
 A source that cannot answer records `unknown` with its reason (`no-doi`, `no-pmid`, `no-identifier`, `not-found`,
-`no-record`, `no-flag`, a failure class); it never stops the run. One run is one status snapshot
-(`status-<UTC time>`), registered as a dataset version (kind `status-snapshot`, sha256 of the snapshot's canonical
-observation rows) when every source finished. A source whose host throttles repeatedly stops; the snapshot then stays
-open and the result is paused. `--snapshot` continues a given snapshot and `--continue` the latest one that did not
-finish (a fixed Study Run step passes `--continue`; a new snapshot starts when none is open): pairs of work and source
-that answered are skipped, failed ones are asked again. An unexpected failure leaves the snapshot open and is a
-`runtime` failure, never a refusal. `--source` defaults to the protocol's live sources; `--limit` asks only the first
-works (a smoke test).
+`no-record`, `no-flag`, a failure class); it never stops the run. One run is one status snapshot (`status-<UTC time>`),
+registered as a dataset version (kind `status-snapshot`, sha256 of the snapshot's canonical observation rows) when every
+source finished. A source whose host throttles repeatedly stops; the snapshot then stays open and the result is paused.
+`--snapshot` continues a given snapshot and `--continue` the latest one that did not finish (so the same command line
+can always pass `--continue`: a new snapshot starts when none is open): pairs of work and source that answered are
+skipped, failed ones are asked again. An unexpected failure leaves the snapshot open and is a `runtime` failure, never a
+refusal. `--source` defaults to the protocol's live sources; `--limit` asks only the first works (a smoke test).
 
 ### `followup status-resolve [--snapshot ID]...`
 

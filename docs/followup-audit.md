@@ -11,6 +11,28 @@ measurements with evidence, coverage and uncertainty; every adverse finding read
 The commands are `ocsl-review followup <command>`; the skill is `ocsl-review-followup-audit`. The evidence commands
 are documented in `docs/followup-evidence.md`, the analysis commands in `docs/followup-analysis.md`.
 
+## Where the commands run
+
+The commands that call no model run in any lab chat: `init`, `pin-bundle`, `verify`, `describe`, `gates`,
+`status-import`, `status-fetch`, `status-resolve`, `hotspots`, `strata`, `dependency`, `citedby`, the `sample`,
+`acquire` and `candidates` stages of `second-gen`, `lag`, `estimands`, `facts`, `verify-facts` and `export`. Three of
+them send requests, HTTPS GET with identifiers only, directly or through the chat's public-web proxy: `status-fetch` to
+Crossref, PubMed and Europe PMC, `citedby` to Europe PMC and OpenAlex, and the `acquire` stage of `second-gen` to Europe
+PMC; every other command reads and writes local files only. Without model judgments, `dependency` decides only `sole`
+(the citing sentence cites no other work) and leaves every other anchor `undetermined`, and an estimand that needs
+judgments reports `not-measured`.
+
+The judging commands (`support`, `function`, `numeric` and the `judge` stage of `second-gen`, part of its default
+`--stage all`) call a model. In the lab they judge through a run principal's broker socket (`OCSL_BROKER_SOCKET`), with
+every instrument's bundle installed on the broker and granted to that principal (see Runs below). A lab chat has no
+such socket. Without one, a judging command exits with
+
+    validation: give --base-url for a judge called directly, or --broker-socket (or OCSL_BROKER_SOCKET)
+
+and on the chat's own orchestration socket with
+
+    validation: the broker socket names no principal: instruments run only on a run principal's socket (a chat turn socket carries no run authority)
+
 ## The branch
 
 `followup init --database <branch> --parent <frozen scores database> [--parent-text <private copy>] --protocol
@@ -24,8 +46,8 @@ second-gen, a private export): those refuse while a branch made with it does not
 runs without it, and `verify` notes it as not mounted instead of failing.
 
 `init` makes a branch once. Asked again with the inputs that made the branch (the same parent and private copy by
-path and digest, protocol digest, incomplete-parent allowance and study bundle), as when its step is sent again after
-its result was lost, it reports that branch (`alreadyMade`) and changes nothing; any other input is refused. An SQLite
+path and digest, protocol digest, incomplete-parent allowance and study bundle), as when the same command runs again
+after its result was lost, it reports that branch (`alreadyMade`) and changes nothing; any other input is refused. An SQLite
 file without any schema object at the branch path, which an init killed before its commit leaves, is replaced.
 
 `followup init --study-bundle <bundle file or sha256>` (or `followup pin-bundle` before the first judge call) pins the

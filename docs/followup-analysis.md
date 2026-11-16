@@ -3,10 +3,10 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
 These are the analysis commands of a follow-up audit of claims and citations in a corpus of review articles (see
-`docs/followup-audit.md` for the branch, the protocol and the evidence commands). Each one works on one follow-up
-branch (`--database`), returns one JSON result and, with the global `--result-file`, writes it as
-`ocsl-review-result-v1` for a Study Run step. Every size, threshold, share and seed comes from the protocol; none of
-these commands has a default for them. Sizes and rates are measured from the run's own data.
+`docs/followup-audit.md` for the branch, the protocol and the evidence commands). Each one works on one follow-up branch
+(`--database`), returns one JSON result and, with the global `--result-file`, writes it as `ocsl-review-result-v1`.
+Every size, threshold, share and seed comes from the protocol; none of these commands has a default for them. Sizes and
+rates are measured from the run's own data.
 
 Order within the pipeline:
 
@@ -83,8 +83,8 @@ The frame, the strata, their inclusion probabilities and sizes, and the freeze.
 - **`--freeze`** rebuilds the strata from the current inputs and writes `fu_protocol_freeze`: the protocol digest, a
   digest over the ordered membership rows (strata and co-cited pairs), the status snapshot the strata used, the parent
   digest (recomputed; a changed parent refuses the freeze), the protocol's estimands with their numerators and
-  denominators, and the sizes. After a freeze the strata (and the hotspot test) cannot be built again; `--freeze`
-  asked again (its step sent again after the result was lost) reports the branch's freeze (`alreadyFrozen`) and builds
+  denominators, and the sizes. After a freeze the strata (and the hotspot test) cannot be built again; `--freeze` asked
+  again (the same command run again after its result was lost) reports the branch's freeze (`alreadyFrozen`) and builds
   nothing.
 
 ## followup numeric --tables <source> [--allow-synthetic-tables]
@@ -206,7 +206,7 @@ cell without any unit is not written.
   replicates and seed; every estimand, variant and cell has its own scope tuple. The after-notice share uses the lag
   model's scope, so equal replicates and seed give equal intervals. `--b` and `--bootstrap-seed` make exploratory
   estimates (recorded, reported as `bootstrapOverride`): `followup facts` refuses estimates with mixed settings and
-  `followup gates` checks `bootstrapAsProtocol`. A Study Run never offers them.
+  `followup gates` checks `bootstrapAsProtocol`.
 - **Contrasts:** an estimand that declares `contrasts: ["journal"]` gets every later journal of the protocol against
   its first, as `journal-ratio` and `journal-difference` of the two shares with intervals from the same bootstrap
   (reviews resampled within each journal, the journals independent).
