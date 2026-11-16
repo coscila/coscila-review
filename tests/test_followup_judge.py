@@ -9,7 +9,6 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 import followup_fixtures as F
 from ocsl_review import instruments
@@ -296,13 +295,14 @@ class HttpJudgeTests(unittest.TestCase):
         self.assertFalse(ConfidentialPolicy("public-literature").with_mode("confidential-manuscript")
                          .judge_allowed(external))
 
-    def test_a_broker_judge_needs_its_module(self):
-        args = SimpleNamespace(base_url=None, broker_socket="/tmp/none.sock", model="m", policy=None, on_premises=False)
-        with mock.patch("importlib.import_module", side_effect=ModuleNotFoundError("x")):
-            with self.assertRaisesRegex(ReviewError, "broker judge"):
+    def test_a_broker_judge_needs_a_reachable_socket_and_a_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(base_url=None, broker_socket=str(Path(directory) / "none.sock"), model="m",
+                                   policy=None, on_premises=False)
+            with self.assertRaisesRegex(ValidationError, "the broker socket is not reachable"):
                 judge_from_args(args)
-        with self.assertRaisesRegex(ValidationError, "--model"):
-            judge_from_args(SimpleNamespace(**{**vars(args), "model": None}))
+            with self.assertRaisesRegex(ValidationError, "--model"):
+                judge_from_args(SimpleNamespace(**{**vars(args), "model": None}))
 
 
 if __name__ == "__main__":

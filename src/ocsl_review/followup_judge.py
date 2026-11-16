@@ -524,8 +524,6 @@ def judge_from_args(args: Any) -> tuple[Any, ConfidentialPolicy]:
     socket_path = socket_path or os.environ.get("OCSL_BROKER_SOCKET")
     if not socket_path:
         raise ValidationError("give --base-url for a judge called directly, or --broker-socket (or OCSL_BROKER_SOCKET)")
-    try:
-        broker = importlib.import_module("ocsl_review.followup_judge_broker")
-    except ModuleNotFoundError as error:
-        raise ReviewError("this build has no broker judge for follow-up instruments (followup_judge_broker)") from error
-    return broker.judge_from_args(args, policy, socket_path), policy
+    # Imported here: followup_judge_broker builds on this module's CallOpen and JudgeReply.
+    from .followup_judge_broker import judge_from_args as broker_judge
+    return broker_judge(args, policy, socket_path), policy
