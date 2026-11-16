@@ -238,8 +238,8 @@ def _git_snapshot(repository: Path) -> dict[str, str] | None:
 
 
 def snapshot_siblings(paths: Any) -> dict[str, dict[str, str]]:
-    # The lab checkout in use and the first bio sibling must be Git worktrees, as before; every further sibling under an
-    # old or a new name is snapshotted too when it is one.
+    # The lab checkout in use and the first bio sibling must be Git worktrees; every further sibling under either name
+    # (LAB_REPO_NAMES, BIO_REPO_NAMES) is snapshotted too when it is one.
     candidates: list[tuple[Path, bool]] = []
     if paths.lab_repo:
         candidates.append((paths.lab_repo.resolve(), True))

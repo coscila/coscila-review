@@ -96,7 +96,7 @@ class SiblingCheckoutTests(unittest.TestCase):
         home = self.layout("coscila-review", *names, git=names)
         siblings = [self.source / name for name in names]
 
-        # The automatic choice keeps the old name only, so deployment staging behaves as before in development clones.
+        # The automatic choice takes only an oc-science-lab sibling, so a coscila sibling never becomes a staging target.
         self.assertIsNone(science_lab_repo(None, home))
         paths = Paths(home=home, state=self.state, lab_repo=science_lab_repo(None, home))
         with self.assertRaisesRegex(ReviewError, "staging command is required"):

@@ -75,7 +75,7 @@ for _length, _digests in {
     11: {"b3d18e1164052ad49fcb59ee72190d6ca9594d6ccd2f04c2149633f4faf2fded"},
 }.items():
     FORBIDDEN.setdefault(_length, set()).update(_digests)
-# Further study figures and identifiers a final review found missing: population and readable counts with and without
+# Further study figures and identifiers: population and readable counts with and without
 # separators, corpus totals, the diagnostic bands in both dash spellings, token and runtime totals, the corrected
 # report's title and file names, the snapshot's directory name, and the identifiers of further census sessions.
 for _length, _digests in {
