@@ -213,7 +213,7 @@ Every run registers the graph as a dataset version (kind `cited-by-graph`, sha25
 
 With `--broker-socket` (or `OCSL_BROKER_SOCKET`) a judging command reaches its judge through the run principal's
 broker. Each call is one one-item job naming the instrument's broker digest (`ocsl-review instruments export`,
-installed with `pnpm ops broker instruments install` and granted to the run principal) and carrying the request the
+installed with `PUT /v2/instruments/{digest}` and granted to the run principal) and carrying the request the
 instrument built. The job's idempotency key comes from the call's identity (instrument digest, tier, variant, call
 kind, item keys, the branch and the number of earlier calls of that identity that settled) and the request digest: a
 call that never settled (a paused or queued job, an unreachable broker) is sent again under the same key and meets the

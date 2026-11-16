@@ -3,13 +3,14 @@
 
 ``BrokerJudge`` follows ``claim_check.Judge`` (``complete(messages, settings=...) -> followup_judge.JudgeReply``) over
 ``census_broker.BrokerTransport``. Each call is one one-item bulk job that names the instrument's broker digest (the
-bundle ``ocsl-review instruments export`` prints and ``pnpm ops broker instruments install`` installs) and carries the
-request the instrument built: its messages unchanged and its settings, which the broker checks against the installed
-bundle and the worker's model before any provider call. The job's idempotency key comes from the call's identity
-(``followup_judge.call_identity``: instrument digest, tier, variant, call kind, item keys, branch and attempt) and the
-request digest. A call repeated after a crash, or after a pass in which it never settled, meets the job the broker
-already holds; a replicate, a repair call and a call after a settled one carry another identity, so each starts a job of
-its own and reaches the model, as the census's call ids do. As in ``census_runner.execute_broker``:
+bundle ``ocsl-review instruments export`` prints, installed with ``PUT /v2/instruments/{digest}`` and granted to the run
+principal) and carries the request the instrument built: its messages unchanged and its settings, which the broker
+checks against the installed bundle and the worker's model before any provider call. The job's idempotency key comes
+from the call's identity (``followup_judge.call_identity``: instrument digest, tier, variant, call kind, item keys,
+branch and attempt) and the request digest. A call repeated after a crash, or after a pass in which it never settled,
+meets the job the broker already holds; a replicate, a repair call and a call after a settled one carry another
+identity, so each starts a job of its own and reaches the model, as the census's call ids do. As in
+``census_runner.execute_broker``:
 
 - the served model and the fingerprint are what the judge's own response named (``servedModel``,
   ``systemFingerprint``); another served model is model drift, which stops the run;

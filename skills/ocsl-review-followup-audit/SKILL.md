@@ -57,12 +57,12 @@ protocol after the strata are frozen.
    census's review documents (`--documents`) so the judge sees the sentences
    around each citing sentence. Support runs with the instrument the protocol
    pins: citation-support-verbatim@1 declares its own request settings per tier
-   and may use the broker socket like the other judging commands, with the
-   bundles of both tiers installed and granted; citation-support@2 runs only on
-   a judge called directly, with the reasoning effort the protocol predeclares
-   per tier. The replicate (`--variant replicate`) follows the primary run of
-   each judging command. A result whose `state` is `paused` names its reason;
-   run the command again to resume.
+   and may use the run principal's broker socket like the other judging
+   commands, with the bundles of both tiers installed and granted;
+   citation-support@2 runs only on a judge called directly, with the reasoning
+   effort the protocol predeclares per tier. The replicate (`--variant
+   replicate`) follows the primary run of each judging command. A result whose
+   `state` is `paused` names its reason; run the command again to resume.
 5. Propagation: `followup citedby`, then `followup second-gen`.
 6. `followup lag`, `followup estimands` (and `--scope pilot` for the pilot's
    results), `followup gates`, `followup facts`, `followup verify-facts` and
