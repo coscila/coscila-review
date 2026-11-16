@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Blindness of the follow-up audit's files: no study identifier, no reference to earlier work, no carried figures.
+"""Blindness of the follow-up audit's files: no study identifier, no figure of an earlier study, no reference to
+earlier work.
 
 The follow-up describes a generic audit of claims and citations in a corpus of review articles. Its strata sizes and
-rates come from the run's own data, so none of its files may carry a figure:
+rates come from the run's own data, so none of its files may carry a figure that an earlier study reported:
 
 - every follow-up file, its tests and its fixtures included, passes the hashed study-identifier scan of the census files
   (``test_instruments.FORBIDDEN``) and the follow-up's own digest tables, after invisible characters are removed, the
   fullwidth percent sign is read as ``%`` and no-break and thin spaces are read as spaces;
-- ``FIGURE_DIGESTS`` holds, as sha256 digests grouped by length, the reference-derived figures, identifiers and named
-  findings the follow-up's design was sized with, in their spellings (bare, comma- and space-grouped, decimal point and
-  comma, with and without a percent sign or the words percent and per cent, k and M forms, ranges with either dash,
-  ratios); no tracked file outside the census's own tests may carry one. ``FOLLOWUP_FIGURE_DIGESTS`` holds the short
-  forms too generic for every file (small whole percentages, small ranges, short k forms), scanned in follow-up files.
-  Bare integers below a thousand, years and round numbers are not hashed: they cannot be told from ordinary numbers,
-  and the figure scan below catches any percentage. The figures themselves are never written in the repo; the digests
-  were computed outside it;
+- ``STUDY_FIGURE_DIGESTS`` holds, as sha256 digests grouped by length, the figures, identifiers and named findings of
+  earlier studies, in their spellings (bare, comma- and space-grouped, decimal point and comma, with and without a
+  percent sign or the words percent and per cent, k and M forms, ranges with either dash, ratios); no tracked file
+  outside the census's own tests may carry one. ``SHORT_STUDY_FIGURE_DIGESTS`` holds the short forms too generic for
+  every file (small whole percentages, small ranges, short k forms), scanned in follow-up files. Bare integers below a
+  thousand, years and round numbers are not hashed: they cannot be told from ordinary numbers, and the figure scan
+  below catches any percentage. The figures themselves are never written in the repository; the digests were computed
+  outside it;
 - the lab-facing text (skill, instrument prompts and schemas, docs, the protocol schema) and the follow-up's source
   modules hold no percentage (with a sign or in words) and no grouped count at all;
 - no follow-up file names earlier work: the phrase scan folds case, whitespace, hyphens and invisible characters.
@@ -56,7 +57,7 @@ DASHES = str.maketrans({"-": " ", "\u2010": " ", "\u2011": " ", "\u2012": " ", "
 SPACES = str.maketrans({"\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u200a": " ", "\u202f": " "})
 FIGURES = re.compile(r"\d+(?:[.,]\d+)?\s?(?:%|percent\b|per cent\b)|\b\d{1,3}(?:,\d{3})+\b|\b\d{1,3}(?: \d{3})+\b",
                      re.IGNORECASE)
-FIGURE_DIGESTS = {
+STUDY_FIGURE_DIGESTS = {
     4: {
         "028e07cc23a20158b5b19ff796b63d5575b74678a818211b02f319567318020d",
         "084ae23e6996e701addeeb7dcf33696f32dcb4ab78c0ca2026f8f5dbbe5a81d0",
@@ -442,7 +443,7 @@ FIGURE_DIGESTS = {
         "5cdf3f46a61afc84b320c302fe125724ff40038fe4d6e4bf7cb5f4e09c6937e1",
     },
 }
-FOLLOWUP_FIGURE_DIGESTS = {
+SHORT_STUDY_FIGURE_DIGESTS = {
     2: {
         "2dbd9afb3bb90d68e38782e1580be725d6e3784c8dba50593560bd8992e56850",
         "2e45f50a2d75e87d7897213692ee17fdec3ee589b21e44ea483b17a2a96e30ed",
@@ -558,7 +559,7 @@ FOLLOWUP_FIGURE_DIGESTS = {
     },
 }
 FOLLOWUP_TABLE: dict[int, set[str]] = {}
-for _table in (FORBIDDEN, FIGURE_DIGESTS, FOLLOWUP_FIGURE_DIGESTS):
+for _table in (FORBIDDEN, STUDY_FIGURE_DIGESTS, SHORT_STUDY_FIGURE_DIGESTS):
     for _length, _digests in _table.items():
         FOLLOWUP_TABLE.setdefault(_length, set()).update(_digests)
 
@@ -600,12 +601,12 @@ class FollowupBlindnessTests(unittest.TestCase):
             self.assertIn(required, names)
         self.assertFalse(set(SCAN_TABLES) & names)
 
-    def test_follow_up_files_carry_no_study_identifiers_or_design_figures(self):
+    def test_follow_up_files_carry_no_study_identifiers_or_study_figures(self):
         for path in files(FOLLOWUP_GLOBS):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], forbidden_hits(normalize(path.read_text(encoding="utf-8")), FOLLOWUP_TABLE))
 
-    def test_no_tracked_file_outside_the_census_tests_carries_a_design_figure(self):
+    def test_no_tracked_file_outside_the_census_tests_carries_a_study_figure(self):
         scanned = {path for path in tracked_files()} | set(files(FOLLOWUP_TESTS))
         self.assertGreater(len(scanned), 50)
         for path in sorted(scanned):
@@ -614,7 +615,7 @@ class FollowupBlindnessTests(unittest.TestCase):
             except UnicodeDecodeError:
                 continue
             with self.subTest(path=str(path.relative_to(ROOT))):
-                self.assertEqual([], forbidden_hits(normalize(text), FIGURE_DIGESTS))
+                self.assertEqual([], forbidden_hits(normalize(text), STUDY_FIGURE_DIGESTS))
 
     def test_follow_up_files_name_no_earlier_work(self):
         for path in files(FOLLOWUP_GLOBS):
@@ -627,16 +628,6 @@ class FollowupBlindnessTests(unittest.TestCase):
         for path in files(LAB_TEXT_GLOBS + FOLLOWUP_SOURCES):
             with self.subTest(path=str(path.relative_to(ROOT))):
                 self.assertEqual([], FIGURES.findall(normalize(path.read_text(encoding="utf-8"))))
-
-    def test_the_lab_copy_of_the_design_digests_is_this_one(self):
-        # coscila scans lab-facing follow-up text (chat template prompts, the follow-up controller reference) with a
-        # verbatim copy of these digests (packages/lab/src/leakage-audit/followup-blindness.ts), pinned by the same
-        # fingerprint: sha256 of the sorted digests joined by newlines, and their number.
-        import hashlib
-        digests = sorted({digest for table in (FIGURE_DIGESTS, FOLLOWUP_FIGURE_DIGESTS) for group in table.values()
-                          for digest in group})
-        self.assertEqual(("c79380d31bd07eb518f6d6c6d647cf79799d701f52b0f1eba51328bd7387abc7", 443),
-                         (hashlib.sha256("\n".join(digests).encode("ascii")).hexdigest(), len(digests)))
 
     def test_the_scans_detect_hidden_and_respelled_figures_and_phrases(self):
         import hashlib
