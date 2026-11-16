@@ -23,9 +23,9 @@ PMC; every other command reads and writes local files only. Without model judgme
 judgments reports `not-measured`.
 
 The judging commands (`support`, `function`, `numeric` and the `judge` stage of `second-gen`, part of its default
-`--stage all`) call a model. In the lab they judge through a run principal's broker socket (`OCSL_BROKER_SOCKET`), with
-every instrument's bundle installed on the broker and granted to that principal (see Runs below). A lab chat has no
-such socket. Without one, a judging command exits with
+`--stage all`) call a model, through a run principal's broker socket with every instrument's bundle installed on the
+broker and granted to that principal, or through a judge called directly (both under Runs below). A lab chat gives
+them no route to a model. Given `--model`, a judging command exits without a broker socket with
 
     validation: give --base-url for a judge called directly, or --broker-socket (or OCSL_BROKER_SOCKET)
 
@@ -33,17 +33,23 @@ and on the chat's own orchestration socket with
 
     validation: the broker socket names no principal: instruments run only on a run principal's socket (a chat turn socket carries no run authority)
 
+Without `--model` it exits with `validation: give --model, the served model the protocol pins`. After a run without
+model judgments, `followup gates` reports `ok: false`: no judge call has a response.
+
 ## The branch
 
 `followup init --database <branch> --parent <frozen scores database> [--parent-text <private copy>] --protocol
-<protocol.json>` makes one SQLite file that holds only the follow-up's rows. Every connection ATTACHes the parent
-census read-only and immutable as `census`; nothing of it is copied and no foreign key crosses databases. Rows name
-the parent by value: a citation locus by journal, review DOI, bibliography label and locus order, a cited work by its
-work key. A frozen census keeps entitled citing sentences only as digests; the optional private copy frozen with its
-text supplies them, and a sentence is accepted only when its digest matches the parent's. The private copy is needed
-only by the commands that read citing sentences (support, function, numeric, the candidate and judging stages of
-second-gen, a private export): those refuse while a branch made with it does not see it mounted, every other command
-runs without it, and `verify` notes it as not mounted instead of failing.
+<protocol.json>` makes one SQLite file that holds only the follow-up's rows. The person running the study supplies the
+protocol. A branch made without `--protocol` takes `verify`, `describe`, `pin-bundle`, the status commands, `gates`,
+`facts`, `verify-facts` and `export`, but `hotspots`, `strata`, `lag` and `estimands` refuse it, every step after the
+freeze refuses it too, and it cannot take a protocol later: the audit's later steps need a branch made with one. Every
+connection ATTACHes the parent census read-only and immutable as `census`; nothing of it is copied and no foreign key
+crosses databases. Rows name the parent by value: a citation locus by journal, review DOI, bibliography label and locus
+order, a cited work by its work key. A frozen census keeps entitled citing sentences only as digests; the optional
+private copy frozen with its text supplies them, and a sentence is accepted only when its digest matches the parent's.
+The private copy is needed only by the commands that read citing sentences (support, function, numeric, the candidate
+and judging stages of second-gen, a private export): those refuse while a branch made with it does not see it mounted,
+every other command runs without it, and `verify` notes it as not mounted instead of failing.
 
 `init` makes a branch once. Asked again with the inputs that made the branch (the same parent and private copy by
 path and digest, protocol digest, incomplete-parent allowance and study bundle), as when the same command runs again
@@ -148,7 +154,12 @@ revocation or cancellation halt) nothing more is sent: no further batch, repair 
 Every judging command can run through the run principal's broker socket, one verbatim bundle job per call, with an
 instrument that exports broker bundles: citation-function@1, numeric-check@1, claim-match@1 and
 citation-support-verbatim@1 (one bundle per tier). citation-support@2 has no verbatim bundle and runs only on a judge
-called directly. With the census's review documents (`--documents`), the support and
+called directly. A judge called directly (`--base-url`) gets each call as one chat-completions request to
+`<base-url>/chat/completions`, with a bearer key read from the environment variable that `--api-key-env` names; its
+receipts exist only in the branch database (`fu_calls`), and no broker budget, grant or capacity limit applies.
+Entitled text goes only to a model served on premises (`--on-premises` with a `--policy` that lists the endpoint in
+`onPremEndpoints`); with any other judge an item with entitled evidence stops the run before the first call, and
+`--public-only` sends the public items only. With the census's review documents (`--documents`), the support and
 function judges also see the sentences around each citing sentence; without them the neighbouring sentences are empty.
 `followup dependency --scope pilot` and `followup estimands --scope pilot` give the pilot's results: the judged
 estimands over the pilot subsample, weighted by the pilot probabilities, under `followup.pilot.*` keys.

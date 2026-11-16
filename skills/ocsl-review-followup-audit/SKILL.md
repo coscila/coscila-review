@@ -1,6 +1,6 @@
 ---
 name: ocsl-review-followup-audit
-description: Branch a frozen citation census, give every cited work a dated retraction, correction or concern status, and build the follow-up audit's strata, statistics, facts and exports in any chat; its model judgments need a run principal's broker socket.
+description: Branch a frozen citation census, give every cited work a dated retraction, correction or concern status, and build the follow-up audit's strata, statistics, facts and exports in any chat; a lab chat gives its judging commands no route to a model.
 ---
 
 # Compromised-evidence dependency audit
@@ -38,9 +38,15 @@ instruments, the branch schema or the protocol after the strata are frozen.
 These call no model. Run them in this order:
 
 1. `followup init --parent <frozen census scores database> --protocol
-   <protocol.json>`: the census is attached read-only and never copied; add
-   `--parent-text` for the private copy that keeps entitled citing sentences
-   and `--study-bundle` when the study has one. Then `followup verify`.
+   <protocol.json>`: the person running the study supplies the protocol file,
+   and the census is attached read-only and never copied. Add `--parent-text`
+   for the private copy that keeps entitled citing sentences and
+   `--study-bundle` when the study has one. Then `followup verify`. The status
+   of cited works needs no protocol: on a branch made without `--protocol`,
+   `verify`, `describe`, `pin-bundle`, `status-import`, `status-fetch`,
+   `status-resolve`, `gates`, `facts`, `verify-facts` and `export` run. Such a
+   branch stops at `hotspots` and `strata` and cannot take a protocol later, so
+   the steps after the status need a branch made with `--protocol`.
 2. Status: `followup status-import` (a Retraction Watch CSV snapshot, read
    locally), `followup status-fetch`, then `followup status-resolve`, which
    gives every cited work one status row with its source and date. An unknown
@@ -67,20 +73,20 @@ and writes local files only.
 
 `followup support --tier abstract|full-text`, `followup function`, `followup
 numeric` and the `judge` stage of `followup second-gen` (part of its default
-`--stage all`) call citation-support-verbatim@1, citation-function@1,
-numeric-check@1 and claim-match@1 through a run principal's broker socket
-(`OCSL_BROKER_SOCKET`), with each instrument's bundle installed on the broker
-and granted to that principal. A lab chat has no such socket. Without one, each
-of these commands exits 5 with
+`--stage all`) judge with citation-support-verbatim@1, citation-function@1,
+numeric-check@1 and claim-match@1. A lab chat gives these four commands no route
+to a model. Given `--model`, each of them exits 5 without a broker socket with
 
     validation: give --base-url for a judge called directly, or --broker-socket (or OCSL_BROKER_SOCKET)
 
-and with the chat's own orchestration socket with
+and on the chat's own orchestration socket with
 
     validation: the broker socket names no principal: instruments run only on a run principal's socket (a chat turn socket carries no run authority)
 
-In a chat, run the commands above and report that the model judgments need a
-run principal's broker socket.
+Without `--model`, each exits 5 with `validation: give --model, the served model
+the protocol pins`. In a chat, run the commands that need no model and report
+that the model judgments were not made. After a run without model judgments,
+`followup gates` reports `ok: false`.
 
 ## Measurement rules
 
