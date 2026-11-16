@@ -37,9 +37,9 @@ from ocsl_review.followup_model import (BROKER_INSTRUMENTS, SUPPORT_INSTRUMENTS,
                                         status_blind_title)
 
 from test_followup_citedby import routes as citedby_routes
+from test_followup_census_surface import SUPPORT_DIGEST
 from test_followup_dependency import insert_frame, locus
 from test_followup_numeric import TABLES
-from test_followup_phase4_surface import SUPPORT_DIGEST
 from test_followup_pipeline import PLAIN_FULL_TEXT, answer as pipeline_answer, pipeline_protocol
 from test_followup_secondgen import ROUTES as SECONDGEN_ROUTES
 from test_followup_status import RW_CSV, clean_environment, no_network, status_routes
