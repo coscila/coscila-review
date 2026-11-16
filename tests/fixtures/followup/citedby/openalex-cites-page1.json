@@ -1,0 +1,23 @@
+{
+ "meta": {
+  "count": 2,
+  "next_cursor": null,
+  "per_page": 200
+ },
+ "results": [
+  {
+   "id": "https://openalex.org/W200000001",
+   "doi": "https://doi.org/10.5555/fu.later.1",
+   "title": "A later synthetic article one",
+   "publication_year": 2024,
+   "publication_date": "2024-02-01"
+  },
+  {
+   "id": "https://openalex.org/W200000004",
+   "doi": "https://doi.org/10.5555/fu.later.4",
+   "title": "A later synthetic article four",
+   "publication_year": 2025,
+   "publication_date": "2025-05-20"
+  }
+ ]
+}

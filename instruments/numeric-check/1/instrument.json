@@ -1,0 +1,114 @@
+{
+  "id": "numeric-check@1",
+  "name": "numeric-check",
+  "version": 1,
+  "status": "active",
+  "description": "Numeric check of a statistic claim: the judge parses what the citing sentence states (condition, metric, geography, reference year, the number as written and its unit) with an exact quote; a deterministic comparison against a pinned table source of the cited statistics report then classifies the claim (consistent, number absent or different, wrong geography, wrong edition, non-epidemiological).",
+  "unit": "one marker occurrence of a statistics-report citation (an S3 locus)",
+  "files": {
+    "systemPrompt": {
+      "path": "system-prompt.txt",
+      "sha256": "68f5af514281d15c6202aed1ff87f69b191a33f73567da7fceeb9c4b1073b633",
+      "mediaType": "text/plain; charset=utf-8"
+    },
+    "outputSchema": {
+      "path": "output.schema.json",
+      "sha256": "add9138ef21e65acfa8085a28af8358828b3a75f4c8a529358a60f0caf5eee03",
+      "mediaType": "application/schema+json"
+    }
+  },
+  "tiers": {
+    "claim": {
+      "population": "S3 loci, only when the protocol records verified table licensing",
+      "evidencePolicy": {
+        "evidence": "the citing sentence with the named work's marker, and the cited work's title and year",
+        "neverSent": [
+          "table values",
+          "status of the cited work",
+          "stratum",
+          "support verdicts",
+          "identifiers"
+        ],
+        "sources": [
+          "citing review, public",
+          "citing review, entitled"
+        ],
+        "entitledRouting": "on-premises judges only",
+        "tables": "the comparison reads a pinned table source outside the model call; tables are never sent"
+      },
+      "geometry": {
+        "itemsPerCall": 10,
+        "grouping": "review",
+        "crossReview": false,
+        "ordering": "document order",
+        "positionsRecorded": true,
+        "positionBase": 1
+      },
+      "request": {
+        "api": "chat.completions",
+        "temperature": 0.0,
+        "seed": null,
+        "reasoningEffort": "none",
+        "stream": false,
+        "maxOutputTokens": {
+          "floor": 1200,
+          "perItem": 300,
+          "rule": "max(floor, perItem * items)"
+        },
+        "timeoutSeconds": 600
+      },
+      "repair": {
+        "passes": 1,
+        "scope": "items without a valid output after the first call"
+      },
+      "transport": {
+        "attempts": 3,
+        "backoffSeconds": [
+          2,
+          4,
+          6
+        ]
+      }
+    }
+  },
+  "requiredModel": {
+    "served": "pinned per analysis by the follow-up protocol (model.served)",
+    "fingerprint": "record-when-offered",
+    "onMismatch": "reject"
+  },
+  "validator": {
+    "id": "numeric-check-items@1",
+    "module": "ocsl_review.numeric_check",
+    "sha256": "2e6a8740b4529591927e170629b91306b81e1aec0a6269bab3038ad426b22ab0"
+  },
+  "builder": {
+    "module": "ocsl_review.followup_items",
+    "sha256": "c5c9a0e70232799da9fb6ff592dfc3364f6eb1bf6370e67a9772e8d670c1a9d3"
+  },
+  "classMap": {
+    "id": "numeric-check@1",
+    "decisions": [
+      "parsed",
+      "not-epidemiological",
+      "abstain"
+    ],
+    "comparison": [
+      "consistent",
+      "number-absent-or-different",
+      "wrong-geography",
+      "wrong-edition",
+      "non-epidemiological"
+    ]
+  },
+  "deterministicRows": {
+    "comparison": "numeric-comparison@1 against a pinned table source (followup_numeric)"
+  },
+  "transport": {
+    "messages": "verbatim",
+    "sentBytesRecorded": true
+  },
+  "notes": [
+    "Statistics-report tables are a pluggable, pinned dataset; licensed tables are read only after their licensing is verified, and the protocol drops S3 otherwise.",
+    "A parse takes the condition, geography and year from the citing sentence; the comparison numeric-comparison@1 is deterministic and runs outside the model call."
+  ]
+}

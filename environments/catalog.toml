@@ -65,6 +65,7 @@ skills = [
   "ocsl-review-novelty-priority",
   "ocsl-review-evidence-balance",
   "ocsl-review-journal-policy",
+  "ocsl-review-followup-audit",
 ]
 
 [[environment]]

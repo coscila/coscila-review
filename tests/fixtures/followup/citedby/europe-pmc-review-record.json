@@ -1,0 +1,19 @@
+{
+ "version": "6.9",
+ "hitCount": 1,
+ "resultList": {
+  "result": [
+   {
+    "id": "9300001",
+    "source": "MED",
+    "pmid": "9300001",
+    "doi": "10.5555/fu.review.a1",
+    "title": "Synthetic review 1",
+    "pubYear": "2021",
+    "isRetracted": "N",
+    "isOpenAccess": "N",
+    "journalTitle": "Synthetic Venue"
+   }
+  ]
+ }
+}

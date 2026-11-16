@@ -1,0 +1,24 @@
+{
+ "version": "6.9",
+ "hitCount": 3,
+ "request": {
+  "id": "9300001",
+  "source": "MED",
+  "page": 2,
+  "pageSize": 2
+ },
+ "citationList": {
+  "citation": [
+   {
+    "id": "9200003",
+    "source": "MED",
+    "citationType": "research-article",
+    "title": "A later synthetic article three",
+    "authorString": "Example A",
+    "journalAbbreviation": "Synth J",
+    "pubYear": 2025,
+    "doi": null
+   }
+  ]
+ }
+}

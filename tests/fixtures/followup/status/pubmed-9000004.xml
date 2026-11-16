@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apache-2.0 synthetic fixture; invented identifiers (10.5555 test prefix), no publisher content -->
+<PubmedArticleSet><PubmedArticle><MedlineCitation Status="MEDLINE"><PMID Version="1">9000004</PMID>
+<Article><Journal><ISSN IssnType="Electronic">0000-0000</ISSN><JournalIssue><PubDate><Year>2016</Year></PubDate></JournalIssue>
+<Title>Synthetic Venue</Title></Journal><ArticleTitle>Fictional mechanism study four</ArticleTitle>
+<Abstract><AbstractText>A fictional abstract.</AbstractText></Abstract>
+<PublicationTypeList><PublicationType>Journal Article</PublicationType></PublicationTypeList></Article>
+</MedlineCitation>
+<PubmedData><ArticleIdList><ArticleId IdType="pubmed">9000004</ArticleId><ArticleId IdType="doi">10.5555/fu.work.plain1</ArticleId></ArticleIdList></PubmedData>
+</PubmedArticle></PubmedArticleSet>

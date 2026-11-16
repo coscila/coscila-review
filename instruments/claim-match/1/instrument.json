@@ -1,0 +1,116 @@
+{
+  "id": "claim-match@1",
+  "name": "claim-match",
+  "version": 1,
+  "status": "active",
+  "description": "Second-generation claim matching: whether a sentence of a later article that cites a review restates one of the review's claims and cites the review for it. Candidates come from BM25 retrieval over the later article's sentences that cite the review; the judge confirms each candidate with an exact quote and explicit abstention.",
+  "unit": "a pair of an original claim (an S1 locus) and one candidate sentence of a citing article",
+  "files": {
+    "systemPrompt": {
+      "path": "system-prompt.txt",
+      "sha256": "079e6f927dd47fdc9159b10e4baa9653560820b3f0d3f376c995392c1977a4b0",
+      "mediaType": "text/plain; charset=utf-8"
+    },
+    "outputSchema": {
+      "path": "output.schema.json",
+      "sha256": "ed150f3a639470f09c07b57cd7695a74550fe14eb309b63d9a11c9edd30abd68",
+      "mediaType": "application/schema+json"
+    }
+  },
+  "tiers": {
+    "pair": {
+      "population": "BM25 candidates of the sampled second-generation citing sentences",
+      "evidencePolicy": {
+        "evidence": "the original claim sentence, the review's title, the candidate sentence with the review's marker, and the candidate's section",
+        "neverSent": [
+          "status of the cited work",
+          "dependency class",
+          "support verdicts",
+          "identifiers"
+        ],
+        "sources": [
+          "citing review, public or entitled",
+          "later article, public or entitled"
+        ],
+        "entitledRouting": "on-premises judges only",
+        "retrieval": {
+          "version": "retrieval-fts5-1",
+          "tokenizer": "unicode61 remove_diacritics 2",
+          "receipt": "every candidate list keeps its retrieval receipt"
+        }
+      },
+      "geometry": {
+        "itemsPerCall": 10,
+        "grouping": "anchor",
+        "crossReview": true,
+        "ordering": "rank",
+        "positionsRecorded": true,
+        "positionBase": 1
+      },
+      "request": {
+        "api": "chat.completions",
+        "temperature": 0.0,
+        "seed": null,
+        "reasoningEffort": "none",
+        "stream": false,
+        "maxOutputTokens": {
+          "floor": 1000,
+          "perItem": 250,
+          "rule": "max(floor, perItem * items)"
+        },
+        "timeoutSeconds": 600
+      },
+      "repair": {
+        "passes": 1,
+        "scope": "items without a valid output after the first call"
+      },
+      "transport": {
+        "attempts": 3,
+        "backoffSeconds": [
+          2,
+          4,
+          6
+        ]
+      }
+    }
+  },
+  "requiredModel": {
+    "served": "pinned per analysis by the follow-up protocol (model.served)",
+    "fingerprint": "record-when-offered",
+    "onMismatch": "reject"
+  },
+  "validator": {
+    "id": "claim-match-items@1",
+    "module": "ocsl_review.claim_match",
+    "sha256": "b3d18dacec3501c3db6f7f1ae893e93e836d98a425dec051b7e18f6620c3ee2f"
+  },
+  "builder": {
+    "module": "ocsl_review.followup_items",
+    "sha256": "c5c9a0e70232799da9fb6ff592dfc3364f6eb1bf6370e67a9772e8d670c1a9d3"
+  },
+  "classMap": {
+    "id": "claim-match@1",
+    "match": [
+      "same-claim",
+      "related-claim",
+      "different-claim"
+    ],
+    "reliance": [
+      "cites-review-for-claim",
+      "cites-review-otherwise",
+      "unclear"
+    ],
+    "uncertain": [
+      "abstain"
+    ],
+    "propagation": "same-claim and cites-review-for-claim"
+  },
+  "transport": {
+    "messages": "verbatim",
+    "sentBytesRecorded": true
+  },
+  "notes": [
+    "No validation set measures this instrument's precision; its matches are model measurements.",
+    "Candidates come from BM25 retrieval with receipts; sentences beyond the protocol's cut-off are recorded as not judged, never as different claims."
+  ]
+}

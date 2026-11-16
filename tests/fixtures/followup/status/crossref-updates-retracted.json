@@ -1,0 +1,33 @@
+{
+ "status": "ok",
+ "message-type": "work-list",
+ "message": {
+  "total-results": 1,
+  "items": [
+   {
+    "DOI": "10.5555/fu.notice.retraction1",
+    "type": "journal-article",
+    "title": [
+     "Retraction notice: Fictional cohort study one"
+    ],
+    "update-to": [
+     {
+      "DOI": "10.5555/fu.work.retracted",
+      "type": "retraction",
+      "source": "publisher",
+      "label": "Retraction",
+      "updated": {
+       "date-parts": [
+        [
+         2022,
+         3,
+         4
+        ]
+       ]
+      }
+     }
+    ]
+   }
+  ]
+ }
+}

@@ -1,0 +1,21 @@
+{
+ "header": {
+  "type": "esummary",
+  "version": "0.3"
+ },
+ "result": {
+  "uids": [
+   "9100001"
+  ],
+  "9100001": {
+   "uid": "9100001",
+   "pubdate": "2022 Mar 4",
+   "epubdate": "",
+   "source": "Synthetic Venue",
+   "title": "Retraction notice: Fictional cohort study one.",
+   "pubtype": [
+    "Retraction of Publication"
+   ]
+  }
+ }
+}

@@ -15,7 +15,7 @@ oc-science-lab-bio/      bioinformatics capabilities, when installed
 oc-science-lab-review/   manuscript review and literature verification
 ```
 
-Installation is additive. It mirrors twenty-two `ocsl-review-*` skills into
+Installation is additive. It mirrors twenty-three `ocsl-review-*` skills into
 configured global skill roots and adds only `ocsl_review_catalog` and
 `ocsl_scholar` to deployment MCP configuration. It does not require tracked
 changes in either sibling repository.
@@ -39,6 +39,16 @@ digest-pinned instruments, the entry-level `citation-census@1` study commands
 receipts attest the request the instrument built), the scores database,
 estimands and facts export are described in
 [census-instrument.md](docs/census-instrument.md).
+
+A [follow-up audit](docs/followup-audit.md) (`ocsl-review followup`) branches a
+frozen census and asks which review claims rest on cited works with a dated
+retraction, expression of concern or correction, or on works cited
+systematically without support, whether such a work is the claim's sole or
+essential support, and whether later articles restate the claim on the review's
+authority. Its [evidence](docs/followup-evidence.md) and
+[analysis](docs/followup-analysis.md) commands record model measurements with
+evidence, coverage and uncertainty; every adverse finding reads "check
+suggested".
 
 For one manuscript, [`ocsl-review screen`](docs/claim-check.md) is research-integrity
 tooling for authors, reviewers and study teams: it resolves numeric, structured and
@@ -172,6 +182,9 @@ commands on a deployment.
 - [Extensive literature workflow](docs/literature-review.md)
 - [Resumable citation-support census](docs/citation-census.md)
 - [Census instrument, scores database, estimands and facts](docs/census-instrument.md)
+- [Follow-up audit: compromised-evidence dependency](docs/followup-audit.md),
+  its [evidence commands](docs/followup-evidence.md) and
+  [analysis commands](docs/followup-analysis.md)
 - [Judge capacity probe](docs/capacity-probe.md)
 - [Corpus review workflow](docs/corpus-review.md)
 - [Storage: packs, snapshots, delta branches and stores](docs/storage.md)

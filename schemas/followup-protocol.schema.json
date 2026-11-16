@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/coscila/coscila-review/schemas/followup-protocol.schema.json",
+  "title": "Follow-up audit protocol",
+  "description": "The predeclared protocol of a compromised-evidence dependency audit on a branch of a frozen census: status sources, strata parameters, instruments, the pinned judge, estimands with their numerators and denominators, rules and gates. Every size and rate comes from the run's own data at run time; the protocol holds parameters only. It is registered when the branch is made and frozen with the strata before any follow-up judging.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "version", "question", "seed", "bootstrap", "journals", "status", "strata", "instruments", "model", "estimands", "rules"],
+  "properties": {
+    "format": {"const": "ocsl-followup-protocol-v1"},
+    "version": {"type": "string", "minLength": 1},
+    "question": {"type": "string", "minLength": 1},
+    "seed": {"type": "integer", "minimum": 0, "description": "selection seed (S0 sample, pilot, replicate, second-generation sample)"},
+    "bootstrap": {
+      "type": "object", "additionalProperties": false, "required": ["b", "seed"],
+      "properties": {"b": {"type": "integer", "minimum": 100}, "seed": {"type": "integer", "minimum": 0}}
+    },
+    "journals": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1},
+                 "description": "journals of the parent census compared (study inputs)"},
+    "years": {
+      "type": "object", "additionalProperties": false, "required": ["from", "to"],
+      "properties": {"from": {"type": "integer", "minimum": 1900, "maximum": 2100}, "to": {"type": "integer", "minimum": 1900, "maximum": 2100}}
+    },
+    "status": {
+      "type": "object", "additionalProperties": false, "required": ["sources", "rule"],
+      "properties": {
+        "sources": {"type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": {"enum": ["crossref", "retraction-watch-csv", "pubmed", "europe-pmc"]}},
+        "retractionWatchCsv": {
+          "type": "object", "additionalProperties": false, "required": ["declaredVersion"],
+          "properties": {"declaredVersion": {"type": "string", "minLength": 1},
+                         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+        },
+        "rule": {"const": "status-resolution@1"},
+        "covers": {
+          "type": "object", "additionalProperties": false,
+          "description": "per source, the notice kinds whose absence its answer covers (a status of none needs every deciding kind covered); a source not named keeps its default (Retraction Watch: retraction, expression-of-concern, reinstatement; Crossref: all four kinds; PubMed: retraction, expression-of-concern, correction; Europe PMC: retraction)",
+          "properties": {
+            "crossref": {"$ref": "#/$defs/noticeKinds"}, "retraction-watch-csv": {"$ref": "#/$defs/noticeKinds"},
+            "pubmed": {"$ref": "#/$defs/noticeKinds"}, "europe-pmc": {"$ref": "#/$defs/noticeKinds"}
+          }
+        }
+      }
+    },
+    "strata": {
+      "type": "object", "additionalProperties": false, "required": ["S1", "S2", "S0", "coCited"],
+      "properties": {
+        "S1": {
+          "type": "object", "additionalProperties": false, "required": ["statuses", "inBodyOnly", "identities"],
+          "properties": {
+            "statuses": {"type": "array", "minItems": 1, "uniqueItems": true,
+                         "items": {"enum": ["retracted", "expression-of-concern", "corrected"]}},
+            "inBodyOnly": {"type": "boolean"},
+            "identities": {"type": "array", "minItems": 1, "uniqueItems": true,
+                           "items": {"enum": ["resolved", "resolved_unverified"]}}
+          }
+        },
+        "S2": {
+          "type": "object", "additionalProperties": false,
+          "required": ["minCitingReviews", "fdr", "base", "category", "excludeFamilies"],
+          "properties": {
+            "minCitingReviews": {"type": "integer", "minimum": 1},
+            "fdr": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+            "base": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["journal", "year"]}},
+            "category": {"const": "abstract-tier-false-among-true-and-false"},
+            "excludeFamilies": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+          }
+        },
+        "S3": {
+          "type": "object", "additionalProperties": false, "required": ["family", "familyRules", "licensingVerified"],
+          "properties": {
+            "family": {"type": "string", "minLength": 1},
+            "familyRules": {
+              "type": "object", "additionalProperties": false, "required": ["version", "titlePatterns"],
+              "properties": {"version": {"type": "string", "minLength": 1},
+                             "titlePatterns": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}}
+            },
+            "licensingVerified": {"type": "boolean",
+                                  "description": "false drops S3 before judging; the tables are never ingested"},
+            "tableSource": {
+              "type": "object", "additionalProperties": false, "required": ["declaredVersion", "sha256"],
+              "properties": {"declaredVersion": {"type": "string", "minLength": 1},
+                             "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+            }
+          }
+        },
+        "S0": {
+          "type": "object", "additionalProperties": false, "required": ["size", "matchOn"],
+          "properties": {
+            "size": {"type": "integer", "minimum": 1},
+            "matchOn": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["journal", "year", "topic"]}}
+          }
+        },
+        "coCited": {
+          "type": "object", "additionalProperties": false, "required": ["definition"],
+          "properties": {"definition": {"const": "same-citing-sentence"}}
+        },
+        "pilot": {
+          "type": "object", "additionalProperties": false, "required": ["s1Share", "s0Count"],
+          "properties": {"s1Share": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+                         "s0Count": {"type": "integer", "minimum": 0}}
+        },
+        "replicate": {
+          "type": "object", "additionalProperties": false, "required": ["share"],
+          "properties": {"share": {"type": "number", "exclusiveMinimum": 0, "maximum": 1}}
+        }
+      }
+    },
+    "instruments": {
+      "type": "object", "additionalProperties": false, "required": ["support", "function"],
+      "properties": {
+        "support": {"enum": ["citation-support@2", "citation-support-verbatim@1"],
+                    "description": "citation-support@2 runs on a judge called directly with the request settings of supportSettings; citation-support-verbatim@1 carries the same prompt, output schema, validator and class map with its request settings declared per tier and one item per call, and also runs through the run principal's broker"},
+        "function": {"const": "citation-function@1"},
+        "numeric": {"const": "numeric-check@1"},
+        "match": {"const": "claim-match@1"},
+        "digests": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                    "description": "registry digests the run must use, keyed by instrument id; checked before any call"},
+        "supportSettings": {
+          "type": "object", "additionalProperties": false, "required": ["abstract", "full-text"],
+          "description": "request settings of citation-support@2, which declares none: predeclared here so the reasoning setting of each tier is explicit, frozen and recorded with every request; left out with citation-support-verbatim@1, which declares its own",
+          "properties": {
+            "abstract": {"$ref": "#/$defs/requestSettings"},
+            "full-text": {"$ref": "#/$defs/requestSettings"}
+          }
+        }
+      },
+      "if": {"properties": {"support": {"const": "citation-support-verbatim@1"}}, "required": ["support"]},
+      "then": {"not": {"required": ["supportSettings"]}}
+    },
+    "model": {
+      "type": "object", "additionalProperties": false, "required": ["served", "location"],
+      "properties": {"served": {"type": "string", "minLength": 1}, "location": {"const": "on-premises"}}
+    },
+    "timing": {
+      "type": "object", "additionalProperties": false, "required": ["graceDays"],
+      "description": "a citing article counts as after a notice only from the end of the notice's period plus graceDays (an article online shortly after a notice was written before it); sensitivityGraceDays predeclares a second reading of cited-after-notice and acknowledges-notice",
+      "properties": {
+        "graceDays": {"type": "integer", "minimum": 0, "maximum": 3650},
+        "sensitivityGraceDays": {"type": "integer", "minimum": 0, "maximum": 3650}
+      }
+    },
+    "secondGeneration": {
+      "type": "object", "additionalProperties": false, "required": ["edges", "k", "sources"],
+      "properties": {
+        "edges": {"type": "integer", "minimum": 1},
+        "k": {"type": "integer", "minimum": 1, "maximum": 200},
+        "sources": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["europe-pmc", "openalex"]}}
+      }
+    },
+    "estimands": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "numerator", "denominator", "by", "weights"],
+        "properties": {
+          "id": {"enum": ["compromised-share", "sole-or-essential", "cited-after-notice", "acknowledges-notice",
+                          "second-generation", "distortion-type", "numeric-classes"]},
+          "numerator": {"type": "string", "minLength": 1},
+          "denominator": {"type": "string", "minLength": 1},
+          "by": {"type": "array", "uniqueItems": true, "items": {"enum": ["journal", "year", "status"]}},
+          "contrasts": {"type": "array", "uniqueItems": true, "items": {"enum": ["journal"]},
+                        "description": "journal: every later journal against the first, ratio and difference of the shares with bootstrap intervals"},
+          "weights": {"const": "realised-inclusion-probability"},
+          "labelSource": {"enum": ["instrument", "adjudication"]}
+        }
+      }
+    },
+    "rules": {
+      "type": "object", "additionalProperties": false,
+      "required": ["abstractSilenceIsNotUnsupported", "failedDownloadIsNotUnsupported", "unassessableToCoverage"],
+      "properties": {
+        "abstractSilenceIsNotUnsupported": {"const": true},
+        "failedDownloadIsNotUnsupported": {"const": true},
+        "unassessableToCoverage": {"const": true},
+        "entitledTextOnPremisesOnly": {"const": true}
+      }
+    },
+    "gates": {"type": "array", "uniqueItems": true, "items": {"enum": ["smoke", "pilot", "capacity", "production", "replicate"]}}
+  },
+  "$defs": {
+    "noticeKinds": {"type": "array", "uniqueItems": true,
+                    "items": {"enum": ["retraction", "expression-of-concern", "correction", "reinstatement"]}},
+    "requestSettings": {
+      "type": "object", "additionalProperties": false, "required": ["reasoningEffort"],
+      "properties": {
+        "reasoningEffort": {"enum": ["none", "low", "medium", "high"]},
+        "temperature": {"type": "number", "minimum": 0, "maximum": 2}
+      }
+    }
+  }
+}

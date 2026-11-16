@@ -1,0 +1,116 @@
+{
+  "id": "citation-function@1",
+  "name": "citation-function",
+  "version": 1,
+  "status": "active",
+  "description": "Citation function per locus: whether a review relies on a cited work, cites it as background, cites it critically, or notes that it was retracted, corrected or subject to an expression of concern. Judged from the citing sentence and its neighbours, with an exact quote and explicit abstention. The judge never sees the cited work's status, the stratum or any support verdict.",
+  "unit": "one marker occurrence of one bibliography entry (a locus of the parent census)",
+  "files": {
+    "systemPrompt": {
+      "path": "system-prompt.txt",
+      "sha256": "4ccf4ce2db8ccd5da1070f7cc11db96b317cc5cec6f03901bdf7f8e003fe1406",
+      "mediaType": "text/plain; charset=utf-8"
+    },
+    "outputSchema": {
+      "path": "output.schema.json",
+      "sha256": "edd9d2425f9ed396befbdd8aa7517b248487c3e7eb0b5e75c9a4579429fa7880",
+      "mediaType": "application/schema+json"
+    }
+  },
+  "tiers": {
+    "locus": {
+      "population": "loci of the frozen follow-up strata",
+      "evidencePolicy": {
+        "evidence": "the citing sentence with the named work's marker, the sentences before and after it in the same citing unit, the section trail, and the cited work's title and year",
+        "neighbours": "the sentences before and after the citing sentence come from the parent census's review document, re-extracted with the census's own extraction and matched by the citing sentence's digest; without the document they are empty strings",
+        "neverSent": [
+          "status of the cited work",
+          "stratum",
+          "support verdicts",
+          "identifiers",
+          "journal of the review"
+        ],
+        "sources": [
+          "citing review, public",
+          "citing review, entitled"
+        ],
+        "entitledRouting": "on-premises judges only",
+        "redactedText": "a locus whose citing sentence the parent census keeps only as a digest, with no text parent to supply it, is unassessable (text-redacted) and never sent",
+        "completeness": "no context is invented: a missing neighbour is sent as an empty string"
+      },
+      "geometry": {
+        "itemsPerCall": 10,
+        "grouping": "review",
+        "crossReview": false,
+        "ordering": "document order",
+        "positionsRecorded": true,
+        "positionBase": 1
+      },
+      "request": {
+        "api": "chat.completions",
+        "temperature": 0.0,
+        "seed": null,
+        "reasoningEffort": "none",
+        "stream": false,
+        "maxOutputTokens": {
+          "floor": 1000,
+          "perItem": 250,
+          "rule": "max(floor, perItem * items)"
+        },
+        "timeoutSeconds": 600
+      },
+      "repair": {
+        "passes": 1,
+        "scope": "items without a valid output after the first call"
+      },
+      "transport": {
+        "attempts": 3,
+        "backoffSeconds": [
+          2,
+          4,
+          6
+        ]
+      }
+    }
+  },
+  "requiredModel": {
+    "served": "pinned per analysis by the follow-up protocol (model.served)",
+    "fingerprint": "record-when-offered",
+    "onMismatch": "reject"
+  },
+  "validator": {
+    "id": "citation-function-items@1",
+    "module": "ocsl_review.citation_function",
+    "sha256": "035eda7462520f64521d4ce08a605edb38e1fdc61d273551292e4b462caa41f8"
+  },
+  "builder": {
+    "module": "ocsl_review.followup_items",
+    "sha256": "c5c9a0e70232799da9fb6ff592dfc3364f6eb1bf6370e67a9772e8d670c1a9d3"
+  },
+  "classMap": {
+    "id": "citation-function@1",
+    "classes": [
+      "relies",
+      "background",
+      "critical",
+      "notes-retraction"
+    ],
+    "uncertain": [
+      "abstain"
+    ],
+    "precedence": [
+      "notes-retraction",
+      "critical",
+      "relies",
+      "background"
+    ]
+  },
+  "transport": {
+    "messages": "verbatim",
+    "sentBytesRecorded": true
+  },
+  "notes": [
+    "No validation set measures this instrument's precision; its classes are model measurements.",
+    "Active with its validator digest pinned; the served model is pinned per analysis by the follow-up protocol (model.served)."
+  ]
+}

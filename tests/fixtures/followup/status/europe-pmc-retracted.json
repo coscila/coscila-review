@@ -1,0 +1,19 @@
+{
+ "version": "6.9",
+ "hitCount": 1,
+ "resultList": {
+  "result": [
+   {
+    "id": "9000001",
+    "source": "MED",
+    "pmid": "9000001",
+    "doi": "10.5555/fu.work.retracted",
+    "title": "Fictional cohort study one",
+    "pubYear": "2018",
+    "isRetracted": "Y",
+    "isOpenAccess": "N",
+    "journalTitle": "Synthetic Venue"
+   }
+  ]
+ }
+}
