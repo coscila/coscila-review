@@ -2,15 +2,15 @@
 """``ocsl-review followup``: a compromised-evidence dependency audit on a branch of a frozen census.
 
 Every command works on one follow-up branch database (``--database``) and returns one JSON result; with the global
-``--result-file`` the companion writes it as ``ocsl-review-result-v1``, so a Study Run step can run the command and
-read its outcome. Judging commands take the study commands' judge options (``--model``, ``--base-url``,
-``--broker-socket``, ``--on-premises --policy``, ``--concurrency``, ``--transport-retries``, ``--transport-cooldown``).
+``--result-file`` the companion also writes it as ``ocsl-review-result-v1``, so a caller reads the outcome from a file.
+Judging commands take the study commands' judge options (``--model``, ``--base-url``, ``--broker-socket``,
+``--on-premises --policy``, ``--concurrency``, ``--transport-retries``, ``--transport-cooldown``).
 
-This module registers the family and its argument lists, the command contract that Study Run steps build against. It
-implements the branch commands (``init``, ``pin-bundle``, ``verify``, ``describe``, ``gates``); each evidence command
-(status observations, support and function judging, dependency, cited-by traversal, facts and exports) and each
-analysis command (hotspot test, strata, numeric checks, second-generation matching, retraction lag and estimands) runs
-the function of its implementing module that ``VERBS`` names.
+This module registers the family and its argument lists, the command contract. It implements the branch commands
+(``init``, ``pin-bundle``, ``verify``, ``describe``, ``gates``); each evidence command (status observations, support and
+function judging, dependency, cited-by traversal, facts and exports) and each analysis command (hotspot test, strata,
+numeric checks, second-generation matching, retraction lag and estimands) runs the function of its implementing module
+that ``VERBS`` names.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ JUDGING = frozenset({"support", "function", "numeric", "second-gen"})
 
 
 def judge_arguments(parser: Any) -> None:
-    """The judge options every judging command shares (the study commands' names, so Study Run steps reuse them)."""
+    """The judge options every judging command shares, under the study commands' names."""
     parser.add_argument("--model", help="served model the protocol pins (model.served)")
     parser.add_argument("--base-url", help="chat-completions base URL of a judge called directly")
     parser.add_argument("--api-key-env", help="environment variable holding the direct judge's key")
@@ -109,8 +109,8 @@ def add_commands(families: Any, register: Any) -> None:
     parsers["status-fetch"].add_argument("--workspace", help="workspace whose egress ledger records the requests")
     parsers["status-fetch"].add_argument("--snapshot", help="continue this status snapshot instead of starting one")
     parsers["status-fetch"].add_argument("--continue", dest="continue_open", action="store_true",
-                                         help="continue the latest snapshot that did not finish (a fixed Study Run "
-                                              "step passes it; a new snapshot starts when none is open)")
+                                         help="continue the latest snapshot that did not finish (the same command "
+                                              "line can always pass it; a new snapshot starts when none is open)")
     parsers["status-resolve"] = commands.add_parser(
         "status-resolve", help="one status row (source and date) for every cited work of the parent census")
     parsers["status-resolve"].add_argument("--snapshot", action="append",
@@ -201,9 +201,9 @@ def add_commands(families: Any, register: Any) -> None:
 
 
 def gates(database: Path) -> dict[str, Any]:
-    """Checks a Study Run can require: parent unchanged, references resolve, a status row for every cited work, strata
-    frozen before any judging, invalid outputs within the bound, fingerprints, one digest per instrument, no entitled
-    evidence sent to a judge that is not on premises."""
+    """Process-validity checks of the follow-up run: parent unchanged, references resolve, a status row for every cited
+    work, strata frozen before any judging, invalid outputs within the bound, fingerprints, one digest per instrument,
+    no entitled evidence sent to a judge that is not on premises."""
     from .followup_branch import FollowupBranch, instrument_pins
     branch = FollowupBranch(database)
     verified = branch.verify(deep=True)

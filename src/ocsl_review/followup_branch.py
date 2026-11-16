@@ -143,7 +143,7 @@ STUDY_BUNDLE_FORMAT = "ocsl-study-bundle-v1"
 
 def load_study_bundle(value: Any) -> tuple[dict[str, Any] | None, str]:
     """(bundle, sha256) of ``--study-bundle``: an ``ocsl-study-bundle-v1`` file whose sha256 is checked against its
-    content, or a bare sha256 (bundle None) when the bundle itself lives with the Study Run."""
+    content, or a bare sha256 (bundle None) when the bundle file is kept elsewhere."""
     import re
     from .instruments import canonical as bundle_canonical, sha256_bytes
     text = str(value or "").strip()
