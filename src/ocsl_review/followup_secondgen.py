@@ -12,7 +12,7 @@ Stages (``--stage``, default ``all`` in this order):
   (looked up by DOI or PMID when the edge has none), through ``followup_net.client`` (identifiers only, no contact
   identity, the scholarly transport's User-Agent, retries and per-host spacing). Outcomes: obtained,
   no-open-full-text, fetch-failed, unavailable (not readable) and citation-not-located (``fu_secondgen_documents``);
-  every response is a receipt (``fu_requests``). Entitled acquisition is not part of this build.
+  every response is a receipt (``fu_requests``). Only open full text is acquired.
 - ``candidates``: the citing article is extracted (``census_extraction.extract_review``); the bibliography entry whose
   DOI or PMID is the review's yields its citing sentences with the marker as rendered (``fu_secondgen_sentences``).
   One BM25 index (``retrieval.EvidenceIndex``) per anchor over the sentences of its sampled citing works; the anchor's

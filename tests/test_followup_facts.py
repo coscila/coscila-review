@@ -3,7 +3,7 @@
 denominators and flags materialized, fact inputs, and a postflight through corpus_facts.verify_export.
 
 ``populated_branch`` runs the evidence commands offline on the synthetic census (status, function, support at both
-tiers, dependency, cited-by) and writes the rows the analysis track owns (strata sizes, a numeric row, a confirmed
+tiers, dependency, cited-by) and writes the rows of the analysis commands (strata sizes, a numeric row, a confirmed
 second-generation restatement, estimates and coverage) directly.
 """
 from __future__ import annotations
@@ -172,7 +172,7 @@ class FactsTests(unittest.TestCase):
         self.assertEqual(7, self.value("followup.calls.citation-function-1.locus.primary.accepted-items"))
         self.assertIn("followup.requests.crossref.ok", self.facts)
 
-    def test_estimates_and_coverage_of_the_analysis_track(self):
+    def test_estimates_and_coverage_of_the_analysis_commands(self):
         estimate = self.facts["followup.estimates.compromised-share.journal-a.all.retracted.share"]
         self.assertEqual((0.25, "compromised-share", 13), (estimate["value"], estimate["method"],
                                                            estimate["derivation"]["seed"]))

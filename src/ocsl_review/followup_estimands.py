@@ -11,7 +11,7 @@ Abstract silence and failed downloads are reasons, never "unsupported".
 
 | Id | Numerator | Denominator | Units |
 |---|---|---|---|
-| compromised-share | loci whose cited work's status is one of the protocol's S1 statuses (each status a level when "status" is in ``by``) | every in-body identity-resolved frame locus, a work of unknown status included (the design's estimand); sensitivity ``available-case``: loci with a known status only | frame (census) |
+| compromised-share | loci whose cited work's status is one of the protocol's S1 statuses (each status a level when "status" is in ``by``) | every in-body identity-resolved frame locus, a work of unknown status included (the primary estimand); sensitivity ``available-case``: loci with a known status only | frame (census) |
 | sole-or-essential | S1 loci with dependency sole or essential; level ``anchor-supported``: of those, loci whose own cited work supports the claim at full text | S1 loci whose own full-text verdict is assessable and whose dependency is sole, essential or redundant | S1 |
 | cited-after-notice | S1 loci whose review went online after the notice (plus the protocol's grace days) | S1 loci with a decidable comparison (the lag distribution in the detail); sensitivity ``grace-<N>d`` with the protocol's sensitivity grace days | S1 |
 | acknowledges-notice | post-notice S1 loci with function notes-retraction | post-notice S1 loci with an assessable function; sensitivity as for cited-after-notice | S1 |
@@ -28,8 +28,9 @@ second-generation) over the pilot subsample only, weighted by 1 / pilot probabil
 seeded pilot draw per status), under the keys ``followup.pilot.<estimand>...``; the census estimands
 (compromised-share, numeric-classes, distortion-type) have no pilot form.
 
-Distortion labels come from adjudication, which this build does not hold: the estimand reports "not-measured" with the
-number of adverse S2 loci (full-text verdict contradicted or not addressed) awaiting labels. Keys:
+Distortion labels come from human adjudication, which a follow-up branch does not record: the estimand reports
+"not-measured" with the number of adverse S2 loci (full-text verdict contradicted or not addressed) awaiting labels.
+Keys:
 ``followup[.pilot].<estimand>[.<variant>][.<level>][.<status>].<journal-slug|all>.<year|all>.<share|lo|hi|n|numerator|
 denominator>``; contrasts ``followup.<estimand>.journal-ratio|journal-difference[.<variant>][.<level>].<journal>-vs-
 <first>.all.<value|lo|hi|n>``.
@@ -96,8 +97,8 @@ def _statuses(connection: sqlite3.Connection) -> dict[str, str]:
 def compromised_units(connection: sqlite3.Connection, protocol: Mapping[str, Any],
                       scope: str = "all") -> dict[str | None, list[Unit]]:
     """Frame loci grouped by review, year and status (census: weight 1 per locus). The primary estimand keeps loci
-    whose work's status is unknown in the denominator (the design's estimand over every in-body identity-resolved
-    locus; a coverage note says how many); the ``available-case`` sensitivity moves them to coverage."""
+    whose work's status is unknown in the denominator (it is defined over every in-body identity-resolved locus; a
+    coverage note says how many); the ``available-case`` sensitivity moves them to coverage."""
     s1 = protocol["strata"]["S1"]
     identities = list(s1["identities"])
     inbody = " AND f.cited_inbody=1" if s1["inBodyOnly"] else ""
@@ -138,8 +139,8 @@ def _weight(row: Mapping[str, Any], scope: str) -> float:
 
 def dependency_units(connection: sqlite3.Connection, protocol: Mapping[str, Any],
                      scope: str = "all") -> dict[str | None, list[Unit]]:
-    """S1 anchors with a determined dependency and an assessable full-text verdict of their own (the design's "S1 loci
-    with assessable full text"); the value is (sole or essential, own work supports the claim)."""
+    """S1 anchors with a determined dependency and an assessable full-text verdict of their own (the S1 loci with
+    assessable full text); the value is (sole or essential, own work supports the claim)."""
     from .followup_dependency import support_classes
     supported = support_classes()["supported"]
     units = []
@@ -498,7 +499,7 @@ def distortion(connection: sqlite3.Connection, protocol: Mapping[str, Any], decl
         detail = {"estimand": "distortion-type", "status": status, "numerator": declared["numerator"],
                   "denominator": declared["denominator"], "labelSource": declared.get("labelSource") or "adjudication",
                   "labels": list(DISTORTION_LABELS), "awaitingLabels": len(cell), "b": b, "seed": seed,
-                  "note": "adjudicated distortion labels are not part of this build; the estimand is not measured"}
+                  "note": "a follow-up branch records no adjudicated distortion labels; the estimand is not measured"}
         rows += write_share_rows(connection, estimand="distortion-type", qualifiers=[status], journal=journal,
                                  slug=slugs.get(journal, ALL), year=year, stratum="S2", numerator=0.0,
                                  denominator=0.0, units=0, estimate=None, bounds=(None, None), detail=detail)

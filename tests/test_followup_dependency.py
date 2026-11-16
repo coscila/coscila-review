@@ -2,8 +2,8 @@
 """dependency-aggregation@1 on the synthetic census: sole, redundant, essential and undetermined anchors, full-text
 verdicts only, unresolved co-citations, a work cited twice, and idempotent recomputation.
 
-``insert_frame`` writes the rows the analysis track's strata builder owns (frame, strata, co-cited loci and a
-protocol freeze) straight from the parent census, so the evidence tests never import that track's modules.
+``insert_frame`` writes the rows ``followup strata`` builds (frame, strata, co-cited loci and a protocol freeze)
+straight from the parent census, so these tests do not run the strata builder.
 """
 from __future__ import annotations
 
@@ -182,7 +182,7 @@ class DependencyTests(unittest.TestCase):
                                                           detail["cocitedWorks"][0]["supports"],
                                                           detail["cocitedWorks"][0]["countsAsSupport"]))
             self.assertEqual("redundant", detail["readings"]["compromisedSupportCounts"])
-        # A status outside the protocol's S1 statuses (or none) counts as support as before.
+        # Support from a co-cited work whose status is outside the protocol's S1 statuses (or that has none) counts.
         row = D.classify({"locus_id": "LA", "claim_id": "C", "work_key": "wA"}, loci, verdicts,
                          statuses={"wB": "corrected"}, compromised=("retracted",))
         self.assertEqual("redundant", row["class"])

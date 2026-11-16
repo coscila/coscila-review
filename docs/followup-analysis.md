@@ -156,8 +156,8 @@ Whether later articles restate a review claim that rests on a compromised work, 
   or the reason (`abstained`, `invalid-output`, `not-judged`, `text-redacted`), and the edge's inclusion probability.
 - **External requests** go through the follow-up's scholarly client: identifiers only, the tool's User-Agent, its retry
   policy and a per-host interval; no contact identity unless the operator configured `OCSL_REVIEW_CONTACT_EMAIL`;
-  `--workspace` names the workspace whose egress ledger records the requests. Entitled acquisition is not part of this
-  build.
+  `--workspace` names the workspace whose egress ledger records the requests. Only open full text is acquired; a
+  citing work without one is `no-open-full-text`.
 
 ## followup lag
 
@@ -192,7 +192,7 @@ cell without any unit is not written.
 
 | Estimand | Numerator | Denominator |
 |---|---|---|
-| `compromised-share` | in-body identity-resolved loci whose work status is one of the S1 statuses (each status a level when `by` names status) | every in-body identity-resolved locus, a work of unknown status included (the design's estimand); sensitivity `available-case`: loci with a known status only |
+| `compromised-share` | in-body identity-resolved loci whose work status is one of the S1 statuses (each status a level when `by` names status) | every in-body identity-resolved locus, a work of unknown status included (the primary estimand); sensitivity `available-case`: loci with a known status only |
 | `sole-or-essential` | S1 loci with dependency sole or essential; level `anchor-supported`: of those, the loci whose own cited work supports the claim at full text | S1 loci whose own full-text verdict is assessable and whose dependency is sole, essential or redundant |
 | `cited-after-notice` | S1 loci whose review went online after the notice (plus the grace days) | S1 loci with a decidable comparison; the lag quartiles are in the detail; sensitivity `grace-<N>d` with `timing.sensitivityGraceDays` |
 | `acknowledges-notice` | post-notice S1 loci with function notes-retraction | post-notice S1 loci with an assessable function; sensitivity as above |
@@ -225,8 +225,8 @@ cell without any unit is not written.
   stat `share`, `lo`, `hi`, `n` (unweighted units in the denominator), `numerator` and `denominator` (weighted); a cell
   without a denominator reports the share as `not-measured`. `detail_json` records the definitions, scope, variant,
   weights, replicates, seed, bootstrap scope and interval method.
-- **Distortion types** come from adjudication, which this build does not hold: the estimand reports `not-measured`
-  with the adverse S2 loci (full-text verdict contradicted or not addressed) awaiting labels.
+- **Distortion types** come from human adjudication, which a follow-up branch does not record: the estimand reports
+  `not-measured` with the adverse S2 loci (full-text verdict contradicted or not addressed) awaiting labels.
 - **Coverage** (`fu_coverage`): for every estimand, variant and cell, the assessable units and every unassessable unit
   with its reason; for a status breakdown the estimand column reads `<estimand>[.<variant>].<status>`. Units without a
   verdict never enter a numerator or a denominator. The compromised share's denominator units of unknown status appear

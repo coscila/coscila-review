@@ -125,7 +125,7 @@ class EstimandTests(unittest.TestCase):
                 "SELECT * FROM fu_coverage WHERE estimand=? AND journal=? AND year=?", (estimand, journal, year))}
 
     def test_compromised_share_over_every_identity_resolved_locus_and_the_available_case(self):
-        # The design's estimand: a locus whose work's status is unknown stays in the denominator (coverage notes it).
+        # The primary estimand: a locus whose work's status is unknown stays in the denominator (coverage notes it).
         self.assertAlmostEqual(5 / 11, self.value("followup.compromised-share.all.all.share"))
         self.assertEqual((5.0, 11.0, 11), tuple(self.value(f"followup.compromised-share.all.all.{stat}")
                                                 for stat in ("numerator", "denominator", "n")))

@@ -150,7 +150,7 @@ estimands over the pilot subsample, weighted by the pilot probabilities, under `
   replicates and seed; `--b` and `--bootstrap-seed` make exploratory estimates, which the facts refuse to mix and the
   gates report).
 - The compromised share is reported over every in-body identity-resolved locus, a work of unknown status included
-  (the design's estimand), with the share over loci of known status as the labelled `available-case` sensitivity;
+  (the primary estimand), with the share over loci of known status as the labelled `available-case` sensitivity;
   sole-or-essential needs an assessable full-text verdict of the anchor's own work; second-generation propagation is
   counted per sampled later article; the lag model's rate ratio is descriptive (census reviews per period as exposure).
 - Integrity classes (never cited, unresolved identity) stay apart from support verdicts.
