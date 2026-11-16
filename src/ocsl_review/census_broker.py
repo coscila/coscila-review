@@ -341,7 +341,7 @@ class BrokerTransport:
         authorization = catalog.get("authorization") if isinstance(catalog.get("authorization"), dict) else {}
         principal = authorization.get("principalId")
         if not isinstance(principal, str) or not principal:
-            raise ValidationError("the broker socket names no principal: the census runs only on a run principal's "
+            raise ValidationError("the broker socket names no principal: instruments run only on a run principal's "
                                   "socket (a chat turn socket carries no run authority)")
         if authorization.get("kind") not in (None, "run"):
             raise ValidationError(f"the broker principal is a {authorization.get('kind')} principal, not a run principal")
@@ -380,9 +380,10 @@ class BrokerTransport:
             catalog = self.catalog      # an outage after the start: the calls meet it and the run pauses as an outage
         if catalog.get("instrumentVerbatim") != 1:
             raise ValidationError("the broker does not offer verbatim instrument mode (instrumentVerbatim): it would not "
-                                  "send the instrument's messages unchanged; the census needs an execution daemon that does")
+                                  "send the instrument's messages unchanged; a verbatim instrument needs an execution "
+                                  "daemon that does")
         if model != self.worker_model:
-            raise ValidationError(f"the broker worker {self.worker_id!r} requests model {self.worker_model!r}, the census "
+            raise ValidationError(f"the broker worker {self.worker_id!r} requests model {self.worker_model!r}, the command "
                                   f"requests {model!r}: the request digests could never agree (pass --model to match)")
         listed = {item.get("digest"): item for item in catalog.get("instruments") or [] if isinstance(item, dict)}
         granted = set((catalog.get("authorization") or {}).get("instruments") or [])
