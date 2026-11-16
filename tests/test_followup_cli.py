@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
 
 import followup_fixtures as F
-from ocsl_review import followup_cli, followup_cli_a, followup_cli_b
+from ocsl_review import followup_cli
 from ocsl_review.cli import RESULT_FORMAT, build_parser, main
-from ocsl_review.errors import ReviewError
 
 
 class FollowupCliTests(unittest.TestCase):
@@ -69,10 +68,8 @@ class FollowupCliTests(unittest.TestCase):
         family = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
         followup = family.choices["followup"]
         commands = next(action for action in followup._actions if isinstance(action, argparse._SubParsersAction))
-        expected = ({"init", "verify", "describe", "gates", "pin-bundle"} | set(followup_cli_a.VERBS)
-                    | set(followup_cli_b.VERBS))
+        expected = {"init", "verify", "describe", "gates", "pin-bundle"} | set(followup_cli.VERBS)
         self.assertEqual(expected, set(commands.choices))
-        self.assertFalse(set(followup_cli_a.VERBS) & set(followup_cli_b.VERBS))
         helps = {action.dest: action.help for action in commands._choices_actions}
         for name, sub in commands.choices.items():
             with self.subTest(command=name):
@@ -81,12 +78,10 @@ class FollowupCliTests(unittest.TestCase):
                 if name not in ("verify-facts",):
                     self.assertIn("--database", sub._option_string_actions)
 
-    def test_a_command_without_its_module_fails_as_a_usage_error(self):
-        with self.assertRaisesRegex(ReviewError, "not implemented in this build"):
-            followup_cli.dispatch({"probe": ("followup_module_that_does_not_exist", "cmd")},
-                                  SimpleNamespace(command="probe"))
-        with self.assertRaisesRegex(ReviewError, "not implemented in this build"):
-            followup_cli.dispatch({"probe": ("followup_schema", "cmd_missing")}, SimpleNamespace(command="probe"))
+    def test_every_command_names_a_function_of_its_module(self):
+        for name, (module, function) in followup_cli.VERBS.items():
+            with self.subTest(command=name):
+                self.assertTrue(callable(getattr(importlib.import_module(f"ocsl_review.{module}"), function, None)))
 
     def test_judging_commands_share_the_study_judge_options(self):
         parser = build_parser()
