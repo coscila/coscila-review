@@ -235,7 +235,11 @@ never leaves agents reading superseded skill text unnoticed. After a companion
 update, `integrate refresh` re-copies exactly the skills whose source changed
 (MCP entries and staging stay as they are) and records the new skill manifest;
 a repeated `integrate install` with the same values does the same. Neither
-overwrites an installed copy edited after installation.
+overwrites an installed copy edited after installation. A skill that an update
+adds is not in the installation's skill manifest: `integrate refresh` and a
+repeated `integrate install` leave it out, and `integrate verify` does not
+report it, so it reaches agents through `integrate uninstall` followed by
+`integrate install`.
 
 ```bash
 "$OCSL_REVIEW_HOME/bin/ocsl-review" integrate refresh
