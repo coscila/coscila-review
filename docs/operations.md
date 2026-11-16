@@ -228,24 +228,36 @@ longer describes it.
 
 ### Updating an existing installation
 
-Installed skill copies record the digest of the source they were copied from.
+Installed skill copies record the digest of the source they were copied from,
+and the skill manifest records which skills each skill root holds.
 `integrate verify` (and therefore `doctor`) fails while any installed copy was
-made from an older source, so a checkout update that only moves the companion
-never leaves agents reading superseded skill text unnoticed. After a companion
-update, `integrate refresh` re-copies exactly the skills whose source changed
-(MCP entries and staging stay as they are) and records the new skill manifest;
-a repeated `integrate install` with the same values does the same. Neither
-overwrites an installed copy edited after installation. A skill that an update
-adds is not in the installation's skill manifest: `integrate refresh` and a
-repeated `integrate install` leave it out, and `integrate verify` does not
-report it, so it reaches agents through `integrate uninstall` followed by
-`integrate install`.
+made from an older source, while a recorded skill root lacks a skill of the
+companion's skill set, or while it holds an installed skill outside that set;
+the failure names those skills and `integrate refresh`. A checkout update that
+only moves the companion therefore never leaves agents reading superseded skill
+text or missing a skill unnoticed. After a companion update, `integrate refresh`
+brings the installation up to the companion's skill set (MCP entries and
+staging stay as they are) and records the new skill manifest:
+
+- it re-copies exactly the skills whose source changed;
+- it installs each skill the installation lacks into every recorded skill
+  root, after the catalog and skill-root checks of an install;
+- it removes an installed skill outside the set and restores what stood at its
+  place before the first install, as `integrate uninstall` does.
+
+A repeated `integrate install` with the same values does the same. Neither
+overwrites an installed copy edited after installation, and neither replaces a
+file or folder that stands at a missing skill's place without belonging to the
+installation: the refresh stops before it changes anything and names that path.
+Once it is moved out of the skill root, the refresh completes. A refresh that
+fails partway restores every skill it had changed.
 
 ```bash
 "$OCSL_REVIEW_HOME/bin/ocsl-review" integrate refresh
 "$OCSL_REVIEW_HOME/bin/ocsl-review" integrate verify --live --strict
 ```
 
+An update that changes only skills needs nothing beyond `integrate refresh`.
 For a larger update (changed MCP entries, staging or environments), validate
 and test the merged source, then preserve private
 backups of the current skill mirrors, ownership records, MCP source and staged
@@ -254,7 +266,7 @@ configuration, runtime environment, and current template pointers.
 Build only environments whose input locks or health-check contracts changed.
 Promotion selects a new immutable template; retained older templates must not
 be edited, and review-time resolution must not silently use superseded inputs.
-Verify all six current templates before refreshing the installation.
+Verify all six current templates before reinstalling.
 
 Once preparation succeeds, use the existing guarded lifecycle with the same
 configured roots and real staging command:
@@ -269,8 +281,8 @@ configured roots and real staging command:
 
 Do not bypass ownership checks if removal detects installed-file or owned-MCP
 edits. Both stages preserve unrelated MCP entries and have their own rollback
-checks; retain the pre-update backup across the entire refresh in case the
-second stage cannot complete. Expect a brief interval between staging passes
+checks; retain the pre-update backup across both stages in case the second
+cannot complete. Expect a brief interval between staging passes
 when newly launched agents do not have the review tools registered.
 
 No web rebuild is required for companion-only changes. New agent/MCP processes

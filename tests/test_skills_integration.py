@@ -8,14 +8,18 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ocsl_review import config as review_config
+from ocsl_review import doctor as review_doctor
 from ocsl_review import integration, lifecycle, skills
 from ocsl_review.config import Paths
 from ocsl_review.errors import ReviewError, ValidationError
@@ -32,6 +36,18 @@ MCP_ENTRIES = {
         "env": {"MODE": "scholar"},
     },
 }
+FOLLOWUP_AUDIT = "ocsl-review-followup-audit"
+
+
+@contextmanager
+def skill_set_without(skill_id: str) -> Iterator[None]:
+    """The companion as a release whose skill set lacks skill_id: its required skills and the catalog check it passed."""
+    smaller = tuple(identifier for identifier in skills.REQUIRED_SKILLS if identifier != skill_id)
+    with (
+        patch.object(skills, "REQUIRED_SKILLS", smaller),
+        patch.object(skills, "validate_catalog", return_value={"ok": True, "skills": len(smaller)}),
+    ):
+        yield
 
 
 class ReviewPathsTestCase(unittest.TestCase):
@@ -58,6 +74,14 @@ class ReviewPathsTestCase(unittest.TestCase):
         self.native = base / "native-skills"
         self.codex = base / "codex-skills"
         self.roots = {"native": self.native, "codex": self.codex}
+
+    def targets(self, skill_id: str) -> set[str]:
+        """The installed places of one skill, in both skill roots."""
+        return {str(root.resolve() / skill_id) for root in (self.native, self.codex)}
+
+    def skill_roots_snapshot(self) -> dict[Path, dict[str, dict[str, Any]]]:
+        """Every node in both skill roots with its digest, mode or link target, to show that nothing changed."""
+        return {root: skills._node_manifest(root) for root in (self.native, self.codex)}
 
 
 class SkillCatalogTests(ReviewPathsTestCase):
@@ -192,6 +216,135 @@ class SkillCatalogTests(ReviewPathsTestCase):
         with self.assertRaisesRegex(ValidationError, "edited after installation"):
             skills.refresh_skill_set(paths)
         self.assertTrue(edited.read_text(encoding="utf-8").endswith("local edit\n"))
+
+    def test_refresh_installs_a_skill_the_installation_lacks_into_every_root(self) -> None:
+        with skill_set_without(FOLLOWUP_AUDIT):
+            skills.install_skill_set(self.paths, self.roots)
+        targets = self.targets(FOLLOWUP_AUDIT)
+
+        report = skills.verify_skill_installation(self.paths)
+        self.assertFalse(report["ok"])
+        self.assertEqual(targets, {item["target"] for item in report["missing"]})
+        self.assertIn(f"the installation lacks required skills: {FOLLOWUP_AUDIT};", report["reason"])
+        self.assertIn("`ocsl-review integrate refresh`", report["reason"])
+        # Integrity alone (what uninstall and the refresh itself start from) holds.
+        self.assertTrue(skills.verify_skill_installation(self.paths, check_source=False)["ok"])
+
+        result = skills.refresh_skill_set(self.paths)
+        self.assertEqual((targets, [], []), (set(result["added"]), result["refreshed"], result["removed"]))
+        source = ROOT / "skills" / FOLLOWUP_AUDIT
+        for target in map(Path, targets):
+            self.assertEqual((source / "SKILL.md").read_bytes(), (target / "SKILL.md").read_bytes())
+            owner = json.loads((target / skills.OWNER_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(skills.tree_digest(source), owner["sourceDigest"])
+        self.assertTrue(skills.verify_skill_installation(self.paths)["ok"])
+
+        # The added copies belong to the installation: uninstall removes them with the others.
+        self.assertEqual(2 * len(skills.REQUIRED_SKILLS), skills.uninstall_skill_set(self.paths)["removed"])
+        self.assertFalse(any(Path(target).exists() for target in targets))
+
+    def test_a_repeated_install_adds_a_skill_the_installation_lacks(self) -> None:
+        with skill_set_without(FOLLOWUP_AUDIT):
+            skills.install_skill_set(self.paths, self.roots)
+        again = skills.install_skill_set(self.paths, self.roots)
+        self.assertTrue(again["reused"])
+        self.assertEqual(self.targets(FOLLOWUP_AUDIT), set(again["added"]))
+        self.assertTrue(skills.verify_skill_installation(self.paths)["ok"])
+
+    def test_refresh_with_nothing_missing_or_stale_changes_nothing(self) -> None:
+        skills.install_skill_set(self.paths, self.roots)
+        manifest = skills.manifest_path(self.paths)
+        before = (manifest.read_bytes(), self.skill_roots_snapshot())
+        result = skills.refresh_skill_set(self.paths)
+        self.assertEqual(([], [], []), (result["refreshed"], result["added"], result["removed"]))
+        self.assertEqual(before, (manifest.read_bytes(), self.skill_roots_snapshot()))
+
+    def test_refresh_refuses_a_node_it_does_not_own_at_a_missing_skill_and_changes_nothing(self) -> None:
+        home = self.copied_home()
+        paths = Paths(home=home, state=self.state, lab_repo=None)
+        with skill_set_without(FOLLOWUP_AUDIT):
+            skills.install_skill_set(paths, self.roots)
+        # A stale copy as well, so that the refusal is seen to leave every kind of change undone.
+        source = home / "skills" / "ocsl-review-router" / "SKILL.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\nchanged in the source\n", encoding="utf-8")
+        foreign = self.native / FOLLOWUP_AUDIT  # in the root refreshed last
+        foreign.mkdir()
+        (foreign / "SKILL.md").write_text("a skill a person keeps here\n", encoding="utf-8")
+        manifest = skills.manifest_path(paths)
+        before = (manifest.read_bytes(), self.skill_roots_snapshot())
+
+        with self.assertRaisesRegex(
+            ValidationError, f"refusing to install {FOLLOWUP_AUDIT}: .* does not belong to this installation"
+        ):
+            skills.refresh_skill_set(paths)
+        self.assertEqual(before, (manifest.read_bytes(), self.skill_roots_snapshot()))
+
+        # Once that folder is moved out of the skill root, the refresh completes.
+        shutil.move(str(foreign), str(Path(self.temporary.name) / "kept-skill"))
+        result = skills.refresh_skill_set(paths)
+        self.assertEqual(self.targets(FOLLOWUP_AUDIT), set(result["added"]))
+        self.assertEqual(self.targets("ocsl-review-router"), set(result["refreshed"]))
+        self.assertTrue(skills.verify_skill_installation(paths)["ok"])
+
+    def test_a_refresh_that_fails_midway_restores_the_installation(self) -> None:
+        home = self.copied_home()
+        paths = Paths(home=home, state=self.state, lab_repo=None)
+        with skill_set_without(FOLLOWUP_AUDIT):
+            skills.install_skill_set(paths, self.roots)
+        source = home / "skills" / "ocsl-review-router" / "SKILL.md"
+        source.write_text(source.read_text(encoding="utf-8") + "\nchanged in the source\n", encoding="utf-8")
+        manifest = skills.manifest_path(paths)
+        before = (manifest.read_bytes(), self.skill_roots_snapshot())
+
+        copytree = shutil.copytree
+        staged: list[Path] = []
+
+        def copy_failing_for_the_last_added_skill(source: Path, destination: Path, **kwargs: Any) -> Any:
+            # The codex root comes first: when the native copy of the missing skill is staged, the codex root holds a
+            # re-copied and an added skill and the native router has been re-copied. The failing copy leaves a part.
+            destination = Path(destination)
+            staged.append(destination)
+            if destination.parent == self.native.resolve() and destination.name.endswith(FOLLOWUP_AUDIT):
+                destination.mkdir()
+                (destination / "SKILL.md").write_text("partial", encoding="utf-8")
+                raise OSError("no space left on device")
+            return copytree(source, destination, **kwargs)
+
+        with (
+            patch.object(skills.shutil, "copytree", side_effect=copy_failing_for_the_last_added_skill),
+            self.assertRaisesRegex(OSError, "no space left on device"),
+        ):
+            skills.refresh_skill_set(paths)
+        self.assertEqual(4, len(staged))
+        self.assertEqual(before, (manifest.read_bytes(), self.skill_roots_snapshot()))
+
+    def test_refresh_removes_an_installed_skill_outside_the_skill_set_and_restores_its_place(self) -> None:
+        home = self.copied_home()
+        paths = Paths(home=home, state=self.state, lab_repo=None)
+        kept = self.native / "ocsl-review-router"
+        kept.mkdir(parents=True)
+        (kept / "local.txt").write_text("native-original", encoding="utf-8")
+        skills.install_skill_set(paths, self.roots)
+        targets = self.targets("ocsl-review-router")
+
+        # A companion release whose skill set lacks the router skill, and its source with it.
+        shutil.rmtree(home / "skills" / "ocsl-review-router")
+        without = tuple(identifier for identifier in skills.REQUIRED_SKILLS if identifier != "ocsl-review-router")
+        with patch.object(skills, "REQUIRED_SKILLS", without):
+            report = skills.verify_skill_installation(paths)
+            self.assertFalse(report["ok"])
+            self.assertEqual(targets, {item["target"] for item in report["extra"]})
+            self.assertNotIn("stale", report)
+            self.assertIn("`ocsl-review integrate refresh`", report["reason"])
+
+            result = skills.refresh_skill_set(paths)
+            self.assertEqual((targets, [], []), (set(result["removed"]), result["refreshed"], result["added"]))
+            self.assertEqual(["local.txt"], [path.name for path in kept.iterdir()])
+            self.assertEqual("native-original", (kept / "local.txt").read_text(encoding="utf-8"))
+            self.assertFalse((self.codex / "ocsl-review-router").exists())
+            self.assertTrue(skills.verify_skill_installation(paths)["ok"])
+            skills.uninstall_skill_set(paths)
+        self.assertEqual("native-original", (kept / "local.txt").read_text(encoding="utf-8"))
 
     def test_skill_roots_cannot_overlap_protected_source_or_state(self) -> None:
         # Bio and lab siblings keep their old names on the lab host and use the coscila-* names in development clones;
@@ -490,6 +643,54 @@ class IntegrationTests(ReviewPathsTestCase):
         self.assertFalse(integration.verify_integration(self.paths)["ok"])
         result = integration.uninstall_integration(self.paths, stage_timeout=30)
         self.assertFalse(result["reused"])
+        self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
+
+    def test_integrate_refresh_installs_a_missing_skill_that_verify_and_doctor_report(self) -> None:
+        with skill_set_without(FOLLOWUP_AUDIT):
+            self.install()
+        targets = self.targets(FOLLOWUP_AUDIT)
+        state_path = integration.install_state_path(self.paths)
+        manifest = skills.manifest_path(self.paths)
+        acceptance = {"ok": True, "acceptanceComplete": True}
+
+        verified = integration.verify_integration(self.paths)
+        self.assertFalse(verified["ok"])
+        self.assertIn(f"the installation lacks required skills: {FOLLOWUP_AUDIT};", verified["reason"])
+        self.assertIn("`ocsl-review integrate refresh`", verified["reason"])
+        with self.assertRaisesRegex(ValidationError, f"lacks required skills: {FOLLOWUP_AUDIT};.*integrate refresh"):
+            lifecycle.cmd_verify(self.verify_args())
+        with patch("ocsl_review.doctor.mcps.doctor", return_value=acceptance):
+            report = review_doctor.doctor(self.paths)
+        self.assertFalse(report["checks"]["integration"])
+        self.assertEqual(verified["reason"], report["integration"]["reason"])
+
+        # A folder the installation does not own at the missing skill's place stops the refresh before any change.
+        foreign = self.native / FOLLOWUP_AUDIT
+        foreign.mkdir()
+        (foreign / "notes.md").write_text("kept by a person\n", encoding="utf-8")
+        before = (state_path.read_bytes(), manifest.read_bytes(), self.skill_roots_snapshot())
+        with self.assertRaisesRegex(ValidationError, "does not belong to this installation"):
+            integration.refresh_integration(self.paths)
+        self.assertEqual(before, (state_path.read_bytes(), manifest.read_bytes(), self.skill_roots_snapshot()))
+        shutil.move(str(foreign), str(Path(self.temporary.name) / "kept-notes"))
+
+        refreshed = integration.refresh_integration(self.paths)
+        self.assertEqual((targets, [], []), (set(refreshed["added"]), refreshed["refreshed"], refreshed["removed"]))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(integration.sha256_file(manifest), state["skillManifest"]["sha256"])
+        self.assertTrue(integration.verify_integration(self.paths)["ok"])
+        with patch("ocsl_review.doctor.mcps.doctor", return_value=acceptance):
+            self.assertTrue(review_doctor.doctor(self.paths)["checks"]["integration"])
+
+        # Nothing left to do: a further refresh or a repeated install writes neither the manifest nor the state.
+        before = (state_path.read_bytes(), manifest.read_bytes(), self.skill_roots_snapshot())
+        again = integration.refresh_integration(self.paths)
+        self.assertEqual(([], [], []), (again["refreshed"], again["added"], again["removed"]))
+        self.assertEqual([], self.install()["added"])
+        self.assertEqual(before, (state_path.read_bytes(), manifest.read_bytes(), self.skill_roots_snapshot()))
+
+        integration.uninstall_integration(self.paths, stage_timeout=30)
+        self.assertFalse(any(Path(target).exists() for target in targets))
         self.assertEqual(self.original_bytes, self.mcp_config.read_bytes())
 
     def test_stage_timeout_environment_is_honored_when_cli_value_is_absent(self) -> None:

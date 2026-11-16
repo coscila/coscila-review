@@ -1,6 +1,6 @@
 # Integration verification and recovery
 
-`integrate verify` checks the private installation-state contract, the skill-manifest digest, every installed skill file and mode, that every installed skill was copied from the current companion source (a stale copy fails until `integrate refresh` re-copies it), both owned MCP values, the MCP rollback backup, and both MCP launch surfaces through the generated deployment configuration. Verification is read-only and does not restage the deployment. It exits nonzero when a structural or MCP probe fails; `--live --strict` also requires bounded live calls.
+`integrate verify` checks the private installation-state contract, the skill-manifest digest, every installed skill file and mode, that each skill root holds the companion's skill set with every copy made from the current companion source (a stale copy, a missing skill or an installed skill outside the set fails until `integrate refresh` re-copies, installs or removes it), both owned MCP values, the MCP rollback backup, and both MCP launch surfaces through the generated deployment configuration. Verification is read-only and does not restage the deployment. It exits nonzero when a structural or MCP probe fails; `--live --strict` also requires bounded live calls.
 
 New installations record the generated configuration passed with `--staged-config`. That path must not be the mutable MCP source file. For an installation record created before this field existed, pass the generated path to each verification explicitly:
 

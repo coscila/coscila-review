@@ -7,7 +7,7 @@ import os
 import shutil
 import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -352,6 +352,31 @@ def _manifest_matches_installation(manifest: Mapping[str, Any], roots: Mapping[s
                 raise ValidationError(f"installed skill was edited after installation: {target}")
 
 
+def _check_skill_roots(paths: Any, roots: Iterable[Path]) -> None:
+    """Refuse skill roots that overlap a protected source or state tree, or each other."""
+    unique_roots = list(dict.fromkeys(roots))
+    protected_roots = config.protected_workspace_roots(paths)
+    for root in unique_roots:
+        for label, protected in protected_roots:
+            if is_within(root, protected) or is_within(protected, root):
+                raise ValidationError(
+                    f"skill root overlaps protected {label}: {root} and {protected}"
+                )
+    for index, first in enumerate(unique_roots):
+        for second in unique_roots[index + 1 :]:
+            if is_within(first, second) or is_within(second, first):
+                raise ValidationError(f"skill roots overlap: {first} and {second}")
+
+
+def _refuse_unowned_target(target: Path, skill_id: str) -> None:
+    """A skill the installation lacks goes only to an empty place: a node there is not the installation's to replace."""
+    if target.exists() or target.is_symlink():
+        raise ValidationError(
+            f"refusing to install {skill_id}: {target} exists and does not belong to this installation; "
+            "move it out of the skill root and run the refresh again"
+        )
+
+
 def install_skill_set(
     paths: Any,
     roots: Mapping[str, Path],
@@ -364,18 +389,7 @@ def install_skill_set(
     normalized_roots = {role: Path(path).expanduser().resolve() for role, path in roots.items()}
     if set(normalized_roots) != {"native", "codex"}:
         raise ValidationError("both native and codex skill roots are required")
-    unique_roots = list(dict.fromkeys(normalized_roots.values()))
-    protected_roots = config.protected_workspace_roots(paths)
-    for root in unique_roots:
-        for label, protected in protected_roots:
-            if is_within(root, protected) or is_within(protected, root):
-                raise ValidationError(
-                    f"skill root overlaps protected {label}: {root} and {protected}"
-                )
-    for index, first in enumerate(unique_roots):
-        for second in unique_roots[index + 1 :]:
-            if is_within(first, second) or is_within(second, first):
-                raise ValidationError(f"skill roots overlap: {first} and {second}")
+    _check_skill_roots(paths, normalized_roots.values())
     if manifest_file.exists():
         existing = json.loads(manifest_file.read_text(encoding="utf-8"))
         _manifest_matches_installation(existing, normalized_roots)
@@ -386,6 +400,8 @@ def install_skill_set(
             "installed": True,
             "reused": True,
             "refreshed": refreshed["refreshed"],
+            "added": refreshed["added"],
+            "removed": refreshed["removed"],
             "manifest": str(manifest_file),
         }
 
@@ -479,12 +495,16 @@ def install_skill_set(
 
 
 def stale_skill_entries(paths: Any, manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Installed copies whose recorded source digest differs from the companion's current skill source."""
+    """Installed copies of the companion's skills whose recorded source digest differs from the current skill source.
+
+    An installed skill outside the companion's skill set is extra, not stale (extra_skill_entries)."""
     stale: list[dict[str, Any]] = []
     current: dict[str, str] = {}
     for root_record in manifest.get("roots", []):
         for entry in root_record.get("skills", []):
             skill_id = str(entry.get("id"))
+            if skill_id not in REQUIRED_SKILLS:
+                continue
             if skill_id not in current:
                 source = paths.home / "skills" / skill_id
                 current[skill_id] = tree_digest(source) if source.is_dir() else ""
@@ -500,14 +520,40 @@ def stale_skill_entries(paths: Any, manifest: Mapping[str, Any]) -> list[dict[st
     return stale
 
 
+def _missing_in_root(root_record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    recorded = {str(entry.get("id")) for entry in root_record.get("skills", [])}
+    root = Path(str(root_record.get("root")))
+    return [
+        {"id": skill_id, "target": str(root / skill_id)}
+        for skill_id in REQUIRED_SKILLS
+        if skill_id not in recorded
+    ]
+
+
+def missing_skill_entries(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Skills of the companion's skill set that a recorded skill root lacks, one record per root and skill."""
+    return [item for root_record in manifest.get("roots", []) for item in _missing_in_root(root_record)]
+
+
+def extra_skill_entries(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Installed skills outside the companion's skill set."""
+    return [
+        {"id": str(entry.get("id")), "target": str(entry.get("target"))}
+        for root_record in manifest.get("roots", [])
+        for entry in root_record.get("skills", [])
+        if entry.get("id") not in REQUIRED_SKILLS
+    ]
+
+
 def verify_skill_installation(
     paths: Any,
     roots: Mapping[str, Path] | None = None,
     *,
     check_source: bool = True,
 ) -> dict[str, Any]:
-    """Check the installed copies: unedited since installation and, unless check_source is false, made from the
-    companion's current skill source (a stale copy keeps text the source no longer has)."""
+    """Check the installed copies: unedited since installation and, unless check_source is false, the companion's skill
+    set in every recorded root, each copy made from the current skill source (a stale copy keeps text the current
+    source lacks, a missing skill never reaches the agents, and an extra one offers them a skill the companion lacks)."""
     manifest_file = manifest_path(paths)
     if not manifest_file.is_file():
         return {"ok": False, "installed": False, "reason": "skill manifest is absent"}
@@ -526,18 +572,33 @@ def verify_skill_installation(
     except ValidationError as exc:
         return {"ok": False, "installed": True, "reason": str(exc)}
     if check_source:
-        stale = stale_skill_entries(paths, manifest)
-        if stale:
-            names = sorted({entry["id"] for entry in stale})
+        findings = [
+            (key, label, items)
+            for key, label, items in (
+                (
+                    "stale",
+                    "installed skills are stale (made from an older companion source)",
+                    stale_skill_entries(paths, manifest),
+                ),
+                ("missing", "the installation lacks required skills", missing_skill_entries(manifest)),
+                (
+                    "extra",
+                    "installed skills are outside the companion's skill set",
+                    extra_skill_entries(manifest),
+                ),
+            )
+            if items
+        ]
+        if findings:
             return {
                 "ok": False,
                 "installed": True,
-                "stale": stale,
-                "reason": (
-                    "installed skills are stale (made from an older companion source): "
-                    + ", ".join(names)
-                    + "; refresh them with `ocsl-review integrate refresh` (or `ocsl-review skills refresh`)"
-                ),
+                **{key: items for key, _, items in findings},
+                "reason": "; ".join(
+                    f"{label}: " + ", ".join(sorted({item["id"] for item in items}))
+                    for _, label, items in findings
+                )
+                + "; refresh the installation with `ocsl-review integrate refresh` (or `ocsl-review skills refresh`)",
             }
     return {
         "ok": True,
@@ -551,10 +612,14 @@ INTEGRATION_STATE_NAME = "install-state.json"
 
 
 def refresh_skill_set(paths: Any, *, integrated: bool = False) -> dict[str, Any]:
-    """Re-copy every installed skill whose source changed since installation, in place and with rollback.
+    """Bring an installation up to the companion's skill set, in place and with rollback.
 
-    The pre-install backups stay as recorded, so uninstall still restores what stood there before the first install.
-    An installed copy edited after installation is refused, never overwritten. Skills a deployment integration owns
+    Re-copies every installed skill whose source changed since installation. Installs each skill of the set that a
+    recorded root lacks, after the catalog and skill-root checks of an install, and only into an empty place: a node
+    there is not the installation's, so it is refused, never replaced. Removes an installed skill outside the set and
+    restores what stood at its place before the first install, as uninstall does. The other pre-install backups stay as
+    recorded, so uninstall still restores what stood there before the first install. An installed copy edited after
+    installation is refused, never overwritten, and a failure undoes every change. Skills a deployment integration owns
     are refreshed through `integrate refresh`, which also records the new skill manifest in the integration state.
     """
     manifest_file = manifest_path(paths)
@@ -569,46 +634,85 @@ def refresh_skill_set(paths: Any, *, integrated: bool = False) -> dict[str, Any]
                     f"refusing to refresh a skill edited after installation: {target}"
                 )
     stale_targets = {entry["target"] for entry in stale_skill_entries(paths, manifest)}
-    if not stale_targets:
-        return {"refreshed": [], "manifest": str(manifest_file)}
+    missing = missing_skill_entries(manifest)
+    extra = [
+        entry
+        for root_record in manifest.get("roots", [])
+        for entry in root_record.get("skills", [])
+        if entry.get("id") not in REQUIRED_SKILLS
+    ]
+    if not stale_targets and not missing and not extra:
+        return {"refreshed": [], "added": [], "removed": [], "manifest": str(manifest_file)}
     if not integrated and (paths.integration / INTEGRATION_STATE_NAME).exists():
         raise ValidationError(
             "these skills belong to a deployment integration; refresh them with `ocsl-review integrate refresh`"
         )
+    if missing:
+        validate_catalog(paths)
+        _check_skill_roots(paths, [Path(record["root"]) for record in manifest.get("roots", [])])
+        for item in missing:
+            _refuse_unowned_target(Path(item["target"]), item["id"])
+    for entry in extra:
+        backup = entry.get("backup", {})
+        if backup.get("kind") != "absent":
+            backup_path = Path(str(backup.get("path")))
+            if _node_manifest(backup_path) != backup.get("manifest"):
+                raise ValidationError(
+                    f"refusing to remove {entry['id']}, which is outside the companion's skill set, "
+                    f"because its backup changed: {backup_path}"
+                )
     install_id = str(manifest.get("installationId"))
     refresh_id = uuid.uuid4().hex
     aside_root = paths.integration / "backups" / f"refresh-{refresh_id}"
-    replaced: list[tuple[Path, Path]] = []
+    # Every change in order: a target set aside (moved back on failure) or a target created (removed on failure).
+    changes: list[tuple[Path, Path | None]] = []
     staged: list[Path] = []
     refreshed: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+
+    def stage_copy(skill_id: str, root: Path) -> tuple[Path, str, dict[str, Any]]:
+        source = paths.home / "skills" / skill_id
+        stage = root / f".ocsl-review-stage-{refresh_id}-{skill_id}"
+        if stage.exists() or stage.is_symlink():
+            raise ValidationError(f"staging path already exists: {stage}")
+        staged.append(stage)  # before the copy, so that a copy failing partway is removed as well
+        shutil.copytree(source, stage, symlinks=True, copy_function=shutil.copy2)
+        source_digest = tree_digest(source)
+        atomic_json(
+            stage / OWNER_FILE,
+            {
+                "schemaVersion": 1,
+                "installationId": install_id,
+                "skillId": skill_id,
+                "sourceDigest": source_digest,
+            },
+        )
+        return stage, source_digest, _node_manifest(stage)
+
+    def set_aside(target: Path, skill_id: str) -> None:
+        aside = aside_root / f"{len(changes):03d}-{skill_id}"
+        aside.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(target, aside)
+        changes.append((target, aside))
+
     try:
         for root_record in manifest.get("roots", []):
+            lacking = _missing_in_root(root_record)
+            kept: list[dict[str, Any]] = []
             for entry in root_record.get("skills", []):
+                skill_id = str(entry["id"])
+                target = Path(entry["target"])
+                if skill_id not in REQUIRED_SKILLS:
+                    set_aside(target, skill_id)
+                    _restore_backup(target, entry["backup"])
+                    removed.append(str(target))
+                    continue
+                kept.append(entry)
                 if entry["target"] not in stale_targets:
                     continue
-                skill_id = str(entry["id"])
-                source = paths.home / "skills" / skill_id
-                target = Path(entry["target"])
-                stage = target.parent / f".ocsl-review-stage-{refresh_id}-{skill_id}"
-                if stage.exists() or stage.is_symlink():
-                    raise ValidationError(f"staging path already exists: {stage}")
-                shutil.copytree(source, stage, symlinks=True, copy_function=shutil.copy2)
-                staged.append(stage)
-                source_digest = tree_digest(source)
-                atomic_json(
-                    stage / OWNER_FILE,
-                    {
-                        "schemaVersion": 1,
-                        "installationId": install_id,
-                        "skillId": skill_id,
-                        "sourceDigest": source_digest,
-                    },
-                )
-                installed_manifest = _node_manifest(stage)
-                aside = aside_root / f"{len(replaced):03d}-{skill_id}"
-                aside.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(target, aside)
-                replaced.append((target, aside))
+                stage, source_digest, installed_manifest = stage_copy(skill_id, target.parent)
+                set_aside(target, skill_id)
                 os.replace(stage, target)
                 staged.remove(stage)
                 if _node_manifest(target) != installed_manifest:
@@ -616,16 +720,38 @@ def refresh_skill_set(paths: Any, *, integrated: bool = False) -> dict[str, Any]
                 entry["sourceDigest"] = source_digest
                 entry["installedManifest"] = installed_manifest
                 refreshed.append(str(target))
+            for item in lacking:
+                skill_id, target = item["id"], Path(item["target"])
+                stage, source_digest, installed_manifest = stage_copy(skill_id, target.parent)
+                _refuse_unowned_target(target, skill_id)
+                os.replace(stage, target)
+                staged.remove(stage)
+                changes.append((target, None))
+                if _node_manifest(target) != installed_manifest:
+                    raise ValidationError(f"installed copy failed verification: {target}")
+                kept.append(
+                    {
+                        "id": skill_id,
+                        "target": str(target),
+                        "sourceDigest": source_digest,
+                        "installedManifest": installed_manifest,
+                        # The place was empty, so uninstall leaves it empty again.
+                        "backup": {"kind": "absent", "path": None, "manifest": {}},
+                    }
+                )
+                added.append(str(target))
+            root_record["skills"] = kept
         manifest["refreshedAt"] = datetime.now(UTC).isoformat()
         atomic_json(manifest_file, manifest, mode=0o600)
     except Exception:
         for stage in staged:
             _remove_node(stage)
         rollback_errors: list[str] = []
-        for target, aside in reversed(replaced):
+        for target, aside in reversed(changes):
             try:
                 _remove_node(target)
-                os.replace(aside, target)
+                if aside is not None:
+                    os.replace(aside, target)
             except Exception as exc:  # noqa: BLE001
                 rollback_errors.append(f"{target}: {exc}")
         if rollback_errors:
@@ -633,9 +759,10 @@ def refresh_skill_set(paths: Any, *, integrated: bool = False) -> dict[str, Any]
                 "skill refresh failed and rollback was incomplete: " + "; ".join(rollback_errors)
             )
         raise
-    for _, aside in replaced:
-        _remove_node(aside)
-    return {"refreshed": refreshed, "manifest": str(manifest_file)}
+    for _, aside in changes:
+        if aside is not None:
+            _remove_node(aside)
+    return {"refreshed": refreshed, "added": added, "removed": removed, "manifest": str(manifest_file)}
 
 
 def uninstall_skill_set(paths: Any) -> dict[str, Any]:

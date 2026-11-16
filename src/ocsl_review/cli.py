@@ -180,7 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _set(verify, "lifecycle", "cmd_verify", READ_ONLY, state_required=True)
     refresh = integrate_commands.add_parser(
-        "refresh", help="re-copy installed skills whose companion source changed (after a companion update)"
+        "refresh",
+        help="bring the installed skills up to the companion's skill set after a companion update: re-copy changed "
+        "skills, install missing ones and remove those outside the set",
     )
     _set(refresh, "lifecycle", "cmd_refresh", OPERATOR, state_required=True)
     uninstall = integrate_commands.add_parser("uninstall")

@@ -435,8 +435,9 @@ def _validate_install_state(state: Mapping[str, Any]) -> None:
 def _verify_active_state(
     paths: Any, state: Mapping[str, Any], *, check_source: bool = True
 ) -> dict[str, Any]:
-    """Integrity of the active installation; with check_source also that the installed skills match the current
-    companion source (a stale copy fails verification and doctor, and `integrate refresh` brings it up to date)."""
+    """Integrity of the active installation; with check_source also that every skill root holds the companion's skill
+    set made from its current source (a stale copy, a missing skill or an installed skill outside the set fails
+    verification and doctor, and `integrate refresh` brings the installation up to date)."""
     _validate_install_state(state)
     skill_manifest = Path(state["skillManifest"]["path"])
     if (
@@ -548,6 +549,8 @@ def install_integration(
             "installed": True,
             "reused": True,
             "refreshed": refreshed["refreshed"],
+            "added": refreshed["added"],
+            "removed": refreshed["removed"],
             "verification": verification,
         }
     if skills.manifest_path(paths).exists():
@@ -611,10 +614,12 @@ def install_integration(
 
 
 def refresh_integration(paths: Any) -> dict[str, Any]:
-    """Re-copy installed skills whose companion source changed and record the new skill manifest in the state.
+    """Bring the installed skills up to the companion's skill set and record the new skill manifest in the state.
 
-    MCP entries and staging are untouched (they name commands and paths, not skill text). Refuses an installation
-    whose skills or MCP entries were edited after installation.
+    The skill refresh re-copies skills whose source changed, installs each skill the installation lacks into every
+    recorded root and removes installed skills outside the set (skills.refresh_skill_set). MCP entries and staging are
+    untouched (they name commands and paths, not skill text). Refuses an installation whose skills or MCP entries were
+    edited after installation.
     """
     state_path = install_state_path(paths)
     if not state_path.is_file():
@@ -622,7 +627,8 @@ def refresh_integration(paths: Any) -> dict[str, Any]:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     _verify_active_state(paths, state, check_source=False)
     result = skills.refresh_skill_set(paths, integrated=True)
-    if result["refreshed"]:
+    changes = {key: result[key] for key in ("refreshed", "added", "removed")}
+    if any(changes.values()):
         skill_manifest = Path(state["skillManifest"]["path"])
         state["skillManifest"] = {
             "path": str(skill_manifest),
@@ -631,7 +637,7 @@ def refresh_integration(paths: Any) -> dict[str, Any]:
         _validate_install_state(state)
         atomic_json(state_path, state, mode=0o600)
     _verify_active_state(paths, state)
-    return {"refreshed": result["refreshed"], "state": str(state_path)}
+    return {**changes, "state": str(state_path)}
 
 
 def verify_integration(paths: Any) -> dict[str, Any]:
