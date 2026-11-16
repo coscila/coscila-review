@@ -8,11 +8,11 @@ crosses databases: rows name the parent by value, a citation locus by (journal, 
 ``work_key``. ``followup_branch.FollowupBranch.verify`` checks every such reference against the parent and that the
 parent's digest is unchanged.
 
-The tables here are the shared contract: the ledger tables every module writes (datasets, artifacts, provider requests,
+``CORE_DDL`` holds the shared contract: the ledger tables every module writes (datasets, artifacts, provider requests,
 judge calls and judgments) and the interface tables one module writes and others read (status, frame and strata,
 support, function, dependency, numeric checks, cited-by edges, second-generation matches, estimates and coverage).
-Tables private to one module live in ``followup_schema_a`` and ``followup_schema_b``; ``ddl()`` and ``dictionary()``
-join all three, so one schema version covers the branch.
+``EVIDENCE_DDL`` and ``ANALYSIS_DDL`` hold the tables only one evidence or analysis module writes. ``ddl()`` and
+``dictionary()`` join all three, so one schema version covers the branch.
 """
 from __future__ import annotations
 
@@ -204,6 +204,58 @@ CREATE TABLE IF NOT EXISTS fu_coverage(
 {_append_only('fu_protocol_freeze', 'protocol freezes')}
 """
 
+
+# Tables only the evidence modules write: cited-by coverage (followup_citedby) and the support evidence with its
+# units (followup_support).
+EVIDENCE_DDL = """
+CREATE TABLE IF NOT EXISTS fu_citedby_coverage(
+  target_doi TEXT NOT NULL, source TEXT NOT NULL, state TEXT NOT NULL
+    CHECK(state IN ('complete','truncated','unavailable','error','no-identifier')),
+  hit_count INTEGER, edges INTEGER NOT NULL, reason TEXT, checked_at TEXT NOT NULL,
+  PRIMARY KEY(target_doi, source));
+CREATE TABLE IF NOT EXISTS fu_evidence(
+  evidence_id TEXT PRIMARY KEY, work_key TEXT NOT NULL, unit TEXT NOT NULL CHECK(unit IN ('abstract','full-text')),
+  provider TEXT, route TEXT, provenance_class TEXT CHECK(provenance_class IS NULL OR
+    provenance_class IN ('public','entitled')), source_sha256 TEXT, text_sha256 TEXT, characters INTEGER,
+  complete INTEGER CHECK(complete IS NULL OR complete IN (0,1)),
+  outcome TEXT NOT NULL CHECK(outcome IN ('obtained','fetch-failed','no-open-full-text','unavailable','incomplete')),
+  request_id TEXT, retrieved_at TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}');
+CREATE INDEX IF NOT EXISTS ix_fu_evidence_work ON fu_evidence(work_key, unit);
+CREATE TABLE IF NOT EXISTS fu_evidence_units(
+  evidence_id TEXT NOT NULL REFERENCES fu_evidence(evidence_id), unit_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL, locator TEXT NOT NULL DEFAULT '', text TEXT NOT NULL, PRIMARY KEY(evidence_id, unit_id));
+"""
+
+# Tables only the analysis modules write: second-generation sampling, documents, sentences and candidate searches
+# (followup_secondgen) and the retraction-lag rows (followup_stats).
+ANALYSIS_DDL = """
+CREATE TABLE IF NOT EXISTS fu_secondgen_sample(
+  anchor_locus_id TEXT NOT NULL, edge_id TEXT NOT NULL, citing_key TEXT NOT NULL, target_doi TEXT NOT NULL,
+  available INTEGER NOT NULL CHECK(available >= 1), sampled INTEGER NOT NULL CHECK(sampled >= 1),
+  inclusion_probability REAL NOT NULL CHECK(inclusion_probability > 0 AND inclusion_probability <= 1),
+  seed TEXT NOT NULL, selected_at TEXT NOT NULL, PRIMARY KEY(anchor_locus_id, edge_id));
+CREATE INDEX IF NOT EXISTS ix_fu_secondgen_sample_citing ON fu_secondgen_sample(citing_key);
+CREATE TABLE IF NOT EXISTS fu_secondgen_documents(
+  citing_key TEXT PRIMARY KEY, provider TEXT, provenance_class TEXT, source_sha256 TEXT,
+  outcome TEXT NOT NULL CHECK(outcome IN ('obtained','fetch-failed','no-open-full-text','unavailable',
+                                          'citation-not-located')),
+  request_id TEXT, retrieved_at TEXT NOT NULL, detail_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS fu_secondgen_sentences(
+  sentence_id TEXT PRIMARY KEY, citing_key TEXT NOT NULL, target_doi TEXT NOT NULL, ordinal INTEGER NOT NULL,
+  section TEXT, marker TEXT, text TEXT NOT NULL, text_sha256 TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_fu_secondgen_sentences_work ON fu_secondgen_sentences(citing_key, target_doi);
+CREATE TABLE IF NOT EXISTS fu_secondgen_candidates(
+  anchor_locus_id TEXT NOT NULL, citing_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('ranked','anchor-text-unavailable','no-sentences')),
+  reason TEXT, receipt_id TEXT, receipt_sha256 TEXT, index_digest TEXT, k INTEGER NOT NULL, sentences INTEGER NOT NULL,
+  candidates INTEGER NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(anchor_locus_id, citing_key));
+CREATE TABLE IF NOT EXISTS fu_lag(
+  locus_id TEXT PRIMARY KEY, work_key TEXT NOT NULL, status TEXT NOT NULL, notice_date TEXT, citing_first_online TEXT,
+  lag_days INTEGER, after_notice INTEGER CHECK(after_notice IS NULL OR after_notice IN (0,1)), date_basis TEXT NOT NULL,
+  reason TEXT);
+"""
+
+
 CORE_DICTIONARY: dict[str, dict[str, str]] = {
     "fu_meta": {"key": "metadata key", "value": "metadata value (JSON for structured values)"},
     "fu_dictionary": {"table_name": "table", "column_name": "column", "type": "declared type", "meaning": "meaning"},
@@ -346,16 +398,67 @@ CORE_DICTIONARY: dict[str, dict[str, str]] = {
         "units": "units", "weighted": "weighted units"},
 }
 
+EVIDENCE_DICTIONARY: dict[str, dict[str, str]] = {
+    "fu_citedby_coverage": {
+        "target_doi": "cited article (an affected review)", "source": "europe-pmc or openalex",
+        "state": "complete, truncated, unavailable, error or no-identifier", "hit_count": "total the source reported",
+        "edges": "edges recorded", "reason": "why the traversal is not complete", "checked_at": "time checked"},
+    "fu_evidence": {
+        "evidence_id": "evidence id (digest of work, unit, provider and source digest)", "work_key": "cited work",
+        "unit": "abstract or full-text", "provider": "provider of the bytes", "route": "retrieval route",
+        "provenance_class": "public or entitled (entitled text reaches on-premises judges only)",
+        "source_sha256": "sha256 of the source bytes", "text_sha256": "sha256 of the extracted text",
+        "characters": "characters of extracted text", "complete": "1 when the evidence covers the whole unit",
+        "outcome": "obtained, fetch-failed, no-open-full-text, unavailable or incomplete",
+        "request_id": "provider request (fu_requests)", "retrieved_at": "time retrieved",
+        "detail_json": "retrieval details (attempts, cache hits, rejected cache candidates)"},
+    "fu_evidence_units": {"evidence_id": "evidence", "unit_id": "unit id", "ordinal": "document order",
+                          "kind": "abstract, paragraph, caption or table", "locator": "section trail of the unit",
+                          "text": "unit text"},
+}
+
+ANALYSIS_DICTIONARY: dict[str, dict[str, str]] = {
+    "fu_secondgen_sample": {
+        "anchor_locus_id": "S1 locus whose claim is followed (dependency sole or essential)",
+        "edge_id": "sampled cited-by edge (fu_citedby_edges)", "citing_key": "citing work",
+        "target_doi": "the anchor's review, DOI in lower case",
+        "available": "cited-by edges of the anchor's review", "sampled": "edges sampled for the anchor",
+        "inclusion_probability": "realised inclusion probability of the edge (sampled / available)",
+        "seed": "selection seed (protocol seed and scope)", "selected_at": "time selected"},
+    "fu_secondgen_documents": {
+        "citing_key": "citing work", "provider": "provider of the full text", "provenance_class": "public or entitled",
+        "source_sha256": "sha256 of the document bytes (fu_artifacts)", "outcome": "obtained, fetch-failed, "
+        "no-open-full-text, unavailable or citation-not-located", "request_id": "provider request (fu_requests)",
+        "retrieved_at": "time retrieved", "detail_json": "retrieval details (identifiers asked, failure class)"},
+    "fu_secondgen_sentences": {
+        "sentence_id": "sentence id (digest of citing work, target and sentence digest)", "citing_key": "citing work",
+        "target_doi": "the cited review", "ordinal": "document order", "section": "section trail",
+        "marker": "marker of the cited review as rendered in the sentence", "text": "sentence text",
+        "text_sha256": "sha256 of the sentence"},
+    "fu_secondgen_candidates": {
+        "anchor_locus_id": "S1 locus whose claim is followed", "citing_key": "sampled citing work",
+        "state": "ranked, anchor-text-unavailable or no-sentences", "reason": "why no search ran",
+        "receipt_id": "retrieval receipt id", "receipt_sha256": "stored retrieval receipt (fu_artifacts)",
+        "index_digest": "digest of the BM25 index searched", "k": "candidates kept per citing work (protocol)",
+        "sentences": "sentences of the citing work that cite the review", "candidates": "sentences ranked within k",
+        "created_at": "time searched"},
+    "fu_lag": {
+        "locus_id": "S1 locus", "work_key": "compromised cited work", "status": "status of the cited work",
+        "notice_date": "date of the deciding notice", "citing_first_online": "first-online date of the citing review",
+        "lag_days": "citing date minus notice date in days (both dates given to the day)",
+        "after_notice": "1 when the review went online after the notice, 0 before, NULL when undecidable",
+        "date_basis": "precision both dates were compared at (day, month or year), or none",
+        "reason": "why the comparison is undecidable"},
+}
+
 
 def ddl() -> str:
-    from . import followup_schema_a, followup_schema_b
-    return CORE_DDL + followup_schema_a.DDL + followup_schema_b.DDL
+    return CORE_DDL + EVIDENCE_DDL + ANALYSIS_DDL
 
 
 def dictionary() -> dict[str, dict[str, str]]:
-    from . import followup_schema_a, followup_schema_b
     merged: dict[str, dict[str, str]] = {}
-    for part in (CORE_DICTIONARY, followup_schema_a.DICTIONARY, followup_schema_b.DICTIONARY):
+    for part in (CORE_DICTIONARY, EVIDENCE_DICTIONARY, ANALYSIS_DICTIONARY):
         clash = set(merged) & set(part)
         if clash:
             raise ValidationError(f"follow-up tables declared twice: {', '.join(sorted(clash))}")
