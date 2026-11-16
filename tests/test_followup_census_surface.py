@@ -3,9 +3,8 @@
 
 The census instrument's bundle files, its registry digest and broker bundle digests, its builder and validator module,
 the instrument it reuses unchanged (citation-support@2: prompt, output schema, manifest, its validator and builder
-module and its registry digest) and the fidelity tests with their
-fixtures are pinned here by sha256 as they stand at f726fff, the companion revision the census runs with. A change to
-any of them is a change of the census and needs a deliberate re-pin here; the follow-up never makes one.
+module and its registry digest) and the fidelity tests with their fixtures are pinned here by sha256. A change to any
+of them is a change of the census and needs a deliberate re-pin here; the follow-up never makes one.
 """
 from __future__ import annotations
 
