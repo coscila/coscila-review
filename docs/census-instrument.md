@@ -688,7 +688,7 @@ provider, and a socket that names no active run principal (a chat turn socket,
 for example) is refused. No bearer token, provider address or key reaches the
 executor; `--api-key-env` is refused with the broker transport.
 
-1. Export one bundle per tier and journal and give them to the operator:
+1. Export one bundle per tier and journal:
 
    ```bash
    ocsl-review instruments export citation-census@1 --tier abstract --param journal="$JOURNAL_A"
@@ -707,9 +707,10 @@ executor; `--api-key-env` is refused with the broker transport.
    verbatim`. The digest is the sha256 of the canonical JSON of
    `{format: ocsl-broker-instrument-v1, instrument, registryDigest, tier,
    parameters, bundleSha256}`, so a changed body never reuses a digest.
-2. The operator installs every bundle (`PUT /v2/instruments/{digest}`) and
-   grants the digests and the judge provider to the run principal. The
-   executor installs nothing.
+2. For a Study Run, the lab's Study Run executor installs every bundle
+   (`PUT /v2/instruments/{digest}`) and grants the digests and the judge
+   provider to the run principal each time the run starts or resumes. The
+   census commands install nothing.
 3. `study prepare ... --study-bundle <file|sha256>` pins the study bundle (an
    `ocsl-study-bundle-v1` record of `instruments.study_bundle_digest`: protocol,
    study prompt, template, instrument digests, dataset versions and package
