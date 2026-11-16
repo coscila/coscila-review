@@ -519,8 +519,8 @@ def cmd_strata(args: Any) -> dict[str, Any]:
     protocol = protocol_of(branch)
     with branch.writing() as connection:
         if getattr(args, "freeze", False) and frozen(connection):
-            # A freeze asked again (a step sent again after its result was lost) reports the freeze the branch holds;
-            # the strata are never built again.
+            # A freeze asked again (the same command run again after its result was lost) reports the freeze the
+            # branch holds; the strata are never built again.
             row = connection.execute("SELECT * FROM fu_protocol_freeze ORDER BY frozen_at DESC LIMIT 1").fetchone()
             return {"database": str(branch.path), **json.loads(row["sizes_json"]), "alreadyFrozen": True,
                     "freeze": {"freezeId": row["freeze_id"], "protocolSha256": row["protocol_sha256"],

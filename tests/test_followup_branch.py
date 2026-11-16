@@ -82,8 +82,8 @@ class BranchTests(unittest.TestCase):
                                           ).fetchone()[0]
             self.assertEqual(sentence_digest(redacted), hashlib.sha256(text.encode()).hexdigest())
 
-    def test_steps_without_the_text_parent_run_and_steps_that_read_sentences_refuse(self):
-        """The private keep-text copy is mounted only for steps that read citing sentences: without it a branch
+    def test_commands_without_the_text_parent_run_and_commands_that_read_sentences_refuse(self):
+        """The private keep-text copy is needed only by the commands that read citing sentences: without it a branch
         connects, verifies, resolves status, builds strata and exports publicly, while support, function, numeric,
         second-gen candidates and a private export refuse instead of turning entitled loci into text-redacted."""
         import shutil
@@ -125,8 +125,8 @@ class BranchTests(unittest.TestCase):
             self.assertTrue(branch.sentence(connection, F.JOURNAL_A, "10.5555/fu.review.a2", "2", 1)[0])
 
     def test_an_init_asked_again_with_its_inputs_reports_the_branch_it_made(self):
-        # A step sent again after its result was lost: the same inputs report the branch unchanged; any other input,
-        # and a branch made without a text parent, is still refused.
+        # The same init run again after its result was lost: the same inputs report the branch unchanged; any other
+        # input, and a branch made without a text parent, is still refused.
         path = self.root / "again.sqlite3"
         bundle = "c" * 64
         first = FollowupBranch.create(path, self.census["parent"], parent_text=self.census["text"],

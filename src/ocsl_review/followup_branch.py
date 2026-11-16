@@ -347,9 +347,10 @@ class FollowupBranch:
     @classmethod
     def _made_before(cls, path: Path, parent: Path, *, parent_text: Path | None, protocol: Any,
                      allow_incomplete: bool, study_bundle: Any) -> dict[str, Any] | None:
-        """An init asked again with the inputs that made the branch at ``path`` (a step sent again after its result
-        was lost): the same parent and text parent (path and digest), protocol digest, incomplete-parent allowance and
-        study bundle pin. Returns the init result marked ``alreadyMade``, or None when any input differs."""
+        """An init asked again with the inputs that made the branch at ``path`` (the same command run again after its
+        result was lost): the same parent and text parent (path and digest), protocol digest, incomplete-parent
+        allowance and study bundle pin. Returns the init result marked ``alreadyMade``, or None when any input
+        differs."""
         try:
             branch = cls(path)
         except ValidationError:
@@ -399,8 +400,8 @@ class FollowupBranch:
 
     @property
     def text_mounted(self) -> bool:
-        """The private text parent this branch was made with is present (it is mounted only for steps that read
-        citing sentences, typically the on-premises judging steps)."""
+        """The private text parent this branch was made with is present (it needs to be present only for the commands
+        that read citing sentences, typically on-premises judging)."""
         return self.parent_text is not None and self.parent_text.is_file()
 
     def require_text(self) -> None:
@@ -408,11 +409,13 @@ class FollowupBranch:
         mounted: entitled sentences would otherwise silently become text-redacted."""
         if self.parent_text is not None and not self.parent_text.is_file():
             raise ValidationError(f"this command reads citing sentences, and the branch's text parent is not mounted: "
-                                  f"{self.parent_text} (mount the private keep-text copy for this step)")
+                                  f"{self.parent_text} (the private keep-text copy must be at that path for this "
+                                  "command)")
 
     def connect(self, *, write: bool = False, check_parent: bool = True) -> sqlite3.Connection:
         """A connection to the branch with the parent ATTACHed read-only and immutable, and the text parent when it is
-        mounted (a step without it never reads an entitled sentence; ``require_text`` guards the steps that do)."""
+        mounted (a command run without it never reads an entitled sentence; ``require_text`` guards the commands that
+        do)."""
         if check_parent:
             self._quick_check(self.parent, "parent")
             if self.text_mounted:
@@ -504,7 +507,8 @@ class FollowupBranch:
             if path is None:
                 continue
             if prefix == "parentText" and not path.is_file():
-                # The private text copy is mounted only for steps that read sentences; its digest is checked when it is.
+                # The private text copy needs to be present only for the commands that read sentences; its digest is
+                # checked where it is.
                 notes.append(f"the text parent is not mounted here ({path}); its digest is checked where it is mounted")
                 continue
             if not path.is_file():

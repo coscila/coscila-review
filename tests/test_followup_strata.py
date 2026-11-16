@@ -271,7 +271,8 @@ class StrataTests(unittest.TestCase):
             self.assertEqual(first.meta()["protocolSha256"], row["protocol_sha256"])
         with self.assertRaisesRegex(ValidationError, "frozen"):
             followup_strata.cmd_strata(SimpleNamespace(database=str(first.path), freeze=False))
-        # A freeze asked again (its step sent again after the result was lost) reports the branch's freeze unchanged.
+        # A freeze asked again (the same command run again after its result was lost) reports the branch's freeze
+        # unchanged.
         again = followup_strata.cmd_strata(SimpleNamespace(database=str(first.path), freeze=True))
         self.assertTrue(again["alreadyFrozen"])
         self.assertEqual({key: one[key] for key in ("freezeId", "strataSha256", "protocolSha256", "frozenAt")},

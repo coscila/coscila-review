@@ -208,7 +208,7 @@ class BrokerJudgeTests(unittest.TestCase):
 
     def test_a_halted_transport_stops_scheduling_and_skips_the_further_passes(self):
         """A budget halt with a resumeAfter: one call, no further batch, repair or pass, no cooldown, every other
-        item left open, and a paused result that carries the halt code and resumeAfter for the Study Run."""
+        item left open, and a paused result that carries the halt code and resumeAfter."""
         from ocsl_review.followup_judge import step_result
         broker = FakeBroker(installed=[function_digest()], pause="BUDGET_EXHAUSTED",
                             resume_after="2999-01-01T00:00:00Z")
