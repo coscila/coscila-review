@@ -707,10 +707,10 @@ executor; `--api-key-env` is refused with the broker transport.
    verbatim`. The digest is the sha256 of the canonical JSON of
    `{format: ocsl-broker-instrument-v1, instrument, registryDigest, tier,
    parameters, bundleSha256}`, so a changed body never reuses a digest.
-2. For a Study Run, the lab's Study Run executor installs every bundle
+2. For a Study Run, the lab's study worker installs every bundle once per run
    (`PUT /v2/instruments/{digest}`) and grants the digests and the judge
    provider to the run principal each time the run starts or resumes. The
-   census commands install nothing.
+   executor installs nothing.
 3. `study prepare ... --study-bundle <file|sha256>` pins the study bundle (an
    `ocsl-study-bundle-v1` record of `instruments.study_bundle_digest`: protocol,
    study prompt, template, instrument digests, dataset versions and package

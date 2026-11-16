@@ -40,18 +40,18 @@ permission request for each paper. Report a real refusal without bypassing it.
 ## Census studies through the run principal's broker
 
 An entry-level census (`citation-census@1`, `ocsl-review study`) runs in the lab
-through the run principal's broker socket: the launcher binds the principal's
-socket directory read-only into the sandbox and sets `OCSL_BROKER_SOCKET` to the
-socket inside it, and `study judge`, `full-text`, `no-truncation` and
-`replicate` then run without `--base-url`. The socket is the run's identity; the
-census commands hold no token or provider key and install nothing. Each time the
-run starts or resumes, the lab's Study Run executor installs each bundle that
+as steps of a Study Run, through the run principal's broker socket: the launcher
+binds the principal's socket directory read-only into the sandbox and sets
+`OCSL_BROKER_SOCKET` to the socket inside it, and `study judge`, `full-text`,
+`no-truncation` and `replicate` then run without `--base-url`. The socket is the
+run's identity; the executor holds no token or provider key and installs
+nothing. The lab's study worker installs each bundle that
 `ocsl-review instruments export citation-census@1 --tier <tier> --param journal=<journal>`
-prints, one per tier and journal (`PUT /v2/instruments/{digest}`), and grants
-the digests and the judge provider to the principal;
-`study prepare --study-bundle` pins the study bundle that every call receipt
-records. Entitled reviews reach only a broker provider that the operator policy
-lists in `onPremBrokerProviders`.
+prints, one per tier and journal, once per run (`PUT /v2/instruments/{digest}`),
+and grants the digests and the judge provider to the principal each time the run
+starts or resumes; `study prepare --study-bundle` pins the study bundle that
+every call receipt records. Entitled reviews reach only a broker provider that
+the operator policy lists in `onPremBrokerProviders`.
 
 Each call is a one-item bulk job carrying the request the instrument built (its
 messages unchanged and its settings, which the broker checks against the

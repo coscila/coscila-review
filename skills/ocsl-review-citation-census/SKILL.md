@@ -21,10 +21,12 @@ live routes, derives each review's cited works with `study works`, settles the
 enumerated reviews its last prepare cannot prepare with `study prepare
 --settle-unprepared` (recorded as unavailable, each with its reason, within the
 protocol's bound `--max-settled-percent`) and runs
-any predeclared manifest comparison only after the census is complete. In the lab the judging commands run through the run principal's
-broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`) once the operator has
-installed the bundles that `ocsl-review instruments export` prints, with the
-study bundle pinned by `study prepare --study-bundle`. Read
+any predeclared manifest comparison only after the census is complete. In the
+lab the judging commands run as steps of a Study Run, through the run
+principal's broker socket (`--broker-socket`, or `OCSL_BROKER_SOCKET`): the
+lab's study worker installs the bundles that `ocsl-review instruments export`
+prints once per run and grants them to the principal each time the run starts
+or resumes, and `study prepare --study-bundle` pins the study bundle. Read
 `$OCSL_REVIEW_HOME/docs/census-instrument.md` first; the instrument runs
 unchanged and its decisions are recorded per entry. `study replay` re-derives
 the recorded verdicts from the responses the broker stores (over the run
